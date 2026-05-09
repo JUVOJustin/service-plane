@@ -1,4 +1,18 @@
-export { signMachineRequest } from './auth.js';
+export {
+  createCapabilityIssuer,
+  createCapabilityIssuerFromJwks,
+  defineServiceGrants,
+  mountCapabilityEndpoints,
+  mountCapabilityJwksEndpoint,
+  mountCapabilityTokenEndpoint,
+  type CapabilityIssuer,
+  type CapabilityIssuerResolver,
+  type CreateCapabilityIssuerFromJwksOptions,
+  type CreateCapabilityIssuerOptions,
+  type MountCapabilityEndpointsOptions,
+  type MountCapabilityJwksEndpointOptions,
+  type MountCapabilityTokenEndpointOptions,
+} from './capabilities.js';
 export {
   cloudflareServiceBinding,
   httpsService,
@@ -14,18 +28,26 @@ export {
 } from './proxy.js';
 export { mergeServiceOpenApi, type OpenApiDocument } from '../shared/openapi.js';
 export {
-  DEFAULT_MAX_SKEW_SECONDS,
+  DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
+  DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
   DEFAULT_REGISTRY_CACHE_TTL_SECONDS,
   SERVICE_DISCOVERY_PATH,
-  SERVICE_PLANE_BODY_SHA256_HEADER,
-  SERVICE_PLANE_KEY_ID_HEADER,
-  SERVICE_PLANE_SIGNATURE_HEADER,
-  SERVICE_PLANE_TIMESTAMP_HEADER,
+  SERVICE_PLANE_AUTHORIZATION_SCHEME,
+  SERVICE_PLANE_CAPABILITY_JWKS_PATH,
+  SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
 } from '../shared/types.js';
 export type {
+  CapabilityCatalog,
+  CapabilityClaims,
+  CapabilityJwks,
+  CapabilityScopeDefinition,
   DiscoveredServiceRoute,
   FetchLike,
+  IssueCapabilityTokenInput,
+  IssuedCapabilityToken,
   RegistryCache,
+  ServiceGrant,
+  ServiceGrantDefinition,
   ServiceDiscoverySnapshot,
   ServiceDiscoveryDocument,
   ServiceEndpoint,
@@ -33,5 +55,4 @@ export type {
   ServiceRegistrySnapshot,
   ServiceRouteDiscovery,
   ServiceRouteVisibility,
-  SignMachineRequestOptions,
 } from '../shared/types.js';

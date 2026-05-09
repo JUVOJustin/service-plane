@@ -1,1 +1,1 @@
-export { memoryRegistryCache } from './memory-cache.js';
+export { memoryCapabilityTokenCache, memoryRegistryCache } from './memory-cache.js';

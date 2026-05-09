@@ -1,7 +1,7 @@
 {
   "name": "service-plane",
-  "version": "0.0.1",
-  "description": "Opinionated Hono service-plane primitives for service discovery, control-plane proxying, and HMAC machine auth.",
+  "version": "0.1.0",
+  "description": "Opinionated Hono service-plane primitives for service discovery, STS capability tokens, route scopes, and control-plane proxying.",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -49,7 +49,8 @@
     "microservices",
     "control-plane",
     "service-discovery",
-    "hmac",
+    "sts",
+    "capabilities",
     "cloudflare-workers"
   ],
   "peerDependencies": {

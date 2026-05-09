@@ -1,12 +1,13 @@
 import type { Context, MiddlewareHandler } from 'hono';
 import type { DiscoveredServiceRoute, ServiceRegistry } from '../shared/types.js';
+import { servicePlaneAuthorization } from '../shared/capability-tokens.js';
 
 export type ControlPlaneProxyOptions = {
   authorizeAuthRoute?: (context: Context, route: DiscoveredServiceRoute) => Promise<void | Response> | void | Response;
+  capabilityToken?: (context: Context, route: DiscoveredServiceRoute) => Promise<string | undefined> | string | undefined;
   forwardHeaders?: (context: Context, route: DiscoveredServiceRoute) => HeadersInit | Promise<HeadersInit | undefined> | undefined;
   registry: ServiceRegistry;
   shouldProxyPath?: (path: string) => boolean;
-  signer?: (request: Request, route: DiscoveredServiceRoute) => Promise<Request> | Request;
 };
 
 export function createControlPlaneProxy(options: ControlPlaneProxyOptions): MiddlewareHandler {
@@ -32,7 +33,11 @@ export function createControlPlaneProxy(options: ControlPlaneProxyOptions): Midd
     let request = rewriteRequest(context.req.raw, route);
     const headers = await options.forwardHeaders?.(context, route);
     if (headers) request = withHeaders(request, headers);
-    if (options.signer) request = await options.signer(request, route);
+    if (route.requiredScopes?.length) {
+      const token = await options.capabilityToken?.(context, route);
+      if (!token) return context.json({ error: 'Capability token required' }, 500);
+      request = withHeaders(request, { authorization: servicePlaneAuthorization(token) });
+    }
     return route.service.fetch(request);
   };
 }

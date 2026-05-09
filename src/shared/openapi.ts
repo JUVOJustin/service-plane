@@ -40,6 +40,7 @@ export async function mergeServiceOpenApi(input: {
       summary: `${route.serviceTitle} ${route.method.toUpperCase()} ${route.path}`,
       tags: [route.serviceTitle],
       'x-service-plane': {
+        ...(route.requiredScopes?.length ? { requiredScopes: route.requiredScopes } : {}),
         serviceId: route.serviceId,
         serviceVersion: route.serviceVersion,
         visibility: route.visibility,

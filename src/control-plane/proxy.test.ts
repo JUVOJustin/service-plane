@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { Hono } from 'hono';
+import { capability, capabilityAuth, defineCapabilities } from '../service/capabilities.js';
 import { defineNamespace, defineService, mountDiscovery } from '../service/discovery.js';
-import { machineAuth } from '../service/auth.js';
-import { verifyMachineRequest } from '../shared/crypto.js';
-import { signMachineRequest } from './auth.js';
-import { createControlPlaneProxy } from './proxy.js';
+import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
+import { createCapabilityIssuer, defineServiceGrants } from './capabilities.js';
 import { cloudflareServiceBinding } from './endpoints.js';
+import { createControlPlaneProxy } from './proxy.js';
 import { createServiceRegistry } from './registry.js';
 
 describe('control-plane proxy', () => {
@@ -27,7 +27,7 @@ describe('control-plane proxy', () => {
           defineNamespace({ app: internalRoutes, prefix: '/', visibility: 'internal' }),
         ],
         title: 'Example',
-        version: '0.0.1',
+        version: '0.1.0',
       }),
     );
     const registry = createServiceRegistry({
@@ -47,23 +47,35 @@ describe('control-plane proxy', () => {
     expect((await controlPlane.request('/providers/example/v1/sync', { method: 'POST' })).status).toBe(404);
   });
 
-  it('signs proxied requests', async () => {
-    const providerRoutes = new Hono().post(
-      '/events/example',
-      machineAuth({
-        now: new Date('2026-05-09T12:00:01.000Z'),
-        resolveSecret: () => 'shared-secret',
+  it('adds STS capability tokens to scoped proxied routes', async () => {
+    const keys = await testKeys();
+    const capabilities = defineCapabilities({
+      scopes: [{ id: 'example.events.ingest', title: 'Ingest example events' }],
+      serviceId: 'example',
+    });
+    const issuer = createCapabilityIssuer({
+      capabilities: [capabilities],
+      grants: defineServiceGrants({
+        grants: [{ caller: 'control-plane', scopes: ['example.events.ingest'], target: 'example' }],
       }),
-      (context) => context.json({ signed: true }),
-    );
-    const provider = new Hono().route('/', providerRoutes);
+      issuer: 'control-plane',
+      keyId: 'test-key',
+      now: () => new Date('2026-05-09T12:00:00.000Z'),
+      privateKey: keys.privateKey,
+      publicJwk: keys.publicJwk,
+    });
+    const providerRoutes = new Hono().post('/events/example', capability('example.events.ingest'), (context) => context.json({ scoped: true }));
+    const provider = new Hono();
+    provider.use('*', capabilityAuth({ expectedAudience: 'example', issuer: 'control-plane', jwks: await issuer.jwks(), now: new Date('2026-05-09T12:00:01.000Z') }));
+    provider.route('/', providerRoutes);
     mountDiscovery(
       provider,
       defineService({
+        capabilities,
         id: 'example',
         namespaces: [defineNamespace({ app: providerRoutes, prefix: '/', visibility: 'public' })],
         title: 'Example',
-        version: '0.0.1',
+        version: '0.1.0',
       }),
     );
     const registry = createServiceRegistry({
@@ -72,28 +84,28 @@ describe('control-plane proxy', () => {
     const controlPlane = new Hono().use(
       '*',
       createControlPlaneProxy({
+        capabilityToken: async (_context, route) =>
+          (
+            await issuer.issueCapabilityToken({
+              callerServiceId: 'control-plane',
+              scopes: route.requiredScopes ?? [],
+              targetServiceId: route.serviceId,
+            })
+          ).token,
         registry,
-        signer: (request) =>
-          signMachineRequest(request, {
-            now: new Date('2026-05-09T12:00:00.000Z'),
-            secret: 'shared-secret',
-          }),
       }),
     );
 
-    expect(await (await controlPlane.request('/events/example', { body: 'payload', method: 'POST' })).json()).toEqual({ signed: true });
-  });
-
-  it('can use the pure verifier for service-side adapters', async () => {
-    const signed = await signMachineRequest(new Request('https://example.test/internal'), {
-      now: new Date('2026-05-09T12:00:00.000Z'),
-      secret: 'shared-secret',
-    });
-    await expect(
-      verifyMachineRequest(signed, {
-        now: new Date('2026-05-09T12:00:01.000Z'),
-        resolveSecret: () => 'shared-secret',
-      }),
-    ).resolves.toMatchObject({ keyId: 'default' });
+    expect((await provider.request('/events/example', { method: 'POST' })).status).toBe(401);
+    expect(await (await controlPlane.request('/events/example', { body: 'payload', method: 'POST' })).json()).toEqual({ scoped: true });
   });
 });
+
+async function testKeys() {
+  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+  const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
+  return {
+    privateKey: pair.privateKey,
+    publicJwk: publicJwkFromPrivateJwk(privateJwk, 'test-key'),
+  };
+}
