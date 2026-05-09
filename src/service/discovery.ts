@@ -1,4 +1,4 @@
-import type { Hono } from 'hono';
+import type { Context } from 'hono';
 import { SERVICE_DISCOVERY_PATH, type ServiceDefinition, type ServiceDiscoveryDocument, type ServiceNamespaceDefinition } from '../shared/types.js';
 import { joinPaths, normalizePath } from '../shared/paths.js';
 
@@ -36,6 +36,12 @@ export function serviceDiscoveryDocument(service: ServiceDefinition): ServiceDis
   };
 }
 
-export function mountDiscovery(app: Pick<Hono, 'get'>, service: ServiceDefinition, path = SERVICE_DISCOVERY_PATH): void {
+export function mountDiscovery(
+	app: {
+		get(path: string, handler: (context: Context) => Response | Promise<Response>): unknown;
+	},
+	service: ServiceDefinition,
+	path = SERVICE_DISCOVERY_PATH,
+): void {
   app.get(path, (context) => context.json(serviceDiscoveryDocument(service), 200));
 }

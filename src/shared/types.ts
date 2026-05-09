@@ -1,4 +1,4 @@
-import type { Context, Hono, MiddlewareHandler } from 'hono';
+import type { Context, MiddlewareHandler } from 'hono';
 
 export const SERVICE_DISCOVERY_PATH = '/.well-known/service-plane/service.json';
 export const SERVICE_PLANE_KEY_ID_HEADER = 'Service-Plane-Key-Id';
@@ -18,7 +18,7 @@ export type RouteSource = {
   }>;
 };
 
-export type HonoAppLike = Pick<Hono, 'fetch' | 'get'> & RouteSource;
+export type HonoAppLike = RouteSource;
 
 export type ServiceNamespaceDefinition = {
   app: HonoAppLike;
