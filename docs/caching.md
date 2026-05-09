@@ -34,6 +34,33 @@ Good for external Node.js deployments with multiple instances.
 
 Acceptable for low-risk discovery document caching. Do not use KV for strict replay prevention.
 
+Minimal Cloudflare KV adapter:
+
+```ts
+import type { RegistryCache, ServiceDiscoverySnapshot } from 'service-plane/control-plane';
+
+function kvRegistryCache(kv: KVNamespace): RegistryCache {
+  return {
+    async get(key) {
+      const value = await kv.get(key, 'json');
+      return value as ServiceDiscoverySnapshot | undefined;
+    },
+    async set(key, value, ttlSeconds) {
+      await kv.put(key, JSON.stringify(value), { expirationTtl: ttlSeconds });
+    },
+  };
+}
+```
+
+Use it in the control plane:
+
+```ts
+const registry = createServiceRegistry({
+  cache: kvRegistryCache(env.SERVICE_REGISTRY_CACHE),
+  services,
+});
+```
+
 **Durable Object**
 
 Good for Cloudflare deployments that need stronger coordination or centralized cache invalidation.

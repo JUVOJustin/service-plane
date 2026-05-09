@@ -43,8 +43,16 @@ export const service = defineService({
   ],
 });
 
-const app = new Hono().route('/', publicRoutes).route('/', internalRoutes);
+const app = new Hono();
 mountDiscovery(app, service);
+app.use(
+  '*',
+  machineAuth({
+    resolveSecret: (keyId) => (keyId === 'default' ? process.env.SERVICE_PLANE_SECRET : undefined),
+  }),
+);
+app.route('/', publicRoutes);
+app.route('/', internalRoutes);
 
 export default app;
 ```
@@ -86,6 +94,8 @@ app.use('*', async (c, next) =>
       }),
   })(c, next),
 );
+
+export default app;
 ```
 
 ## Route Visibility
@@ -105,6 +115,20 @@ Visibility is not inferred from the path. This avoids accidentally exposing inte
 The shared secret is never sent over the wire. The signer sends a key id, timestamp, body hash, and signature. The verifier recomputes the signature from the request method, path/query, timestamp, and body hash. Requests outside the timestamp window are rejected.
 
 Static bearer tokens are intentionally not included in v0.0.1.
+
+Define the same HMAC secret for every control plane and service that trust each other. The package accepts the secret as an argument, but the examples use this secret name:
+
+```txt
+SERVICE_PLANE_SECRET
+```
+
+For Cloudflare Workers, set it on the control plane and every service Worker:
+
+```sh
+npx wrangler secret put SERVICE_PLANE_SECRET
+```
+
+For Node.js or other Hono runtimes, provide the same value through your normal secret manager or environment, for example `process.env.SERVICE_PLANE_SECRET`.
 
 ## Caching
 

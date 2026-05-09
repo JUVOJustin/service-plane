@@ -26,6 +26,7 @@ export type {
   DiscoveredServiceRoute,
   FetchLike,
   RegistryCache,
+  ServiceDiscoverySnapshot,
   ServiceDiscoveryDocument,
   ServiceEndpoint,
   ServiceRegistry,

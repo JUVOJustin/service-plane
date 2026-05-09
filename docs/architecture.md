@@ -4,6 +4,32 @@
 
 The control plane owns public ingress, global authentication, docs, and routing decisions. Each service owns its Hono routes, internal APIs, workflows, storage, and provider-specific validation.
 
+## Runtime Shape
+
+```mermaid
+flowchart LR
+  Internet["Public Internet"] --> Control["Control Plane Hono App"]
+  Control --> Auth["User Auth / Session Checks"]
+  Control --> Registry["Service Registry"]
+  Registry --> DiscoveryA["Service A Discovery"]
+  Registry --> DiscoveryB["Service B Discovery"]
+  Registry --> DiscoveryC["Service C Discovery"]
+  Control --> Signer["HMAC-SHA-256 Request Signer"]
+  Signer --> ServiceA["Service A Hono App"]
+  Signer --> ServiceB["Service B Hono App"]
+  Signer --> ServiceC["Service C Hono App"]
+  ServiceA --> VerifyA["machineAuth Verifier"]
+  ServiceB --> VerifyB["machineAuth Verifier"]
+  ServiceC --> VerifyC["machineAuth Verifier"]
+  VerifyA --> RoutesA["public / auth / internal Routes"]
+  VerifyB --> RoutesB["public / auth / internal Routes"]
+  VerifyC --> RoutesC["public / auth / internal Routes"]
+  Internet -. "direct unsigned service request" .-> ServiceA
+  ServiceA -. "401 before handler" .-> Internet
+```
+
+The word `public` is a control-plane exposure level, not an instruction to expose a service Worker or service process directly to the world. A direct request to a service route should still pass `machineAuth`. Discovery can remain reachable so the control plane can learn which routes a service provides.
+
 ## Primitives
 
 **Service**
@@ -36,7 +62,7 @@ The proxy routes matching requests to services. It never proxies `internal` rout
 
 **Machine auth**
 
-Internal calls use HMAC-SHA-256 signed requests. This is portable across Cloudflare Workers and Node.js because it only depends on Fetch and Web Crypto.
+Service calls use HMAC-SHA-256 signed requests. This is portable across Cloudflare Workers and Node.js because it only depends on Fetch and Web Crypto.
 
 ## What This Package Does Not Own
 
