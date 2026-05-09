@@ -60,16 +60,20 @@ import {
   signMachineRequest,
 } from 'service-plane/control-plane';
 
-const app = new Hono();
+type Env = {
+  EXAMPLE_SERVICE: Fetcher;
+  SERVICE_PLANE_SECRET: string;
+};
 
-app.use(
-  '*',
+const app = new Hono<{ Bindings: Env }>();
+
+app.use('*', async (c, next) =>
   createControlPlaneProxy({
     registry: createServiceRegistry({
       services: [
         cloudflareServiceBinding({
           id: 'example',
-          binding: env.EXAMPLE_SERVICE,
+          binding: c.env.EXAMPLE_SERVICE,
         }),
       ],
     }),
@@ -78,9 +82,9 @@ app.use(
     },
     signer: (request) =>
       signMachineRequest(request, {
-        secret: env.SERVICE_PLANE_SECRET,
+        secret: c.env.SERVICE_PLANE_SECRET,
       }),
-  }),
+  })(c, next),
 );
 ```
 
