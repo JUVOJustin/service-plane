@@ -109,6 +109,7 @@ function isRouteDiscovery(value: unknown): value is ServiceRouteDiscovery {
   return (
     typeof route.method === 'string' &&
     typeof route.path === 'string' &&
+    (!route.requiredScopes || (Array.isArray(route.requiredScopes) && route.requiredScopes.every((scope) => typeof scope === 'string'))) &&
     (route.visibility === 'public' || route.visibility === 'auth' || route.visibility === 'internal')
   );
 }

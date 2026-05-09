@@ -8,9 +8,9 @@ export class ServicePlaneError extends Error {
   }
 }
 
-export class MachineAuthError extends ServicePlaneError {
-  constructor(message: string) {
-    super(message, 401);
-    this.name = 'MachineAuthError';
+export class CapabilityAuthError extends ServicePlaneError {
+  constructor(message: string, status = 401) {
+    super(message, status);
+    this.name = 'CapabilityAuthError';
   }
 }

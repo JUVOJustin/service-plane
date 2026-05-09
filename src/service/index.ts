@@ -1,31 +1,53 @@
 export {
+  capability,
+  capabilityAuth,
+  capabilityFetch,
+  capabilityIdentity,
+  capabilityTokenCacheKey,
+  createCapabilityTokenProvider,
+  defineCapabilities,
+  serviceCapabilities,
+  tokenExpiresAt,
+  verifyCapabilityToken,
+  withCapabilityAuthorization,
+} from './capabilities.js';
+export type {
+  CapabilityFetchOptions,
+  CapabilityFetchWithProviderOptions,
+  CreateCapabilityTokenProviderOptions,
+} from './capabilities.js';
+export {
   defineNamespace,
   defineService,
   mountDiscovery,
   serviceDiscoveryDocument,
 } from './discovery.js';
 export {
-  machineAuth,
-  machineIdentity,
-  verifyMachineRequest,
-} from './auth.js';
-export {
-  DEFAULT_MAX_SKEW_SECONDS,
+  DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
   SERVICE_DISCOVERY_PATH,
-  SERVICE_PLANE_BODY_SHA256_HEADER,
-  SERVICE_PLANE_KEY_ID_HEADER,
-  SERVICE_PLANE_SIGNATURE_HEADER,
-  SERVICE_PLANE_TIMESTAMP_HEADER,
+  SERVICE_PLANE_AUTHORIZATION_SCHEME,
+  SERVICE_PLANE_CAPABILITY_CONTEXT,
+  SERVICE_PLANE_CAPABILITY_VERIFIER,
 } from '../shared/types.js';
 export type {
+  CapabilityAuthMiddleware,
+  CapabilityCatalog,
+  CapabilityContextSource,
+  CapabilityIdentity,
+  CapabilityJwks,
+  CapabilityJwksResolver,
+  CapabilityScopeDefinition,
+  CapabilityTokenCache,
+  CapabilityTokenCacheEntry,
+  CapabilityTokenProvider,
+  CapabilityVerifierOptions,
+  DefineServiceOptions,
   HonoAppLike,
-  MachineAuthContext,
-  MachineAuthMiddleware,
-  MachineSecretResolver,
+  IssueCapabilityTokenInput,
+  IssuedCapabilityToken,
   ServiceDefinition,
   ServiceDiscoveryDocument,
   ServiceNamespaceDefinition,
   ServiceRouteDiscovery,
   ServiceRouteVisibility,
-  VerifyMachineRequestOptions,
 } from '../shared/types.js';

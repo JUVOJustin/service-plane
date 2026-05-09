@@ -1,39 +1,26 @@
 # Security
 
-`service-plane` v0.0.1 uses HMAC-SHA-256 request signing for machine-to-machine calls.
+`service-plane` v0.1.0 uses STS capability tokens for direct service-to-service calls.
 
-## Why HMAC Instead Of Static Tokens
+## STS Capability Tokens
 
-A static bearer token proves that the caller knows the secret, but the secret is sent with every request. If the header is logged or captured, it can be reused until rotation.
+The control plane signs short-lived ES256 JWS tokens. Services verify those tokens with the control plane public key and then enforce `aud`, `iss`, `exp`, and route-required scopes.
 
-HMAC request signing proves that the caller knows the secret without sending it. The signature is bound to the method, path/query, timestamp, and body hash. Changing any of those values invalidates the request.
+The private signing key stays in the control plane. Services only need the public JWKS.
 
-## Timestamp Window
-
-Signed requests include `Service-Plane-Timestamp`. The verifier rejects requests outside `maxSkewSeconds`, which defaults to 300 seconds.
-
-This is not strict one-time replay protection. A captured request can theoretically be replayed inside the timestamp window. It does prevent old captured requests from being reused later without adding Redis, D1, Workers KV, or a Durable Object dependency.
-
-## Headers
-
-```txt
-Service-Plane-Key-Id: default
-Service-Plane-Timestamp: 2026-05-09T12:00:00.000Z
-Service-Plane-Body-Sha256: <base64url sha256>
-Service-Plane-Signature: hmac-sha256=:<base64url hmac>
+```json
+{
+  "iss": "control-plane",
+  "sub": "moco",
+  "aud": "fizzy",
+  "scp": ["fizzy.users.lookup"],
+  "exp": 1778337900
+}
 ```
 
-## Secret Rotation
+Route scopes are target-owned operation names. The control plane only issues tokens for caller, target, and scope combinations listed in its grant manifest.
 
-Use `Service-Plane-Key-Id` to resolve the active secret:
-
-```ts
-machineAuth({
-  resolveSecret: (keyId) => secrets[keyId],
-});
-```
-
-Run both old and new keys during rotation, then remove the old key after all callers have switched.
+Do not protect service-to-service APIs with a shared mesh secret. If every service knows the same secret and target services accept it as authorization, any service can bypass STS grants. Use STS tokens for peer calls and keep service-to-plane authentication separate.
 
 ## Future Strict Replay Protection
 

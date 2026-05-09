@@ -2,33 +2,29 @@
 
 `service-plane` models a system with a public control plane and independently owned service routers.
 
-The control plane owns public ingress, global authentication, docs, and routing decisions. Each service owns its Hono routes, internal APIs, workflows, storage, and provider-specific validation.
+The control plane owns public ingress, global authentication, docs, service grants, and STS token issuance. Each service owns its Hono routes, internal APIs, workflows, storage, provider-specific validation, and capability scope catalog.
 
 ## Runtime Shape
 
 ```mermaid
-flowchart LR
-  Internet["Public Internet"] --> Control["Control Plane Hono App"]
-  Control --> Auth["User Auth / Session Checks"]
-  Control --> Registry["Service Registry"]
-  Registry --> DiscoveryA["Service A Discovery"]
-  Registry --> DiscoveryB["Service B Discovery"]
-  Registry --> DiscoveryC["Service C Discovery"]
-  Control --> Signer["HMAC-SHA-256 Request Signer"]
-  Signer --> ServiceA["Service A Hono App"]
-  Signer --> ServiceB["Service B Hono App"]
-  Signer --> ServiceC["Service C Hono App"]
-  ServiceA --> VerifyA["machineAuth Verifier"]
-  ServiceB --> VerifyB["machineAuth Verifier"]
-  ServiceC --> VerifyC["machineAuth Verifier"]
-  VerifyA --> RoutesA["public / auth / internal Routes"]
-  VerifyB --> RoutesB["public / auth / internal Routes"]
-  VerifyC --> RoutesC["public / auth / internal Routes"]
-  Internet -. "direct unsigned service request" .-> ServiceA
-  ServiceA -. "401 before handler" .-> Internet
+sequenceDiagram
+  participant Target as Target Service
+  participant Control as Control Plane STS
+  participant Caller as Caller Service
+
+  Target-->>Control: Discovery document with routes and required scopes
+  Note over Control: Code grants caller -> target scopes
+  Caller->>Control: Request token for target and scopes
+  Control->>Control: Validate caller, target, scopes, and grant
+  Control-->>Caller: Short-lived ES256 JWS capability token
+  Caller->>Target: Direct Service Binding, Worker RPC, or HTTPS call with token
+  Target->>Target: capability(...) verifies signature, audience, expiry, and scope
+  Target-->>Caller: Response
 ```
 
-The word `public` is a control-plane exposure level, not an instruction to expose a service Worker or service process directly to the world. A direct request to a service route should still pass `machineAuth`. Discovery can remain reachable so the control plane can learn which routes a service provides.
+The control plane is on the token issuance path, not the request data path. Cloudflare-internal services can call each other directly through Service Bindings or Worker RPC. External Hono services use HTTPS with the same token verifier.
+
+Token verification is local and cache-free. A service only needs the control plane public JWKS to verify a received token. Caller-side token caching only reduces repeated token issuance calls to the control plane. The default cache is in-memory, and high-throughput Cloudflare Workers can provide a Cache API or KV adapter without adding a separate cache service.
 
 ## Primitives
 
@@ -50,7 +46,21 @@ defineNamespace({
 
 **Discovery document**
 
-Every service can expose `/.well-known/service-plane/service.json`. The document is generated from its namespaces and Hono route table, so route implementation and discovery stay close together.
+Every service can expose `/.well-known/service-plane/service.json`. The document is generated from its namespaces, Hono route table, route capability annotations, and optional capability catalog.
+
+**Capability catalog**
+
+A service defines operation-level scopes such as `fizzy.users.lookup`. Scopes are owned by the target service, not by the caller.
+
+**Capability route annotation**
+
+`capability('fizzy.users.lookup')` is both the route annotation and the runtime guard. It adds required scope metadata to discovery and verifies incoming STS tokens when the route runs.
+
+**Control-plane STS**
+
+The control plane issues short-lived ES256 JWS capability tokens. Grants are code-first: caller, target, and allowed scopes are explicitly listed.
+
+The STS private key is not shared with services. Services verify tokens with the public JWKS, so a caller cannot mint or alter its own token.
 
 **Control-plane registry**
 
@@ -60,9 +70,9 @@ The registry fetches discovery documents from configured service endpoints. Endp
 
 The proxy routes matching requests to services. It never proxies `internal` routes publicly.
 
-**Machine auth**
+**Control-plane proxy tokens**
 
-Service calls use HMAC-SHA-256 signed requests. This is portable across Cloudflare Workers and Node.js because it only depends on Fetch and Web Crypto.
+When the control plane proxies a route with `requiredScopes`, it attaches an STS token for the target service. The service verifies the token the same way it verifies direct service-to-service calls.
 
 ## What This Package Does Not Own
 
