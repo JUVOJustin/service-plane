@@ -1,0 +1,67 @@
+{
+  "name": "service-plane",
+  "version": "0.0.1",
+  "description": "Opinionated Hono service-plane primitives for service discovery, control-plane proxying, and HMAC machine auth.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JUVOJustin/service-plane.git"
+  },
+  "bugs": {
+    "url": "https://github.com/JUVOJustin/service-plane/issues"
+  },
+  "homepage": "https://github.com/JUVOJustin/service-plane#readme",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md",
+    "docs",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./service": {
+      "types": "./dist/service/index.d.ts",
+      "import": "./dist/service/index.js"
+    },
+    "./control-plane": {
+      "types": "./dist/control-plane/index.d.ts",
+      "import": "./dist/control-plane/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "import": "./dist/testing/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "hono",
+    "microservices",
+    "control-plane",
+    "service-discovery",
+    "hmac",
+    "cloudflare-workers"
+  ],
+  "peerDependencies": {
+    "hono": ">=4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.0",
+    "hono": "^4.12.18",
+    "typescript": "^5.0.4",
+    "vitest": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=18.14.1"
+  }
+}
