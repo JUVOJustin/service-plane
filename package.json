@@ -1,7 +1,7 @@
 {
   "name": "service-plane",
-  "version": "0.1.0",
-  "description": "Opinionated Hono service-plane primitives for service discovery, STS capability tokens, route scopes, and control-plane proxying.",
+  "version": "0.2.0",
+  "description": "Opinionated Cap'n Web service-plane primitives for object-capability RPC, STS capability tokens, scope-gated methods, and control-plane brokering.",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -32,6 +32,10 @@
       "types": "./dist/control-plane/index.d.ts",
       "import": "./dist/control-plane/index.js"
     },
+    "./secrets": {
+      "types": "./dist/shared/secrets.d.ts",
+      "import": "./dist/shared/secrets.js"
+    },
     "./testing": {
       "types": "./dist/testing/index.d.ts",
       "import": "./dist/testing/index.js"
@@ -45,20 +49,21 @@
     "prepare": "npm run build"
   },
   "keywords": [
-    "hono",
+    "capnweb",
+    "cap-n-web",
+    "rpc",
+    "object-capability",
     "microservices",
     "control-plane",
-    "service-discovery",
     "sts",
     "capabilities",
     "cloudflare-workers"
   ],
-  "peerDependencies": {
-    "hono": ">=4.0.0"
+  "dependencies": {
+    "capnweb": "^0.7.0"
   },
   "devDependencies": {
     "@types/node": "^25.0.0",
-    "hono": "^4.12.18",
     "typescript": "^5.0.4",
     "vitest": "^4.0.0"
   },

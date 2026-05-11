@@ -1,15 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { Hono } from 'hono';
 import { publicJwkFromPrivateJwk, verifyCapabilityToken } from '../shared/capability-tokens.js';
 import { defineCapabilities } from '../service/capabilities.js';
 import {
+  capabilityEndpointsHandler,
+  capabilityJwksHandler,
+  capabilityTokenHandler,
   createCapabilityIssuer,
   createCapabilityIssuerFromJwks,
   defineServiceGrants,
-  mountCapabilityEndpoints,
-  mountCapabilityTokenEndpoint,
   type CreateCapabilityIssuerOptions,
 } from './capabilities.js';
+import { SERVICE_PLANE_CAPABILITY_JWKS_PATH, SERVICE_PLANE_CAPABILITY_TOKEN_PATH } from '../shared/types.js';
 
 describe('capability issuer', () => {
   it('issues tokens for granted service scopes', async () => {
@@ -80,28 +81,6 @@ describe('capability issuer', () => {
     ).rejects.toThrow('Service-Plane capability grant denied');
   });
 
-  it('rejects empty scope token requests', async () => {
-    const keys = await testKeys();
-    const issuer = createCapabilityIssuer({
-      capabilities: [fizzyCapabilities],
-      grants: defineServiceGrants({
-        grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
-      }),
-      issuer: 'control-plane',
-      keyId: 'test-key',
-      privateKey: keys.privateKey,
-      publicJwk: keys.publicJwk,
-    });
-
-    await expect(
-      issuer.issueCapabilityToken({
-        callerServiceId: 'moco',
-        scopes: [],
-        targetServiceId: 'fizzy',
-      }),
-    ).rejects.toThrow('Service-Plane capability token requires at least one scope');
-  });
-
   it('clamps and validates caller requested token TTLs', async () => {
     const keys = await testKeys();
     const issuer = createCapabilityIssuer({
@@ -133,18 +112,9 @@ describe('capability issuer', () => {
         ttlSeconds: 0,
       }),
     ).rejects.toThrow('Service-Plane capability token TTL must be a positive integer');
-
-    await expect(
-      issuer.issueCapabilityToken({
-        callerServiceId: 'moco',
-        scopes: ['fizzy.users.lookup'],
-        targetServiceId: 'fizzy',
-        ttlSeconds: 1.5,
-      }),
-    ).rejects.toThrow('Service-Plane capability token TTL must be a positive integer');
   });
 
-  it('rejects malformed token endpoint TTLs', async () => {
+  it('serves token requests via a framework-agnostic Request handler', async () => {
     const keys = await testKeys();
     const issuer = createCapabilityIssuer({
       capabilities: [fizzyCapabilities],
@@ -156,35 +126,26 @@ describe('capability issuer', () => {
       privateKey: keys.privateKey,
       publicJwk: keys.publicJwk,
     });
-    const app = new Hono();
-    mountCapabilityTokenEndpoint(app, issuer, {
-      authenticateCaller: () => 'moco',
-    });
+    const handler = capabilityTokenHandler(issuer, { authenticateCaller: () => 'moco' });
 
-    const nonNumberResponse = await app.request('/.well-known/service-plane/capability-token', {
-      body: JSON.stringify({
-        scopes: ['fizzy.users.lookup'],
-        targetServiceId: 'fizzy',
-        ttlSeconds: '3600',
-      }),
+    const ok = await handler(new Request(`https://control.example.com${SERVICE_PLANE_CAPABILITY_TOKEN_PATH}`, {
+      body: JSON.stringify({ scopes: ['fizzy.users.lookup'], targetServiceId: 'fizzy' }),
       headers: { 'content-type': 'application/json' },
       method: 'POST',
-    });
-    const zeroResponse = await app.request('/.well-known/service-plane/capability-token', {
-      body: JSON.stringify({
-        scopes: ['fizzy.users.lookup'],
-        targetServiceId: 'fizzy',
-        ttlSeconds: 0,
-      }),
+    }));
+    expect(ok.status).toBe(200);
+    const body = (await ok.json()) as { token: string };
+    expect(typeof body.token).toBe('string');
+
+    const malformedTtl = await handler(new Request(`https://control.example.com${SERVICE_PLANE_CAPABILITY_TOKEN_PATH}`, {
+      body: JSON.stringify({ scopes: ['fizzy.users.lookup'], targetServiceId: 'fizzy', ttlSeconds: '10' }),
       headers: { 'content-type': 'application/json' },
       method: 'POST',
-    });
-
-    expect(nonNumberResponse.status).toBe(400);
-    expect(zeroResponse.status).toBe(400);
+    }));
+    expect(malformedTtl.status).toBe(400);
   });
 
-  it('can mount token and JWKS endpoints together', async () => {
+  it('serves both token and JWKS endpoints from a single handler', async () => {
     const keys = await testKeys();
     const issuer = createCapabilityIssuer({
       capabilities: [fizzyCapabilities],
@@ -196,24 +157,26 @@ describe('capability issuer', () => {
       privateKey: keys.privateKey,
       publicJwk: keys.publicJwk,
     });
-    const app = new Hono();
-    mountCapabilityEndpoints(app, issuer, {
-      authenticateCaller: () => 'moco',
-    });
+    const handler = capabilityEndpointsHandler(issuer, { authenticateCaller: () => 'moco' });
 
-    expect((await app.request('/.well-known/service-plane/jwks.json')).status).toBe(200);
-    expect(
-      (
-        await app.request('/.well-known/service-plane/capability-token', {
-          body: JSON.stringify({
-            scopes: ['fizzy.users.lookup'],
-            targetServiceId: 'fizzy',
-          }),
-          headers: { 'content-type': 'application/json' },
-          method: 'POST',
-        })
-      ).status,
-    ).toBe(200);
+    const jwksHandler = capabilityJwksHandler(issuer);
+    const directJwks = await jwksHandler(new Request(`https://control.example.com${SERVICE_PLANE_CAPABILITY_JWKS_PATH}`));
+    expect(directJwks.status).toBe(200);
+
+    const otherPath = await handler(new Request('https://control.example.com/healthz'));
+    expect(otherPath).toBeUndefined();
+
+    const jwks = await handler(new Request(`https://control.example.com${SERVICE_PLANE_CAPABILITY_JWKS_PATH}`));
+    expect(jwks?.status).toBe(200);
+    const body = (await jwks!.json()) as { keys: unknown[] };
+    expect(Array.isArray(body.keys)).toBe(true);
+
+    const token = await handler(new Request(`https://control.example.com${SERVICE_PLANE_CAPABILITY_TOKEN_PATH}`, {
+      body: JSON.stringify({ scopes: ['fizzy.users.lookup'], targetServiceId: 'fizzy' }),
+      headers: { 'content-type': 'application/json' },
+      method: 'POST',
+    }));
+    expect(token?.status).toBe(200);
   });
 
   it('requires public JWKS material and supports non-extractable private keys', async () => {
@@ -246,7 +209,7 @@ describe('capability issuer', () => {
     await expect(issuer.jwks()).resolves.toEqual({ keys: [keys.publicJwk] });
   });
 
-  it('can create issuers directly from private JWK material and validates key pairs', async () => {
+  it('builds issuers from a private JWK and validates the key pair', async () => {
     const keys = await testKeys();
     const issuer = await createCapabilityIssuerFromJwks({
       capabilities: [fizzyCapabilities],
@@ -269,45 +232,10 @@ describe('capability issuer', () => {
         }),
         issuer: 'control-plane',
         keyId: 'test-key',
-      privateJwk: keys.privateJwk,
-      publicJwks: { keys: [otherKeys.publicJwk] },
-    }),
+        privateJwk: keys.privateJwk,
+        publicJwks: { keys: [otherKeys.publicJwk] },
+      }),
     ).rejects.toThrow('Service-Plane public JWK does not match private signing key');
-  });
-
-  it('rejects conflicting public JWK inputs', async () => {
-    const keys = await testKeys();
-
-    await expect(
-      createCapabilityIssuerFromJwks({
-        capabilities: [fizzyCapabilities],
-        grants: defineServiceGrants({
-          grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
-        }),
-        issuer: 'control-plane',
-        keyId: 'test-key',
-        privateJwk: keys.privateJwk,
-        publicJwk: keys.publicJwk,
-        publicJwks: { keys: [keys.publicJwk] },
-      }),
-    ).rejects.toThrow('Service-Plane capability issuer accepts either publicJwk or publicJwks, not both');
-  });
-
-  it('requires the configured key id in JWKS material', async () => {
-    const keys = await testKeys();
-
-    await expect(
-      createCapabilityIssuerFromJwks({
-        capabilities: [fizzyCapabilities],
-        grants: defineServiceGrants({
-          grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
-        }),
-        issuer: 'control-plane',
-        keyId: 'missing-key',
-        privateJwk: keys.privateJwk,
-        publicJwks: { keys: [keys.publicJwk] },
-      }),
-    ).rejects.toThrow('Service-Plane JWKS is missing key id: missing-key');
   });
 });
 

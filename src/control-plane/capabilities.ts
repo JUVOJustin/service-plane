@@ -1,4 +1,3 @@
-import type { Context } from 'hono';
 import { CapabilityAuthError } from '../shared/errors.js';
 import { publicJwkFromPrivateJwk, signCapabilityToken, verifyCapabilityToken } from '../shared/capability-tokens.js';
 import {
@@ -12,6 +11,12 @@ import {
   type ServiceGrant,
   type ServiceGrantDefinition,
 } from '../shared/types.js';
+
+// ---------------------------------------------------------------------------
+// Issuer (unchanged in behaviour from the Hono-based implementation; this is
+// intentional — the STS / JWKS / grant model is reused verbatim and only the
+// transport that *delivers* the token to the target service has changed).
+// ---------------------------------------------------------------------------
 
 export type CapabilityIssuer = {
   issueCapabilityToken(input: IssueCapabilityTokenInput): Promise<IssuedCapabilityToken>;
@@ -34,28 +39,6 @@ export type CreateCapabilityIssuerFromJwksOptions = Omit<CreateCapabilityIssuerO
   publicJwk?: JsonWebKey;
   publicJwks?: CapabilityJwks;
   validateKeyPair?: boolean;
-};
-
-export type MountCapabilityTokenEndpointOptions = {
-  authenticateCaller(context: Context): Promise<Response | string> | Response | string;
-  path?: string;
-};
-
-export type CapabilityIssuerResolver = CapabilityIssuer | ((context: Context) => Promise<CapabilityIssuer> | CapabilityIssuer);
-
-export type MountCapabilityJwksEndpointOptions = {
-  path?: string;
-};
-
-export type MountCapabilityEndpointsOptions = {
-  authenticateCaller(context: Context): Promise<Response | string> | Response | string;
-  jwksPath?: string;
-  tokenPath?: string;
-};
-
-type CapabilityEndpointApp = {
-  get(path: string, handler: (context: Context) => Response | Promise<Response>): unknown;
-  post(path: string, handler: (context: Context) => Response | Promise<Response>): unknown;
 };
 
 export function defineServiceGrants(definition: ServiceGrantDefinition): ServiceGrantDefinition {
@@ -123,22 +106,82 @@ export async function createCapabilityIssuerFromJwks(options: CreateCapabilityIs
   });
 }
 
-export function mountCapabilityTokenEndpoint(
-  app: {
-    post(path: string, handler: (context: Context) => Response | Promise<Response>): unknown;
-  },
+// ---------------------------------------------------------------------------
+// Framework-agnostic HTTP handlers.
+//
+// The token issuance and JWKS endpoints stay HTTP because they are accessed
+// out-of-band from the RPC transport: a service that needs to verify a token
+// must be able to fetch JWKS without already having a session, and a caller
+// must be able to mint a token before opening one. The handlers are pure
+// `Request → Response` functions so they compose into any runtime — Cloudflare
+// Workers fetch handlers, Hono apps, Bun.serve, etc.
+// ---------------------------------------------------------------------------
+
+export type CapabilityIssuerResolver = CapabilityIssuer | ((request: Request) => Promise<CapabilityIssuer> | CapabilityIssuer);
+
+export type CapabilityTokenEndpointOptions = {
+  /**
+   * Authenticate the caller of the token endpoint and return their service
+   * id. Return a `Response` to short-circuit (e.g. with a 401). The caller
+   * id returned here MUST match `callerServiceId` in the request body, or
+   * be supplied authoritatively by the function.
+   */
+  authenticateCaller(request: Request): Promise<Response | string> | Response | string;
+  /** Path the handler responds on. Defaults to
+   * `/.well-known/service-plane/capability-token`. */
+  path?: string;
+};
+
+export type CapabilityJwksEndpointOptions = {
+  path?: string;
+};
+
+export type CapabilityEndpointsOptions = CapabilityTokenEndpointOptions & {
+  jwksPath?: string;
+  tokenPath?: string;
+};
+
+export type CapabilityEndpointHandler = (request: Request) => Promise<Response | undefined>;
+
+/** Build a single `Request → Response | undefined` handler that serves both
+ * the token issuance endpoint and the JWKS endpoint. Returns `undefined`
+ * when the request matches neither path so callers can chain it with their
+ * own routing. */
+export function capabilityEndpointsHandler(
   issuer: CapabilityIssuerResolver,
-  options: MountCapabilityTokenEndpointOptions,
-): void {
-  app.post(options.path ?? SERVICE_PLANE_CAPABILITY_TOKEN_PATH, async (context) => {
-    const caller = await options.authenticateCaller(context);
+  options: CapabilityEndpointsOptions,
+): CapabilityEndpointHandler {
+  const tokenPath = options.tokenPath ?? SERVICE_PLANE_CAPABILITY_TOKEN_PATH;
+  const jwksPath = options.jwksPath ?? SERVICE_PLANE_CAPABILITY_JWKS_PATH;
+  const tokenHandler = capabilityTokenHandler(issuer, { authenticateCaller: options.authenticateCaller, path: tokenPath });
+  const jwksHandler = capabilityJwksHandler(issuer, { path: jwksPath });
+
+  return async (request) => {
+    const url = new URL(request.url);
+    if (url.pathname === tokenPath) return tokenHandler(request);
+    if (url.pathname === jwksPath) return jwksHandler(request);
+    return undefined;
+  };
+}
+
+export function capabilityTokenHandler(
+  issuer: CapabilityIssuerResolver,
+  options: CapabilityTokenEndpointOptions,
+): (request: Request) => Promise<Response> {
+  const path = options.path ?? SERVICE_PLANE_CAPABILITY_TOKEN_PATH;
+  return async (request) => {
+    const url = new URL(request.url);
+    if (url.pathname !== path || request.method !== 'POST') {
+      return new Response('Not Found', { status: 404 });
+    }
+    const caller = await options.authenticateCaller(request);
     if (caller instanceof Response) return caller;
-    const resolvedIssuer = typeof issuer === 'function' ? await issuer(context) : issuer;
+    const resolvedIssuer = typeof issuer === 'function' ? await issuer(request) : issuer;
 
     try {
-      const body = await readTokenRequest(context.req.raw);
+      const body = await readTokenRequest(request);
       if (body.callerServiceId && body.callerServiceId !== caller) {
-        return context.json({ error: 'Caller service mismatch' }, 403);
+        return Response.json({ error: 'Caller service mismatch' }, { status: 403 });
       }
       const issued = await resolvedIssuer.issueCapabilityToken({
         callerServiceId: caller,
@@ -146,38 +189,38 @@ export function mountCapabilityTokenEndpoint(
         targetServiceId: body.targetServiceId,
         ...(body.ttlSeconds === undefined ? {} : { ttlSeconds: body.ttlSeconds }),
       });
-      return context.json({
+      return Response.json({
         expiresAt: issued.expiresAt.toISOString(),
         token: issued.token,
         tokenType: 'ServicePlane',
       });
     } catch (error) {
-      if (error instanceof CapabilityAuthError) return context.json({ error: error.message }, error.status as 400 | 401 | 403 | 500);
+      if (error instanceof CapabilityAuthError) {
+        return Response.json({ error: error.message }, { status: error.status });
+      }
       throw error;
     }
-  });
+  };
 }
 
-export function mountCapabilityEndpoints(app: CapabilityEndpointApp, issuer: CapabilityIssuerResolver, options: MountCapabilityEndpointsOptions): void {
-  mountCapabilityTokenEndpoint(app, issuer, {
-    authenticateCaller: options.authenticateCaller,
-    ...(options.tokenPath ? { path: options.tokenPath } : {}),
-  });
-  mountCapabilityJwksEndpoint(app, issuer, options.jwksPath ? { path: options.jwksPath } : {});
-}
-
-export function mountCapabilityJwksEndpoint(
-  app: {
-    get(path: string, handler: (context: Context) => Response | Promise<Response>): unknown;
-  },
+export function capabilityJwksHandler(
   issuer: CapabilityIssuerResolver,
-  options: MountCapabilityJwksEndpointOptions = {},
-): void {
-  app.get(options.path ?? SERVICE_PLANE_CAPABILITY_JWKS_PATH, async (context) => {
-    const resolvedIssuer = typeof issuer === 'function' ? await issuer(context) : issuer;
-    return context.json(await resolvedIssuer.jwks());
-  });
+  options: CapabilityJwksEndpointOptions = {},
+): (request: Request) => Promise<Response> {
+  const path = options.path ?? SERVICE_PLANE_CAPABILITY_JWKS_PATH;
+  return async (request) => {
+    const url = new URL(request.url);
+    if (url.pathname !== path || request.method !== 'GET') {
+      return new Response('Not Found', { status: 404 });
+    }
+    const resolvedIssuer = typeof issuer === 'function' ? await issuer(request) : issuer;
+    return Response.json(await resolvedIssuer.jwks());
+  };
 }
+
+// ---------------------------------------------------------------------------
+// Internal validation helpers.
+// ---------------------------------------------------------------------------
 
 function normalizeGrant(grant: ServiceGrant): ServiceGrant {
   return {
@@ -221,8 +264,7 @@ function normalizeScopes(scopes: string[], status: number): string[] {
   if (scopes.length === 0) {
     throw new CapabilityAuthError('Service-Plane capability token requires at least one scope', status);
   }
-  const normalized = scopes.map(normalizeScope);
-  return [...new Set(normalized)];
+  return [...new Set(scopes.map(normalizeScope))];
 }
 
 function normalizeScope(scope: string): string {

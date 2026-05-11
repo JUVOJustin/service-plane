@@ -1,55 +1,47 @@
 # Capability Catalogs
 
-Capability catalogs are owned by the target service. They describe the operation-level scopes that callers may request, for example `fizzy.users.lookup`.
-
-## Option 1: Shared Contracts Package
-
-A shared package is useful in a monorepo or coordinated deployment setup:
-
-```txt
-packages/service-contracts/src/fizzy.ts
-services/fizzy/src/index.ts
-services/moco/src/fizzy-client.ts
-apps/control-plane/src/grants.ts
-```
+A capability catalog is the source of truth for the operation-level scopes a service exports. Catalogs are owned by the *target* service.
 
 ```ts
-// packages/service-contracts/src/fizzy.ts
-import { defineCapabilities } from 'service-plane/service';
+import { defineCapabilities } from 'service-plane';
 
-export const fizzyCapabilities = defineCapabilities({
-  serviceId: 'fizzy',
+export const exampleCapabilities = defineCapabilities({
+  serviceId: 'example',
   scopes: [
-    { id: 'fizzy.users.lookup', title: 'Lookup Fizzy users' },
-    { id: 'fizzy.users.update', title: 'Update Fizzy users' },
+    { id: 'example.sync.run', title: 'Run example sync' },
+    { id: 'example.events.ingest', title: 'Ingest example events' },
+    { id: 'example.users.read', title: 'Read example users' },
   ],
 });
 ```
 
-Use this when services and the control plane are released together, or when you want compile-time imports for Hono RPC route types.
+The catalog is consumed in three places:
 
-Do not put runtime credentials, private keys, tenant configuration, or service URLs in the contracts package. Keep it to public contracts: capability catalogs, route types, request/response schemas, and shared Zod schemas.
+1. The control-plane issuer (`createCapabilityIssuer({ capabilities: [...] })`) uses it to validate that grant entries reference real scopes.
+2. `defineService({ capabilities, exports: [{ scopes: [...] }] })` rejects any exported capability whose declared scopes are not in the catalog.
+3. The discovery document (`/.well-known/service-plane/services.json`) embeds the catalog so tooling can reason about the service's surface.
 
-## Option 2: Runtime Discovery
+## Naming
 
-Independently deployed services can keep capabilities service-local:
+Use a stable `<serviceId>.<resource>.<action>` convention. Wildcards are not supported — denying `example.users.*` requires enumerating the exact scopes you want to revoke. This keeps grant validation straightforward and audit-friendly.
+
+## Grants
+
+Grants tell the issuer which callers may request which scopes against which targets. They live in the control plane:
 
 ```ts
-export const service = defineService({
-  capabilities: fizzyCapabilities,
-  id: 'fizzy',
-  namespaces,
-  title: 'Fizzy',
-  version: '0.1.0',
+defineServiceGrants({
+  grants: [
+    { caller: 'moco', target: 'example', scopes: ['example.sync.run'] },
+    { caller: 'control-plane', target: 'example', scopes: ['example.sync.run', 'example.events.ingest'] },
+  ],
 });
 ```
 
-The control plane can then discover capabilities through `/.well-known/service-plane/service.json`. This avoids coupling external services to an npm package.
+A token request that asks for an un-granted scope returns `403 Service-Plane capability grant denied`.
 
-Use this when services can deploy independently, when third-party services are onboarded over HTTPS, or when the control plane should rely on live service discovery.
+## Per-Method Scopes
 
-## Recommendation
+`requireScopes(this, 'example.sync.run')` runs *inside* the method. Different methods on the same `RpcTarget` may require different scopes. The `scopes` array passed to `defineService(..., exports: [{ scopes }])` is the *union* of scopes any method on that capability could need; it surfaces in discovery so the broker and grant tooling know what tokens to mint.
 
-Prefer a shared contracts package for first-party monorepos and Cloudflare Worker service bindings. Prefer runtime discovery for external Hono services or independently deployed teams.
-
-Both patterns are compatible. A control plane can import first-party catalogs from a package and still discover external service catalogs at runtime.
+For a stricter contract, set `defineService(input, { requireRouteScopes: true })`. Any non-internal capability that does not declare scopes will throw at startup, catching accidentally-public surfaces.
