@@ -10,10 +10,10 @@ Prefer Worker RPC for Cloudflare-native internal APIs. Use Hono `fetch` routes w
 
 ```ts
 import { Hono } from 'hono';
-import { capability, capabilityAuth, type CapabilityJwks, defineCapabilities, defineNamespace, defineService, mountDiscovery } from 'service-plane/service';
+import { capability, capabilityAuth, defineCapabilities, defineNamespace, defineService, jwksFromServiceBinding, mountDiscovery } from 'service-plane/service';
 
 type Env = {
-  STS_JWKS: CapabilityJwks;
+  CONTROL_PLANE: Fetcher;
 };
 
 const capabilities = defineCapabilities({
@@ -40,7 +40,7 @@ app.use('*', (c, next) =>
   capabilityAuth({
     expectedAudience: 'example',
     issuer: 'control-plane',
-    jwks: c.env.STS_JWKS,
+    jwks: jwksFromServiceBinding(c.env.CONTROL_PLANE),
   })(c, next),
 );
 app.route('/', routes);
@@ -53,7 +53,6 @@ export default app;
 ```ts
 import { Hono } from 'hono';
 import {
-  type CapabilityJwks,
   createCapabilityIssuerFromJwks,
   defineServiceGrants,
   mountCapabilityEndpoints,
@@ -62,7 +61,6 @@ import { defineCapabilities } from 'service-plane/service';
 
 type Env = {
   STS_PRIVATE_KEY_JWK: string;
-  STS_JWKS: CapabilityJwks;
 };
 
 const capabilities = defineCapabilities({
@@ -83,7 +81,6 @@ mountCapabilityEndpoints(
       issuer: 'control-plane',
       keyId: 'default',
       privateJwk: JSON.parse(c.env.STS_PRIVATE_KEY_JWK),
-      publicJwks: c.env.STS_JWKS,
     }),
   {
     authenticateCaller: (c) => c.req.header('x-service-id') ?? c.json({ error: 'Unauthorized' }, 401),
@@ -103,7 +100,7 @@ export class ExampleEntrypoint extends WorkerEntrypoint<Env> {
     const identity = await verifyCapabilityToken(token, {
       expectedAudience: 'example',
       issuer: 'control-plane',
-      jwks: this.env.STS_JWKS,
+      jwks: jwksFromServiceBinding(this.env.CONTROL_PLANE),
       requiredScopes: ['example.sync.run'],
     });
 
@@ -205,8 +202,8 @@ return createControlPlaneProxy({
 ## Notes
 
 - Keep STS private keys in Worker secrets, not source code or wrangler config.
-- Define the STS public JWKS on every service that verifies capability tokens.
-- Provide `publicJwks` when creating the capability issuer. `createCapabilityIssuerFromJwks(...)` imports the private key as non-extractable and validates that the JWKS key matching `keyId` belongs to the private key.
+- Let the control plane publish JWKS via `mountCapabilityEndpoints(...)`; services normally consume it with `jwksFromServiceBinding(...)` or `jwksFromUrl(...)`.
+- `createCapabilityIssuerFromJwks(...)` derives the public JWKS from `privateJwk` by default and validates that the derived key can verify issued tokens.
 - Replace the example `x-service-id` check with authenticated service identity in production, such as an OAuth client credential or a platform identity signal.
 - Run `wrangler types` after binding changes in your application.
 - Service Bindings are private, but STS tokens keep one authorization model across Worker RPC, Service Binding fetch, and external Hono HTTPS services.

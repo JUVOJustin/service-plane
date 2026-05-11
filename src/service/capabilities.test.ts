@@ -12,9 +12,12 @@ import {
   capabilityTokenCacheKey,
   createCapabilityTokenProvider,
   defineCapabilities,
+  jwksFromServiceBinding,
+  jwksFromUrl,
   serviceCapabilities,
 } from './capabilities.js';
 import { memoryCapabilityTokenCache } from '../testing/index.js';
+import { SERVICE_PLANE_CAPABILITY_JWKS_PATH } from '../shared/types.js';
 
 describe('service capabilities', () => {
   it('protects annotated Hono routes and exposes capability identity', async () => {
@@ -145,6 +148,72 @@ describe('service capabilities', () => {
 
     expect((await fetcher('https://fizzy.internal/providers/fizzy/v1/users/a')).status).toBe(200);
     expect(issuedTokens).toBe(1);
+  });
+
+  it('verifies routes with JWKS fetched from the control-plane service binding', async () => {
+    const keys = await testKeys();
+    const issuer = createCapabilityIssuer({
+      capabilities: [fizzyCapabilities],
+      grants: defineServiceGrants({
+        grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
+      }),
+      issuer: 'control-plane',
+      keyId: 'test-key',
+      now: () => new Date('2026-05-09T12:00:00.000Z'),
+      privateKey: keys.privateKey,
+      publicJwk: keys.publicJwk,
+    });
+    const controlPlane = new Hono().get(SERVICE_PLANE_CAPABILITY_JWKS_PATH, async (context) => context.json(await issuer.jwks()));
+    let jwksRequests = 0;
+    const binding = {
+      fetch: async (request: Request) => {
+        jwksRequests += 1;
+        return controlPlane.fetch(request);
+      },
+    };
+
+    const app = new Hono();
+    app.use('*', (context, next) =>
+      capabilityAuth({
+        expectedAudience: 'fizzy',
+        issuer: 'control-plane',
+        jwks: jwksFromServiceBinding(binding),
+        now: new Date('2026-05-09T12:00:01.000Z'),
+      })(context, next),
+    );
+    app.get('/providers/fizzy/v1/users/:email', capability('fizzy.users.lookup'), (context) => context.json({ email: context.req.param('email') }));
+
+    const issued = await issuer.issueCapabilityToken({
+      callerServiceId: 'moco',
+      scopes: ['fizzy.users.lookup'],
+      targetServiceId: 'fizzy',
+    });
+
+    const first = await app.request('/providers/fizzy/v1/users/test@example.com', {
+      headers: { authorization: `ServicePlane ${issued.token}` },
+    });
+    const second = await app.request('/providers/fizzy/v1/users/test@example.com', {
+      headers: { authorization: `ServicePlane ${issued.token}` },
+    });
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(jwksRequests).toBe(1);
+  });
+
+  it('fetches and caches remote JWKS from URLs', async () => {
+    const keys = await testKeys();
+    let jwksRequests = 0;
+    const resolver = jwksFromUrl('https://control-plane.example.com/.well-known/service-plane/jwks.json', {
+      fetch: async () => {
+        jwksRequests += 1;
+        return Response.json({ keys: [keys.publicJwk] });
+      },
+    });
+
+    await expect(resolver()).resolves.toEqual({ keys: [keys.publicJwk] });
+    await expect(resolver()).resolves.toEqual({ keys: [keys.publicJwk] });
+    expect(jwksRequests).toBe(1);
   });
 
   it('rejects invalid caller token provider configuration early', () => {

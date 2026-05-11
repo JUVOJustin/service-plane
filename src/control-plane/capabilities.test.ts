@@ -246,7 +246,7 @@ describe('capability issuer', () => {
     await expect(issuer.jwks()).resolves.toEqual({ keys: [keys.publicJwk] });
   });
 
-  it('can create issuers directly from JWK material and validates key pairs', async () => {
+  it('can create issuers directly from private JWK material and validates key pairs', async () => {
     const keys = await testKeys();
     const issuer = await createCapabilityIssuerFromJwks({
       capabilities: [fizzyCapabilities],
@@ -256,7 +256,6 @@ describe('capability issuer', () => {
       issuer: 'control-plane',
       keyId: 'test-key',
       privateJwk: keys.privateJwk,
-      publicJwks: { keys: [keys.publicJwk] },
     });
 
     await expect(issuer.jwks()).resolves.toEqual({ keys: [keys.publicJwk] });
@@ -270,10 +269,28 @@ describe('capability issuer', () => {
         }),
         issuer: 'control-plane',
         keyId: 'test-key',
-        privateJwk: keys.privateJwk,
-        publicJwks: { keys: [otherKeys.publicJwk] },
-      }),
+      privateJwk: keys.privateJwk,
+      publicJwks: { keys: [otherKeys.publicJwk] },
+    }),
     ).rejects.toThrow('Service-Plane public JWK does not match private signing key');
+  });
+
+  it('rejects conflicting public JWK inputs', async () => {
+    const keys = await testKeys();
+
+    await expect(
+      createCapabilityIssuerFromJwks({
+        capabilities: [fizzyCapabilities],
+        grants: defineServiceGrants({
+          grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
+        }),
+        issuer: 'control-plane',
+        keyId: 'test-key',
+        privateJwk: keys.privateJwk,
+        publicJwk: keys.publicJwk,
+        publicJwks: { keys: [keys.publicJwk] },
+      }),
+    ).rejects.toThrow('Service-Plane capability issuer accepts either publicJwk or publicJwks, not both');
   });
 
   it('requires the configured key id in JWKS material', async () => {

@@ -9,7 +9,7 @@ Run a normal Hono app on Node.js, Bun, Deno, or another Fetch-compatible runtime
 ```ts
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
-import { capability, capabilityAuth, defineCapabilities, defineNamespace, defineService, mountDiscovery } from 'service-plane/service';
+import { capability, capabilityAuth, defineCapabilities, defineNamespace, defineService, jwksFromUrl, mountDiscovery } from 'service-plane/service';
 
 const publicRoutes = new Hono().post('/events/example/:target', capability('example.events.ingest'), (c) => c.text('ok'));
 const internalRoutes = new Hono().post('/providers/example/v1/sync', capability('example.sync.run'), (c) => c.json({ ok: true }));
@@ -43,7 +43,7 @@ app.use(
   capabilityAuth({
     expectedAudience: 'example',
     issuer: 'control-plane',
-    jwks: () => loadControlPlaneJwks(),
+    jwks: jwksFromUrl('https://control-plane.example.com/.well-known/service-plane/jwks.json'),
   }),
 );
 app.route('/', publicRoutes);
@@ -88,7 +88,6 @@ mountCapabilityEndpoints(
       issuer: 'control-plane',
       keyId: 'default',
       privateJwk: await loadPrivateJwk(),
-      publicJwks: await loadPublicJwks(),
     }),
   {
     authenticateCaller: (c) => c.req.header('x-service-id') ?? c.json({ error: 'Unauthorized' }, 401),

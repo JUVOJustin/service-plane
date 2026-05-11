@@ -6,7 +6,7 @@
 
 The control plane signs short-lived ES256 JWS tokens. Services verify those tokens with the control plane public key and then enforce `aud`, `iss`, `exp`, and route-required scopes.
 
-The private signing key stays in the control plane. Services only need the public JWKS.
+The private signing key stays in the control plane. Services fetch the public JWKS from the control plane through a Service Binding or HTTPS and cache it locally.
 
 ```json
 {

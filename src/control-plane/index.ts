@@ -29,9 +29,12 @@ export {
 export { mergeServiceOpenApi, type OpenApiDocument } from '../shared/openapi.js';
 export {
   DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
+  DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
   DEFAULT_REGISTRY_CACHE_TTL_SECONDS,
   SERVICE_DISCOVERY_PATH,
   SERVICE_PLANE_AUTHORIZATION_SCHEME,
+  SERVICE_PLANE_CAPABILITY_JWKS_PATH,
+  SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
 } from '../shared/types.js';
 export type {
   CapabilityCatalog,

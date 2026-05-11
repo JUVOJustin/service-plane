@@ -50,12 +50,12 @@ The service owns its scopes and annotates the routes that need them. It verifies
 // services/example-service/src/index.ts
 import { Hono } from 'hono';
 import {
-  type CapabilityJwks,
   capability,
   capabilityAuth,
   capabilityIdentity,
   defineNamespace,
   defineService,
+  jwksFromServiceBinding,
   mountDiscovery,
 } from 'service-plane/service';
 import { exampleCapabilities } from '../../../packages/service-contracts/src/capabilities';
@@ -97,7 +97,7 @@ export const service = defineService(
 );
 
 type Env = {
-  STS_JWKS: CapabilityJwks;
+  CONTROL_PLANE: Fetcher;
 };
 
 const app = new Hono<{ Bindings: Env }>();
@@ -109,7 +109,7 @@ app.use('*', (c, next) => {
   return capabilityAuth({
     expectedAudience: 'example',
     issuer: 'control-plane',
-    jwks: c.env.STS_JWKS,
+    jwks: jwksFromServiceBinding(c.env.CONTROL_PLANE),
   })(c, next);
 });
 app.route('/', publicRoutes);
@@ -126,23 +126,18 @@ Configure the service Worker with:
   "name": "example-service",
   "main": "src/index.ts",
   "compatibility_date": "2026-05-09",
-  "vars": {
-    "STS_JWKS": {
-      "keys": [
-        {
-          "kty": "EC",
-          "crv": "P-256",
-          "kid": "default",
-          "x": "...",
-          "y": "..."
-        }
-      ]
+  "services": [
+    {
+      "binding": "CONTROL_PLANE",
+      "service": "control-plane"
     }
-  }
+  ]
 }
 ```
 
 The `public` namespace above means the control plane may expose the route. The service route still requires a valid `ServicePlane` token when called directly.
+
+`jwksFromServiceBinding(...)` fetches the control plane public JWKS through a Cloudflare Service Binding and caches it in memory. If a service is not on Cloudflare, use `jwksFromUrl('https://control-plane.example.com/.well-known/service-plane/jwks.json')` instead.
 
 `capabilityAuth(...)` only configures token verification for the app. Route authorization comes from `capability(...)` on each protected route, or from calling `verifyCapabilityToken(...)` with `requiredScopes` in a non-Hono entrypoint.
 
@@ -162,12 +157,10 @@ import {
   mountCapabilityEndpoints,
 } from 'service-plane/control-plane';
 import { exampleCapabilities } from '../../../packages/service-contracts/src/capabilities';
-import type { CapabilityJwks } from 'service-plane/control-plane';
 
 type Env = {
   EXAMPLE_SERVICE: Fetcher;
   STS_PRIVATE_KEY_JWK: string;
-  STS_JWKS: CapabilityJwks;
 };
 
 const app = new Hono<{ Bindings: Env }>();
@@ -192,7 +185,6 @@ async function issuerFor(env: Env) {
     issuer: 'control-plane',
     keyId: 'default',
     privateJwk: JSON.parse(env.STS_PRIVATE_KEY_JWK),
-    publicJwks: env.STS_JWKS,
   });
 }
 
@@ -246,19 +238,6 @@ Configure the control-plane Worker with:
   "secrets": {
     "required": ["STS_PRIVATE_KEY_JWK"]
   },
-  "vars": {
-    "STS_JWKS": {
-      "keys": [
-        {
-          "kty": "EC",
-          "crv": "P-256",
-          "kid": "default",
-          "x": "...",
-          "y": "..."
-        }
-      ]
-    }
-  },
   "services": [
     {
       "binding": "EXAMPLE_SERVICE",
@@ -280,7 +259,7 @@ For local development, put the same value in `apps/control-plane/.dev.vars`:
 STS_PRIVATE_KEY_JWK='{"kty":"EC","crv":"P-256",...}'
 ```
 
-`STS_JWKS` is not secret. It is the public verification key set published by the control plane and consumed by services. The JWKS entry with `kid: "default"` must match `STS_PRIVATE_KEY_JWK`; providing it explicitly keeps the private key non-extractable at runtime.
+The control plane derives its public JWKS from `STS_PRIVATE_KEY_JWK` and publishes it at `/.well-known/service-plane/jwks.json`. Services fetch that public key set through `jwksFromServiceBinding(...)` or `jwksFromUrl(...)`, so normal services do not need STS key material in their own config.
 
 Run the control plane and service together:
 

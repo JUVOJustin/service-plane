@@ -24,7 +24,7 @@ sequenceDiagram
 
 A capability token is reusable until it expires. The default max TTL is 120 seconds. Caching is not required for correctness or security: if a caller has no cached token, it can request a new one from the control plane before calling the target service.
 
-The target service never needs a token cache. It verifies each request locally with the control plane public JWKS, checking signature, issuer, audience, expiry, and scopes.
+The target service never needs a token cache. It verifies each request locally with the control plane public JWKS, checking signature, issuer, audience, expiry, and scopes. Use `jwksFromServiceBinding(...)` on Cloudflare or `jwksFromUrl(...)` for HTTPS services so the service fetches and caches the public JWKS instead of storing key material in config.
 
 For performance, a caller should keep a best-effort token cache per unique permission set:
 
@@ -144,7 +144,7 @@ If every service knows the same secret and target services accept that secret as
 Use separate trust channels:
 
 - STS signing key: private key lives only in the control plane.
-- STS verification key: public JWKS is available to services.
+- STS verification key: public JWKS is published by the control plane and fetched by services.
 - Service-to-plane authentication: each service may have its own credential for requesting tokens.
 - Service-to-service authorization: targets accept STS capability tokens, not peer shared-secret signatures.
 

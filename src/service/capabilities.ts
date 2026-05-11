@@ -6,22 +6,43 @@ import {
   decodeCapabilityTokenPayload,
 } from '../shared/capability-tokens.js';
 import {
+  DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
+  SERVICE_PLANE_CAPABILITY_JWKS_PATH,
   SERVICE_PLANE_CAPABILITY_CONTEXT,
   SERVICE_PLANE_CAPABILITY_VERIFIER,
   type CapabilityAuthMiddleware,
   type CapabilityCatalog,
   type CapabilityContextSource,
   type CapabilityIdentity,
+  type CapabilityJwks,
+  type CapabilityJwksResolver,
   type CapabilityScopeDefinition,
   type CapabilityTokenCache,
   type CapabilityTokenProvider,
   type CapabilityVerifierOptions,
+  type FetchLike,
   type HonoAppLike,
   type IssueCapabilityTokenInput,
   type IssuedCapabilityToken,
 } from '../shared/types.js';
 
 const routeCapabilities = new WeakMap<object, string[]>();
+const serviceBindingJwksResolvers = new WeakMap<object, Map<string, CapabilityJwksResolver>>();
+const urlJwksResolvers = new Map<string, CapabilityJwksResolver>();
+
+export type RemoteJwksFetch = typeof fetch | FetchLike;
+
+export type JwksFromUrlOptions = {
+  cacheTtlSeconds?: number;
+  fetch?: RemoteJwksFetch;
+  headers?: HeadersInit | (() => HeadersInit | Promise<HeadersInit>);
+  now?: () => Date;
+};
+
+export type JwksFromServiceBindingOptions = Omit<JwksFromUrlOptions, 'fetch'> & {
+  origin?: string;
+  path?: string;
+};
 
 export type CreateCapabilityTokenProviderOptions = {
   cache?: CapabilityTokenCache;
@@ -81,6 +102,59 @@ export function capabilityAuth(options: CapabilityVerifierOptions): CapabilityAu
     context.set(SERVICE_PLANE_CAPABILITY_VERIFIER, options);
     await next();
   };
+}
+
+export function jwksFromUrl(url: string | URL, options: JwksFromUrlOptions = {}): CapabilityJwksResolver {
+  const key = JSON.stringify({
+    cacheTtlSeconds: options.cacheTtlSeconds ?? DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
+    url: String(url),
+  });
+  if (!options.fetch && !options.headers && !options.now) {
+    const existing = urlJwksResolvers.get(key);
+    if (existing) return existing;
+  }
+
+  const resolver = createRemoteJwksResolver({
+    ...options,
+    url,
+  });
+  if (!options.fetch && !options.headers && !options.now) urlJwksResolvers.set(key, resolver);
+  return resolver;
+}
+
+export function jwksFromServiceBinding(binding: FetchLike, options: JwksFromServiceBindingOptions = {}): CapabilityJwksResolver {
+  const origin = options.origin ?? 'https://service-plane-control-plane.internal';
+  const path = options.path ?? SERVICE_PLANE_CAPABILITY_JWKS_PATH;
+  const url = new URL(path, origin);
+  if (options.headers || options.now) {
+    return createRemoteJwksResolver({
+      ...options,
+      fetch: binding,
+      url,
+    });
+  }
+
+  const key = JSON.stringify({
+    cacheTtlSeconds: options.cacheTtlSeconds ?? DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
+    url: String(url),
+  });
+
+  let resolvers = serviceBindingJwksResolvers.get(binding);
+  if (!resolvers) {
+    resolvers = new Map();
+    serviceBindingJwksResolvers.set(binding, resolvers);
+  }
+
+  const existing = resolvers.get(key);
+  if (existing) return existing;
+
+  const resolver = createRemoteJwksResolver({
+    ...options,
+    fetch: binding,
+    url,
+  });
+  resolvers.set(key, resolver);
+  return resolver;
 }
 
 export function capabilityIdentity(context: CapabilityContextSource): CapabilityIdentity | undefined {
@@ -208,6 +282,67 @@ function firstDuplicate(values: string[]): string | undefined {
     seen.add(value);
     return false;
   });
+}
+
+function createRemoteJwksResolver(options: JwksFromUrlOptions & { url: string | URL }): CapabilityJwksResolver {
+  const cacheTtlSeconds = normalizeCacheTtlSeconds(options.cacheTtlSeconds ?? DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS);
+  const fetcher = options.fetch ?? fetch;
+  let cached: { expiresAt: number; jwks: CapabilityJwks } | undefined;
+  let inFlight: Promise<CapabilityJwks> | undefined;
+
+  return async () => {
+    const now = (options.now?.() ?? new Date()).getTime();
+    if (cached && cached.expiresAt > now) return cached.jwks;
+    if (inFlight) return inFlight;
+
+    inFlight = (async () => {
+      const headers = typeof options.headers === 'function' ? await options.headers() : options.headers;
+      const request = headers === undefined ? new Request(String(options.url)) : new Request(String(options.url), { headers });
+      const response = await fetchJwks(fetcher, request);
+      if (!response.ok) {
+        throw new CapabilityAuthError(`Unable to fetch Service-Plane JWKS: ${response.status}`, 500);
+      }
+
+      let body: unknown;
+      try {
+        body = await response.json();
+      } catch {
+        throw new CapabilityAuthError('Invalid Service-Plane JWKS response', 500);
+      }
+
+      const jwks = parseRemoteJwks(body);
+      cached = {
+        expiresAt: now + cacheTtlSeconds * 1000,
+        jwks,
+      };
+      return jwks;
+    })();
+
+    try {
+      return await inFlight;
+    } finally {
+      inFlight = undefined;
+    }
+  };
+}
+
+function fetchJwks(fetcher: RemoteJwksFetch, request: Request): Promise<Response> {
+  return typeof fetcher === 'function' ? fetcher(request) : fetcher.fetch(request);
+}
+
+function parseRemoteJwks(value: unknown): CapabilityJwks {
+  if (!value || typeof value !== 'object') throw new CapabilityAuthError('Invalid Service-Plane JWKS response', 500);
+  const keys = (value as { keys?: unknown }).keys;
+  if (!Array.isArray(keys) || keys.length === 0) throw new CapabilityAuthError('Invalid Service-Plane JWKS response', 500);
+  if (!keys.every((key) => key && typeof key === 'object')) throw new CapabilityAuthError('Invalid Service-Plane JWKS response', 500);
+  return { keys: keys as CapabilityJwks['keys'] };
+}
+
+function normalizeCacheTtlSeconds(ttlSeconds: number): number {
+  if (!Number.isFinite(ttlSeconds) || !Number.isInteger(ttlSeconds) || ttlSeconds <= 0) {
+    throw new CapabilityAuthError('Service-Plane JWKS cache TTL must be a positive integer', 500);
+  }
+  return ttlSeconds;
 }
 
 async function readCapabilityTokenCache(

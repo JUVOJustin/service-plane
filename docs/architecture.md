@@ -24,7 +24,7 @@ sequenceDiagram
 
 The control plane is on the token issuance path, not the request data path. Cloudflare-internal services can call each other directly through Service Bindings or Worker RPC. External Hono services use HTTPS with the same token verifier.
 
-Token verification is local and cache-free. A service only needs the control plane public JWKS to verify a received token. Caller-side token caching only reduces repeated token issuance calls to the control plane. The default cache is in-memory, and high-throughput Cloudflare Workers can provide a Cache API or KV adapter without adding a separate cache service.
+Token verification is local once the service has the control plane public JWKS. `jwksFromServiceBinding(...)` and `jwksFromUrl(...)` cache that public key set in memory, so services do not need JWKS in their Worker config. Caller-side token caching only reduces repeated token issuance calls to the control plane. The default cache is in-memory, and high-throughput Cloudflare Workers can provide a Cache API or KV adapter without adding a separate cache service.
 
 ## Primitives
 
@@ -60,7 +60,7 @@ A service defines operation-level scopes such as `fizzy.users.lookup`. Scopes ar
 
 The control plane issues short-lived ES256 JWS capability tokens. Grants are code-first: caller, target, and allowed scopes are explicitly listed.
 
-The STS private key is not shared with services. Services verify tokens with the public JWKS, so a caller cannot mint or alter its own token.
+The STS private key is not shared with services. Services verify tokens with the public JWKS published by the control plane, so a caller cannot mint or alter its own token.
 
 **Control-plane registry**
 

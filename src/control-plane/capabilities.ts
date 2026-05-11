@@ -1,8 +1,10 @@
 import type { Context } from 'hono';
 import { CapabilityAuthError } from '../shared/errors.js';
-import { signCapabilityToken, verifyCapabilityToken } from '../shared/capability-tokens.js';
+import { publicJwkFromPrivateJwk, signCapabilityToken, verifyCapabilityToken } from '../shared/capability-tokens.js';
 import {
   DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
+  SERVICE_PLANE_CAPABILITY_JWKS_PATH,
+  SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
   type CapabilityCatalog,
   type CapabilityJwks,
   type IssueCapabilityTokenInput,
@@ -29,8 +31,10 @@ export type CreateCapabilityIssuerOptions = {
 
 export type CreateCapabilityIssuerFromJwksOptions = Omit<CreateCapabilityIssuerOptions, 'privateKey' | 'publicJwk'> & {
   privateJwk: JsonWebKey;
+  publicJwk?: JsonWebKey;
+  publicJwks?: CapabilityJwks;
   validateKeyPair?: boolean;
-} & ({ publicJwk: JsonWebKey; publicJwks?: never } | { publicJwk?: never; publicJwks: CapabilityJwks });
+};
 
 export type MountCapabilityTokenEndpointOptions = {
   authenticateCaller(context: Context): Promise<Response | string> | Response | string;
@@ -126,7 +130,7 @@ export function mountCapabilityTokenEndpoint(
   issuer: CapabilityIssuerResolver,
   options: MountCapabilityTokenEndpointOptions,
 ): void {
-  app.post(options.path ?? '/.well-known/service-plane/capability-token', async (context) => {
+  app.post(options.path ?? SERVICE_PLANE_CAPABILITY_TOKEN_PATH, async (context) => {
     const caller = await options.authenticateCaller(context);
     if (caller instanceof Response) return caller;
     const resolvedIssuer = typeof issuer === 'function' ? await issuer(context) : issuer;
@@ -169,7 +173,7 @@ export function mountCapabilityJwksEndpoint(
   issuer: CapabilityIssuerResolver,
   options: MountCapabilityJwksEndpointOptions = {},
 ): void {
-  app.get(options.path ?? '/.well-known/service-plane/jwks.json', async (context) => {
+  app.get(options.path ?? SERVICE_PLANE_CAPABILITY_JWKS_PATH, async (context) => {
     const resolvedIssuer = typeof issuer === 'function' ? await issuer(context) : issuer;
     return context.json(await resolvedIssuer.jwks());
   });
@@ -276,10 +280,16 @@ async function importEs256PrivateKey(privateJwk: JsonWebKey): Promise<CryptoKey>
 }
 
 function resolvePublicJwk(options: CreateCapabilityIssuerFromJwksOptions): JsonWebKey {
+  if (options.publicJwk && options.publicJwks) {
+    throw new CapabilityAuthError('Service-Plane capability issuer accepts either publicJwk or publicJwks, not both', 500);
+  }
   if (options.publicJwk) return options.publicJwk;
-  const publicJwk = options.publicJwks?.keys.find((key) => key.kid === options.keyId);
-  if (!publicJwk) throw new CapabilityAuthError(`Service-Plane JWKS is missing key id: ${options.keyId}`, 500);
-  return publicJwk;
+  if (options.publicJwks) {
+    const publicJwk = options.publicJwks.keys.find((key) => key.kid === options.keyId);
+    if (!publicJwk) throw new CapabilityAuthError(`Service-Plane JWKS is missing key id: ${options.keyId}`, 500);
+    return publicJwk;
+  }
+  return publicJwkFromPrivateJwk(options.privateJwk, options.keyId);
 }
 
 async function validateEs256KeyPair(privateKey: CryptoKey, publicJwk: JsonWebKey, keyId: string): Promise<void> {
