@@ -1,16 +1,16 @@
 import {
   DEFAULT_REGISTRY_CACHE_TTL_SECONDS,
   SERVICE_DISCOVERY_PATH,
-  type DiscoveredServiceRoute,
+  type CapabilityCatalog,
   type RegistryCache,
+  type ServiceCapabilityDescriptor,
+  type ServiceCapabilityVisibility,
   type ServiceDiscoveryDocument,
   type ServiceDiscoverySnapshot,
-  type ServiceEndpoint,
   type ServiceRegistry,
-  type ServiceRegistrySnapshot,
-  type ServiceRouteDiscovery,
+  type ServiceRpcEndpoint,
+  type ServiceRpcTransport,
 } from '../shared/types.js';
-import { pathMatches } from '../shared/paths.js';
 import { serviceDiscoveryRequest } from './endpoints.js';
 
 export type CreateServiceRegistryOptions = {
@@ -18,38 +18,40 @@ export type CreateServiceRegistryOptions = {
   cacheKey?: string;
   cacheTtlSeconds?: number;
   discoveryPath?: string;
-  services: ServiceEndpoint[];
+  services: ServiceRpcEndpoint[];
 };
 
+/** Discover and cache the set of services + their exported capabilities. */
 export function createServiceRegistry(options: CreateServiceRegistryOptions): ServiceRegistry {
   const cacheKey = options.cacheKey ?? 'service-plane:registry';
   const cacheTtlSeconds = options.cacheTtlSeconds ?? DEFAULT_REGISTRY_CACHE_TTL_SECONDS;
   const discoveryPath = options.discoveryPath ?? SERVICE_DISCOVERY_PATH;
+  const endpointsById = new Map(options.services.map((endpoint) => [endpoint.id, endpoint] as const));
 
   return {
     async discover() {
       const cached = await options.cache?.get(cacheKey);
-      if (cached) return withRoutes(cached, options.services);
-
+      if (cached) {
+        return { ...cached, endpoints: options.services };
+      }
       const services = await discoverServices(options.services, discoveryPath);
       const snapshot: ServiceDiscoverySnapshot = {
         discoveredAt: new Date().toISOString(),
         services,
       };
       await options.cache?.set(cacheKey, snapshot, cacheTtlSeconds);
-      return withRoutes(snapshot, options.services);
+      return { ...snapshot, endpoints: options.services };
     },
-
-    async match(method: string, path: string) {
-      const snapshot = await this.discover();
-      return snapshot.routes.find((route) => route.method === method.toUpperCase() && pathMatches(route.path, path));
+    endpoint(id) {
+      return endpointsById.get(id);
     },
   };
 }
 
-async function discoverServices(endpoints: ServiceEndpoint[], discoveryPath: string): Promise<ServiceDiscoveryDocument[]> {
+async function discoverServices(endpoints: ServiceRpcEndpoint[], discoveryPath: string): Promise<ServiceDiscoveryDocument[]> {
   const documents = await Promise.all(
     endpoints.map(async (endpoint) => {
+      if (!endpoint.fetch) return undefined;
       try {
         const response = await endpoint.fetch(serviceDiscoveryRequest(endpoint, discoveryPath));
         if (!response.ok) return undefined;
@@ -63,34 +65,6 @@ async function discoverServices(endpoints: ServiceEndpoint[], discoveryPath: str
   return documents.filter((document): document is ServiceDiscoveryDocument => !!document);
 }
 
-function withRoutes(snapshot: ServiceDiscoverySnapshot, endpoints: ServiceEndpoint[]): ServiceRegistrySnapshot {
-  const endpointsById = new Map(endpoints.map((endpoint) => [endpoint.id, endpoint]));
-  const routes = snapshot.services.flatMap((service) => {
-    const endpoint = endpointsById.get(service.id);
-    if (!endpoint) return [];
-    return service.routes.map((route) => discoveredRoute(service, route, endpoint));
-  });
-  return {
-    ...snapshot,
-    routes,
-  };
-}
-
-function discoveredRoute(
-  service: ServiceDiscoveryDocument,
-  route: ServiceRouteDiscovery,
-  endpoint: ServiceEndpoint,
-): DiscoveredServiceRoute {
-  return {
-    ...route,
-    method: route.method.toUpperCase(),
-    service: endpoint,
-    serviceId: service.id,
-    serviceTitle: service.title,
-    serviceVersion: service.version,
-  };
-}
-
 function isServiceDiscoveryDocument(value: unknown): value is ServiceDiscoveryDocument {
   if (!value || typeof value !== 'object') return false;
   const document = value as ServiceDiscoveryDocument;
@@ -98,18 +72,34 @@ function isServiceDiscoveryDocument(value: unknown): value is ServiceDiscoveryDo
     typeof document.id === 'string' &&
     typeof document.title === 'string' &&
     typeof document.version === 'string' &&
-    Array.isArray(document.routes) &&
-    document.routes.every(isRouteDiscovery)
+    Array.isArray(document.exports) &&
+    document.exports.every(isServiceCapabilityDescriptor) &&
+    Array.isArray(document.rpcTransports) &&
+    document.rpcTransports.every(isServiceRpcTransport) &&
+    (document.capabilities === undefined || isCapabilityCatalog(document.capabilities))
   );
 }
 
-function isRouteDiscovery(value: unknown): value is ServiceRouteDiscovery {
+function isServiceCapabilityDescriptor(value: unknown): value is ServiceCapabilityDescriptor {
   if (!value || typeof value !== 'object') return false;
-  const route = value as ServiceRouteDiscovery;
+  const descriptor = value as ServiceCapabilityDescriptor;
   return (
-    typeof route.method === 'string' &&
-    typeof route.path === 'string' &&
-    (!route.requiredScopes || (Array.isArray(route.requiredScopes) && route.requiredScopes.every((scope) => typeof scope === 'string'))) &&
-    (route.visibility === 'public' || route.visibility === 'auth' || route.visibility === 'internal')
+    Array.isArray(descriptor.scopes) &&
+    descriptor.scopes.every((scope) => typeof scope === 'string') &&
+    isVisibility(descriptor.visibility)
   );
+}
+
+function isVisibility(value: unknown): value is ServiceCapabilityVisibility {
+  return value === 'public' || value === 'auth' || value === 'internal';
+}
+
+function isServiceRpcTransport(value: unknown): value is ServiceRpcTransport {
+  return value === 'http-batch' || value === 'websocket';
+}
+
+function isCapabilityCatalog(value: unknown): value is CapabilityCatalog {
+  if (!value || typeof value !== 'object') return false;
+  const catalog = value as CapabilityCatalog;
+  return typeof catalog.serviceId === 'string' && Array.isArray(catalog.scopes);
 }

@@ -1,84 +1,53 @@
-import type { Context, MiddlewareHandler } from 'hono';
-
-export const SERVICE_DISCOVERY_PATH = '/.well-known/service-plane/service.json';
+// Stable paths used over HTTP. RPC traffic itself uses Cap'n Web; only the
+// out-of-band control-plane endpoints (token issuance, JWKS, services manifest)
+// remain HTTP.
+export const SERVICE_DISCOVERY_PATH = '/.well-known/service-plane/services.json';
 export const SERVICE_PLANE_CAPABILITY_JWKS_PATH = '/.well-known/service-plane/jwks.json';
 export const SERVICE_PLANE_CAPABILITY_TOKEN_PATH = '/.well-known/service-plane/capability-token';
+
 export const DEFAULT_REGISTRY_CACHE_TTL_SECONDS = 30;
 export const DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS = 120;
 export const DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS = 300;
-export const SERVICE_PLANE_CAPABILITY_CONTEXT = 'servicePlaneCapability';
-export const SERVICE_PLANE_CAPABILITY_VERIFIER = 'servicePlaneCapabilityVerifier';
+
+// Cap'n Web RPC sessions carry the bootstrap token in-band, not in HTTP
+// headers. The legacy ServicePlane authorization scheme is still emitted on
+// HTTP-batch transport for backwards compatibility with reverse proxies that
+// inspect the Authorization header. Servers do not require it.
 export const SERVICE_PLANE_AUTHORIZATION_SCHEME = 'ServicePlane';
 
-export type ServiceRouteVisibility = 'public' | 'auth' | 'internal';
+// Visibility levels for capabilities exposed by a service. The control-plane
+// broker uses these to decide which root capability to hand out to which
+// caller.
+export type ServiceCapabilityVisibility = 'public' | 'auth' | 'internal';
 
-export type RouteSource = {
-  routes: Array<{
-    handler?: unknown;
-    method: string;
-    path: string;
-  }>;
-};
-
-export type HonoAppLike = RouteSource;
-
-export type ServiceNamespaceDefinition = {
-  app: HonoAppLike;
-  openapi?: unknown;
-  prefix: string;
-  visibility: ServiceRouteVisibility;
-};
-
-export type ServiceDefinition = {
-  capabilities?: CapabilityCatalog;
+export type CapabilityScopeDefinition = {
+  description?: string;
   id: string;
-  namespaces: ServiceNamespaceDefinition[];
-  title: string;
-  version: string;
+  title?: string;
 };
 
-export type DefineServiceOptions = {
-  requireRouteScopes?: boolean;
+export type CapabilityCatalog = {
+  scopes: CapabilityScopeDefinition[];
+  serviceId: string;
 };
 
-export type ServiceRouteDiscovery = {
-  method: string;
-  path: string;
-  requiredScopes?: string[];
-  visibility: ServiceRouteVisibility;
+// Discovery descriptor for a service. Replaces the old per-route OpenAPI/JSON
+// list. Surfaces only what tooling needs to know about an RPC service.
+export type ServiceCapabilityDescriptor = {
+  scopes: string[];
+  visibility: ServiceCapabilityVisibility;
 };
 
 export type ServiceDiscoveryDocument = {
   capabilities?: CapabilityCatalog;
+  exports: ServiceCapabilityDescriptor[];
   id: string;
-  routes: ServiceRouteDiscovery[];
+  rpcTransports: ServiceRpcTransport[];
   title: string;
   version: string;
 };
 
-export type DiscoveredServiceRoute = ServiceRouteDiscovery & {
-  service: ServiceEndpoint;
-  serviceId: string;
-  serviceTitle: string;
-  serviceVersion: string;
-};
-
-export type FetchLike = {
-  fetch(request: Request): Promise<Response>;
-};
-
-export type ServiceEndpoint = {
-  fetch(request: Request): Promise<Response>;
-  id: string;
-  origin: string;
-};
-
-export type ServiceRegistrySnapshot = {
-  discoveredAt: string;
-  routes: DiscoveredServiceRoute[];
-  services: ServiceDiscoveryDocument[];
-  stale?: boolean;
-};
+export type ServiceRpcTransport = 'http-batch' | 'websocket';
 
 export type ServiceDiscoverySnapshot = {
   discoveredAt: string;
@@ -91,20 +60,23 @@ export type RegistryCache = {
   set(key: string, value: ServiceDiscoverySnapshot, ttlSeconds: number): Promise<void>;
 };
 
-export type ServiceRegistry = {
-  discover(): Promise<ServiceRegistrySnapshot>;
-  match(method: string, path: string): Promise<DiscoveredServiceRoute | undefined>;
-};
-
-export type CapabilityScopeDefinition = {
-  description?: string;
+// A registered RPC service endpoint. Used by both the broker and the registry.
+export type ServiceRpcEndpoint = {
+  // Optional HTTP fetcher for the discovery document and for HTTP-batch RPC
+  // sessions when no `connect` factory is supplied.
+  fetch?(request: Request): Promise<Response>;
   id: string;
-  title?: string;
+  // Cap'n Web origin used to address the service over HTTP-batch. Defaults to
+  // `https://<id>.service-plane.internal`.
+  origin?: string;
+  // The set of root capability paths supported by the service. Defaults to
+  // `['/rpc']` when omitted.
+  rpcPath?: string;
 };
 
-export type CapabilityCatalog = {
-  scopes: CapabilityScopeDefinition[];
-  serviceId: string;
+export type ServiceRegistry = {
+  discover(): Promise<ServiceDiscoverySnapshot & { endpoints: ServiceRpcEndpoint[] }>;
+  endpoint(id: string): ServiceRpcEndpoint | undefined;
 };
 
 export type ServiceGrant = {
@@ -153,17 +125,6 @@ export type VerifyCapabilityTokenOptions = {
 
 export type CapabilityVerifierOptions = Omit<VerifyCapabilityTokenOptions, 'requiredScopes'>;
 
-export type CapabilityAuthVariables = {
-  Variables: {
-    [SERVICE_PLANE_CAPABILITY_CONTEXT]?: CapabilityIdentity;
-    [SERVICE_PLANE_CAPABILITY_VERIFIER]?: CapabilityVerifierOptions;
-  };
-};
-
-export type CapabilityAuthMiddleware = MiddlewareHandler<CapabilityAuthVariables>;
-
-export type CapabilityContextSource = Context<CapabilityAuthVariables>;
-
 export type IssueCapabilityTokenInput = {
   callerServiceId: string;
   scopes: string[];
@@ -188,4 +149,10 @@ export type CapabilityTokenCache = {
 
 export type CapabilityTokenProvider = {
   token(): Promise<string>;
+};
+
+// Lightweight fetch-like contract used for JWKS lookup over Cloudflare Service
+// Bindings. Matches the shape of the Workers `Fetcher` binding.
+export type FetchLike = {
+  fetch(request: Request): Promise<Response>;
 };

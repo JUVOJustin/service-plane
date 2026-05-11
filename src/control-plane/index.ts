@@ -1,17 +1,18 @@
 export {
+  capabilityEndpointsHandler,
+  capabilityJwksHandler,
+  capabilityTokenHandler,
   createCapabilityIssuer,
   createCapabilityIssuerFromJwks,
   defineServiceGrants,
-  mountCapabilityEndpoints,
-  mountCapabilityJwksEndpoint,
-  mountCapabilityTokenEndpoint,
+  type CapabilityEndpointHandler,
+  type CapabilityEndpointsOptions,
   type CapabilityIssuer,
   type CapabilityIssuerResolver,
+  type CapabilityJwksEndpointOptions,
+  type CapabilityTokenEndpointOptions,
   type CreateCapabilityIssuerFromJwksOptions,
   type CreateCapabilityIssuerOptions,
-  type MountCapabilityEndpointsOptions,
-  type MountCapabilityJwksEndpointOptions,
-  type MountCapabilityTokenEndpointOptions,
 } from './capabilities.js';
 export {
   cloudflareServiceBinding,
@@ -23,10 +24,14 @@ export {
   type CreateServiceRegistryOptions,
 } from './registry.js';
 export {
-  createControlPlaneProxy,
-  type ControlPlaneProxyOptions,
-} from './proxy.js';
-export { mergeServiceOpenApi, type OpenApiDocument } from '../shared/openapi.js';
+  createControlPlaneRpcBroker,
+  type BrokerCaller,
+  type BrokeredCapabilityVisibility,
+  type BrokeredServiceConfig,
+  type BrokeredServiceTransport,
+  type ControlPlaneRpcBroker,
+  type CreateControlPlaneRpcBrokerOptions,
+} from './broker.js';
 export {
   DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
   DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
@@ -41,18 +46,17 @@ export type {
   CapabilityClaims,
   CapabilityJwks,
   CapabilityScopeDefinition,
-  DiscoveredServiceRoute,
   FetchLike,
   IssueCapabilityTokenInput,
   IssuedCapabilityToken,
   RegistryCache,
+  ServiceCapabilityDescriptor,
+  ServiceCapabilityVisibility,
+  ServiceDiscoveryDocument,
+  ServiceDiscoverySnapshot,
   ServiceGrant,
   ServiceGrantDefinition,
-  ServiceDiscoverySnapshot,
-  ServiceDiscoveryDocument,
-  ServiceEndpoint,
   ServiceRegistry,
-  ServiceRegistrySnapshot,
-  ServiceRouteDiscovery,
-  ServiceRouteVisibility,
+  ServiceRpcEndpoint,
+  ServiceRpcTransport,
 } from '../shared/types.js';

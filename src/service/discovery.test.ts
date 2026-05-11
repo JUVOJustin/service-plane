@@ -1,65 +1,105 @@
 import { describe, expect, it } from 'vitest';
-import { Hono } from 'hono';
-import { defineService, defineNamespace, serviceDiscoveryDocument } from './discovery.js';
-import { capability, defineCapabilities } from './capabilities.js';
+import { defineCapabilities } from './capabilities.js';
+import { defineService, RpcTarget, serviceDiscoveryDocument } from './discovery.js';
 
-describe('service discovery', () => {
-  it('builds a discovery document from explicit Hono namespaces', () => {
-    const publicApp = new Hono().post('/events/:source', (context) => context.text(context.req.param('source')));
-    const internalApp = new Hono().post('/v1/sync', (context) => context.json({ ok: true }));
+describe('defineService', () => {
+  const capabilities = defineCapabilities({
+    scopes: [
+      { id: 'example.events.ingest' },
+      { id: 'example.sync.run' },
+    ],
+    serviceId: 'example',
+  });
 
+  class PublicRoot extends RpcTarget {}
+  class InternalRoot extends RpcTarget {}
+
+  it('builds a discovery document from explicit RPC capability exports', () => {
     const service = defineService({
-      id: 'moco',
-      namespaces: [
-        defineNamespace({ app: publicApp, prefix: '/', visibility: 'public' }),
-        defineNamespace({ app: internalApp, prefix: '/providers/moco', visibility: 'internal' }),
+      capabilities,
+      exports: [
+        { factory: () => new PublicRoot(), id: 'public', scopes: ['example.events.ingest'], visibility: 'public' },
+        { factory: () => new InternalRoot(), id: 'internal', scopes: ['example.sync.run'], visibility: 'internal' },
       ],
-      title: 'MOCO',
-      version: '0.0.1',
+      id: 'example',
+      rpcTransports: ['http-batch', 'websocket'],
+      title: 'Example',
+      version: '0.1.0',
     });
 
     expect(serviceDiscoveryDocument(service)).toEqual({
-      id: 'moco',
-      routes: [
-        { method: 'POST', path: '/events/:source', visibility: 'public' },
-        { method: 'POST', path: '/providers/moco/v1/sync', visibility: 'internal' },
+      capabilities,
+      exports: [
+        { scopes: ['example.events.ingest'], visibility: 'public' },
+        { scopes: ['example.sync.run'], visibility: 'internal' },
       ],
-      title: 'MOCO',
-      version: '0.0.1',
+      id: 'example',
+      rpcTransports: ['http-batch', 'websocket'],
+      title: 'Example',
+      version: '0.1.0',
     });
   });
 
-  it('validates route capability annotations against the service catalog', () => {
-    const routes = new Hono().post('/v1/sync', capability('moco.sync.run'), (context) => context.json({ ok: true }));
-    const capabilities = defineCapabilities({
-      scopes: [{ id: 'moco.connections.read' }],
-      serviceId: 'moco',
-    });
-
+  it('rejects scopes not declared in the catalog', () => {
     expect(() =>
       defineService({
         capabilities,
-        id: 'moco',
-        namespaces: [defineNamespace({ app: routes, prefix: '/providers/moco', visibility: 'internal' })],
-        title: 'MOCO',
+        exports: [{ factory: () => new PublicRoot(), id: 'public', scopes: ['example.unknown'], visibility: 'public' }],
+        id: 'example',
+        title: 'Example',
         version: '0.1.0',
       }),
-    ).toThrow('Service-Plane route requires unknown scope: moco.sync.run');
+    ).toThrow('Service-Plane exported capability requires unknown scope: example.unknown');
   });
 
-  it('can require every service route to use capability annotations', () => {
-    const routes = new Hono().post('/v1/sync', (context) => context.json({ ok: true }));
+  it('rejects scoped capabilities when the service has no catalog', () => {
+    expect(() =>
+      defineService({
+        exports: [{ factory: () => new PublicRoot(), id: 'public', scopes: ['example.events.ingest'], visibility: 'public' }],
+        id: 'example',
+        title: 'Example',
+        version: '0.1.0',
+      }),
+    ).toThrow('requires scopes but service has no capability catalog');
+  });
 
+  it('can require every public/auth capability to declare scopes', () => {
     expect(() =>
       defineService(
         {
-          id: 'moco',
-          namespaces: [defineNamespace({ app: routes, prefix: '/providers/moco', visibility: 'internal' })],
-          title: 'MOCO',
+          capabilities,
+          exports: [{ factory: () => new PublicRoot(), id: 'public', visibility: 'public' }],
+          id: 'example',
+          title: 'Example',
           version: '0.1.0',
         },
         { requireRouteScopes: true },
       ),
-    ).toThrow('Service-Plane route is missing capability(...) annotation: POST /providers/moco/v1/sync');
+    ).toThrow('Service-Plane exported capability is missing required scope annotations: public');
+  });
+
+  it('rejects duplicate exported capability ids', () => {
+    expect(() =>
+      defineService({
+        capabilities,
+        exports: [
+          { factory: () => new PublicRoot(), id: 'public', scopes: ['example.events.ingest'], visibility: 'public' },
+          { factory: () => new PublicRoot(), id: 'public', scopes: ['example.events.ingest'], visibility: 'auth' },
+        ],
+        id: 'example',
+        title: 'Example',
+        version: '0.1.0',
+      }),
+    ).toThrow('Duplicate Service-Plane exported capability: public');
+  });
+
+  it('defaults rpcTransports to http-batch only', () => {
+    const service = defineService({
+      exports: [{ factory: () => new PublicRoot(), id: 'public', visibility: 'internal' }],
+      id: 'example',
+      title: 'Example',
+      version: '0.1.0',
+    });
+    expect(service.rpcTransports).toEqual(['http-batch']);
   });
 });
