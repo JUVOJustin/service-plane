@@ -61,8 +61,7 @@ describe('control-plane proxy', () => {
       issuer: 'control-plane',
       keyId: 'test-key',
       now: () => new Date('2026-05-09T12:00:00.000Z'),
-      privateKey: keys.privateKey,
-      publicJwk: keys.publicJwk,
+      privateJwk: keys.privateJwk,
     });
     const providerRoutes = new Hono().post('/events/example', capability('example.events.ingest'), (context) => context.json({ scoped: true }));
     const provider = new Hono();
@@ -105,7 +104,7 @@ async function testKeys() {
   const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
   const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
   return {
-    privateKey: pair.privateKey,
+    privateJwk,
     publicJwk: publicJwkFromPrivateJwk(privateJwk, 'test-key'),
   };
 }

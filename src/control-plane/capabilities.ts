@@ -1,4 +1,5 @@
-import type { Context } from 'hono';
+import type { Context, Handler } from 'hono';
+import { createFactory } from 'hono/factory';
 import { CapabilityAuthError } from '../shared/errors.js';
 import { publicJwkFromPrivateJwk, signCapabilityToken, verifyCapabilityToken } from '../shared/capability-tokens.js';
 import {
@@ -13,6 +14,9 @@ import {
   type ServiceGrantDefinition,
 } from '../shared/types.js';
 
+const endpointFactory = createFactory();
+const DEFAULT_CAPABILITY_KEY_ID = 'default';
+
 export type CapabilityIssuer = {
   issueCapabilityToken(input: IssueCapabilityTokenInput): Promise<IssuedCapabilityToken>;
   jwks(): Promise<CapabilityJwks>;
@@ -22,18 +26,18 @@ export type CreateCapabilityIssuerOptions = {
   capabilities: CapabilityCatalog[];
   grants: ServiceGrantDefinition;
   issuer: string;
-  keyId: string;
+  keyId?: string;
   now?: () => Date;
-  privateKey: CryptoKey;
-  publicJwk: JsonWebKey;
+  privateJwk: JsonWebKey;
   ttlSeconds?: number;
 };
 
-export type CreateCapabilityIssuerFromJwksOptions = Omit<CreateCapabilityIssuerOptions, 'privateKey' | 'publicJwk'> & {
-  privateJwk: JsonWebKey;
-  publicJwk?: JsonWebKey;
-  publicJwks?: CapabilityJwks;
+export type CreateCapabilityIssuerFromPrivateJwkOptions = CreateCapabilityIssuerOptions & {
   validateKeyPair?: boolean;
+};
+
+export type GenerateCapabilitySigningJwkOptions = {
+  keyId?: string;
 };
 
 export type MountCapabilityTokenEndpointOptions = {
@@ -54,8 +58,8 @@ export type MountCapabilityEndpointsOptions = {
 };
 
 type CapabilityEndpointApp = {
-  get(path: string, handler: (context: Context) => Response | Promise<Response>): unknown;
-  post(path: string, handler: (context: Context) => Response | Promise<Response>): unknown;
+  get(path: string, ...handlers: Handler[]): unknown;
+  post(path: string, ...handlers: Handler[]): unknown;
 };
 
 export function defineServiceGrants(definition: ServiceGrantDefinition): ServiceGrantDefinition {
@@ -65,9 +69,8 @@ export function defineServiceGrants(definition: ServiceGrantDefinition): Service
 }
 
 export function createCapabilityIssuer(options: CreateCapabilityIssuerOptions): CapabilityIssuer {
-  if (!options.publicJwk || typeof options.publicJwk !== 'object') {
-    throw new CapabilityAuthError('Service-Plane capability issuer requires a public JWK', 500);
-  }
+  const keyId = options.keyId ?? DEFAULT_CAPABILITY_KEY_ID;
+  const publicJwk = publicJwkFromPrivateJwk(options.privateJwk, keyId);
   const capabilitiesByService = capabilityScopesByService(options.capabilities);
   const grants = options.grants.grants.map((grant) => validateGrant(grant, capabilitiesByService));
   const maxTtlSeconds = normalizeTtlSeconds(options.ttlSeconds ?? DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS, 500);
@@ -88,8 +91,8 @@ export function createCapabilityIssuer(options: CreateCapabilityIssuerOptions): 
           scp: requestedScopes,
           sub: input.callerServiceId,
         },
-        keyId: options.keyId,
-        privateKey: options.privateKey,
+        keyId,
+        privateJwk: options.privateJwk,
         ttlSeconds,
         ...(options.now ? { now: options.now() } : {}),
       });
@@ -98,9 +101,9 @@ export function createCapabilityIssuer(options: CreateCapabilityIssuerOptions): 
       return {
         keys: [
           {
-            ...options.publicJwk,
+            ...publicJwk,
             alg: 'ES256',
-            kid: options.keyId,
+            kid: keyId,
             key_ops: ['verify'],
             use: 'sig',
           },
@@ -110,27 +113,35 @@ export function createCapabilityIssuer(options: CreateCapabilityIssuerOptions): 
   };
 }
 
-export async function createCapabilityIssuerFromJwks(options: CreateCapabilityIssuerFromJwksOptions): Promise<CapabilityIssuer> {
-  const privateKey = await importEs256PrivateKey(options.privateJwk);
-  const publicJwk = resolvePublicJwk(options);
+export async function createCapabilityIssuerFromPrivateJwk(options: CreateCapabilityIssuerFromPrivateJwkOptions): Promise<CapabilityIssuer> {
+  const keyId = options.keyId ?? DEFAULT_CAPABILITY_KEY_ID;
+  const publicJwk = publicJwkFromPrivateJwk(options.privateJwk, keyId);
   if (options.validateKeyPair ?? true) {
-    await validateEs256KeyPair(privateKey, publicJwk, options.keyId);
+    await validateEs256KeyPair(options.privateJwk, publicJwk, keyId);
   }
-  return createCapabilityIssuer({
-    ...options,
-    privateKey,
-    publicJwk,
-  });
+  return createCapabilityIssuer({ ...options, keyId });
+}
+
+export async function generateCapabilitySigningJwk(options: GenerateCapabilitySigningJwkOptions = {}): Promise<JsonWebKey> {
+  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+  const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
+  return {
+    ...privateJwk,
+    alg: 'ES256',
+    ...(options.keyId ? { kid: options.keyId } : {}),
+    key_ops: ['sign'],
+    use: 'sig',
+  };
 }
 
 export function mountCapabilityTokenEndpoint(
   app: {
-    post(path: string, handler: (context: Context) => Response | Promise<Response>): unknown;
+    post(path: string, ...handlers: Handler[]): unknown;
   },
   issuer: CapabilityIssuerResolver,
   options: MountCapabilityTokenEndpointOptions,
 ): void {
-  app.post(options.path ?? SERVICE_PLANE_CAPABILITY_TOKEN_PATH, async (context) => {
+  app.post(options.path ?? SERVICE_PLANE_CAPABILITY_TOKEN_PATH, ...endpointFactory.createHandlers(async (context) => {
     const caller = await options.authenticateCaller(context);
     if (caller instanceof Response) return caller;
     const resolvedIssuer = typeof issuer === 'function' ? await issuer(context) : issuer;
@@ -155,7 +166,7 @@ export function mountCapabilityTokenEndpoint(
       if (error instanceof CapabilityAuthError) return context.json({ error: error.message }, error.status as 400 | 401 | 403 | 500);
       throw error;
     }
-  });
+  }));
 }
 
 export function mountCapabilityEndpoints(app: CapabilityEndpointApp, issuer: CapabilityIssuerResolver, options: MountCapabilityEndpointsOptions): void {
@@ -168,15 +179,15 @@ export function mountCapabilityEndpoints(app: CapabilityEndpointApp, issuer: Cap
 
 export function mountCapabilityJwksEndpoint(
   app: {
-    get(path: string, handler: (context: Context) => Response | Promise<Response>): unknown;
+    get(path: string, ...handlers: Handler[]): unknown;
   },
   issuer: CapabilityIssuerResolver,
   options: MountCapabilityJwksEndpointOptions = {},
 ): void {
-  app.get(options.path ?? SERVICE_PLANE_CAPABILITY_JWKS_PATH, async (context) => {
+  app.get(options.path ?? SERVICE_PLANE_CAPABILITY_JWKS_PATH, ...endpointFactory.createHandlers(async (context) => {
     const resolvedIssuer = typeof issuer === 'function' ? await issuer(context) : issuer;
     return context.json(await resolvedIssuer.jwks());
-  });
+  }));
 }
 
 function normalizeGrant(grant: ServiceGrant): ServiceGrant {
@@ -271,28 +282,7 @@ function normalizeTtlSeconds(ttlSeconds: number, status: number): number {
   return ttlSeconds;
 }
 
-async function importEs256PrivateKey(privateJwk: JsonWebKey): Promise<CryptoKey> {
-  try {
-    return await crypto.subtle.importKey('jwk', privateJwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
-  } catch {
-    throw new CapabilityAuthError('Invalid Service-Plane ES256 private JWK', 500);
-  }
-}
-
-function resolvePublicJwk(options: CreateCapabilityIssuerFromJwksOptions): JsonWebKey {
-  if (options.publicJwk && options.publicJwks) {
-    throw new CapabilityAuthError('Service-Plane capability issuer accepts either publicJwk or publicJwks, not both', 500);
-  }
-  if (options.publicJwk) return options.publicJwk;
-  if (options.publicJwks) {
-    const publicJwk = options.publicJwks.keys.find((key) => key.kid === options.keyId);
-    if (!publicJwk) throw new CapabilityAuthError(`Service-Plane JWKS is missing key id: ${options.keyId}`, 500);
-    return publicJwk;
-  }
-  return publicJwkFromPrivateJwk(options.privateJwk, options.keyId);
-}
-
-async function validateEs256KeyPair(privateKey: CryptoKey, publicJwk: JsonWebKey, keyId: string): Promise<void> {
+async function validateEs256KeyPair(privateJwk: JsonWebKey, publicJwk: JsonWebKey, keyId: string): Promise<void> {
   try {
     const issued = await signCapabilityToken({
       claims: {
@@ -303,7 +293,7 @@ async function validateEs256KeyPair(privateKey: CryptoKey, publicJwk: JsonWebKey
       },
       keyId,
       now: new Date('2026-01-01T00:00:00.000Z'),
-      privateKey,
+      privateJwk,
       ttlSeconds: 60,
     });
     await verifyCapabilityToken(issued.token, {

@@ -16,7 +16,7 @@ describe('STS capability tokens', () => {
       },
       keyId: 'test-key',
       now: NOW,
-      privateKey: keys.privateKey,
+      privateJwk: keys.privateJwk,
     });
 
     await expect(
@@ -46,7 +46,7 @@ describe('STS capability tokens', () => {
       },
       keyId: 'test-key',
       now: NOW,
-      privateKey: keys.privateKey,
+      privateJwk: keys.privateJwk,
     });
     const parts = issued.token.split('.');
     const tamperedPayload = btoa(JSON.stringify({ aud: 'fizzy', exp: 9999999999, iat: 1, iss: 'control-plane', jti: 'x', nbf: 1, scp: ['fizzy.users.lookup'], sub: 'evil' }))
@@ -75,7 +75,7 @@ describe('STS capability tokens', () => {
       },
       keyId: 'test-key',
       now: NOW,
-      privateKey: keys.privateKey,
+      privateJwk: keys.privateJwk,
     });
     const [header, payload] = issued.token.split('.');
 
@@ -107,7 +107,7 @@ describe('STS capability tokens', () => {
       },
       keyId: 'test-key',
       now: NOW,
-      privateKey: keys.privateKey,
+      privateJwk: keys.privateJwk,
     });
 
     await expect(
@@ -130,7 +130,7 @@ describe('STS capability tokens', () => {
       },
       keyId: 'test-key',
       now: NOW,
-      privateKey: keys.privateKey,
+      privateJwk: keys.privateJwk,
       ttlSeconds: 60,
     });
 
@@ -166,6 +166,6 @@ async function testKeys() {
   const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
   return {
     jwks: { keys: [publicJwkFromPrivateJwk(privateJwk, 'test-key')] },
-    privateKey: pair.privateKey,
+    privateJwk,
   };
 }

@@ -8,11 +8,12 @@ Run a normal Hono app on Node.js, Bun, Deno, or another Fetch-compatible runtime
 
 ```ts
 import { serve } from '@hono/node-server';
-import { Hono } from 'hono';
+import { createFactory } from 'hono/factory';
 import { capability, capabilityAuth, defineCapabilities, defineNamespace, defineService, jwksFromUrl, mountDiscovery } from 'service-plane/service';
 
-const publicRoutes = new Hono().post('/events/example/:target', capability('example.events.ingest'), (c) => c.text('ok'));
-const internalRoutes = new Hono().post('/providers/example/v1/sync', capability('example.sync.run'), (c) => c.json({ ok: true }));
+const factory = createFactory();
+const publicRoutes = factory.createApp().post('/events/example/:target', capability('example.events.ingest'), (c) => c.text('ok'));
+const internalRoutes = factory.createApp().post('/providers/example/v1/sync', capability('example.sync.run'), (c) => c.json({ ok: true }));
 
 const capabilities = defineCapabilities({
   serviceId: 'example',
@@ -36,7 +37,7 @@ const service = defineService(
   { requireRouteScopes: true },
 );
 
-const app = new Hono();
+const app = factory.createApp();
 mountDiscovery(app, service);
 app.use(
   '*',
@@ -56,9 +57,9 @@ serve(app);
 
 ```ts
 import { serve } from '@hono/node-server';
-import { Hono } from 'hono';
+import { createFactory } from 'hono/factory';
 import {
-  createCapabilityIssuerFromJwks,
+  createCapabilityIssuerFromPrivateJwk,
   defineServiceGrants,
   mountCapabilityEndpoints,
 } from 'service-plane/control-plane';
@@ -72,12 +73,13 @@ const exampleCapabilities = defineCapabilities({
   ],
 });
 
-const controlPlane = new Hono();
+const factory = createFactory();
+const controlPlane = factory.createApp();
 
 mountCapabilityEndpoints(
   controlPlane,
   async () =>
-    createCapabilityIssuerFromJwks({
+    createCapabilityIssuerFromPrivateJwk({
       capabilities: [exampleCapabilities],
       grants: defineServiceGrants({
         grants: [
@@ -98,6 +100,14 @@ controlPlane.get('/health', (c) => c.json({ ok: true }));
 
 serve({ fetch: controlPlane.fetch, port: 3000 });
 ```
+
+Generate the signing key once and store it in the control plane secret system for your runtime:
+
+```sh
+node --input-type=module -e "import { generateCapabilitySigningJwk } from 'service-plane/control-plane'; console.log(JSON.stringify(await generateCapabilitySigningJwk({ keyId: 'default' })))"
+```
+
+`loadPrivateJwk()` should return that JSON value parsed as a JWK. Do not copy it into the service processes; services only need the public JWKS URL.
 
 ## Client
 

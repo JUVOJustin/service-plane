@@ -48,7 +48,7 @@ The service owns its scopes and annotates the routes that need them. It verifies
 
 ```ts
 // services/example-service/src/index.ts
-import { Hono } from 'hono';
+import { createFactory } from 'hono/factory';
 import {
   capability,
   capabilityAuth,
@@ -60,7 +60,13 @@ import {
 } from 'service-plane/service';
 import { exampleCapabilities } from '../../../packages/service-contracts/src/capabilities';
 
-const publicRoutes = new Hono().post(
+type Env = {
+  CONTROL_PLANE: Fetcher;
+};
+
+const serviceFactory = createFactory<{ Bindings: Env }>();
+
+const publicRoutes = serviceFactory.createApp().post(
   '/events/example/:target',
   capability('example.events.ingest'),
   (c) =>
@@ -70,7 +76,7 @@ const publicRoutes = new Hono().post(
     }),
 );
 
-const internalRoutes = new Hono().post(
+const internalRoutes = serviceFactory.createApp().post(
   '/providers/example/v1/sync',
   capability('example.sync.run'),
   (c) =>
@@ -96,11 +102,7 @@ export const service = defineService(
   { requireRouteScopes: true },
 );
 
-type Env = {
-  CONTROL_PLANE: Fetcher;
-};
-
-const app = new Hono<{ Bindings: Env }>();
+const app = serviceFactory.createApp();
 mountDiscovery(app, service);
 app.use('*', (c, next) => {
   const path = new URL(c.req.url).pathname;
@@ -147,10 +149,10 @@ The control plane owns grants and signs short-lived tokens. It may also proxy pu
 
 ```ts
 // apps/control-plane/src/index.ts
-import { Hono } from 'hono';
+import { createFactory } from 'hono/factory';
 import {
   cloudflareServiceBinding,
-  createCapabilityIssuerFromJwks,
+  createCapabilityIssuerFromPrivateJwk,
   createControlPlaneProxy,
   createServiceRegistry,
   defineServiceGrants,
@@ -163,10 +165,11 @@ type Env = {
   STS_PRIVATE_KEY_JWK: string;
 };
 
-const app = new Hono<{ Bindings: Env }>();
+const controlPlaneFactory = createFactory<{ Bindings: Env }>();
+const app = controlPlaneFactory.createApp();
 
 async function issuerFor(env: Env) {
-  return createCapabilityIssuerFromJwks({
+  return createCapabilityIssuerFromPrivateJwk({
     capabilities: [exampleCapabilities],
     grants: defineServiceGrants({
       grants: [
@@ -247,7 +250,13 @@ Configure the control-plane Worker with:
 }
 ```
 
-Store the private signing key as a secret:
+Generate the private signing key once. This produces one JSON value; only the control plane receives it:
+
+```sh
+node --input-type=module -e "import { generateCapabilitySigningJwk } from 'service-plane/control-plane'; console.log(JSON.stringify(await generateCapabilitySigningJwk({ keyId: 'default' })))"
+```
+
+Store that JSON as the control-plane secret:
 
 ```sh
 npx wrangler secret put STS_PRIVATE_KEY_JWK
@@ -259,7 +268,12 @@ For local development, put the same value in `apps/control-plane/.dev.vars`:
 STS_PRIVATE_KEY_JWK='{"kty":"EC","crv":"P-256",...}'
 ```
 
-The control plane derives its public JWKS from `STS_PRIVATE_KEY_JWK` and publishes it at `/.well-known/service-plane/jwks.json`. Services fetch that public key set through `jwksFromServiceBinding(...)` or `jwksFromUrl(...)`, so normal services do not need STS key material in their own config.
+The auth-key setup is intentionally asymmetric:
+
+- `STS_PRIVATE_KEY_JWK` exists only in the control-plane Worker.
+- The control plane derives the public JWKS from that secret and publishes it at `/.well-known/service-plane/jwks.json`.
+- Services fetch the public JWKS through `jwksFromServiceBinding(...)` or `jwksFromUrl(...)`.
+- Service Workers do not get STS private keys and cannot mint their own tokens.
 
 Run the control plane and service together:
 
@@ -382,6 +396,7 @@ This keeps Redis, D1, Workers KV, and database dependencies out of the package. 
 
 - [Architecture](docs/architecture.md)
 - [Service-To-Service Authorization](docs/service-to-service.md)
+- [Auth Keys](docs/auth-keys.md)
 - [Capability Catalogs](docs/capability-catalogs.md)
 - [Cloudflare Workers](docs/cloudflare-workers.md)
 - [External Hono Services](docs/external-hono-service.md)

@@ -30,8 +30,7 @@ describe('service capabilities', () => {
       issuer: 'control-plane',
       keyId: 'test-key',
       now: () => new Date('2026-05-09T12:00:00.000Z'),
-      privateKey: keys.privateKey,
-      publicJwk: keys.publicJwk,
+      privateJwk: keys.privateJwk,
     });
     const jwks = await issuer.jwks();
 
@@ -160,8 +159,7 @@ describe('service capabilities', () => {
       issuer: 'control-plane',
       keyId: 'test-key',
       now: () => new Date('2026-05-09T12:00:00.000Z'),
-      privateKey: keys.privateKey,
-      publicJwk: keys.publicJwk,
+      privateJwk: keys.privateJwk,
     });
     const controlPlane = new Hono().get(SERVICE_PLANE_CAPABILITY_JWKS_PATH, async (context) => context.json(await issuer.jwks()));
     let jwksRequests = 0;
@@ -300,7 +298,7 @@ async function testKeys() {
   const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
   const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
   return {
-    privateKey: pair.privateKey,
+    privateJwk,
     publicJwk: publicJwkFromPrivateJwk(privateJwk, 'test-key'),
   };
 }

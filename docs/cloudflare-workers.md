@@ -9,7 +9,7 @@ Prefer Worker RPC for Cloudflare-native internal APIs. Use Hono `fetch` routes w
 ## Service Worker
 
 ```ts
-import { Hono } from 'hono';
+import { createFactory } from 'hono/factory';
 import { capability, capabilityAuth, defineCapabilities, defineNamespace, defineService, jwksFromServiceBinding, mountDiscovery } from 'service-plane/service';
 
 type Env = {
@@ -21,7 +21,8 @@ const capabilities = defineCapabilities({
   scopes: [{ id: 'example.sync.run', title: 'Run example sync' }],
 });
 
-const routes = new Hono().post('/providers/example/v1/sync', capability('example.sync.run'), (c) => c.json({ ok: true }));
+const factory = createFactory<{ Bindings: Env }>();
+const routes = factory.createApp().post('/providers/example/v1/sync', capability('example.sync.run'), (c) => c.json({ ok: true }));
 
 const service = defineService(
   {
@@ -34,7 +35,7 @@ const service = defineService(
   { requireRouteScopes: true },
 );
 
-const app = new Hono<{ Bindings: Env }>();
+const app = factory.createApp();
 mountDiscovery(app, service);
 app.use('*', (c, next) =>
   capabilityAuth({
@@ -51,9 +52,9 @@ export default app;
 ## Control Plane Worker
 
 ```ts
-import { Hono } from 'hono';
+import { createFactory } from 'hono/factory';
 import {
-  createCapabilityIssuerFromJwks,
+  createCapabilityIssuerFromPrivateJwk,
   defineServiceGrants,
   mountCapabilityEndpoints,
 } from 'service-plane/control-plane';
@@ -68,12 +69,13 @@ const capabilities = defineCapabilities({
   scopes: [{ id: 'example.sync.run', title: 'Run example sync' }],
 });
 
-const app = new Hono<{ Bindings: Env }>();
+const factory = createFactory<{ Bindings: Env }>();
+const app = factory.createApp();
 
 mountCapabilityEndpoints(
   app,
   (c) =>
-    createCapabilityIssuerFromJwks({
+    createCapabilityIssuerFromPrivateJwk({
       capabilities: [capabilities],
       grants: defineServiceGrants({
         grants: [{ caller: 'moco', target: 'example', scopes: ['example.sync.run'] }],
@@ -88,6 +90,21 @@ mountCapabilityEndpoints(
 );
 
 export default app;
+```
+
+## STS Key Setup
+
+Only the control plane stores the private STS signing key. Services fetch the public JWKS from the control plane and do not need this secret.
+
+```sh
+node --input-type=module -e "import { generateCapabilitySigningJwk } from 'service-plane/control-plane'; console.log(JSON.stringify(await generateCapabilitySigningJwk({ keyId: 'default' })))"
+npx wrangler secret put STS_PRIVATE_KEY_JWK
+```
+
+For local development, place the same JSON value in the control plane `.dev.vars` file:
+
+```txt
+STS_PRIVATE_KEY_JWK='{"kty":"EC","crv":"P-256",...}'
 ```
 
 ## Worker RPC Calls
@@ -203,7 +220,7 @@ return createControlPlaneProxy({
 
 - Keep STS private keys in Worker secrets, not source code or wrangler config.
 - Let the control plane publish JWKS via `mountCapabilityEndpoints(...)`; services normally consume it with `jwksFromServiceBinding(...)` or `jwksFromUrl(...)`.
-- `createCapabilityIssuerFromJwks(...)` derives the public JWKS from `privateJwk` by default and validates that the derived key can verify issued tokens.
+- `createCapabilityIssuerFromPrivateJwk(...)` derives the public JWKS from `privateJwk` by default and validates that the derived key can verify issued tokens.
 - Replace the example `x-service-id` check with authenticated service identity in production, such as an OAuth client credential or a platform identity signal.
 - Run `wrangler types` after binding changes in your application.
 - Service Bindings are private, but STS tokens keep one authorization model across Worker RPC, Service Binding fetch, and external Hono HTTPS services.
