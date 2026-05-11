@@ -1,8 +1,8 @@
 # Service-To-Service Authorization
 
-`service-plane` uses STS capability tokens for direct service-to-service calls.
+`service-plane` uses STS capability tokens to authorize service-to-service Cap'n Web sessions.
 
-The control plane is the authorization authority. Services call each other directly after receiving a short-lived token, so the control plane is not on the hot request path.
+The control plane is the authorization authority. Services open Cap'n Web sessions directly to each other after receiving a short-lived token; the control plane is not on the hot RPC path.
 
 ## Token Flow
 
@@ -12,140 +12,63 @@ sequenceDiagram
   participant Plane as Control Plane STS
   participant Target as Target Service
 
-  Caller->>Plane: Authenticate as service and request target scopes
-  Plane->>Plane: Check grant manifest
-  Plane-->>Caller: ES256 JWS token, exp in about 120s by default
-  Caller->>Target: Direct RPC/fetch with Authorization: ServicePlane token
-  Target->>Target: Verify signature, issuer, audience, expiry, and scopes
-  Target-->>Caller: Response
+  Caller->>Plane: POST /.well-known/service-plane/capability-token
+  Plane->>Plane: Authenticate caller, check grant manifest
+  Plane-->>Caller: ES256 JWS token (default exp 120s)
+  Caller->>Target: open Cap'n Web session, api.authenticate(token)
+  Target->>Target: verify signature, issuer, audience, expiry, scopes
+  Target-->>Caller: pipelined RpcStub<ScopedApi>
+  Caller->>Target: scoped method calls (same RPC batch on HTTP-batch)
 ```
+
+The bootstrap `authenticate(token)` and the caller's first method call ride the same network round trip on HTTP-batch transport thanks to Cap'n Web's promise pipelining.
 
 ## Token Reuse And Caching
 
-A capability token is reusable until it expires. The default max TTL is 120 seconds. Caching is not required for correctness or security: if a caller has no cached token, it can request a new one from the control plane before calling the target service.
+A capability token is reusable until it expires. The default TTL is 120 seconds. Caching is not required for correctness; the target service verifies each token locally with the cached JWKS regardless of where the token came from.
 
-The target service never needs a token cache. It verifies each request locally with the control plane public JWKS, checking signature, issuer, audience, expiry, and scopes. Use `jwksFromServiceBinding(...)` on Cloudflare or `jwksFromUrl(...)` for HTTPS services so the service fetches and caches the public JWKS instead of storing key material in config.
+For performance, callers should keep a token cache per unique `(callerServiceId, targetServiceId, scopes)` tuple. `createCapabilityTokenProvider({...})` does this in-memory, and `capabilityRpcSession({...})` accepts a `CapabilityTokenCache` that can shard across isolates. See [caching.md](caching.md).
 
-For performance, a caller should keep a best-effort token cache per unique permission set:
+## Authentication Handshake
 
-```txt
-callerServiceId + targetServiceId + sorted scopes
-```
-
-`createCapabilityTokenProvider(...)` implements an in-memory cache by default. It requests a token once, reuses it for matching calls, and refreshes shortly before expiry.
-
-Cloudflare Workers can run different requests in different isolates, so module memory is an optimization, not a durability guarantee. If that causes too many STS requests, pass a shared cache adapter:
+The convention is a single `authenticate(token)` method on the public root capability:
 
 ```ts
-const tokenProvider = createCapabilityTokenProvider({
-  cache: capabilityTokenCache,
-  callerServiceId: 'moco',
-  targetServiceId: 'fizzy',
-  scopes: ['fizzy.users.lookup'],
-  requestToken: (input) => requestTokenFromControlPlane(input),
-});
+class Public extends RpcTarget {
+  constructor(private readonly env: Env) { super(); }
+  async authenticate(token: string) {
+    const identity = await verifyAuthenticationToken(token, {
+      expectedAudience: 'example',
+      issuer: 'control-plane',
+      jwks: jwksFromServiceBinding(this.env.CONTROL_PLANE),
+    });
+    return bindCapabilityIdentity(new Scoped(), identity);
+  }
+}
 ```
 
-The cache stores already-issued short-lived tokens. It does not store the STS private key or grant policy, and it does not require an additional service per worker. Good Cloudflare options are Cache API for edge-local reuse or Workers KV when cross-isolate reuse is more important than strict read-after-write behavior.
+`bindCapabilityIdentity(target, identity)` associates the verified identity with the scoped target. Once bound, every method on the target may call `requireScopes(this, ...)` to enforce scope requirements. The bound identity is also reachable via `capabilityIdentity(this)`.
+
+## Scope Enforcement
+
+Use `requireScopes(this, 'scope.id', ...)` at the top of any method that needs a scope check:
 
 ```ts
-const tokenProvider = createCapabilityTokenProvider({
-  callerServiceId: 'moco',
-  targetServiceId: 'fizzy',
-  scopes: ['fizzy.users.lookup'],
-  requestToken: (input) => requestTokenFromControlPlane(input),
-});
-
-const client = hc<FizzyRoutes>('https://fizzy.internal', {
-  fetch: capabilityFetch({ tokenProvider }),
-});
+class Scoped extends RpcTarget {
+  async runSync() {
+    const me = requireScopes(this, 'example.sync.run');
+    return { caller: me.serviceId };
+  }
+}
 ```
 
-For maximum performance:
+For codebases that prefer decorators, the `scope(...)` decorator wraps the method body with the same check. Plain function-call form remains the default — it is explicit and works without decorator-syntax build flags.
 
-- Create token providers once per service client, not inside every handler.
-- Reuse the same provider for repeated calls with the same target and scopes.
-- Keep scopes narrow, but group scopes that are always used together to avoid unnecessary token fetches.
-- Use the default short TTL unless the target operation is very latency-sensitive and revocation speed is less important. Caller-requested TTLs are clamped to the issuer max TTL.
+## Direct vs. Brokered Calls
 
-The target service still validates every request locally. Token caching only avoids repeated STS calls; it does not skip verification on the target.
+Two patterns are supported:
 
-## Why Not Remove Token Acquisition?
+1. **Direct.** The caller obtains an STS token from the control plane and opens its own Cap'n Web session against the target service. Lowest latency, least coupling. Use `capabilityRpcSession({...})`.
+2. **Brokered.** The caller opens a Cap'n Web session against the control plane and asks for a brokered stub via `broker.public(serviceId)`, `broker.auth(serviceId)`, or `broker.internal(serviceId)`. The control plane mints the token and proxies. Useful for unauthenticated public traffic that should not learn service URLs, and for end-user-authenticated `auth` traffic.
 
-There are cryptographic alternatives that avoid runtime token acquisition, but they move authorization complexity into every service:
-
-- Per-service signed requests: each caller signs every request with its own private key, and each target verifies caller public keys plus grant policy locally.
-- Mutual TLS: infrastructure authenticates both sides, but each target still needs its own authorization policy.
-- Shared HMAC secrets: simpler mechanically, but weaker for this model because a shared secret can let services bypass central grants.
-
-STS keeps the grant decision centralized while keeping target verification local. The only online control-plane dependency is token issuance. In normal operation, the caller-side token cache amortizes that cost across many service calls.
-
-## Scope Ownership
-
-Scopes are owned by the target service. A route declares its required operation scopes:
-
-```ts
-const routes = new Hono().get(
-  '/providers/fizzy/v1/users/:email',
-  capability('fizzy.users.lookup'),
-  (c) => c.json({ ok: true }),
-);
-```
-
-The control plane owns grants:
-
-```ts
-defineServiceGrants({
-  grants: [{ caller: 'moco', target: 'fizzy', scopes: ['fizzy.users.lookup'] }],
-});
-```
-
-This splits responsibility cleanly:
-
-- Target service: defines what operations exist.
-- Control plane: decides which callers may receive tokens.
-- Caller service: asks for the minimum scopes it needs.
-
-Capability catalogs can be shared through a contracts package or discovered at runtime from service discovery. See [Capability Catalogs](capability-catalogs.md).
-
-`capabilityAuth(...)` only configures token verification for downstream route middleware. It does not authorize a route by itself. Put `capability(...)` on routes that require service-to-service authorization, or call `verifyCapabilityToken(...)` manually with `requiredScopes` for non-Hono/RPC entrypoints.
-
-For stricter service packages, use `defineService(service, { requireRouteScopes: true })`. This fails fast when a route is registered without `capability(...)`, and `defineService(...)` always validates that route scopes exist in the service capability catalog.
-
-## User Authorization Boundary
-
-The pattern “user authorization is done in the control plane; services do not care about users” is useful, but only if stated precisely.
-
-It is reasonable for product-level user authorization:
-
-- The control plane authenticates users and decides whether a user may configure or trigger a workflow.
-- The control plane translates that user action into service-to-service calls.
-- Services receive service identity and capability scopes, not raw user sessions.
-
-It is not enough when a service owns user-visible data boundaries:
-
-- If a service stores tenant data, connection ownership, or user-specific records, it should still enforce those resource boundaries.
-- Prefer passing stable resource identifiers such as `connectionId`, `ownerId`, or `tenantId` in the request body and validating them against service-local state.
-- Do not let a broad service token mean “access all data.”
-
-The reusable rule is:
-
-```txt
-Control plane authorizes who may ask.
-Target service authorizes what the token may do to its own resources.
-```
-
-## Avoiding STS Bypass
-
-Do not use one shared mesh secret for all services.
-
-If every service knows the same secret and target services accept that secret as internal request authorization, any service can impersonate another service or skip STS grants.
-
-Use separate trust channels:
-
-- STS signing key: private key lives only in the control plane.
-- STS verification key: public JWKS is published by the control plane and fetched by services.
-- Service-to-plane authentication: each service may have its own credential for requesting tokens.
-- Service-to-service authorization: targets accept STS capability tokens, not peer shared-secret signatures.
-
-For service-to-service APIs, use `capabilityAuth(...)` and `capability(...)`.
+Direct calls are the default for service-to-service. Use the broker for the `public` surface and for `auth` traffic that needs end-user attribution.

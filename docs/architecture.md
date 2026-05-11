@@ -1,79 +1,79 @@
 # Architecture
 
-`service-plane` models a system with a public control plane and independently owned service routers.
+`service-plane` models a system with a public control plane and independently owned RPC services built on [Cap'n Web](https://github.com/cloudflare/capnweb).
 
-The control plane owns public ingress, global authentication, docs, service grants, and STS token issuance. Each service owns its Hono routes, internal APIs, workflows, storage, provider-specific validation, and capability scope catalog.
+The control plane owns global authentication, capability token issuance (STS), JWKS publication, the brokered surface for unauthenticated and end-user traffic, and the manifest of registered services. Each service owns its own `RpcTarget` capabilities, scope catalog, internal storage, workflows, and provider-specific validation.
 
 ## Runtime Shape
 
 ```mermaid
 sequenceDiagram
-  participant Target as Target Service
-  participant Control as Control Plane STS
   participant Caller as Caller Service
+  participant Plane as Control Plane STS
+  participant Target as Target Service
 
-  Target-->>Control: Discovery document with routes and required scopes
-  Note over Control: Code grants caller -> target scopes
-  Caller->>Control: Request token for target and scopes
-  Control->>Control: Validate caller, target, scopes, and grant
-  Control-->>Caller: Short-lived ES256 JWS capability token
-  Caller->>Target: Direct Service Binding, Worker RPC, or HTTPS call with token
-  Target->>Target: capability(...) verifies signature, audience, expiry, and scope
-  Target-->>Caller: Response
+  Note over Target,Plane: Target publishes JWKS at /.well-known/service-plane/jwks.json
+  Caller->>Plane: POST /.well-known/service-plane/capability-token<br/>(callerServiceId, targetServiceId, scopes)
+  Plane->>Plane: Validate caller, target, scopes against grant manifest
+  Plane-->>Caller: ES256 JWS capability token (default exp 120s)
+  Caller->>Target: Open Cap'n Web session, call api.authenticate(token)
+  Target->>Target: verifyAuthenticationToken(...) → CapabilityIdentity
+  Target-->>Caller: Pipelined RpcStub<ScopedApi>
+  Caller->>Target: Method calls ride the same RPC batch
+  Target->>Target: requireScopes(this, ...) checks bound identity
+  Target-->>Caller: Result
 ```
 
-The control plane is on the token issuance path, not the request data path. Cloudflare-internal services can call each other directly through Service Bindings or Worker RPC. External Hono services use HTTPS with the same token verifier.
-
-Token verification is local once the service has the control plane public JWKS. `jwksFromServiceBinding(...)` and `jwksFromUrl(...)` cache that public key set in memory, so services do not need JWKS in their Worker config. Caller-side token caching only reduces repeated token issuance calls to the control plane. The default cache is in-memory, and high-throughput Cloudflare Workers can provide a Cache API or KV adapter without adding a separate cache service.
+The control plane is on the token issuance path, not the request data path. Cloudflare-internal services can talk directly through Service Bindings; external HTTPS services use the same handshake. Token verification is local once the service has cached the JWKS — there is no JIT call to the control plane on the hot path.
 
 ## Primitives
 
-**Service**
+**Service** — A runtime unit with an id, title, version, and one or more exported capabilities.
 
-A service is a runtime unit with an id, title, version, and one or more route namespaces.
-
-**Namespace**
-
-A namespace binds one Hono app to a visibility level and path prefix.
+**Capability export** — A factory that returns an `RpcTarget` plus a visibility (`public` / `auth` / `internal`) and the scopes its methods statically require. Surfaces in the discovery document and is what the broker brokers.
 
 ```ts
-defineNamespace({
-  app: routes,
-  prefix: '/providers/example',
-  visibility: 'internal',
-});
+defineService({
+  capabilities: exampleCapabilities,
+  exports: [{
+    factory: () => new Public(env),
+    id: 'public',
+    scopes: ['example.sync.run'],
+    visibility: 'public',
+  }],
+  id: 'example',
+  rpcTransports: ['http-batch'],
+  title: 'Example',
+  version: '0.1.0',
+}, { requireRouteScopes: true });
 ```
 
-**Discovery document**
+**Capability catalog** — `defineCapabilities({...})` declares the operation-level scopes a service exports (e.g. `example.sync.run`). Scopes are owned by the target service, not by callers.
 
-Every service can expose `/.well-known/service-plane/service.json`. The document is generated from its namespaces, Hono route table, route capability annotations, and optional capability catalog.
+**Authentication handshake** — Convention is a single `authenticate(token)` method on the public root that calls `verifyAuthenticationToken(...)` and `bindCapabilityIdentity(...)` to return the scoped capability target.
 
-**Capability catalog**
+**`requireScopes(target, ...)`** — Method-body guard. Reads the verified `CapabilityIdentity` bound to `this` and throws `CapabilityAuthError(403)` if any required scope is missing. The functional form keeps DX uniform across vanilla classes and decorated classes.
 
-A service defines operation-level scopes such as `fizzy.users.lookup`. Scopes are owned by the target service, not by the caller.
+**`requireRouteScopes`** — Build-time check on `defineService(..., { requireRouteScopes: true })` that every non-internal exported capability declares scopes. Catches accidentally-public, unauthenticated capabilities at startup.
 
-**Capability route annotation**
+**Discovery document** — `/.well-known/service-plane/services.json`. JSON describing each service's exported capabilities (id, scopes, visibility, transports). Used by the registry and by tooling. The Cap'n Web RPC contract itself lives in TypeScript types and is not duplicated in JSON.
 
-`capability('fizzy.users.lookup')` is both the route annotation and the runtime guard. It adds required scope metadata to discovery and verifies incoming STS tokens when the route runs.
+**Control-plane STS** — `createCapabilityIssuer(...)` + `capabilityTokenHandler(...)`. Signs short-lived ES256 JWS tokens after validating the caller-target-scope grant. The private key never leaves the control plane; services verify against the published JWKS.
 
-**Control-plane STS**
+**Control-plane registry** — `createServiceRegistry(...)`. Fetches discovery documents from configured endpoints and caches them. Used to enumerate the surface a control-plane broker exposes.
 
-The control plane issues short-lived ES256 JWS capability tokens. Grants are code-first: caller, target, and allowed scopes are explicitly listed.
+**Control-plane broker** — `createControlPlaneRpcBroker(...)`. An RPC root capability with `public(serviceId)`, `auth(serviceId)`, and `internal(serviceId)` methods that return brokered sub-capabilities. Each brokered capability has a `connect(scopes)` method that mints a token via the issuer and returns the authenticated stub for the target service. The broker enforces visibility based on the supplied `BrokerCaller`.
 
-The STS private key is not shared with services. Services verify tokens with the public JWKS published by the control plane, so a caller cannot mint or alter its own token.
+## Transports
 
-**Control-plane registry**
+`service-plane` supports the standard Cap'n Web transports:
 
-The registry fetches discovery documents from configured service endpoints. Endpoints may be Cloudflare Service Bindings or normal HTTPS services.
+- **HTTP-batch** (`newHttpBatchRpcSession` / `newHttpBatchRpcResponse`) — default for service-to-service. One round trip per batch, works through Cloudflare Service Bindings, no WebSocket cost.
+- **WebSocket** (`newWebSocketRpcSession` / `newWorkersWebSocketRpcResponse`) — opt-in for browsers and long-lived flows.
+- **Custom `RpcTransport`** — pass any object that implements `send` / `receive` / `abort`. Used by the in-memory test transport `memoryRpcTransportPair()`.
 
-**Control-plane proxy**
+A service declares which transports it supports via `defineService({ rpcTransports: [...] })`. The default is `['http-batch']`.
 
-The proxy routes matching requests to services. It never proxies `internal` routes publicly.
+## Where service-plane stops
 
-**Control-plane proxy tokens**
-
-When the control plane proxies a route with `requiredScopes`, it attaches an STS token for the target service. The service verifies the token the same way it verifies direct service-to-service calls.
-
-## What This Package Does Not Own
-
-`service-plane` does not own connection storage, workflow engines, tenant databases, or provider SDKs. Those stay service-local. A future optional connections layer can be added if the pattern proves reusable across services.
+`service-plane` does not own connection storage, workflow engines, tenant databases, OpenAPI generation, or provider SDKs. Those stay service-local. The library is intentionally small: it is the glue between Cap'n Web and a code-first STS.
