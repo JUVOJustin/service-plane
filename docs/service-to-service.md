@@ -85,7 +85,11 @@ STS keeps the grant decision centralized while keeping target verification local
 Scopes are owned by the target service. A route declares its required operation scopes:
 
 ```ts
-const routes = new Hono().get(
+import { createFactory } from 'hono/factory';
+import { capability } from 'service-plane/service';
+
+const factory = createFactory();
+const routes = factory.createApp().get(
   '/providers/fizzy/v1/users/:email',
   capability('fizzy.users.lookup'),
   (c) => c.json({ ok: true }),

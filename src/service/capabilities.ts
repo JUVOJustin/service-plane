@@ -1,3 +1,4 @@
+import { createMiddleware } from 'hono/factory';
 import { CapabilityAuthError } from '../shared/errors.js';
 import {
   extractServicePlaneToken,
@@ -11,6 +12,7 @@ import {
   SERVICE_PLANE_CAPABILITY_CONTEXT,
   SERVICE_PLANE_CAPABILITY_VERIFIER,
   type CapabilityAuthMiddleware,
+  type CapabilityAuthVariables,
   type CapabilityCatalog,
   type CapabilityContextSource,
   type CapabilityIdentity,
@@ -77,7 +79,7 @@ export function defineCapabilities(catalog: CapabilityCatalog): CapabilityCatalo
 
 export function capability(...requiredScopes: string[]): CapabilityAuthMiddleware {
   const scopes = normalizeScopes(requiredScopes);
-  const middleware: CapabilityAuthMiddleware = async (context, next) => {
+  const middleware = createMiddleware<CapabilityAuthVariables>(async (context, next) => {
     const verifier = context.get(SERVICE_PLANE_CAPABILITY_VERIFIER);
     if (!verifier) return context.json({ error: 'Service-Plane capability auth is not configured' }, 500);
 
@@ -92,16 +94,16 @@ export function capability(...requiredScopes: string[]): CapabilityAuthMiddlewar
       if (error instanceof CapabilityAuthError) return context.json({ error: error.message }, error.status as 400 | 401 | 403 | 500);
       throw error;
     }
-  };
+  });
   routeCapabilities.set(middleware, scopes);
   return middleware;
 }
 
 export function capabilityAuth(options: CapabilityVerifierOptions): CapabilityAuthMiddleware {
-  return async (context, next) => {
+  return createMiddleware<CapabilityAuthVariables>(async (context, next) => {
     context.set(SERVICE_PLANE_CAPABILITY_VERIFIER, options);
     await next();
-  };
+  });
 }
 
 export function jwksFromUrl(url: string | URL, options: JwksFromUrlOptions = {}): CapabilityJwksResolver {

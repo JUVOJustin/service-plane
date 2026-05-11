@@ -27,8 +27,7 @@ describe('service-plane end-to-end topology', () => {
       issuer: 'control-plane',
       keyId: 'test-key',
       now: () => ISSUED_AT,
-      privateKey: keys.privateKey,
-      publicJwk: keys.publicJwk,
+      privateJwk: keys.privateJwk,
     });
     let controlPlaneAuthChecks = 0;
 
@@ -193,7 +192,7 @@ async function testKeys() {
   const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
   const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
   return {
-    privateKey: pair.privateKey,
+    privateJwk,
     publicJwk: publicJwkFromPrivateJwk(privateJwk, 'test-key'),
   };
 }
