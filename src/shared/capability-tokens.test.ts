@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { CapabilityAuthError } from './errors.js';
 import { publicJwkFromPrivateJwk, signCapabilityToken, verifyCapabilityToken } from './capability-tokens.js';
+import { CapabilityAuthError } from './errors.js';
 
 const NOW = new Date('2026-05-09T12:00:00.000Z');
 
@@ -49,7 +49,18 @@ describe('STS capability tokens', () => {
       privateJwk: keys.privateJwk,
     });
     const parts = issued.token.split('.');
-    const tamperedPayload = btoa(JSON.stringify({ aud: 'fizzy', exp: 9999999999, iat: 1, iss: 'control-plane', jti: 'x', nbf: 1, scp: ['fizzy.users.lookup'], sub: 'evil' }))
+    const tamperedPayload = btoa(
+      JSON.stringify({
+        aud: 'fizzy',
+        exp: 9999999999,
+        iat: 1,
+        iss: 'control-plane',
+        jti: 'x',
+        nbf: 1,
+        scp: ['fizzy.users.lookup'],
+        sub: 'evil',
+      }),
+    )
       .replace(/\+/gu, '-')
       .replace(/\//gu, '_')
       .replace(/=+$/u, '');

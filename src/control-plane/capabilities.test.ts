@@ -1,7 +1,7 @@
-import { describe, expect, it } from 'vitest';
 import { Hono } from 'hono';
-import { publicJwkFromPrivateJwk, verifyCapabilityToken } from '../shared/capability-tokens.js';
+import { describe, expect, it } from 'vitest';
 import { defineCapabilities } from '../service/capabilities.js';
+import { publicJwkFromPrivateJwk, verifyCapabilityToken } from '../shared/capability-tokens.js';
 import {
   createCapabilityIssuer,
   createCapabilityIssuerFromPrivateJwk,

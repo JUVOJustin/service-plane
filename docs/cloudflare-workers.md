@@ -2,15 +2,15 @@
 
 Cloudflare Workers are a first-class target for `service-plane`.
 
-Use Cloudflare Service Bindings or Worker RPC for Worker-to-Worker calls when services live in the same Cloudflare account. STS tokens keep the authorization model portable while allowing the request itself to stay direct.
+Use Cloudflare Service Bindings or [Worker RPC](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/rpc/) when Workers live in the same Cloudflare account. Cloudflare service bindings are the deployment-level trust boundary for Worker-to-plane and plane-to-Worker calls; STS tokens remain the application-level authorization mechanism for Worker-to-Worker calls.
 
 Prefer Worker RPC for Cloudflare-native internal APIs. Use Hono `fetch` routes when you want the exact same contract to run over public HTTPS for external services.
 
 ## Service Worker
 
 ```ts
-import { createFactory } from 'hono/factory';
-import { capability, capabilityAuth, defineCapabilities, defineNamespace, defineService, jwksFromServiceBinding, mountDiscovery } from 'service-plane/service';
+import { Hono } from 'hono';
+import { capability, defineCapabilities, ServicePlaneService } from 'service-plane/service';
 
 type Env = {
   CONTROL_PLANE: Fetcher;
@@ -21,91 +21,95 @@ const capabilities = defineCapabilities({
   scopes: [{ id: 'example.sync.run', title: 'Run example sync' }],
 });
 
-const factory = createFactory<{ Bindings: Env }>();
-const routes = factory.createApp().post('/providers/example/v1/sync', capability('example.sync.run'), (c) => c.json({ ok: true }));
+const routes = new Hono<{ Bindings: Env }>().post('/providers/example/v1/sync', capability('example.sync.run'), (c) => c.json({ ok: true }));
 
-const service = defineService(
-  {
-    capabilities,
-    id: 'example',
-    title: 'Example',
-    version: '0.1.0',
-    namespaces: [defineNamespace({ app: routes, prefix: '/', visibility: 'internal' })],
+const service = new ServicePlaneService<{ Bindings: Env }>({
+  auth: {
+    controlPlaneBinding: (env) => env.CONTROL_PLANE,
   },
-  { requireRouteScopes: true },
-);
+  capabilities,
+  id: 'example',
+  title: 'Example',
+  version: '0.1.0',
+  namespaces: [{ app: routes, visibility: 'internal' }],
+});
 
-const app = factory.createApp();
-mountDiscovery(app, service);
-app.use('*', (c, next) =>
-  capabilityAuth({
-    expectedAudience: 'example',
-    issuer: 'control-plane',
-    jwks: jwksFromServiceBinding(c.env.CONTROL_PLANE),
-  })(c, next),
-);
-app.route('/', routes);
-
-export default app;
+export default service.app;
 ```
 
 ## Control Plane Worker
 
 ```ts
-import { createFactory } from 'hono/factory';
+import { WorkerEntrypoint } from 'cloudflare:workers';
 import {
-  createCapabilityIssuerFromPrivateJwk,
-  defineServiceGrants,
-  mountCapabilityEndpoints,
+  cloudflareServiceBinding,
+  type ServiceDiscoveryDocument,
+  type IssueCapabilityTokenForCallerInput,
+  ServicePlaneControlPlane,
 } from 'service-plane/control-plane';
-import { defineCapabilities } from 'service-plane/service';
 
 type Env = {
-  STS_PRIVATE_KEY_JWK: string;
+  EXAMPLE_SERVICE: Fetcher;
+  STS_SIGNING_SECRET: string;
 };
 
-const capabilities = defineCapabilities({
-  serviceId: 'example',
-  scopes: [{ id: 'example.sync.run', title: 'Run example sync' }],
+const exampleServiceDiscovery = {
+  capabilities: {
+    serviceId: 'example',
+    scopes: [{ id: 'example.sync.run', title: 'Run example sync' }],
+  },
+  id: 'example',
+  routes: [{ method: 'POST', path: '/providers/example/v1/sync', requiredScopes: ['example.sync.run'], visibility: 'internal' }],
+  title: 'Example',
+  version: '0.1.0',
+} satisfies ServiceDiscoveryDocument;
+
+const controlPlane = new ServicePlaneControlPlane<{ Bindings: Env }>({
+  proxy: false,
+  services: (c) => [
+    cloudflareServiceBinding({
+      binding: c.env.EXAMPLE_SERVICE,
+      discovery: exampleServiceDiscovery,
+      grants: [{ caller: 'moco', scopes: ['example.sync.run'] }],
+      id: 'example',
+    }),
+  ],
+  signingSecret: (env) => env.STS_SIGNING_SECRET,
 });
 
-const factory = createFactory<{ Bindings: Env }>();
-const app = factory.createApp();
+export class MocoTokens extends WorkerEntrypoint<Env> {
+  async issueCapabilityToken(input: IssueCapabilityTokenForCallerInput) {
+    return controlPlane.issueCapabilityTokenForCaller('moco', input, this.env);
+  }
+}
 
-mountCapabilityEndpoints(
-  app,
-  (c) =>
-    createCapabilityIssuerFromPrivateJwk({
-      capabilities: [capabilities],
-      grants: defineServiceGrants({
-        grants: [{ caller: 'moco', target: 'example', scopes: ['example.sync.run'] }],
-      }),
-      issuer: 'control-plane',
-      keyId: 'default',
-      privateJwk: JSON.parse(c.env.STS_PRIVATE_KEY_JWK),
-    }),
-  {
-    authenticateCaller: (c) => c.req.header('x-service-id') ?? c.json({ error: 'Unauthorized' }, 401),
-  },
-);
-
-export default app;
+export default controlPlane.app;
 ```
+
+This setup does not configure HMAC caller auth because token issuance happens through the private `MocoTokens` RPC entrypoint. If you expose the HTTP token endpoint to non-Cloudflare callers, configure `hmacServiceClientAuth(...)` for that endpoint.
+
+The `discovery` property skips runtime service-discovery fetches. For same-account Cloudflare Workers, this is usually faster and simpler than asking each service for `/.well-known/service-plane/service.json` at startup. HTTPS services can omit `discovery` and keep dynamic discovery by URL.
 
 ## STS Key Setup
 
 Only the control plane stores the private STS signing key. Services fetch the public JWKS from the control plane and do not need this secret.
 
 ```sh
-node --input-type=module -e "import { generateCapabilitySigningJwk } from 'service-plane/control-plane'; console.log(JSON.stringify(await generateCapabilitySigningJwk({ keyId: 'default' })))"
-npx wrangler secret put STS_PRIVATE_KEY_JWK
+node --input-type=module -e "import { generateCapabilitySigningSecret } from 'service-plane/control-plane'; console.log(await generateCapabilitySigningSecret())"
+npx wrangler secret put STS_SIGNING_SECRET
 ```
 
-For local development, place the same JSON value in the control plane `.dev.vars` file:
+For local development, place the same value in the control plane `.dev.vars` file:
 
 ```txt
-STS_PRIVATE_KEY_JWK='{"kty":"EC","crv":"P-256",...}'
+STS_SIGNING_SECRET='nYb0v...43_base64url_chars'
 ```
+
+## Request IDs
+
+`ServicePlaneControlPlane` installs Hono's `requestId()` middleware with the default `X-Request-Id` header. A caller-provided ID is reused. If the control plane generates a new ID, proxying writes that value into `X-Request-Id` before forwarding to the service Worker.
+
+`ServicePlaneService` only reads an incoming `X-Request-Id` for logs. Service Workers do not generate request IDs because public ingress is expected to enter through the control plane.
 
 ## Worker RPC Calls
 
@@ -127,6 +131,57 @@ export class ExampleEntrypoint extends WorkerEntrypoint<Env> {
 ```
 
 For Hono RPC or Service Binding `fetch`, use `capabilityFetch({ callerServiceId, targetServiceId, scopes, requestToken })` so the token is sent as `Authorization: ServicePlane <token>`.
+
+## Control Plane RPC Token Issuance
+
+Cloudflare WorkerEntrypoint service bindings let one Worker call public methods on another Worker without a public URL. Cloudflare describes these RPC calls as direct method calls over service bindings, declared in `wrangler` config.
+
+For private Cloudflare-only token issuance, avoid HTTP and HMAC overhead by exposing a WorkerEntrypoint method whose caller id is fixed by deployment code:
+
+```ts
+// control-plane/src/index.ts
+import { WorkerEntrypoint } from 'cloudflare:workers';
+import { type IssueCapabilityTokenForCallerInput, ServicePlaneControlPlane } from 'service-plane/control-plane';
+
+const controlPlane = new ServicePlaneControlPlane<{ Bindings: Env }>({
+  // same services/signingSecret setup as the HTTP app
+});
+
+export class MocoTokenEntrypoint extends WorkerEntrypoint<Env> {
+  async issueCapabilityToken(input: IssueCapabilityTokenForCallerInput) {
+    return controlPlane.issueCapabilityTokenForCaller('moco', input, this.env);
+  }
+}
+```
+
+Bind the caller Worker to that named entrypoint:
+
+```jsonc
+{
+  "services": [
+    {
+      "binding": "CONTROL_PLANE_TOKENS",
+      "service": "control-plane",
+      "entrypoint": "MocoTokenEntrypoint"
+    }
+  ]
+}
+```
+
+Then the caller uses the RPC binding as its token requester:
+
+```ts
+import { capabilityFetch, controlPlaneRpcTokenRequester } from 'service-plane/service';
+
+const fetchWithCapability = capabilityFetch({
+  callerServiceId: 'moco',
+  targetServiceId: 'example',
+  scopes: ['example.sync.run'],
+  requestToken: controlPlaneRpcTokenRequester(env.CONTROL_PLANE_TOKENS),
+});
+```
+
+Do not expose one generic RPC method that trusts a caller-supplied `callerServiceId`. Use a named entrypoint, separate binding, or deployment-local method that fixes the caller id before issuing the token.
 
 ## Capability Token Cache
 
@@ -162,12 +217,14 @@ function cloudflareCacheApiTokenCache(cache: Cache, origin: string): CapabilityT
 Then use it in the caller Worker:
 
 ```ts
+import { capabilityFetch, controlPlaneRpcTokenRequester } from 'service-plane/service';
+
 const fetchWithCapability = capabilityFetch({
   cache: cloudflareCacheApiTokenCache(caches.default, 'https://moco.example.com'),
   callerServiceId: 'moco',
   targetServiceId: 'example',
   scopes: ['example.sync.run'],
-  requestToken: (input) => requestTokenFromControlPlane(input),
+  requestToken: controlPlaneRpcTokenRequester(env.CONTROL_PLANE_TOKENS),
 });
 ```
 
@@ -220,7 +277,6 @@ return createControlPlaneProxy({
 
 - Keep STS private keys in Worker secrets, not source code or wrangler config.
 - Let the control plane publish JWKS via `mountCapabilityEndpoints(...)`; services normally consume it with `jwksFromServiceBinding(...)` or `jwksFromUrl(...)`.
-- `createCapabilityIssuerFromPrivateJwk(...)` derives the public JWKS from `privateJwk` by default and validates that the derived key can verify issued tokens.
-- Replace the example `x-service-id` check with authenticated service identity in production, such as an OAuth client credential or a platform identity signal.
+- `createCapabilityIssuerFromSigningSecret(...)` derives the ES256 private JWK and public JWKS from `STS_SIGNING_SECRET` by default and validates that the derived key can verify issued tokens.
 - Run `wrangler types` after binding changes in your application.
 - Service Bindings are private, but STS tokens keep one authorization model across Worker RPC, Service Binding fetch, and external Hono HTTPS services.

@@ -1,14 +1,14 @@
 import type { Context } from 'hono';
+import { CapabilityAuthError } from '../shared/errors.js';
+import { joinPaths, normalizePath } from '../shared/paths.js';
 import {
-  SERVICE_DISCOVERY_PATH,
   type DefineServiceOptions,
+  SERVICE_DISCOVERY_PATH,
   type ServiceDefinition,
   type ServiceDiscoveryDocument,
   type ServiceNamespaceDefinition,
 } from '../shared/types.js';
-import { joinPaths, normalizePath } from '../shared/paths.js';
 import { routeRequiredScopes } from './capabilities.js';
-import { CapabilityAuthError } from '../shared/errors.js';
 
 export function defineNamespace(namespace: ServiceNamespaceDefinition): ServiceNamespaceDefinition {
   return {
@@ -70,11 +70,11 @@ export function serviceDiscoveryDocument(service: ServiceDefinition): ServiceDis
 }
 
 export function mountDiscovery(
-	app: {
-		get(path: string, handler: (context: Context) => Response | Promise<Response>): unknown;
-	},
-	service: ServiceDefinition,
-	path = SERVICE_DISCOVERY_PATH,
+  app: {
+    get(path: string, handler: (context: Context) => Response | Promise<Response>): unknown;
+  },
+  service: ServiceDefinition,
+  path = SERVICE_DISCOVERY_PATH,
 ): void {
   app.get(path, (context) => context.json(serviceDiscoveryDocument(service), 200));
 }
@@ -89,16 +89,32 @@ function validateServiceDefinition(service: ServiceDefinition, options: DefineSe
     if (!Array.isArray(namespace.app.routes)) {
       throw new CapabilityAuthError('Service-Plane namespace app must expose Hono routes', 500);
     }
-    for (const route of namespace.app.routes) {
-      const path = joinPaths(namespace.prefix, route.path);
-      if (path === SERVICE_DISCOVERY_PATH) continue;
+    const routes = namespace.app.routes
+      .map((route) => ({
+        method: route.method.toUpperCase(),
+        path: joinPaths(namespace.prefix, route.path),
+        requiredScopes: routeRequiredScopes(route.handler),
+      }))
+      .filter((route) => route.path !== SERVICE_DISCOVERY_PATH);
+    const scopesByRoute = routes.reduce((merged, route) => {
+      const key = `${route.method} ${route.path}`;
+      merged.set(key, [...new Set([...(merged.get(key) ?? []), ...route.requiredScopes])]);
+      return merged;
+    }, new Map<string, string[]>());
 
-      const requiredScopes = routeRequiredScopes(route.handler);
+    for (const route of routes) {
+      const requiredScopes = scopesByRoute.get(`${route.method} ${route.path}`) ?? [];
       if (options.requireRouteScopes && requiredScopes.length === 0) {
-        throw new CapabilityAuthError(`Service-Plane route is missing capability(...) annotation: ${route.method.toUpperCase()} ${path}`, 500);
+        throw new CapabilityAuthError(
+          `Service-Plane route is missing capability(...) annotation: ${route.method.toUpperCase()} ${route.path}`,
+          500,
+        );
       }
       if (requiredScopes.length > 0 && !service.capabilities) {
-        throw new CapabilityAuthError(`Service-Plane route requires scopes but service has no capability catalog: ${route.method.toUpperCase()} ${path}`, 500);
+        throw new CapabilityAuthError(
+          `Service-Plane route requires scopes but service has no capability catalog: ${route.method.toUpperCase()} ${route.path}`,
+          500,
+        );
       }
       for (const scope of requiredScopes) {
         if (!knownScopes.has(scope)) {

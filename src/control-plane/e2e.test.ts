@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
 import { Hono } from 'hono';
+import { describe, expect, it } from 'vitest';
 import { capability, capabilityAuth, capabilityIdentity, defineCapabilities } from '../service/capabilities.js';
 import { defineNamespace, defineService, mountDiscovery } from '../service/discovery.js';
 import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
@@ -46,7 +46,10 @@ describe('service-plane end-to-end topology', () => {
       createControlPlaneProxy({
         authorizeAuthRoute: (context) => {
           controlPlaneAuthChecks += 1;
-          const principal = context.req.header('authorization')?.replace(/^Bearer\s+/iu, '').trim();
+          const principal = context.req
+            .header('authorization')
+            ?.replace(/^Bearer\s+/iu, '')
+            .trim();
           if (!principal) return context.json({ error: 'Unauthorized' }, 401);
         },
         capabilityToken: async (_context, route) =>
@@ -58,7 +61,10 @@ describe('service-plane end-to-end topology', () => {
             })
           ).token,
         forwardHeaders: (context) => {
-          const principal = context.req.header('authorization')?.replace(/^Bearer\s+/iu, '').trim();
+          const principal = context.req
+            .header('authorization')
+            ?.replace(/^Bearer\s+/iu, '')
+            .trim();
           return principal ? { 'x-user-id': principal } : undefined;
         },
         registry,
@@ -83,7 +89,8 @@ describe('service-plane end-to-end topology', () => {
       expect(service.calls.public).toBe(1);
     }
 
-    const alpha = services[0]!;
+    const [alpha] = services;
+    if (!alpha) throw new Error('Missing alpha service fixture');
     expect((await alpha.app.request('/console/alpha/summary')).status).toBe(401);
     expect(alpha.calls.auth).toBe(0);
     expect(controlPlaneAuthChecks).toBe(0);

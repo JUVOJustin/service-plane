@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
 import { Hono } from 'hono';
+import { describe, expect, it } from 'vitest';
 import { capability, capabilityAuth, defineCapabilities } from '../service/capabilities.js';
 import { defineNamespace, defineService, mountDiscovery } from '../service/discovery.js';
 import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
@@ -13,10 +13,7 @@ describe('control-plane proxy', () => {
     const publicRoutes = new Hono().post('/events/example/:target', async (context) => context.text(await context.req.text()));
     const authRoutes = new Hono().get('/connections/example', (context) => context.json({ owner: context.req.header('x-owner-id') }));
     const internalRoutes = new Hono().post('/providers/example/v1/sync', (context) => context.json({ ok: true }));
-    const provider = new Hono()
-      .route('/', publicRoutes)
-      .route('/', authRoutes)
-      .route('/', internalRoutes);
+    const provider = new Hono().route('/', publicRoutes).route('/', authRoutes).route('/', internalRoutes);
     mountDiscovery(
       provider,
       defineService({
@@ -42,7 +39,9 @@ describe('control-plane proxy', () => {
       }),
     );
 
-    await expect(await (await controlPlane.request('/events/example/project', { body: 'raw-body', method: 'POST' })).text()).toBe('raw-body');
+    await expect(await (await controlPlane.request('/events/example/project', { body: 'raw-body', method: 'POST' })).text()).toBe(
+      'raw-body',
+    );
     await expect(await (await controlPlane.request('/connections/example')).json()).toEqual({ owner: 'owner-1' });
     expect((await controlPlane.request('/providers/example/v1/sync', { method: 'POST' })).status).toBe(404);
   });
@@ -63,9 +62,19 @@ describe('control-plane proxy', () => {
       now: () => new Date('2026-05-09T12:00:00.000Z'),
       privateJwk: keys.privateJwk,
     });
-    const providerRoutes = new Hono().post('/events/example', capability('example.events.ingest'), (context) => context.json({ scoped: true }));
+    const providerRoutes = new Hono().post('/events/example', capability('example.events.ingest'), (context) =>
+      context.json({ scoped: true }),
+    );
     const provider = new Hono();
-    provider.use('*', capabilityAuth({ expectedAudience: 'example', issuer: 'control-plane', jwks: await issuer.jwks(), now: new Date('2026-05-09T12:00:01.000Z') }));
+    provider.use(
+      '*',
+      capabilityAuth({
+        expectedAudience: 'example',
+        issuer: 'control-plane',
+        jwks: await issuer.jwks(),
+        now: new Date('2026-05-09T12:00:01.000Z'),
+      }),
+    );
     provider.route('/', providerRoutes);
     mountDiscovery(
       provider,
@@ -97,6 +106,46 @@ describe('control-plane proxy', () => {
 
     expect((await provider.request('/events/example', { method: 'POST' })).status).toBe(401);
     expect(await (await controlPlane.request('/events/example', { body: 'payload', method: 'POST' })).json()).toEqual({ scoped: true });
+  });
+
+  it('uses proxy-safe request headers when forwarding to services', async () => {
+    const routes = new Hono().get('/events/example', (context) =>
+      context.json({
+        acceptEncoding: context.req.header('accept-encoding') ?? null,
+        connection: context.req.header('connection') ?? null,
+        custom: context.req.header('x-client-header') ?? null,
+      }),
+    );
+    const provider = new Hono().route('/', routes);
+    mountDiscovery(
+      provider,
+      defineService({
+        id: 'example',
+        namespaces: [defineNamespace({ app: routes, prefix: '/', visibility: 'public' })],
+        title: 'Example',
+        version: '0.1.0',
+      }),
+    );
+    const registry = createServiceRegistry({
+      services: [cloudflareServiceBinding({ binding: { fetch: (request) => provider.fetch(request) }, id: 'example' })],
+    });
+    const controlPlane = new Hono().use('*', createControlPlaneProxy({ registry }));
+
+    await expect(
+      (
+        await controlPlane.request('/events/example', {
+          headers: {
+            'accept-encoding': 'gzip',
+            connection: 'keep-alive',
+            'x-client-header': 'client-value',
+          },
+        })
+      ).json(),
+    ).resolves.toEqual({
+      acceptEncoding: null,
+      connection: null,
+      custom: 'client-value',
+    });
   });
 });
 

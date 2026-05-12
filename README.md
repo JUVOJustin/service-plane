@@ -1,398 +1,281 @@
 # service-plane
 
-Opinionated Hono primitives for service-oriented applications with a public control plane and independently owned service routers.
+Opinionated Hono primitives for service-oriented apps with a public control plane and independently owned service routers.
 
-`service-plane` is intentionally small. It does not replace Hono, Zod, Hono RPC, or OpenAPI tooling. It standardizes the missing parts around service discovery, explicit route visibility, STS capability tokens, route-level scope annotations, and control-plane proxying.
+`service-plane` does not replace Hono, Hono RPC, Zod, or OpenAPI tooling. It gives you a small default setup for:
 
-## Install
+- service discovery
+- explicit route visibility
+- route-level capability scopes
+- short-lived service-to-service tokens
+- control-plane proxying
+- request IDs and token-safe service logs
+
+## Quickstart
+
+This guide sets up one control plane and one service as separate HTTP deployments. The control plane reaches services by URL, services fetch the control plane JWKS by URL, and caller services authenticate to the control plane with per-service client secrets.
+
+The snippets use `process.env` for brevity. Use your runtime's environment or secret API if you are not on Node.js.
+
+### 1. Install
 
 ```sh
 npm install service-plane hono
 ```
 
-## Minimal App
+### 2. Define The Service Capabilities
 
-The examples below form one real setup: one service Worker, one control-plane Worker, and one caller client.
-
-Use this file layout:
-
-```txt
-apps/control-plane/src/index.ts
-apps/control-plane/wrangler.jsonc
-packages/service-contracts/src/capabilities.ts
-services/example-service/src/index.ts
-services/example-service/wrangler.jsonc
-services/moco/src/example-client.ts
-```
-
-### Shared Capability Catalog
-
-In a monorepo, a small shared package is a convenient place for capability catalogs and Hono RPC route types. It is optional: independently deployed services can keep the catalog service-local and let the control plane read it from service discovery instead.
+Capabilities belong to the service that owns the routes. Keep this file next to the service. If your control plane is deployed from another repo, keep an equivalent public definition there or discover it from the service.
 
 ```ts
-// packages/service-contracts/src/capabilities.ts
+// services/resource-service/src/capabilities.ts
 import { defineCapabilities } from 'service-plane/service';
 
-export const exampleCapabilities = defineCapabilities({
-  serviceId: 'example',
+export const resourceCapabilities = defineCapabilities({
+  serviceId: 'resource',
   scopes: [
-    { id: 'example.sync.run', title: 'Run example sync' },
-    { id: 'example.events.ingest', title: 'Ingest example events' },
+    { id: 'resource.events.ingest', title: 'Ingest resource events' },
+    { id: 'resource.sync.run', title: 'Run resource sync' },
   ],
 });
 ```
 
-### Service Worker
+### 3. Create The Service
 
-The service owns its scopes and annotates the routes that need them. It verifies STS tokens with the control plane public JWKS.
+The service defines Hono routes, marks each protected route with `capability(...)`, and hands the routers to `ServicePlaneService`.
 
 ```ts
-// services/example-service/src/index.ts
-import { createFactory } from 'hono/factory';
-import {
-  capability,
-  capabilityAuth,
-  capabilityIdentity,
-  defineNamespace,
-  defineService,
-  jwksFromServiceBinding,
-  mountDiscovery,
-} from 'service-plane/service';
-import { exampleCapabilities } from '../../../packages/service-contracts/src/capabilities';
+// services/resource-service/src/index.ts
+import { Hono } from 'hono';
+import { capability, capabilityIdentity, jwksFromUrl, ServicePlaneService } from 'service-plane/service';
+import { resourceCapabilities } from './capabilities';
 
-type Env = {
-  CONTROL_PLANE: Fetcher;
-};
+const controlPlaneUrl = process.env.CONTROL_PLANE_URL ?? 'https://plane.example.com';
 
-const serviceFactory = createFactory<{ Bindings: Env }>();
-
-const publicRoutes = serviceFactory.createApp().post(
-  '/events/example/:target',
-  capability('example.events.ingest'),
-  (c) =>
-    c.json({
-      caller: capabilityIdentity(c)?.serviceId,
-      target: c.req.param('target'),
-    }),
+const publicRoutes = new Hono().post('/events/resource/:id', capability('resource.events.ingest'), (c) =>
+  c.json({
+    caller: capabilityIdentity(c)?.serviceId,
+    id: c.req.param('id'),
+    ok: true,
+  }),
 );
 
-const internalRoutes = serviceFactory.createApp().post(
-  '/providers/example/v1/sync',
-  capability('example.sync.run'),
-  (c) =>
-    c.json({
-      caller: capabilityIdentity(c)?.serviceId,
-      ok: true,
-    }),
+const internalRoutes = new Hono().post('/internal/resource/sync', capability('resource.sync.run'), (c) =>
+  c.json({
+    caller: capabilityIdentity(c)?.serviceId,
+    ok: true,
+  }),
 );
 
-export type ExampleRoutes = typeof internalRoutes;
+export type ResourceRoutes = typeof internalRoutes;
 
-export const service = defineService(
-  {
-    capabilities: exampleCapabilities,
-    id: 'example',
-    title: 'Example',
-    version: '0.1.0',
-    namespaces: [
-      defineNamespace({ app: publicRoutes, prefix: '/', visibility: 'public' }),
-      defineNamespace({ app: internalRoutes, prefix: '/', visibility: 'internal' }),
-    ],
+const service = new ServicePlaneService({
+  auth: {
+    jwks: jwksFromUrl(new URL('/.well-known/service-plane/jwks.json', controlPlaneUrl)),
   },
-  { requireRouteScopes: true },
-);
-
-const app = serviceFactory.createApp();
-mountDiscovery(app, service);
-app.use('*', (c, next) => {
-  const path = new URL(c.req.url).pathname;
-  if (path.startsWith('/.well-known/service-plane/')) return next();
-
-  return capabilityAuth({
-    expectedAudience: 'example',
-    issuer: 'control-plane',
-    jwks: jwksFromServiceBinding(c.env.CONTROL_PLANE),
-  })(c, next);
+  capabilities: resourceCapabilities,
+  id: 'resource',
+  title: 'Resource Service',
+  version: '0.1.0',
+  namespaces: [
+    { app: publicRoutes, visibility: 'public' },
+    { app: internalRoutes, visibility: 'internal' },
+  ],
 });
-app.route('/', publicRoutes);
-app.route('/', internalRoutes);
 
-export default app;
+export default service.app;
 ```
 
-Configure the service Worker with:
+Deploy this service at a stable internal or public URL, for example:
 
-```jsonc
-// services/example-service/wrangler.jsonc
-{
-  "name": "example-service",
-  "main": "src/index.ts",
-  "compatibility_date": "2026-05-09",
-  "services": [
-    {
-      "binding": "CONTROL_PLANE",
-      "service": "control-plane"
-    }
-  ]
-}
+```txt
+RESOURCE_SERVICE_URL=https://resource.example.com
+CONTROL_PLANE_URL=https://plane.example.com
 ```
 
-The `public` namespace above means the control plane may expose the route. The service route still requires a valid `ServicePlane` token when called directly.
+### 4. Create The Control Plane
 
-`jwksFromServiceBinding(...)` fetches the control plane public JWKS through a Cloudflare Service Binding and caches it in memory. If a service is not on Cloudflare, use `jwksFromUrl('https://control-plane.example.com/.well-known/service-plane/jwks.json')` instead.
-
-`capabilityAuth(...)` only configures token verification for the app. Route authorization comes from `capability(...)` on each protected route, or from calling `verifyCapabilityToken(...)` with `requiredScopes` in a non-Hono entrypoint.
-
-### Control Plane Worker
-
-The control plane owns grants and signs short-lived tokens. It may also proxy public/auth routes and attach an STS token when the target route declares `requiredScopes`.
+The control plane grants scopes, publishes the token/JWKS endpoints, discovers services, authenticates caller services before issuing tokens, and proxies `public` and `auth` routes.
 
 ```ts
 // apps/control-plane/src/index.ts
-import { createFactory } from 'hono/factory';
-import {
-  cloudflareServiceBinding,
-  createCapabilityIssuerFromPrivateJwk,
-  createControlPlaneProxy,
-  createServiceRegistry,
-  defineServiceGrants,
-  mountCapabilityEndpoints,
-} from 'service-plane/control-plane';
-import { exampleCapabilities } from '../../../packages/service-contracts/src/capabilities';
+import { hmacServiceClientAuth, httpsService, ServicePlaneControlPlane } from 'service-plane/control-plane';
 
-type Env = {
-  EXAMPLE_SERVICE: Fetcher;
-  STS_PRIVATE_KEY_JWK: string;
-};
+const resourceServiceUrl = requiredEnv('RESOURCE_SERVICE_URL');
+const stsSigningSecret = requiredEnv('STS_SIGNING_SECRET');
+const workerAHmacSecret = requiredEnv('WORKER_A_HMAC_SECRET');
 
-const controlPlaneFactory = createFactory<{ Bindings: Env }>();
-const app = controlPlaneFactory.createApp();
-
-async function issuerFor(env: Env) {
-  return createCapabilityIssuerFromPrivateJwk({
-    capabilities: [exampleCapabilities],
-    grants: defineServiceGrants({
+const controlPlane = new ServicePlaneControlPlane({
+  authenticateCaller: hmacServiceClientAuth({
+    clients: [{ clientId: 'worker-a', secret: workerAHmacSecret }],
+  }),
+  services: () => [
+    httpsService({
+      baseUrl: resourceServiceUrl,
+      id: 'resource',
       grants: [
         {
-          caller: 'moco',
-          target: 'example',
-          scopes: ['example.sync.run'],
+          caller: 'control-plane',
+          scopes: ['resource.events.ingest'],
         },
         {
-          caller: 'control-plane',
-          target: 'example',
-          scopes: ['example.events.ingest', 'example.sync.run'],
+          caller: 'worker-a',
+          scopes: ['resource.sync.run'],
         },
       ],
     }),
-    issuer: 'control-plane',
-    keyId: 'default',
-    privateJwk: JSON.parse(env.STS_PRIVATE_KEY_JWK),
-  });
-}
-
-mountCapabilityEndpoints(
-  app,
-  (c) => issuerFor(c.env),
-  {
-    authenticateCaller: (c) => {
-      const serviceId = c.req.header('x-service-id');
-      if (!serviceId) return c.json({ error: 'Unauthorized' }, 401);
-      return serviceId;
-    },
-  },
-);
-
-app.use('*', async (c, next) => {
-  const registry = createServiceRegistry({
-    services: [
-      cloudflareServiceBinding({
-        binding: c.env.EXAMPLE_SERVICE,
-        id: 'example',
-      }),
-    ],
-  });
-
-  return createControlPlaneProxy({
-    capabilityToken: async (_c, route) => {
-      const issuer = await issuerFor(c.env);
-      const issued = await issuer.issueCapabilityToken({
-        callerServiceId: 'control-plane',
-        scopes: route.requiredScopes ?? [],
-        targetServiceId: route.serviceId,
-      });
-      return issued.token;
-    },
-    registry,
-  })(c, next);
+  ],
+  signingSecret: () => stsSigningSecret,
 });
 
-export default app;
-```
+// The control-plane app is a normal Hono app. Add frontend auth,
+// dashboards, API routes, or any other middleware around service-plane.
+controlPlane.app.use('/dashboard/*', async (c, next) => {
+  const session = c.req.header('authorization');
+  if (!session) return c.json({ error: 'Unauthorized' }, 401);
+  await next();
+});
 
-Configure the control-plane Worker with:
+controlPlane.app.get('/dashboard', (c) => c.html('<h1>Control Plane</h1>'));
 
-```jsonc
-// apps/control-plane/wrangler.jsonc
-{
-  "name": "control-plane",
-  "main": "src/index.ts",
-  "compatibility_date": "2026-05-09",
-  "secrets": {
-    "required": ["STS_PRIVATE_KEY_JWK"]
-  },
-  "services": [
-    {
-      "binding": "EXAMPLE_SERVICE",
-      "service": "example-service"
-    }
-  ]
+export default controlPlane.app;
+
+function requiredEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`Missing ${name}`);
+  return value;
 }
 ```
 
-Generate the private signing key once. This produces one JSON value; only the control plane receives it:
-
-```sh
-node --input-type=module -e "import { generateCapabilitySigningJwk } from 'service-plane/control-plane'; console.log(JSON.stringify(await generateCapabilitySigningJwk({ keyId: 'default' })))"
-```
-
-Store that JSON as the control-plane secret:
-
-```sh
-npx wrangler secret put STS_PRIVATE_KEY_JWK
-```
-
-For local development, put the same value in `apps/control-plane/.dev.vars`:
-
-```txt
-STS_PRIVATE_KEY_JWK='{"kty":"EC","crv":"P-256",...}'
-```
-
-The auth-key setup is intentionally asymmetric:
-
-- `STS_PRIVATE_KEY_JWK` exists only in the control-plane Worker.
-- The control plane derives the public JWKS from that secret and publishes it at `/.well-known/service-plane/jwks.json`.
-- Services fetch the public JWKS through `jwksFromServiceBinding(...)` or `jwksFromUrl(...)`.
-- Service Workers do not get STS private keys and cannot mint their own tokens.
-
-Run the control plane and service together:
-
-```sh
-npx wrangler dev -c apps/control-plane/wrangler.jsonc -c services/example-service/wrangler.jsonc
-```
-
-The first config is the primary local Worker exposed over HTTP. The second Worker is available to the primary Worker through the `EXAMPLE_SERVICE` binding.
-
-For the small example above, `x-service-id` authenticates the caller to the token endpoint. Replace that with your real service-to-plane authentication before exposing the endpoint outside a trusted local or internal environment.
-
-### Caller Service Client
-
-Callers request a token for `caller + target + scopes` and use it for direct Hono RPC or Service Binding `fetch` calls.
+If middleware must run before the service-plane endpoints or proxy, create a Hono app first and pass it as `app`:
 
 ```ts
-// services/moco/src/example-client.ts
-import { hc } from 'hono/client';
-import { capabilityFetch } from 'service-plane/service';
-import type { ExampleRoutes } from '../../example-service/src';
+const app = new Hono();
+app.use('/admin/*', requireAdminSession);
 
-export const exampleClient = hc<ExampleRoutes>('https://example.internal', {
+const controlPlane = new ServicePlaneControlPlane({
+  app,
+  // ...
+});
+```
+
+### 5. Generate The Control-Plane Secrets
+
+Only the control plane gets this secret. Services fetch the public JWKS from the control plane.
+
+```sh
+node --input-type=module -e "import { generateCapabilitySigningSecret } from 'service-plane/control-plane'; console.log(await generateCapabilitySigningSecret())"
+```
+
+Store the output as `STS_SIGNING_SECRET`:
+
+```sh
+export STS_SIGNING_SECRET='nYb0v...43_base64url_chars'
+```
+
+Caller services also need credentials for the control-plane token endpoint. For HMAC, store the same high-entropy secret in the caller service and the control plane.
+
+```sh
+node --input-type=module -e "import { generateServiceClientSecret } from 'service-plane/control-plane'; console.log('WORKER_A_HMAC_SECRET=' + generateServiceClientSecret())"
+```
+
+Use your platform's secret manager in production:
+
+- control plane: `STS_SIGNING_SECRET`, `WORKER_A_HMAC_SECRET`
+- worker-a: `WORKER_A_HMAC_SECRET`
+
+### 6. Run The Plane And Service
+
+Run each deployment with its own environment:
+
+- service: `CONTROL_PLANE_URL=https://plane.example.com`
+- control plane: `RESOURCE_SERVICE_URL=https://resource.example.com`, `STS_SIGNING_SECRET=...`, and `WORKER_A_HMAC_SECRET=...`
+- worker-a: `CONTROL_PLANE_URL=https://plane.example.com`, `RESOURCE_SERVICE_URL=https://resource.example.com`, and `WORKER_A_HMAC_SECRET=...`
+
+### 7. Call A Public Route Through The Control Plane
+
+```sh
+curl -X POST http://localhost:8787/events/resource/123
+```
+
+The control plane:
+
+1. discovers the service route
+2. sees that it is `public`
+3. mints a short-lived `ServicePlane` token for `resource.events.ingest`
+4. forwards the request to the service with `Authorization: ServicePlane <token>`
+5. preserves or generates `X-Request-Id` and passes it through
+
+Direct calls to the service route still require a valid `ServicePlane` token.
+
+## Service-To-Service Client
+
+Use `capabilityFetch(...)` when one service calls another service directly through Hono RPC or normal `fetch`.
+
+```ts
+// services/worker-a/src/resource-client.ts
+import { hc } from 'hono/client';
+import { capabilityFetch, controlPlaneHmacTokenRequester } from 'service-plane/service';
+import type { ResourceRoutes } from '../../resource-service/src';
+
+const controlPlaneUrl = process.env.CONTROL_PLANE_URL ?? 'https://plane.example.com';
+const resourceServiceUrl = process.env.RESOURCE_SERVICE_URL ?? 'https://resource.example.com';
+const workerAHmacSecret = requiredEnv('WORKER_A_HMAC_SECRET');
+
+export const resourceClient = hc<ResourceRoutes>(resourceServiceUrl, {
   fetch: capabilityFetch({
-    callerServiceId: 'moco',
-    targetServiceId: 'example',
-    scopes: ['example.sync.run'],
-    requestToken: async (input) => {
-      const response = await fetch('https://control-plane.internal/.well-known/service-plane/capability-token', {
-        body: JSON.stringify(input),
-        headers: { 'content-type': 'application/json', 'x-service-id': 'moco' },
-        method: 'POST',
-      });
-      if (!response.ok) throw new Error(await response.text());
-      return (await response.json()) as { expiresAt: string; token: string };
-    },
+    callerServiceId: 'worker-a',
+    targetServiceId: 'resource',
+    scopes: ['resource.sync.run'],
+    requestToken: controlPlaneHmacTokenRequester({
+      clientId: 'worker-a',
+      clientSecret: workerAHmacSecret,
+      controlPlaneUrl,
+    }),
   }),
 });
+
+function requiredEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`Missing ${name}`);
+  return value;
+}
 ```
 
-Token caching is an optional performance optimization, not a correctness requirement. `capabilityFetch(...)` creates a token provider with a best-effort in-memory cache and refreshes shortly before expiry, so warm isolates do not need to hit the control plane. The default token TTL is 120 seconds. If the cache is empty, the caller requests a new token and continues.
+`capabilityFetch(...)` keeps a best-effort in-memory token cache and refreshes shortly before expiry. The default token TTL is 120 seconds.
 
-Cloudflare can run requests in different isolates. For high-throughput services, add a shared cache adapter instead of adding a dedicated cache service:
+`capabilityFetch(...)` preserves existing request headers. If a service handles a request and calls another service, pass the incoming `X-Request-Id` on the outgoing request so the same ID appears in plane, caller, and target logs.
 
-```ts
-import type {
-  CapabilityTokenCache,
-  CapabilityTokenCacheEntry,
-  IssueCapabilityTokenInput,
-} from 'service-plane/service';
+## Defaults
 
-function cloudflareCacheApiTokenCache(cache: Cache, origin: string): CapabilityTokenCache {
-  const requestFor = (key: string) => new Request(`${origin}/__service-plane/token-cache/${encodeURIComponent(key)}`);
+`ServicePlaneService` installs:
 
-  return {
-    async get(key) {
-      const response = await cache.match(requestFor(key));
-      if (!response) return undefined;
-      return (await response.json()) as CapabilityTokenCacheEntry;
-    },
-    async set(key, value, ttlSeconds) {
-      await cache.put(
-        requestFor(key),
-        new Response(JSON.stringify(value), {
-          headers: {
-            'cache-control': `max-age=${ttlSeconds}`,
-            'content-type': 'application/json',
-          },
-        }),
-      );
-    },
-  };
-}
+- service discovery at `/.well-known/service-plane/service.json`
+- capability-token verification, using the control plane JWKS
+- `X-Request-Id` reading for logs; services do not generate request IDs
+- structured token-safe service logs
+- `requireRouteScopes: true`
 
-async function requestTokenFromControlPlane(input: IssueCapabilityTokenInput) {
-  const response = await fetch('https://control-plane.internal/.well-known/service-plane/capability-token', {
-    body: JSON.stringify(input),
-    headers: { 'content-type': 'application/json', 'x-service-id': 'moco' },
-    method: 'POST',
-  });
-  if (!response.ok) throw new Error(await response.text());
-  return (await response.json()) as { expiresAt: string; token: string };
-}
+`ServicePlaneControlPlane` installs:
 
-const fizzyFetch = capabilityFetch({
-  cache: cloudflareCacheApiTokenCache(caches.default, 'https://moco.example.com'),
-  callerServiceId: 'moco',
-  targetServiceId: 'example',
-  scopes: ['example.sync.run'],
-  requestToken: requestTokenFromControlPlane,
-});
-```
+- token issuance at `/.well-known/service-plane/capability-token`
+- public JWKS at `/.well-known/service-plane/jwks.json`
+- service discovery and proxying
+- inline service discovery support on service endpoints, useful for private Cloudflare bindings
+- Hono `requestId()` generation and forwarding with `X-Request-Id`
+- automatic control-plane STS tokens for proxied scoped routes
 
 ## Route Visibility
 
-Services expose Hono routers through explicit namespaces:
+Each service namespace must declare visibility:
 
-- `public`: control planes may proxy these routes without user auth. Use for webhooks and public ingest. The service still owns provider-specific validation.
-- `auth`: control planes may proxy these routes after application-level auth.
-- `internal`: control planes must not publicly proxy these routes. Use for service-to-service APIs.
+- `public`: the control plane may proxy the route without app-user auth. Use for webhooks and public ingest.
+- `auth`: the control plane may proxy the route after your app-user auth check.
+- `internal`: the control plane does not publicly proxy the route. Use for service-to-service APIs.
 
-Visibility is not inferred from the path. This avoids accidentally exposing internal APIs because a route happens to exist in a Hono app.
+Visibility is explicit. It is not inferred from URL paths.
 
-## Caching
-
-The registry has an optional callback cache:
-
-```ts
-createServiceRegistry({
-  cache: {
-    get: async (key) => undefined,
-    set: async (key, value, ttlSeconds) => {},
-  },
-  services: [],
-});
-```
-
-This keeps Redis, D1, Workers KV, and database dependencies out of the package. Use the storage system that fits your runtime.
-
-## Documentation
+## More
 
 - [Architecture](docs/architecture.md)
 - [Service-To-Service Authorization](docs/service-to-service.md)

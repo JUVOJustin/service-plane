@@ -1,12 +1,12 @@
 import { decode, sign, verifyWithJwks } from 'hono/jwt';
 import { CapabilityAuthError } from './errors.js';
 import {
-  DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
-  SERVICE_PLANE_AUTHORIZATION_SCHEME,
   type CapabilityClaims,
   type CapabilityIdentity,
   type CapabilityJwks,
+  DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
   type IssuedCapabilityToken,
+  SERVICE_PLANE_AUTHORIZATION_SCHEME,
   type VerifyCapabilityTokenOptions,
 } from './types.js';
 

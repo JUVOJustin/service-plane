@@ -1,7 +1,7 @@
-import { describe, expect, it } from 'vitest';
 import { Hono } from 'hono';
-import { defineService, defineNamespace, serviceDiscoveryDocument } from './discovery.js';
+import { describe, expect, it } from 'vitest';
 import { capability, defineCapabilities } from './capabilities.js';
+import { defineNamespace, defineService, serviceDiscoveryDocument } from './discovery.js';
 
 describe('service discovery', () => {
   it('builds a discovery document from explicit Hono namespaces', () => {

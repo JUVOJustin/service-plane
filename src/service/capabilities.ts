@@ -1,16 +1,13 @@
 import { createMiddleware } from 'hono/factory';
-import { CapabilityAuthError } from '../shared/errors.js';
 import {
+  decodeCapabilityTokenPayload,
   extractServicePlaneToken,
   servicePlaneAuthorization,
   verifyCapabilityToken,
-  decodeCapabilityTokenPayload,
 } from '../shared/capability-tokens.js';
+import { CapabilityAuthError } from '../shared/errors.js';
+import { SERVICE_PLANE_HMAC_CLIENT_HEADER, SERVICE_PLANE_HMAC_TIMESTAMP_HEADER, signServicePlaneHmacRequest } from '../shared/hmac-auth.js';
 import {
-  DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
-  SERVICE_PLANE_CAPABILITY_JWKS_PATH,
-  SERVICE_PLANE_CAPABILITY_CONTEXT,
-  SERVICE_PLANE_CAPABILITY_VERIFIER,
   type CapabilityAuthMiddleware,
   type CapabilityAuthVariables,
   type CapabilityCatalog,
@@ -22,10 +19,16 @@ import {
   type CapabilityTokenCache,
   type CapabilityTokenProvider,
   type CapabilityVerifierOptions,
+  DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
   type FetchLike,
   type HonoAppLike,
   type IssueCapabilityTokenInput,
   type IssuedCapabilityToken,
+  SERVICE_PLANE_CAPABILITY_CONTEXT,
+  SERVICE_PLANE_CAPABILITY_JWKS_PATH,
+  SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
+  SERVICE_PLANE_CAPABILITY_VERIFIER,
+  SERVICE_PLANE_REQUEST_ID_HEADER,
 } from '../shared/types.js';
 
 const routeCapabilities = new WeakMap<object, string[]>();
@@ -65,6 +68,28 @@ export type CapabilityFetchOptions = CreateCapabilityTokenProviderOptions & {
 export type CapabilityFetchWithProviderOptions = {
   fetch?: typeof fetch;
   tokenProvider: CapabilityTokenProvider;
+};
+
+export type ControlPlaneTokenRequesterOptions = {
+  controlPlaneUrl: string | URL;
+  fetch?: typeof fetch | FetchLike;
+  headers?: HeadersInit | (() => HeadersInit | Promise<HeadersInit>);
+  requestId?: string | (() => string | Promise<string | undefined> | undefined);
+  requestIdHeaderName?: string;
+  serviceClientSecret: string | (() => Promise<string> | string);
+  tokenPath?: string;
+};
+
+export type ControlPlaneHmacTokenRequesterOptions = Omit<ControlPlaneTokenRequesterOptions, 'serviceClientSecret'> & {
+  clientId: string;
+  clientIdHeaderName?: string;
+  clientSecret: string | (() => Promise<string> | string);
+  now?: () => Date;
+  timestampHeaderName?: string;
+};
+
+export type ControlPlaneRpcTokenBinding = {
+  issueCapabilityToken(input: IssueCapabilityTokenInput): Promise<IssuedCapabilityToken | { expiresAt: Date | string; token: string }>;
 };
 
 export function defineCapabilities(catalog: CapabilityCatalog): CapabilityCatalog {
@@ -169,7 +194,10 @@ export function routeRequiredScopes(handler: unknown): string[] {
   return typeof handler === 'function' || (typeof handler === 'object' && handler !== null) ? (routeCapabilities.get(handler) ?? []) : [];
 }
 
-export function serviceCapabilities(app: HonoAppLike, catalog: CapabilityCatalog): CapabilityCatalog & { routes: Array<{ method: string; path: string; requiredScopes: string[] }> } {
+export function serviceCapabilities(
+  app: HonoAppLike,
+  catalog: CapabilityCatalog,
+): CapabilityCatalog & { routes: Array<{ method: string; path: string; requiredScopes: string[] }> } {
   return {
     ...catalog,
     routes: app.routes.flatMap((route) => {
@@ -187,7 +215,9 @@ export function createCapabilityTokenProvider(options: CreateCapabilityTokenProv
   const targetServiceId = normalizeValue(options.targetServiceId, 'target service id');
   const scopes = normalizeScopes(options.scopes);
   const ttlSeconds = options.ttlSeconds === undefined ? undefined : normalizeTtlSeconds(options.ttlSeconds);
-  const cacheKey = options.cacheKey ?? capabilityTokenCacheKey({ callerServiceId, scopes, targetServiceId, ...(ttlSeconds === undefined ? {} : { ttlSeconds }) });
+  const cacheKey =
+    options.cacheKey ??
+    capabilityTokenCacheKey({ callerServiceId, scopes, targetServiceId, ...(ttlSeconds === undefined ? {} : { ttlSeconds }) });
 
   return {
     async token() {
@@ -216,7 +246,12 @@ export function createCapabilityTokenProvider(options: CreateCapabilityTokenProv
   };
 }
 
-export function capabilityTokenCacheKey(input: { callerServiceId: string; scopes: string[]; targetServiceId: string; ttlSeconds?: number }): string {
+export function capabilityTokenCacheKey(input: {
+  callerServiceId: string;
+  scopes: string[];
+  targetServiceId: string;
+  ttlSeconds?: number;
+}): string {
   const parts = {
     callerServiceId: input.callerServiceId,
     scopes: [...input.scopes].sort(),
@@ -224,6 +259,88 @@ export function capabilityTokenCacheKey(input: { callerServiceId: string; scopes
     ttlSeconds: input.ttlSeconds ?? null,
   };
   return `service-plane:capability-token:${encodeURIComponent(JSON.stringify(parts))}`;
+}
+
+export function controlPlaneTokenRequester(
+  options: ControlPlaneTokenRequesterOptions,
+): CreateCapabilityTokenProviderOptions['requestToken'] {
+  const fetcher = options.fetch ?? fetch;
+  const tokenUrl = new URL(options.tokenPath ?? SERVICE_PLANE_CAPABILITY_TOKEN_PATH, options.controlPlaneUrl);
+  const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
+
+  return async (input) => {
+    const headers = new Headers(typeof options.headers === 'function' ? await options.headers() : options.headers);
+    headers.set('authorization', `Bearer ${await resolveServiceClientSecret(options.serviceClientSecret)}`);
+    headers.set('content-type', 'application/json');
+    const requestId = await resolveRequestId(options.requestId);
+    if (requestId) headers.set(requestIdHeaderName, requestId);
+
+    const response = await fetchToken(
+      fetcher,
+      new Request(tokenUrl, {
+        body: JSON.stringify(input),
+        headers,
+        method: 'POST',
+      }),
+    );
+    if (!response.ok) throw new CapabilityAuthError(`Unable to fetch Service-Plane capability token: ${response.status}`, response.status);
+
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch {
+      throw new CapabilityAuthError('Invalid Service-Plane capability token response', 500);
+    }
+    return parseIssuedCapabilityToken(body);
+  };
+}
+
+export function controlPlaneHmacTokenRequester(
+  options: ControlPlaneHmacTokenRequesterOptions,
+): CreateCapabilityTokenProviderOptions['requestToken'] {
+  const fetcher = options.fetch ?? fetch;
+  const tokenUrl = new URL(options.tokenPath ?? SERVICE_PLANE_CAPABILITY_TOKEN_PATH, options.controlPlaneUrl);
+  const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
+  const clientIdHeaderName = options.clientIdHeaderName ?? SERVICE_PLANE_HMAC_CLIENT_HEADER;
+  const timestampHeaderName = options.timestampHeaderName ?? SERVICE_PLANE_HMAC_TIMESTAMP_HEADER;
+
+  return async (input) => {
+    const headers = new Headers(typeof options.headers === 'function' ? await options.headers() : options.headers);
+    headers.set('content-type', 'application/json');
+    const requestId = await resolveRequestId(options.requestId);
+    if (requestId) headers.set(requestIdHeaderName, requestId);
+
+    const request = await signServicePlaneHmacRequest(
+      new Request(tokenUrl, {
+        body: JSON.stringify(input),
+        headers,
+        method: 'POST',
+      }),
+      {
+        clientId: options.clientId,
+        clientIdHeaderName,
+        requestIdHeaderName,
+        secret: await resolveServiceClientSecret(options.clientSecret),
+        timestampHeaderName,
+        ...(options.now ? { now: options.now() } : {}),
+      },
+    );
+
+    const response = await fetchToken(fetcher, request);
+    if (!response.ok) throw new CapabilityAuthError(`Unable to fetch Service-Plane capability token: ${response.status}`, response.status);
+
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch {
+      throw new CapabilityAuthError('Invalid Service-Plane capability token response', 500);
+    }
+    return parseIssuedCapabilityToken(body);
+  };
+}
+
+export function controlPlaneRpcTokenRequester(binding: ControlPlaneRpcTokenBinding): CreateCapabilityTokenProviderOptions['requestToken'] {
+  return async (input) => parseIssuedCapabilityToken(await binding.issueCapabilityToken(input));
 }
 
 export function capabilityFetch(options: CapabilityFetchOptions | CapabilityFetchWithProviderOptions): typeof fetch {
@@ -330,6 +447,35 @@ function createRemoteJwksResolver(options: JwksFromUrlOptions & { url: string | 
 
 function fetchJwks(fetcher: RemoteJwksFetch, request: Request): Promise<Response> {
   return typeof fetcher === 'function' ? fetcher(request) : fetcher.fetch(request);
+}
+
+function fetchToken(fetcher: typeof fetch | FetchLike, request: Request): Promise<Response> {
+  return typeof fetcher === 'function' ? fetcher(request) : fetcher.fetch(request);
+}
+
+async function resolveServiceClientSecret(secret: ControlPlaneTokenRequesterOptions['serviceClientSecret']): Promise<string> {
+  const resolved = typeof secret === 'function' ? await secret() : secret;
+  const normalized = resolved.trim();
+  if (!normalized) throw new CapabilityAuthError('Service-Plane service client secret cannot be empty', 500);
+  return normalized;
+}
+
+async function resolveRequestId(requestId: ControlPlaneTokenRequesterOptions['requestId']): Promise<string | undefined> {
+  const resolved = typeof requestId === 'function' ? await requestId() : requestId;
+  const normalized = resolved?.trim();
+  return normalized || undefined;
+}
+
+function parseIssuedCapabilityToken(value: unknown): IssuedCapabilityToken {
+  if (!value || typeof value !== 'object') throw new CapabilityAuthError('Invalid Service-Plane capability token response', 500);
+  const issued = value as { expiresAt?: unknown; token?: unknown };
+  if (!(typeof issued.expiresAt === 'string' || issued.expiresAt instanceof Date) || typeof issued.token !== 'string') {
+    throw new CapabilityAuthError('Invalid Service-Plane capability token response', 500);
+  }
+  return {
+    expiresAt: issued.expiresAt instanceof Date ? issued.expiresAt : new Date(issued.expiresAt),
+    token: issued.token,
+  };
 }
 
 function parseRemoteJwks(value: unknown): CapabilityJwks {

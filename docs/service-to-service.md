@@ -37,12 +37,18 @@ callerServiceId + targetServiceId + sorted scopes
 Cloudflare Workers can run different requests in different isolates, so module memory is an optimization, not a durability guarantee. If that causes too many STS requests, pass a shared cache adapter:
 
 ```ts
+import { controlPlaneHmacTokenRequester } from 'service-plane/service';
+
 const tokenProvider = createCapabilityTokenProvider({
   cache: capabilityTokenCache,
   callerServiceId: 'moco',
   targetServiceId: 'fizzy',
   scopes: ['fizzy.users.lookup'],
-  requestToken: (input) => requestTokenFromControlPlane(input),
+  requestToken: controlPlaneHmacTokenRequester({
+    clientId: 'moco',
+    clientSecret: process.env.MOCO_HMAC_SECRET,
+    controlPlaneUrl: 'https://control-plane.internal',
+  }),
 });
 ```
 
@@ -53,7 +59,11 @@ const tokenProvider = createCapabilityTokenProvider({
   callerServiceId: 'moco',
   targetServiceId: 'fizzy',
   scopes: ['fizzy.users.lookup'],
-  requestToken: (input) => requestTokenFromControlPlane(input),
+  requestToken: controlPlaneHmacTokenRequester({
+    clientId: 'moco',
+    clientSecret: process.env.MOCO_HMAC_SECRET,
+    controlPlaneUrl: 'https://control-plane.internal',
+  }),
 });
 
 const client = hc<FizzyRoutes>('https://fizzy.internal', {
@@ -69,6 +79,18 @@ For maximum performance:
 - Use the default short TTL unless the target operation is very latency-sensitive and revocation speed is less important. Caller-requested TTLs are clamped to the issuer max TTL.
 
 The target service still validates every request locally. Token caching only avoids repeated STS calls; it does not skip verification on the target.
+
+## Service-To-Plane Authentication
+
+Services must authenticate when they ask the control plane for a token. Do not use a caller-supplied service id header as identity.
+
+For distributed HTTP deployments, generate one HMAC secret per caller:
+
+```sh
+node --input-type=module -e "import { generateServiceClientSecret } from 'service-plane/control-plane'; console.log('MOCO_HMAC_SECRET=' + generateServiceClientSecret())"
+```
+
+Store the secret in the caller and the control plane. Configure the control plane with `hmacServiceClientAuth(...)`, which verifies a signature bound to method, path, body, timestamp, client id, and request id. The grants still decide which target scopes that service may receive.
 
 ## Why Not Remove Token Acquisition?
 
@@ -96,12 +118,14 @@ const routes = factory.createApp().get(
 );
 ```
 
-The control plane owns grants:
+The control plane owns grants. In the high-level wrapper, keep them on the target service registration:
 
 ```ts
-defineServiceGrants({
-  grants: [{ caller: 'moco', target: 'fizzy', scopes: ['fizzy.users.lookup'] }],
-});
+httpsService({
+  baseUrl: 'https://fizzy.internal',
+  id: 'fizzy',
+  grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'] }],
+})
 ```
 
 This splits responsibility cleanly:

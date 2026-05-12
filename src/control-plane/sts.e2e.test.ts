@@ -1,7 +1,15 @@
-import { describe, expect, it } from 'vitest';
 import { Hono } from 'hono';
+import { describe, expect, it } from 'vitest';
+import {
+  capability,
+  capabilityAuth,
+  capabilityFetch,
+  capabilityIdentity,
+  createCapabilityTokenProvider,
+  defineCapabilities,
+} from '../service/capabilities.js';
 import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
-import { capability, capabilityAuth, capabilityFetch, capabilityIdentity, createCapabilityTokenProvider, defineCapabilities } from '../service/capabilities.js';
+import { hashServiceClientSecret, serviceClientCredentialsAuth } from './caller-auth.js';
 import { createCapabilityIssuer, defineServiceGrants, mountCapabilityTokenEndpoint } from './capabilities.js';
 
 describe('STS direct service topology', () => {
@@ -37,8 +45,11 @@ describe('STS direct service topology', () => {
     const jwks = await issuer.jwks();
     const sts = new Hono();
     let stsCalls = 0;
+    const mocoServiceClientSecret = 'moco-client-secret';
     mountCapabilityTokenEndpoint(sts, issuer, {
-      authenticateCaller: (context) => context.req.header('x-service-id') ?? context.json({ error: 'Unauthorized' }, 401),
+      authenticateCaller: serviceClientCredentialsAuth({
+        credentials: [{ secretHash: await hashServiceClientSecret(mocoServiceClientSecret), serviceId: 'moco' }],
+      }),
     });
 
     const fizzy = serviceApp({
@@ -63,7 +74,7 @@ describe('STS direct service topology', () => {
         stsCalls += 1;
         const response = await sts.request('/.well-known/service-plane/capability-token', {
           body: JSON.stringify(input),
-          headers: { 'content-type': 'application/json', 'x-service-id': 'moco' },
+          headers: { authorization: `Bearer ${mocoServiceClientSecret}`, 'content-type': 'application/json' },
           method: 'POST',
         });
         if (!response.ok) throw new Error(await response.text());
@@ -95,7 +106,7 @@ describe('STS direct service topology', () => {
         scopes: ['charlie.reports.read'],
         targetServiceId: 'charlie',
       }),
-      headers: { 'content-type': 'application/json', 'x-service-id': 'moco' },
+      headers: { authorization: `Bearer ${mocoServiceClientSecret}`, 'content-type': 'application/json' },
       method: 'POST',
     });
     expect(denied.status).toBe(403);
@@ -106,7 +117,10 @@ describe('STS direct service topology', () => {
 
 function serviceApp(input: { audience: string; issuer: string; jwks: { keys: JsonWebKey[] }; path: string; scope: string }) {
   const app = new Hono();
-  app.use('*', capabilityAuth({ expectedAudience: input.audience, issuer: input.issuer, jwks: input.jwks, now: new Date('2026-05-09T12:00:10.000Z') }));
+  app.use(
+    '*',
+    capabilityAuth({ expectedAudience: input.audience, issuer: input.issuer, jwks: input.jwks, now: new Date('2026-05-09T12:00:10.000Z') }),
+  );
   app.get(input.path, capability(input.scope), (context) =>
     context.json({
       caller: capabilityIdentity(context)?.serviceId,

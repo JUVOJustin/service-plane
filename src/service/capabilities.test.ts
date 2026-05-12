@@ -1,23 +1,26 @@
-import { describe, expect, it } from 'vitest';
 import { Hono } from 'hono';
 import { hc } from 'hono/client';
+import { describe, expect, it } from 'vitest';
 import { createCapabilityIssuer, defineServiceGrants } from '../control-plane/capabilities.js';
 import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
-import { defineNamespace, defineService, serviceDiscoveryDocument } from './discovery.js';
+import { SERVICE_PLANE_CAPABILITY_JWKS_PATH } from '../shared/types.js';
+import { memoryCapabilityTokenCache } from '../testing/index.js';
 import {
   capability,
   capabilityAuth,
   capabilityFetch,
   capabilityIdentity,
   capabilityTokenCacheKey,
+  controlPlaneHmacTokenRequester,
+  controlPlaneRpcTokenRequester,
+  controlPlaneTokenRequester,
   createCapabilityTokenProvider,
   defineCapabilities,
   jwksFromServiceBinding,
   jwksFromUrl,
   serviceCapabilities,
 } from './capabilities.js';
-import { memoryCapabilityTokenCache } from '../testing/index.js';
-import { SERVICE_PLANE_CAPABILITY_JWKS_PATH } from '../shared/types.js';
+import { defineNamespace, defineService, serviceDiscoveryDocument } from './discovery.js';
 
 describe('service capabilities', () => {
   it('protects annotated Hono routes and exposes capability identity', async () => {
@@ -62,7 +65,9 @@ describe('service capabilities', () => {
   });
 
   it('adds route scopes to discovery documents', () => {
-    const routes = new Hono().get('/providers/fizzy/v1/users/:email', capability('fizzy.users.lookup'), (context) => context.json({ ok: true }));
+    const routes = new Hono().get('/providers/fizzy/v1/users/:email', capability('fizzy.users.lookup'), (context) =>
+      context.json({ ok: true }),
+    );
     const service = defineService({
       capabilities: fizzyCapabilities,
       id: 'fizzy',
@@ -149,6 +154,89 @@ describe('service capabilities', () => {
     expect(issuedTokens).toBe(1);
   });
 
+  it('requests capability tokens from a control plane with service client credentials and request ids', async () => {
+    const requestToken = controlPlaneTokenRequester({
+      controlPlaneUrl: 'https://control-plane.internal',
+      fetch: async (request) => {
+        expect(new URL(request.url).pathname).toBe('/.well-known/service-plane/capability-token');
+        expect(request.headers.get('authorization')).toBe('Bearer moco-service-secret');
+        expect(request.headers.get('content-type')).toBe('application/json');
+        expect(request.headers.get('x-request-id')).toBe('trace-1');
+        await expect(request.json()).resolves.toEqual({
+          callerServiceId: 'moco',
+          scopes: ['fizzy.users.lookup'],
+          targetServiceId: 'fizzy',
+        });
+        return Response.json({ expiresAt: '2026-05-09T12:02:00.000Z', token: 'token-1' });
+      },
+      requestId: 'trace-1',
+      serviceClientSecret: 'moco-service-secret',
+    });
+
+    await expect(
+      requestToken({
+        callerServiceId: 'moco',
+        scopes: ['fizzy.users.lookup'],
+        targetServiceId: 'fizzy',
+      }),
+    ).resolves.toEqual({
+      expiresAt: new Date('2026-05-09T12:02:00.000Z'),
+      token: 'token-1',
+    });
+  });
+
+  it('requests capability tokens with HMAC headers', async () => {
+    const requestToken = controlPlaneHmacTokenRequester({
+      clientId: 'moco-client',
+      clientSecret: 'moco-hmac-secret',
+      controlPlaneUrl: 'https://control-plane.internal',
+      fetch: async (request) => {
+        expect(request.headers.get('authorization')).toMatch(/^ServicePlane-HMAC [A-Za-z0-9_-]+$/u);
+        expect(request.headers.get('x-service-plane-client')).toBe('moco-client');
+        expect(request.headers.get('x-service-plane-timestamp')).toBe('2026-05-12T10:15:00.000Z');
+        expect(request.headers.get('x-request-id')).toBe('trace-hmac-1');
+        return Response.json({ expiresAt: '2026-05-12T10:17:00.000Z', token: 'token-1' });
+      },
+      now: () => new Date('2026-05-12T10:15:00.000Z'),
+      requestId: 'trace-hmac-1',
+    });
+
+    await expect(
+      requestToken({
+        callerServiceId: 'moco',
+        scopes: ['fizzy.users.lookup'],
+        targetServiceId: 'fizzy',
+      }),
+    ).resolves.toEqual({
+      expiresAt: new Date('2026-05-12T10:17:00.000Z'),
+      token: 'token-1',
+    });
+  });
+
+  it('requests capability tokens from a private RPC binding', async () => {
+    const requestToken = controlPlaneRpcTokenRequester({
+      async issueCapabilityToken(input) {
+        expect(input).toEqual({
+          callerServiceId: 'moco',
+          scopes: ['fizzy.users.lookup'],
+          targetServiceId: 'fizzy',
+        });
+        return { expiresAt: '2026-05-12T10:17:00.000Z', token: 'rpc-token-1', tokenType: 'ServicePlane' };
+      },
+    });
+
+    await expect(
+      requestToken({
+        callerServiceId: 'moco',
+        scopes: ['fizzy.users.lookup'],
+        targetServiceId: 'fizzy',
+      }),
+    ).resolves.toEqual({
+      expiresAt: new Date('2026-05-12T10:17:00.000Z'),
+      token: 'rpc-token-1',
+    });
+  });
+
   it('verifies routes with JWKS fetched from the control-plane service binding', async () => {
     const keys = await testKeys();
     const issuer = createCapabilityIssuer({
@@ -179,7 +267,9 @@ describe('service capabilities', () => {
         now: new Date('2026-05-09T12:00:01.000Z'),
       })(context, next),
     );
-    app.get('/providers/fizzy/v1/users/:email', capability('fizzy.users.lookup'), (context) => context.json({ email: context.req.param('email') }));
+    app.get('/providers/fizzy/v1/users/:email', capability('fizzy.users.lookup'), (context) =>
+      context.json({ email: context.req.param('email') }),
+    );
 
     const issued = await issuer.issueCapabilityToken({
       callerServiceId: 'moco',

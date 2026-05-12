@@ -40,6 +40,10 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "check": "biome check .",
+    "check:write": "biome check --write .",
+    "format": "biome format --write .",
+    "lint": "biome lint .",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "prepare": "npm run build"
@@ -57,6 +61,7 @@
     "hono": ">=4.0.0"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.4.15",
     "@types/node": "^25.0.0",
     "hono": "^4.12.18",
     "typescript": "^5.0.4",

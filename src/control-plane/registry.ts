@@ -1,8 +1,9 @@
+import { pathMatches } from '../shared/paths.js';
 import {
   DEFAULT_REGISTRY_CACHE_TTL_SECONDS,
-  SERVICE_DISCOVERY_PATH,
   type DiscoveredServiceRoute,
   type RegistryCache,
+  SERVICE_DISCOVERY_PATH,
   type ServiceDiscoveryDocument,
   type ServiceDiscoverySnapshot,
   type ServiceEndpoint,
@@ -10,7 +11,6 @@ import {
   type ServiceRegistrySnapshot,
   type ServiceRouteDiscovery,
 } from '../shared/types.js';
-import { pathMatches } from '../shared/paths.js';
 import { serviceDiscoveryRequest } from './endpoints.js';
 
 export type CreateServiceRegistryOptions = {
@@ -51,6 +51,10 @@ async function discoverServices(endpoints: ServiceEndpoint[], discoveryPath: str
   const documents = await Promise.all(
     endpoints.map(async (endpoint) => {
       try {
+        if (endpoint.discovery) {
+          const discovery = typeof endpoint.discovery === 'function' ? await endpoint.discovery() : endpoint.discovery;
+          return isServiceDiscoveryDocument(discovery) ? discovery : undefined;
+        }
         const response = await endpoint.fetch(serviceDiscoveryRequest(endpoint, discoveryPath));
         if (!response.ok) return undefined;
         const value = await response.json();

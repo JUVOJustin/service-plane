@@ -9,6 +9,7 @@ export const DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS = 300;
 export const SERVICE_PLANE_CAPABILITY_CONTEXT = 'servicePlaneCapability';
 export const SERVICE_PLANE_CAPABILITY_VERIFIER = 'servicePlaneCapabilityVerifier';
 export const SERVICE_PLANE_AUTHORIZATION_SCHEME = 'ServicePlane';
+export const SERVICE_PLANE_REQUEST_ID_HEADER = 'X-Request-Id';
 
 export type ServiceRouteVisibility = 'public' | 'auth' | 'internal';
 
@@ -68,7 +69,9 @@ export type FetchLike = {
 };
 
 export type ServiceEndpoint = {
+  discovery?: ServiceDiscoveryDocument | (() => Promise<ServiceDiscoveryDocument> | ServiceDiscoveryDocument);
   fetch(request: Request): Promise<Response>;
+  grants?: ServiceEndpointGrant[];
   id: string;
   origin: string;
 };
@@ -111,6 +114,10 @@ export type ServiceGrant = {
   caller: string;
   scopes: string[];
   target: string;
+};
+
+export type ServiceEndpointGrant = Omit<ServiceGrant, 'target'> & {
+  target?: string;
 };
 
 export type ServiceGrantDefinition = {

@@ -1,18 +1,19 @@
 import type { Context, Handler } from 'hono';
 import { createFactory } from 'hono/factory';
-import { CapabilityAuthError } from '../shared/errors.js';
 import { publicJwkFromPrivateJwk, signCapabilityToken, verifyCapabilityToken } from '../shared/capability-tokens.js';
+import { CapabilityAuthError } from '../shared/errors.js';
 import {
-  DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
-  SERVICE_PLANE_CAPABILITY_JWKS_PATH,
-  SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
   type CapabilityCatalog,
   type CapabilityJwks,
+  DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
   type IssueCapabilityTokenInput,
   type IssuedCapabilityToken,
+  SERVICE_PLANE_CAPABILITY_JWKS_PATH,
+  SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
   type ServiceGrant,
   type ServiceGrantDefinition,
 } from '../shared/types.js';
+import { issuedCapabilityTokenRpcResponse } from './rpc.js';
 
 const endpointFactory = createFactory();
 const DEFAULT_CAPABILITY_KEY_ID = 'default';
@@ -113,7 +114,9 @@ export function createCapabilityIssuer(options: CreateCapabilityIssuerOptions): 
   };
 }
 
-export async function createCapabilityIssuerFromPrivateJwk(options: CreateCapabilityIssuerFromPrivateJwkOptions): Promise<CapabilityIssuer> {
+export async function createCapabilityIssuerFromPrivateJwk(
+  options: CreateCapabilityIssuerFromPrivateJwkOptions,
+): Promise<CapabilityIssuer> {
   const keyId = options.keyId ?? DEFAULT_CAPABILITY_KEY_ID;
   const publicJwk = publicJwkFromPrivateJwk(options.privateJwk, keyId);
   if (options.validateKeyPair ?? true) {
@@ -141,35 +144,38 @@ export function mountCapabilityTokenEndpoint(
   issuer: CapabilityIssuerResolver,
   options: MountCapabilityTokenEndpointOptions,
 ): void {
-  app.post(options.path ?? SERVICE_PLANE_CAPABILITY_TOKEN_PATH, ...endpointFactory.createHandlers(async (context) => {
-    const caller = await options.authenticateCaller(context);
-    if (caller instanceof Response) return caller;
-    const resolvedIssuer = typeof issuer === 'function' ? await issuer(context) : issuer;
+  app.post(
+    options.path ?? SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
+    ...endpointFactory.createHandlers(async (context) => {
+      const caller = await options.authenticateCaller(context);
+      if (caller instanceof Response) return caller;
+      const resolvedIssuer = typeof issuer === 'function' ? await issuer(context) : issuer;
 
-    try {
-      const body = await readTokenRequest(context.req.raw);
-      if (body.callerServiceId && body.callerServiceId !== caller) {
-        return context.json({ error: 'Caller service mismatch' }, 403);
+      try {
+        const body = await readTokenRequest(context.req.raw);
+        if (body.callerServiceId && body.callerServiceId !== caller) {
+          return context.json({ error: 'Caller service mismatch' }, 403);
+        }
+        const issued = await resolvedIssuer.issueCapabilityToken({
+          callerServiceId: caller,
+          scopes: body.scopes,
+          targetServiceId: body.targetServiceId,
+          ...(body.ttlSeconds === undefined ? {} : { ttlSeconds: body.ttlSeconds }),
+        });
+        return context.json(issuedCapabilityTokenRpcResponse(issued));
+      } catch (error) {
+        if (error instanceof CapabilityAuthError) return context.json({ error: error.message }, error.status as 400 | 401 | 403 | 500);
+        throw error;
       }
-      const issued = await resolvedIssuer.issueCapabilityToken({
-        callerServiceId: caller,
-        scopes: body.scopes,
-        targetServiceId: body.targetServiceId,
-        ...(body.ttlSeconds === undefined ? {} : { ttlSeconds: body.ttlSeconds }),
-      });
-      return context.json({
-        expiresAt: issued.expiresAt.toISOString(),
-        token: issued.token,
-        tokenType: 'ServicePlane',
-      });
-    } catch (error) {
-      if (error instanceof CapabilityAuthError) return context.json({ error: error.message }, error.status as 400 | 401 | 403 | 500);
-      throw error;
-    }
-  }));
+    }),
+  );
 }
 
-export function mountCapabilityEndpoints(app: CapabilityEndpointApp, issuer: CapabilityIssuerResolver, options: MountCapabilityEndpointsOptions): void {
+export function mountCapabilityEndpoints(
+  app: CapabilityEndpointApp,
+  issuer: CapabilityIssuerResolver,
+  options: MountCapabilityEndpointsOptions,
+): void {
   mountCapabilityTokenEndpoint(app, issuer, {
     authenticateCaller: options.authenticateCaller,
     ...(options.tokenPath ? { path: options.tokenPath } : {}),
@@ -184,10 +190,13 @@ export function mountCapabilityJwksEndpoint(
   issuer: CapabilityIssuerResolver,
   options: MountCapabilityJwksEndpointOptions = {},
 ): void {
-  app.get(options.path ?? SERVICE_PLANE_CAPABILITY_JWKS_PATH, ...endpointFactory.createHandlers(async (context) => {
-    const resolvedIssuer = typeof issuer === 'function' ? await issuer(context) : issuer;
-    return context.json(await resolvedIssuer.jwks());
-  }));
+  app.get(
+    options.path ?? SERVICE_PLANE_CAPABILITY_JWKS_PATH,
+    ...endpointFactory.createHandlers(async (context) => {
+      const resolvedIssuer = typeof issuer === 'function' ? await issuer(context) : issuer;
+      return context.json(await resolvedIssuer.jwks());
+    }),
+  );
 }
 
 function normalizeGrant(grant: ServiceGrant): ServiceGrant {
@@ -211,11 +220,9 @@ function validateGrant(grant: ServiceGrant, capabilitiesByService: Map<string, S
 function capabilityScopesByService(capabilities: CapabilityCatalog[]): Map<string, Set<string>> {
   const byService = new Map<string, Set<string>>();
   for (const catalog of capabilities) {
-    if (byService.has(catalog.serviceId)) throw new CapabilityAuthError(`Duplicate Service-Plane capability service: ${catalog.serviceId}`, 500);
-    byService.set(
-      catalog.serviceId,
-      new Set(catalog.scopes.map((scope) => normalizeScope(scope.id))),
-    );
+    if (byService.has(catalog.serviceId))
+      throw new CapabilityAuthError(`Duplicate Service-Plane capability service: ${catalog.serviceId}`, 500);
+    byService.set(catalog.serviceId, new Set(catalog.scopes.map((scope) => normalizeScope(scope.id))));
   }
   return byService;
 }

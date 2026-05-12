@@ -1,42 +1,3 @@
-export {
-  capability,
-  capabilityAuth,
-  capabilityFetch,
-  capabilityIdentity,
-  capabilityTokenCacheKey,
-  createCapabilityTokenProvider,
-  defineCapabilities,
-  jwksFromServiceBinding,
-  jwksFromUrl,
-  serviceCapabilities,
-  tokenExpiresAt,
-  verifyCapabilityToken,
-  withCapabilityAuthorization,
-} from './capabilities.js';
-export type {
-  CapabilityFetchOptions,
-  CapabilityFetchWithProviderOptions,
-  CreateCapabilityTokenProviderOptions,
-  JwksFromServiceBindingOptions,
-  JwksFromUrlOptions,
-  RemoteJwksFetch,
-} from './capabilities.js';
-export {
-  defineNamespace,
-  defineService,
-  mountDiscovery,
-  serviceDiscoveryDocument,
-} from './discovery.js';
-export {
-  DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
-  DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
-  SERVICE_DISCOVERY_PATH,
-  SERVICE_PLANE_AUTHORIZATION_SCHEME,
-  SERVICE_PLANE_CAPABILITY_JWKS_PATH,
-  SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
-  SERVICE_PLANE_CAPABILITY_CONTEXT,
-  SERVICE_PLANE_CAPABILITY_VERIFIER,
-} from '../shared/types.js';
 export type {
   CapabilityAuthMiddleware,
   CapabilityCatalog,
@@ -60,3 +21,61 @@ export type {
   ServiceRouteDiscovery,
   ServiceRouteVisibility,
 } from '../shared/types.js';
+export {
+  DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
+  DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
+  SERVICE_DISCOVERY_PATH,
+  SERVICE_PLANE_AUTHORIZATION_SCHEME,
+  SERVICE_PLANE_CAPABILITY_CONTEXT,
+  SERVICE_PLANE_CAPABILITY_JWKS_PATH,
+  SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
+  SERVICE_PLANE_CAPABILITY_VERIFIER,
+  SERVICE_PLANE_REQUEST_ID_HEADER,
+} from '../shared/types.js';
+export type {
+  CapabilityFetchOptions,
+  CapabilityFetchWithProviderOptions,
+  ControlPlaneHmacTokenRequesterOptions,
+  ControlPlaneRpcTokenBinding,
+  ControlPlaneTokenRequesterOptions,
+  CreateCapabilityTokenProviderOptions,
+  JwksFromServiceBindingOptions,
+  JwksFromUrlOptions,
+  RemoteJwksFetch,
+} from './capabilities.js';
+export {
+  capability,
+  capabilityAuth,
+  capabilityFetch,
+  capabilityIdentity,
+  capabilityTokenCacheKey,
+  controlPlaneHmacTokenRequester,
+  controlPlaneRpcTokenRequester,
+  controlPlaneTokenRequester,
+  createCapabilityTokenProvider,
+  defineCapabilities,
+  jwksFromServiceBinding,
+  jwksFromUrl,
+  serviceCapabilities,
+  tokenExpiresAt,
+  verifyCapabilityToken,
+  withCapabilityAuthorization,
+} from './capabilities.js';
+export {
+  defineNamespace,
+  defineService,
+  mountDiscovery,
+  serviceDiscoveryDocument,
+} from './discovery.js';
+export {
+  type ServicePlaneLogEvent,
+  type ServicePlaneLoggerOptions,
+  type ServicePlaneLogLevel,
+  servicePlaneLogger,
+} from './logger.js';
+export {
+  type ServicePlaneNamespace,
+  ServicePlaneService,
+  type ServicePlaneServiceAuthOptions,
+  type ServicePlaneServiceOptions,
+} from './service.js';

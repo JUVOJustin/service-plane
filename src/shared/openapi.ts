@@ -12,10 +12,7 @@ export type OpenApiDocument = {
   [key: string]: unknown;
 };
 
-export async function mergeServiceOpenApi(input: {
-  baseDocument: OpenApiDocument;
-  registry: ServiceRegistry;
-}): Promise<OpenApiDocument> {
+export async function mergeServiceOpenApi(input: { baseDocument: OpenApiDocument; registry: ServiceRegistry }): Promise<OpenApiDocument> {
   const snapshot = await input.registry.discover();
   const paths: Record<string, Record<string, unknown>> = {
     ...(input.baseDocument.paths ?? {}),
@@ -29,7 +26,11 @@ export async function mergeServiceOpenApi(input: {
       tags.push({ name: route.serviceTitle });
       knownTags.add(route.serviceTitle);
     }
-    const methods = (paths[route.path] ??= {});
+    let methods = paths[route.path];
+    if (!methods) {
+      methods = {};
+      paths[route.path] = methods;
+    }
     methods[route.method.toLowerCase()] = {
       description: `${route.visibility} route discovered from ${route.serviceTitle}.`,
       responses: {
