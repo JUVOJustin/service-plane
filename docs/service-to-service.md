@@ -90,7 +90,7 @@ For distributed HTTP deployments, generate one HMAC secret per caller:
 node --input-type=module -e "import { generateServiceClientSecret } from 'service-plane/control-plane'; console.log('MOCO_HMAC_SECRET=' + generateServiceClientSecret())"
 ```
 
-Store the secret in the caller and the control plane. Configure the control plane with `hmacServiceClientAuth(...)`, which verifies a signature bound to method, path, body, timestamp, client id, and request id. The grants still decide which target scopes that service may receive.
+Store the secret in the caller and the control plane. Configure the control plane with `hmacServiceClientAuth(...)`, which verifies a signature bound to method, path, body, timestamp, client id, and request id. For distributed HTTP deployments, configure `replayCache` as well so captured requests cannot be replayed inside the timestamp skew window. The grants still decide which target scopes that service may receive.
 
 ## Why Not Remove Token Acquisition?
 

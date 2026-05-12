@@ -24,6 +24,7 @@ import {
   type HonoAppLike,
   type IssueCapabilityTokenInput,
   type IssuedCapabilityToken,
+  MAX_CAPABILITY_TOKEN_TTL_SECONDS,
   SERVICE_PLANE_CAPABILITY_CONTEXT,
   SERVICE_PLANE_CAPABILITY_JWKS_PATH,
   SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
@@ -388,8 +389,16 @@ function normalizeValue(value: string, field: string): string {
 }
 
 function normalizeTtlSeconds(ttlSeconds: number): number {
-  if (!Number.isFinite(ttlSeconds) || !Number.isInteger(ttlSeconds) || ttlSeconds <= 0) {
-    throw new CapabilityAuthError('Service-Plane capability token TTL must be a positive integer', 500);
+  if (
+    !Number.isFinite(ttlSeconds) ||
+    !Number.isSafeInteger(ttlSeconds) ||
+    ttlSeconds <= 0 ||
+    ttlSeconds > MAX_CAPABILITY_TOKEN_TTL_SECONDS
+  ) {
+    throw new CapabilityAuthError(
+      `Service-Plane capability token TTL must be a positive integer no greater than ${MAX_CAPABILITY_TOKEN_TTL_SECONDS} seconds`,
+      500,
+    );
   }
   return ttlSeconds;
 }

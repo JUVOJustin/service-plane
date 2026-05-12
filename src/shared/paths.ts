@@ -19,16 +19,31 @@ export function pathAndQuery(request: Request): string {
 }
 
 export function pathMatches(routePath: string, requestPath: string): boolean {
-  const pattern = normalizePath(routePath)
-    .split('/')
-    .map((part) => {
-      if (part.startsWith(':')) return '[^/]+';
-      return escapeRegExp(part);
-    })
-    .join('/');
+  const pattern = pathPattern(normalizePath(routePath));
+  if (!pattern) return false;
   return new RegExp(`^${pattern}$`, 'u').test(normalizePath(requestPath));
 }
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+}
+
+function pathPattern(path: string): string | undefined {
+  const patterns = path.split('/').map(pathPartPattern);
+  return patterns.includes(undefined) ? undefined : patterns.join('/');
+}
+
+function pathPartPattern(part: string): string | undefined {
+  const param = /^:([^{}]+)(?:\{(.+)\})?$/u.exec(part);
+  if (!param) return escapeRegExp(part);
+
+  const constraint = param[2];
+  if (!constraint) return '[^/]+';
+
+  try {
+    new RegExp(`^(?:${constraint})$`, 'u');
+  } catch {
+    return undefined;
+  }
+  return `(?:${constraint})`;
 }

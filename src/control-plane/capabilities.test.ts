@@ -137,6 +137,15 @@ describe('capability issuer', () => {
         ttlSeconds: 1.5,
       }),
     ).rejects.toThrow('Service-Plane capability token TTL must be a positive integer');
+
+    await expect(
+      issuer.issueCapabilityToken({
+        callerServiceId: 'moco',
+        scopes: ['fizzy.users.lookup'],
+        targetServiceId: 'fizzy',
+        ttlSeconds: 90_000,
+      }),
+    ).rejects.toThrow('Service-Plane capability token TTL must be a positive integer');
   });
 
   it('rejects malformed token endpoint TTLs', async () => {

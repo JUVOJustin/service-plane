@@ -17,6 +17,7 @@ export type ServicePlaneHmacRequestParts = {
 export type SignServicePlaneHmacRequestOptions = {
   clientId: string;
   clientIdHeaderName?: string;
+  maxBodyBytes?: number;
   now?: Date;
   requestIdHeaderName?: string;
   secret: string;
@@ -36,7 +37,7 @@ export async function signServicePlaneHmacRequest(request: Request, options: Sig
   const signed = new Request(request, { headers });
   const signature = await servicePlaneHmacSignature(
     options.secret,
-    await servicePlaneHmacRequestParts(signed, options.clientId, timestamp, requestIdHeaderName),
+    await servicePlaneHmacRequestParts(signed, options.clientId, timestamp, requestIdHeaderName, options.maxBodyBytes),
   );
   headers.set('authorization', servicePlaneHmacAuthorization(signature));
   return new Request(signed, { headers });
@@ -47,11 +48,12 @@ export async function servicePlaneHmacRequestParts(
   clientId: string,
   timestamp: string,
   requestIdHeaderName = SERVICE_PLANE_REQUEST_ID_HEADER,
+  maxBodyBytes?: number,
 ): Promise<ServicePlaneHmacRequestParts> {
   const url = new URL(request.url);
   const requestId = request.headers.get(requestIdHeaderName)?.trim() || undefined;
   return {
-    bodyHash: await sha256Base64Url(new Uint8Array(await request.clone().arrayBuffer())),
+    bodyHash: await sha256Base64Url(await requestBodyBytes(request, maxBodyBytes)),
     clientId,
     method: request.method.toUpperCase(),
     pathWithQuery: `${url.pathname}${url.search}`,
@@ -117,4 +119,25 @@ export function bytesToBase64Url(bytes: Uint8Array): string {
   let binary = '';
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary).replace(/\+/gu, '-').replace(/\//gu, '_').replace(/=+$/u, '');
+}
+
+async function requestBodyBytes(request: Request, maxBodyBytes?: number): Promise<Uint8Array> {
+  if (maxBodyBytes !== undefined) {
+    if (!Number.isSafeInteger(maxBodyBytes) || maxBodyBytes <= 0) {
+      throw new CapabilityAuthError('Service-Plane HMAC max body size must be a positive integer', 500);
+    }
+    const contentLength = request.headers.get('content-length');
+    if (contentLength) {
+      const parsed = Number(contentLength);
+      if (Number.isFinite(parsed) && parsed > maxBodyBytes) {
+        throw new CapabilityAuthError('Service-Plane HMAC request body is too large', 413);
+      }
+    }
+  }
+
+  const bytes = new Uint8Array(await request.clone().arrayBuffer());
+  if (maxBodyBytes !== undefined && bytes.byteLength > maxBodyBytes) {
+    throw new CapabilityAuthError('Service-Plane HMAC request body is too large', 413);
+  }
+  return bytes;
 }

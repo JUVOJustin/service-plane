@@ -33,6 +33,7 @@ export function createControlPlaneProxy(options: ControlPlaneProxyOptions): Midd
     }
 
     const headers = new Headers(context.req.raw.headers);
+    headers.delete('authorization');
     const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
     const requestId = requestIdFromContext(context) ?? headers.get(requestIdHeaderName) ?? undefined;
     if (requestId) headers.set(requestIdHeaderName, requestId);

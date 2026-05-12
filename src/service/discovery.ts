@@ -96,23 +96,30 @@ function validateServiceDefinition(service: ServiceDefinition, options: DefineSe
         requiredScopes: routeRequiredScopes(route.handler),
       }))
       .filter((route) => route.path !== SERVICE_DISCOVERY_PATH);
-    const scopesByRoute = routes.reduce((merged, route) => {
+    const routesByKey = routes.reduce((merged, route) => {
       const key = `${route.method} ${route.path}`;
-      merged.set(key, [...new Set([...(merged.get(key) ?? []), ...route.requiredScopes])]);
+      const existing = merged.get(key) ?? [];
+      existing.push(route);
+      merged.set(key, existing);
       return merged;
-    }, new Map<string, string[]>());
+    }, new Map<string, typeof routes>());
 
-    for (const route of routes) {
-      const requiredScopes = scopesByRoute.get(`${route.method} ${route.path}`) ?? [];
+    for (const [key, matchingRoutes] of routesByKey) {
+      const [method, ...pathParts] = key.split(' ');
+      const path = pathParts.join(' ');
+      const requiredScopes = [...new Set(matchingRoutes.flatMap((route) => route.requiredScopes))];
       if (options.requireRouteScopes && requiredScopes.length === 0) {
+        throw new CapabilityAuthError(`Service-Plane route is missing capability(...) annotation: ${method?.toUpperCase()} ${path}`, 500);
+      }
+      if (options.requireRouteScopes && matchingRoutes[0]?.requiredScopes.length === 0) {
         throw new CapabilityAuthError(
-          `Service-Plane route is missing capability(...) annotation: ${route.method.toUpperCase()} ${route.path}`,
+          `Service-Plane route must begin with capability(...) annotation: ${method?.toUpperCase()} ${path}`,
           500,
         );
       }
       if (requiredScopes.length > 0 && !service.capabilities) {
         throw new CapabilityAuthError(
-          `Service-Plane route requires scopes but service has no capability catalog: ${route.method.toUpperCase()} ${route.path}`,
+          `Service-Plane route requires scopes but service has no capability catalog: ${method?.toUpperCase()} ${path}`,
           500,
         );
       }

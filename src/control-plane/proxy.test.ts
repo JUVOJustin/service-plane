@@ -147,6 +147,51 @@ describe('control-plane proxy', () => {
       custom: 'client-value',
     });
   });
+
+  it('does not forward caller authorization headers unless explicitly configured', async () => {
+    const routes = new Hono().get('/events/example', (context) =>
+      context.json({
+        authorization: context.req.header('authorization') ?? null,
+      }),
+    );
+    const provider = new Hono().route('/', routes);
+    mountDiscovery(
+      provider,
+      defineService({
+        id: 'example',
+        namespaces: [defineNamespace({ app: routes, prefix: '/', visibility: 'public' })],
+        title: 'Example',
+        version: '0.1.0',
+      }),
+    );
+    const registry = createServiceRegistry({
+      services: [cloudflareServiceBinding({ binding: { fetch: (request) => provider.fetch(request) }, id: 'example' })],
+    });
+
+    const defaultControlPlane = new Hono().use('*', createControlPlaneProxy({ registry }));
+    await expect(
+      (
+        await defaultControlPlane.request('/events/example', {
+          headers: { authorization: 'Bearer user-token' },
+        })
+      ).json(),
+    ).resolves.toEqual({ authorization: null });
+
+    const forwardingControlPlane = new Hono().use(
+      '*',
+      createControlPlaneProxy({
+        forwardHeaders: (context) => ({ authorization: context.req.header('authorization') ?? '' }),
+        registry,
+      }),
+    );
+    await expect(
+      (
+        await forwardingControlPlane.request('/events/example', {
+          headers: { authorization: 'Bearer user-token' },
+        })
+      ).json(),
+    ).resolves.toEqual({ authorization: 'Bearer user-token' });
+  });
 });
 
 async function testKeys() {

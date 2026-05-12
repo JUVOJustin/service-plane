@@ -130,6 +130,19 @@ describe('STS capability tokens', () => {
     ).rejects.toThrow('Invalid Service-Plane capability claims');
   });
 
+  it('rejects oversized tokens before parsing untrusted claims', async () => {
+    const keys = await testKeys();
+    const token = `${btoa(JSON.stringify({ alg: 'ES256', kid: 'test-key' }))}.${'a'.repeat(8200)}.signature`;
+
+    await expect(
+      verifyCapabilityToken(token, {
+        expectedAudience: 'fizzy',
+        jwks: keys.jwks,
+        now: new Date('2026-05-09T12:01:00.000Z'),
+      }),
+    ).rejects.toThrow('Service-Plane capability token is too large');
+  });
+
   it('rejects expired, wrong-audience, and missing-scope tokens', async () => {
     const keys = await testKeys();
     const issued = await signCapabilityToken({
@@ -169,6 +182,25 @@ describe('STS capability tokens', () => {
         now: new Date('2026-05-09T12:02:00.000Z'),
       }),
     ).rejects.toThrow('Expired Service-Plane capability token');
+  });
+
+  it('rejects unsafe or excessive token TTLs', async () => {
+    const keys = await testKeys();
+
+    await expect(
+      signCapabilityToken({
+        claims: {
+          aud: 'fizzy',
+          iss: 'control-plane',
+          scp: ['fizzy.users.lookup'],
+          sub: 'moco',
+        },
+        keyId: 'test-key',
+        now: NOW,
+        privateJwk: keys.privateJwk,
+        ttlSeconds: 90_000,
+      }),
+    ).rejects.toThrow('Service-Plane capability token TTL must be a positive integer');
   });
 });
 

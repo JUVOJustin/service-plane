@@ -28,10 +28,10 @@ The token endpoint must authenticate the caller before issuing a token. The high
 
 For distributed HTTP deployments, `hmacServiceClientAuth(...)` verifies a request signature and returns the matched service id. The signature covers method, path, body hash, timestamp, client id, and request id. A service id header is request metadata at best; it is not authentication.
 
-By default, HMAC requests are limited by timestamp skew. Pass `replayCache` to reject repeated signatures or request ids inside the skew window when your runtime has a suitable short-lived cache.
+By default, HMAC requests are limited by timestamp skew. For distributed HTTP deployments, pass `replayCache` so repeated signatures or signed request ids are rejected inside the skew window. Omit it only for private binding/local-only topologies where the transport already prevents replay.
 
 `serviceClientCredentialsAuth(...)` is also available for simpler bearer-secret deployments where hash-only storage in the control plane matters more than request signing.
 
-## Future Strict Replay Protection
+## Strict Replay Protection
 
-Strict one-time replay protection can be added with a storage callback later. Redis `SET NX EX`, a Durable Object, or a strongly consistent database are better choices than eventually consistent caches for this.
+Use a replay cache with one-time insert semantics. Redis `SET NX EX`, a Durable Object, or a strongly consistent database are better choices than eventually consistent caches for this.

@@ -6,11 +6,15 @@ import {
   type CapabilityJwks,
   DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
   type IssuedCapabilityToken,
+  MAX_CAPABILITY_TOKEN_TTL_SECONDS,
   SERVICE_PLANE_AUTHORIZATION_SCHEME,
   type VerifyCapabilityTokenOptions,
 } from './types.js';
 
 const JWS_ALGORITHM = 'ES256';
+const MAX_CAPABILITY_TOKEN_LENGTH = 8192;
+const MAX_CAPABILITY_CLAIM_STRING_LENGTH = 512;
+const MAX_CAPABILITY_SCOPE_COUNT = 128;
 
 export type SignCapabilityTokenOptions = {
   claims: Omit<CapabilityClaims, 'exp' | 'iat' | 'jti' | 'nbf'> & Partial<Pick<CapabilityClaims, 'jti'>>;
@@ -48,6 +52,8 @@ export async function signCapabilityToken(options: SignCapabilityTokenOptions): 
 }
 
 export async function verifyCapabilityToken(token: string, options: VerifyCapabilityTokenOptions): Promise<CapabilityIdentity> {
+  if (token.length > MAX_CAPABILITY_TOKEN_LENGTH) throw new CapabilityAuthError('Service-Plane capability token is too large');
+
   const parts = token.split('.');
   if (parts.length !== 3 || !parts[0] || !parts[1] || !parts[2]) throw new CapabilityAuthError('Invalid Service-Plane capability token');
 
@@ -140,11 +146,25 @@ function parseCapabilityClaims(value: unknown): CapabilityClaims {
   ) {
     throw new CapabilityAuthError('Invalid Service-Plane capability claims');
   }
+  if (
+    !isBoundedClaimString(aud) ||
+    !isBoundedClaimString(iss) ||
+    !isBoundedClaimString(jti) ||
+    !isBoundedClaimString(sub) ||
+    scp.length > MAX_CAPABILITY_SCOPE_COUNT ||
+    !scp.every(isBoundedClaimString)
+  ) {
+    throw new CapabilityAuthError('Invalid Service-Plane capability claims');
+  }
   return { aud, exp, iat, iss, jti, nbf, scp, sub };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
+}
+
+function isBoundedClaimString(value: string): boolean {
+  return value.length > 0 && value.length <= MAX_CAPABILITY_CLAIM_STRING_LENGTH;
 }
 
 function randomId(): string {
@@ -169,8 +189,15 @@ async function verifyTokenSignature(token: string, jwks: CapabilityJwks): Promis
 }
 
 function normalizeTtlSeconds(ttlSeconds: number): number {
-  if (!Number.isFinite(ttlSeconds) || !Number.isInteger(ttlSeconds) || ttlSeconds <= 0) {
-    throw new CapabilityAuthError('Service-Plane capability token TTL must be a positive integer');
+  if (
+    !Number.isFinite(ttlSeconds) ||
+    !Number.isSafeInteger(ttlSeconds) ||
+    ttlSeconds <= 0 ||
+    ttlSeconds > MAX_CAPABILITY_TOKEN_TTL_SECONDS
+  ) {
+    throw new CapabilityAuthError(
+      `Service-Plane capability token TTL must be a positive integer no greater than ${MAX_CAPABILITY_TOKEN_TTL_SECONDS} seconds`,
+    );
   }
   return ttlSeconds;
 }

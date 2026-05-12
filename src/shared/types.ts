@@ -5,6 +5,7 @@ export const SERVICE_PLANE_CAPABILITY_JWKS_PATH = '/.well-known/service-plane/jw
 export const SERVICE_PLANE_CAPABILITY_TOKEN_PATH = '/.well-known/service-plane/capability-token';
 export const DEFAULT_REGISTRY_CACHE_TTL_SECONDS = 30;
 export const DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS = 120;
+export const MAX_CAPABILITY_TOKEN_TTL_SECONDS = 24 * 60 * 60;
 export const DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS = 300;
 export const SERVICE_PLANE_CAPABILITY_CONTEXT = 'servicePlaneCapability';
 export const SERVICE_PLANE_CAPABILITY_VERIFIER = 'servicePlaneCapabilityVerifier';

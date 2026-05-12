@@ -42,7 +42,7 @@ export function createServiceRegistry(options: CreateServiceRegistryOptions): Se
 
     async match(method: string, path: string) {
       const snapshot = await this.discover();
-      return snapshot.routes.find((route) => route.method === method.toUpperCase() && pathMatches(route.path, path));
+      return bestMatchingRoute(snapshot.routes, method, path);
     },
   };
 }
@@ -113,7 +113,37 @@ function isRouteDiscovery(value: unknown): value is ServiceRouteDiscovery {
   return (
     typeof route.method === 'string' &&
     typeof route.path === 'string' &&
+    route.path.startsWith('/') &&
     (!route.requiredScopes || (Array.isArray(route.requiredScopes) && route.requiredScopes.every((scope) => typeof scope === 'string'))) &&
     (route.visibility === 'public' || route.visibility === 'auth' || route.visibility === 'internal')
   );
+}
+
+function bestMatchingRoute(routes: DiscoveredServiceRoute[], method: string, path: string): DiscoveredServiceRoute | undefined {
+  const normalizedMethod = method.toUpperCase();
+  return routes
+    .filter((route) => route.method === normalizedMethod && pathMatches(route.path, path))
+    .sort((left, right) => routeRank(right) - routeRank(left))[0];
+}
+
+function routeRank(route: DiscoveredServiceRoute): number {
+  return visibilityRank(route.visibility) * 10_000 + routeSpecificity(route.path);
+}
+
+function visibilityRank(visibility: DiscoveredServiceRoute['visibility']): number {
+  if (visibility === 'internal') return 3;
+  if (visibility === 'auth') return 2;
+  return 1;
+}
+
+function routeSpecificity(path: string): number {
+  return path
+    .split('/')
+    .filter(Boolean)
+    .reduce((score, part) => {
+      if (part === '*') return score;
+      if (part.startsWith(':') && part.includes('{')) return score + 3;
+      if (part.startsWith(':')) return score + 2;
+      return score + 4;
+    }, path.length);
 }

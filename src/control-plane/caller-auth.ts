@@ -13,6 +13,7 @@ import { SERVICE_PLANE_REQUEST_ID_HEADER } from '../shared/types.js';
 const SERVICE_CLIENT_SECRET_BYTES = 32;
 const SERVICE_CLIENT_SECRET_HASH_PREFIX = 'sha256:';
 const DEFAULT_HMAC_MAX_SKEW_SECONDS = 60;
+const DEFAULT_HMAC_MAX_BODY_BYTES = 64 * 1024;
 
 export type ServiceClientCredential = {
   secretHash: string;
@@ -61,6 +62,7 @@ export type HmacServiceClientAuthOptions = {
   clientIdHeader?: string;
   clients: HmacServiceClient[] | ((context: Context) => Promise<HmacServiceClient[]> | HmacServiceClient[]);
   log?: (event: HmacServiceClientAuthLogEvent) => void;
+  maxBodyBytes?: number;
   maxSkewSeconds?: number;
   now?: () => Date;
   replayCache?: HmacServiceClientReplayCache;
@@ -119,6 +121,7 @@ export function hmacServiceClientAuth(options: HmacServiceClientAuthOptions) {
   const timestampHeader = options.timestampHeader ?? SERVICE_PLANE_HMAC_TIMESTAMP_HEADER;
   const requestIdHeader = options.requestIdHeader ?? SERVICE_PLANE_REQUEST_ID_HEADER;
   const maxSkewSeconds = options.maxSkewSeconds ?? DEFAULT_HMAC_MAX_SKEW_SECONDS;
+  const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_HMAC_MAX_BODY_BYTES;
   const log = options.log ?? defaultHmacCallerAuthLog;
 
   return async (context: Context): Promise<Response | string> => {
@@ -161,7 +164,7 @@ export function hmacServiceClientAuth(options: HmacServiceClientAuthOptions) {
 
       const expected = await servicePlaneHmacSignature(
         client.secret,
-        await servicePlaneHmacRequestParts(context.req.raw, clientId, timestamp, requestIdHeader),
+        await servicePlaneHmacRequestParts(context.req.raw, clientId, timestamp, requestIdHeader, maxBodyBytes),
       );
       if (!timingSafeEqual(signature, expected)) {
         log(hmacUnauthorizedEvent(context, 'invalid_signature', 'Invalid Service-Plane HMAC signature'));
@@ -169,7 +172,7 @@ export function hmacServiceClientAuth(options: HmacServiceClientAuthOptions) {
       }
       if (
         options.replayCache &&
-        (await isHmacReplay(options.replayCache, clientId, requestIdFromContext(context) ?? signature, maxSkewSeconds))
+        (await isHmacReplay(options.replayCache, clientId, context.req.header(requestIdHeader)?.trim() || signature, maxSkewSeconds))
       ) {
         log(hmacUnauthorizedEvent(context, 'invalid_signature', 'Replayed Service-Plane HMAC signature'));
         return context.json({ error: 'Unauthorized' }, 401);
