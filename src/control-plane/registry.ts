@@ -122,7 +122,7 @@ function isRouteDiscovery(value: unknown): value is ServiceRouteDiscovery {
 function bestMatchingRoute(routes: DiscoveredServiceRoute[], method: string, path: string): DiscoveredServiceRoute | undefined {
   const normalizedMethod = method.toUpperCase();
   return routes
-    .filter((route) => route.method === normalizedMethod && pathMatches(route.path, path))
+    .filter((route) => (route.method === normalizedMethod || route.method === 'ALL') && pathMatches(route.path, path))
     .sort((left, right) => routeRank(right) - routeRank(left))[0];
 }
 

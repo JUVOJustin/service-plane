@@ -70,10 +70,14 @@ export type HmacServiceClientAuthOptions = {
   timestampHeader?: string;
 };
 
-export type HmacServiceClientReplayCache = {
-  get(key: string): Promise<boolean> | boolean;
-  set(key: string, ttlSeconds: number): Promise<void> | void;
-};
+export type HmacServiceClientReplayCache =
+  | {
+      reserve(key: string, ttlSeconds: number): Promise<boolean> | boolean;
+    }
+  | {
+      get(key: string): Promise<boolean> | boolean;
+      set(key: string, ttlSeconds: number): Promise<void> | void;
+    };
 
 // Generates the caller-side secret for authenticating to the control-plane token endpoint.
 export function generateServiceClientSecret(): string {
@@ -266,6 +270,7 @@ async function isHmacReplay(
   ttlSeconds: number,
 ): Promise<boolean> {
   const key = `service-plane:hmac:${clientId}:${idempotencyKey}`;
+  if ('reserve' in replayCache) return !(await replayCache.reserve(key, ttlSeconds));
   if (await replayCache.get(key)) return true;
   await replayCache.set(key, ttlSeconds);
   return false;

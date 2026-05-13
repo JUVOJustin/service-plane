@@ -363,6 +363,70 @@ describe('ServicePlaneControlPlane', () => {
     expect((await controlPlane.app.request(signedRequest.clone())).status).toBe(401);
   });
 
+  it('can reject HMAC replays with an atomic replay cache reservation', async () => {
+    const signingSecret = await generateCapabilitySigningSecret();
+    const capabilities = defineCapabilities({
+      scopes: [{ id: 'example.sync.run' }],
+      serviceId: 'example',
+    });
+    const service = new Hono();
+    mountDiscovery(
+      service,
+      defineService({
+        capabilities,
+        id: 'example',
+        namespaces: [
+          defineNamespace({ app: new Hono().post('/sync', capability('example.sync.run')), prefix: '/', visibility: 'internal' }),
+        ],
+        title: 'Example',
+        version: '0.1.0',
+      }),
+    );
+
+    const reserved = new Set<string>();
+    const clientSecret = 'moco-hmac-secret';
+    const controlPlane = new ServicePlaneControlPlane({
+      authenticateCaller: hmacServiceClientAuth({
+        clients: [{ clientId: 'moco-client', secret: clientSecret, serviceId: 'moco' }],
+        now: () => new Date('2026-05-12T10:15:00.000Z'),
+        replayCache: {
+          reserve: (key) => {
+            if (reserved.has(key)) return false;
+            reserved.add(key);
+            return true;
+          },
+        },
+      }),
+      services: () => [
+        cloudflareServiceBinding({
+          binding: { fetch: (request) => service.fetch(request) },
+          grants: [{ caller: 'moco', scopes: ['example.sync.run'] }],
+          id: 'example',
+        }),
+      ],
+      signingSecret: () => signingSecret,
+    });
+    const signedRequest = await signServicePlaneHmacRequest(
+      new Request('https://control-plane.internal/.well-known/service-plane/capability-token', {
+        body: JSON.stringify({
+          callerServiceId: 'moco',
+          scopes: ['example.sync.run'],
+          targetServiceId: 'example',
+        }),
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
+      }),
+      {
+        clientId: 'moco-client',
+        now: new Date('2026-05-12T10:15:00.000Z'),
+        secret: clientSecret,
+      },
+    );
+
+    expect((await controlPlane.app.request(signedRequest.clone())).status).toBe(200);
+    expect((await controlPlane.app.request(signedRequest.clone())).status).toBe(401);
+  });
+
   it('issues RPC tokens for deployment-bound Cloudflare callers without service-client secrets', async () => {
     const signingSecret = await generateCapabilitySigningSecret();
     const capabilities = defineCapabilities({

@@ -96,6 +96,35 @@ describe('service registry', () => {
     expect(discoveryFetches).toBe(0);
   });
 
+  it('matches routes registered for all HTTP methods', async () => {
+    const app = new Hono().all('/events', (context) => context.text(context.req.method));
+    const registry = createServiceRegistry({
+      services: [
+        cloudflareServiceBinding({
+          binding: { fetch: (request) => app.fetch(request) },
+          discovery: {
+            id: 'example',
+            routes: [{ method: 'ALL', path: '/events', visibility: 'public' }],
+            title: 'Example',
+            version: '0.0.1',
+          },
+          id: 'example',
+        }),
+      ],
+    });
+
+    await expect(registry.match('GET', '/events')).resolves.toMatchObject({
+      method: 'ALL',
+      path: '/events',
+      visibility: 'public',
+    });
+    await expect(registry.match('POST', '/events')).resolves.toMatchObject({
+      method: 'ALL',
+      path: '/events',
+      visibility: 'public',
+    });
+  });
+
   it('prefers the most restrictive matching route when route patterns overlap', async () => {
     const app = new Hono().get('/admin', (context) => context.text('admin'));
     const registry = createServiceRegistry({

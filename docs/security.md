@@ -35,3 +35,5 @@ By default, HMAC requests are limited by timestamp skew. For distributed HTTP de
 ## Strict Replay Protection
 
 Use a replay cache with one-time insert semantics. Redis `SET NX EX`, a Durable Object, or a strongly consistent database are better choices than eventually consistent caches for this.
+
+For strict replay protection, provide a `reserve(key, ttlSeconds)` adapter that atomically stores the key only when it does not already exist and returns `true` for a new key. The older `get`/`set` adapter shape is still accepted for simple local caches, but it cannot make the check-and-write step atomic by itself.
