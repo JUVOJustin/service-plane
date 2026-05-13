@@ -1,89 +1,117 @@
 # External Hono Services
 
-External services use the same Hono route and discovery model as Cloudflare Worker services.
+External services use the same Hono route, discovery, and STS capability model as Cloudflare Worker services.
 
 ## Service
 
-Run a normal Hono app on Node.js, Bun, Deno, or another Fetch-compatible runtime. Expose the discovery document and protect actual service routes with `machineAuth`, including routes marked `public`.
+Run a normal Hono app on Node.js, Bun, Deno, or another Fetch-compatible runtime. Expose the discovery document and protect actual service routes with `ServicePlaneService` plus route-level `capability(...)` annotations.
 
 ```ts
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
-import { defineNamespace, defineService, machineAuth, mountDiscovery } from 'service-plane/service';
+import { capability, defineCapabilities, jwksFromUrl, ServicePlaneService } from 'service-plane/service';
 
-const publicRoutes = new Hono().post('/events/example/:target', (c) => c.text('ok'));
-const internalRoutes = new Hono().post('/providers/example/v1/sync', (c) => c.json({ ok: true }));
+const publicRoutes = new Hono().post('/events/example/:target', capability('example.events.ingest'), (c) => c.text('ok'));
+const internalRoutes = new Hono().post('/providers/example/v1/sync', capability('example.sync.run'), (c) => c.json({ ok: true }));
 
-const service = defineService({
-  id: 'example',
-  title: 'Example',
-  version: '0.0.1',
-  namespaces: [
-    defineNamespace({ app: publicRoutes, prefix: '/', visibility: 'public' }),
-    defineNamespace({ app: internalRoutes, prefix: '/', visibility: 'internal' }),
+const capabilities = defineCapabilities({
+  serviceId: 'example',
+  scopes: [
+    { id: 'example.events.ingest', title: 'Ingest example events' },
+    { id: 'example.sync.run', title: 'Run example sync' },
   ],
 });
 
-const app = new Hono();
-mountDiscovery(app, service);
-app.use(
-  '*',
-  machineAuth({
-    resolveSecret: (keyId) => (keyId === 'default' ? process.env.SERVICE_PLANE_SECRET : undefined),
-  }),
-);
-app.route('/', publicRoutes);
-app.route('/', internalRoutes);
+const service = new ServicePlaneService({
+  auth: {
+    jwks: jwksFromUrl('https://control-plane.example.com/.well-known/service-plane/jwks.json'),
+  },
+  capabilities,
+  id: 'example',
+  title: 'Example',
+  version: '0.1.0',
+  namespaces: [
+    { app: publicRoutes, visibility: 'public' },
+    { app: internalRoutes, visibility: 'internal' },
+  ],
+});
 
-serve(app);
+serve(service.app);
 ```
 
 ## Control Plane
 
 ```ts
 import { serve } from '@hono/node-server';
-import { Hono } from 'hono';
-import {
-  createControlPlaneProxy,
-  createServiceRegistry,
-  httpsService,
-  signMachineRequest,
-} from 'service-plane/control-plane';
+import { hmacServiceClientAuth, httpsService, ServicePlaneControlPlane } from 'service-plane/control-plane';
 
-const registry = createServiceRegistry({
-  services: [
+const mocoHmacSecret = requiredEnv('MOCO_HMAC_SECRET');
+
+const controlPlane = new ServicePlaneControlPlane({
+  authenticateCaller: hmacServiceClientAuth({
+    clients: [{ clientId: 'moco', secret: mocoHmacSecret }],
+  }),
+  proxy: false,
+  services: () => [
     httpsService({
-      id: 'example',
+      grants: [
+        { caller: 'control-plane', scopes: ['example.events.ingest'] },
+        { caller: 'moco', scopes: ['example.sync.run'] },
+      ],
       baseUrl: 'https://example-service.internal',
+      id: 'example',
     }),
   ],
+  signingSecret: () => loadSigningSecret(),
 });
 
-const controlPlane = new Hono();
+controlPlane.app.get('/health', (c) => c.json({ ok: true }));
 
-controlPlane.use(
-  '*',
-  createControlPlaneProxy({
-    registry,
-    authorizeAuthRoute: (c) => {
-      if (!c.req.header('authorization')) return c.json({ error: 'Unauthorized' }, 401);
-    },
-    signer: (request) =>
-      signMachineRequest(request, {
-        secret: mustEnv('SERVICE_PLANE_SECRET'),
-      }),
-  }),
-);
+serve({ fetch: controlPlane.app.fetch, port: 3000 });
 
-controlPlane.get('/health', (c) => c.json({ ok: true }));
-
-serve({ fetch: controlPlane.fetch, port: 3000 });
-
-function mustEnv(name: string): string {
+function requiredEnv(name: string): string {
   const value = process.env[name];
   if (!value) throw new Error(`Missing ${name}`);
   return value;
 }
 ```
 
-External services should always verify HMAC signatures. Do not trust forwarded identity headers from public traffic unless the machine signature has already been verified.
+Generate the signing key once and store it in the control plane secret system for your runtime:
+
+```sh
+node --input-type=module -e "import { generateCapabilitySigningSecret } from 'service-plane/control-plane'; console.log(await generateCapabilitySigningSecret())"
+```
+
+`loadSigningSecret()` should return that base64url value. Do not copy it into the service processes; services only need the public JWKS URL.
+
+Generate one HMAC secret for each caller that may request tokens:
+
+```sh
+node --input-type=module -e "import { generateServiceClientSecret } from 'service-plane/control-plane'; console.log('MOCO_HMAC_SECRET=' + generateServiceClientSecret())"
+```
+
+Store the HMAC secret in the caller service and the control plane.
+
+## Client
+
+```ts
+import { hc } from 'hono/client';
+import { capabilityFetch, controlPlaneHmacTokenRequester } from 'service-plane/service';
+
+const mocoHmacSecret = requiredEnv('MOCO_HMAC_SECRET');
+
+const client = hc<ExampleRoutes>('https://example-service.internal', {
+  fetch: capabilityFetch({
+    callerServiceId: 'moco',
+    targetServiceId: 'example',
+    scopes: ['example.sync.run'],
+    requestToken: controlPlaneHmacTokenRequester({
+      clientId: 'moco',
+      clientSecret: mocoHmacSecret,
+      controlPlaneUrl: 'https://control-plane.internal',
+    }),
+  }),
+});
+```
+
+External services should always verify STS capability tokens. Do not trust forwarded identity headers from public traffic unless the token has already been verified.

@@ -1,11 +1,11 @@
-import { describe, expect, it } from 'vitest';
 import { Hono } from 'hono';
+import { describe, expect, it } from 'vitest';
+import { capability, capabilityAuth, defineCapabilities } from '../service/capabilities.js';
 import { defineNamespace, defineService, mountDiscovery } from '../service/discovery.js';
-import { machineAuth } from '../service/auth.js';
-import { verifyMachineRequest } from '../shared/crypto.js';
-import { signMachineRequest } from './auth.js';
-import { createControlPlaneProxy } from './proxy.js';
+import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
+import { createCapabilityIssuer, defineServiceGrants } from './capabilities.js';
 import { cloudflareServiceBinding } from './endpoints.js';
+import { createControlPlaneProxy } from './proxy.js';
 import { createServiceRegistry } from './registry.js';
 
 describe('control-plane proxy', () => {
@@ -13,10 +13,7 @@ describe('control-plane proxy', () => {
     const publicRoutes = new Hono().post('/events/example/:target', async (context) => context.text(await context.req.text()));
     const authRoutes = new Hono().get('/connections/example', (context) => context.json({ owner: context.req.header('x-owner-id') }));
     const internalRoutes = new Hono().post('/providers/example/v1/sync', (context) => context.json({ ok: true }));
-    const provider = new Hono()
-      .route('/', publicRoutes)
-      .route('/', authRoutes)
-      .route('/', internalRoutes);
+    const provider = new Hono().route('/', publicRoutes).route('/', authRoutes).route('/', internalRoutes);
     mountDiscovery(
       provider,
       defineService({
@@ -27,7 +24,7 @@ describe('control-plane proxy', () => {
           defineNamespace({ app: internalRoutes, prefix: '/', visibility: 'internal' }),
         ],
         title: 'Example',
-        version: '0.0.1',
+        version: '0.1.0',
       }),
     );
     const registry = createServiceRegistry({
@@ -42,28 +39,51 @@ describe('control-plane proxy', () => {
       }),
     );
 
-    await expect(await (await controlPlane.request('/events/example/project', { body: 'raw-body', method: 'POST' })).text()).toBe('raw-body');
+    await expect(await (await controlPlane.request('/events/example/project', { body: 'raw-body', method: 'POST' })).text()).toBe(
+      'raw-body',
+    );
     await expect(await (await controlPlane.request('/connections/example')).json()).toEqual({ owner: 'owner-1' });
     expect((await controlPlane.request('/providers/example/v1/sync', { method: 'POST' })).status).toBe(404);
   });
 
-  it('signs proxied requests', async () => {
-    const providerRoutes = new Hono().post(
-      '/events/example',
-      machineAuth({
-        now: new Date('2026-05-09T12:00:01.000Z'),
-        resolveSecret: () => 'shared-secret',
+  it('adds STS capability tokens to scoped proxied routes', async () => {
+    const keys = await testKeys();
+    const capabilities = defineCapabilities({
+      scopes: [{ id: 'example.events.ingest', title: 'Ingest example events' }],
+      serviceId: 'example',
+    });
+    const issuer = createCapabilityIssuer({
+      capabilities: [capabilities],
+      grants: defineServiceGrants({
+        grants: [{ caller: 'control-plane', scopes: ['example.events.ingest'], target: 'example' }],
       }),
-      (context) => context.json({ signed: true }),
+      issuer: 'control-plane',
+      keyId: 'test-key',
+      now: () => new Date('2026-05-09T12:00:00.000Z'),
+      privateJwk: keys.privateJwk,
+    });
+    const providerRoutes = new Hono().post('/events/example', capability('example.events.ingest'), (context) =>
+      context.json({ scoped: true }),
     );
-    const provider = new Hono().route('/', providerRoutes);
+    const provider = new Hono();
+    provider.use(
+      '*',
+      capabilityAuth({
+        expectedAudience: 'example',
+        issuer: 'control-plane',
+        jwks: await issuer.jwks(),
+        now: new Date('2026-05-09T12:00:01.000Z'),
+      }),
+    );
+    provider.route('/', providerRoutes);
     mountDiscovery(
       provider,
       defineService({
+        capabilities,
         id: 'example',
         namespaces: [defineNamespace({ app: providerRoutes, prefix: '/', visibility: 'public' })],
         title: 'Example',
-        version: '0.0.1',
+        version: '0.1.0',
       }),
     );
     const registry = createServiceRegistry({
@@ -72,28 +92,113 @@ describe('control-plane proxy', () => {
     const controlPlane = new Hono().use(
       '*',
       createControlPlaneProxy({
+        capabilityToken: async (_context, route) =>
+          (
+            await issuer.issueCapabilityToken({
+              callerServiceId: 'control-plane',
+              scopes: route.requiredScopes ?? [],
+              targetServiceId: route.serviceId,
+            })
+          ).token,
         registry,
-        signer: (request) =>
-          signMachineRequest(request, {
-            now: new Date('2026-05-09T12:00:00.000Z'),
-            secret: 'shared-secret',
-          }),
       }),
     );
 
-    expect(await (await controlPlane.request('/events/example', { body: 'payload', method: 'POST' })).json()).toEqual({ signed: true });
+    expect((await provider.request('/events/example', { method: 'POST' })).status).toBe(401);
+    expect(await (await controlPlane.request('/events/example', { body: 'payload', method: 'POST' })).json()).toEqual({ scoped: true });
   });
 
-  it('can use the pure verifier for service-side adapters', async () => {
-    const signed = await signMachineRequest(new Request('https://example.test/internal'), {
-      now: new Date('2026-05-09T12:00:00.000Z'),
-      secret: 'shared-secret',
-    });
-    await expect(
-      verifyMachineRequest(signed, {
-        now: new Date('2026-05-09T12:00:01.000Z'),
-        resolveSecret: () => 'shared-secret',
+  it('uses proxy-safe request headers when forwarding to services', async () => {
+    const routes = new Hono().get('/events/example', (context) =>
+      context.json({
+        acceptEncoding: context.req.header('accept-encoding') ?? null,
+        connection: context.req.header('connection') ?? null,
+        custom: context.req.header('x-client-header') ?? null,
       }),
-    ).resolves.toMatchObject({ keyId: 'default' });
+    );
+    const provider = new Hono().route('/', routes);
+    mountDiscovery(
+      provider,
+      defineService({
+        id: 'example',
+        namespaces: [defineNamespace({ app: routes, prefix: '/', visibility: 'public' })],
+        title: 'Example',
+        version: '0.1.0',
+      }),
+    );
+    const registry = createServiceRegistry({
+      services: [cloudflareServiceBinding({ binding: { fetch: (request) => provider.fetch(request) }, id: 'example' })],
+    });
+    const controlPlane = new Hono().use('*', createControlPlaneProxy({ registry }));
+
+    await expect(
+      (
+        await controlPlane.request('/events/example', {
+          headers: {
+            'accept-encoding': 'gzip',
+            connection: 'keep-alive',
+            'x-client-header': 'client-value',
+          },
+        })
+      ).json(),
+    ).resolves.toEqual({
+      acceptEncoding: null,
+      connection: null,
+      custom: 'client-value',
+    });
+  });
+
+  it('does not forward caller authorization headers unless explicitly configured', async () => {
+    const routes = new Hono().get('/events/example', (context) =>
+      context.json({
+        authorization: context.req.header('authorization') ?? null,
+      }),
+    );
+    const provider = new Hono().route('/', routes);
+    mountDiscovery(
+      provider,
+      defineService({
+        id: 'example',
+        namespaces: [defineNamespace({ app: routes, prefix: '/', visibility: 'public' })],
+        title: 'Example',
+        version: '0.1.0',
+      }),
+    );
+    const registry = createServiceRegistry({
+      services: [cloudflareServiceBinding({ binding: { fetch: (request) => provider.fetch(request) }, id: 'example' })],
+    });
+
+    const defaultControlPlane = new Hono().use('*', createControlPlaneProxy({ registry }));
+    await expect(
+      (
+        await defaultControlPlane.request('/events/example', {
+          headers: { authorization: 'Bearer user-token' },
+        })
+      ).json(),
+    ).resolves.toEqual({ authorization: null });
+
+    const forwardingControlPlane = new Hono().use(
+      '*',
+      createControlPlaneProxy({
+        forwardHeaders: (context) => ({ authorization: context.req.header('authorization') ?? '' }),
+        registry,
+      }),
+    );
+    await expect(
+      (
+        await forwardingControlPlane.request('/events/example', {
+          headers: { authorization: 'Bearer user-token' },
+        })
+      ).json(),
+    ).resolves.toEqual({ authorization: 'Bearer user-token' });
   });
 });
+
+async function testKeys() {
+  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+  const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
+  return {
+    privateJwk,
+    publicJwk: publicJwkFromPrivateJwk(privateJwk, 'test-key'),
+  };
+}

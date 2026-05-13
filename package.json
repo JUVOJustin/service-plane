@@ -1,7 +1,7 @@
 {
   "name": "service-plane",
-  "version": "0.0.1",
-  "description": "Opinionated Hono service-plane primitives for service discovery, control-plane proxying, and HMAC machine auth.",
+  "version": "0.1.0",
+  "description": "Opinionated Hono service-plane primitives for service discovery, STS capability tokens, route scopes, and control-plane proxying.",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -40,6 +40,10 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "check": "biome check .",
+    "check:write": "biome check --write .",
+    "format": "biome format --write .",
+    "lint": "biome lint .",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "prepare": "npm run build"
@@ -49,13 +53,15 @@
     "microservices",
     "control-plane",
     "service-discovery",
-    "hmac",
+    "sts",
+    "capabilities",
     "cloudflare-workers"
   ],
   "peerDependencies": {
-    "hono": ">=4.0.0"
+    "hono": ">=4.10.3 <5.0.0"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.4.15",
     "@types/node": "^25.0.0",
     "hono": "^4.12.18",
     "typescript": "^5.0.4",

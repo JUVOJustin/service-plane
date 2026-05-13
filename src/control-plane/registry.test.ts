@@ -1,9 +1,9 @@
-import { describe, expect, it } from 'vitest';
 import { Hono } from 'hono';
-import { defineNamespace, defineService, mountDiscovery } from '../service/discovery.js';
+import { describe, expect, it } from 'vitest';
+import { defineNamespace, defineService, mountDiscovery, serviceDiscoveryDocument } from '../service/discovery.js';
+import { memoryRegistryCache } from '../testing/memory-cache.js';
 import { cloudflareServiceBinding } from './endpoints.js';
 import { createServiceRegistry } from './registry.js';
-import { memoryRegistryCache } from '../testing/memory-cache.js';
 
 describe('service registry', () => {
   it('discovers routes from service endpoints', async () => {
@@ -62,5 +62,89 @@ describe('service registry', () => {
     await registry.discover();
 
     expect(discoveryFetches).toBe(2);
+  });
+
+  it('uses inline discovery documents without calling the service endpoint', async () => {
+    let discoveryFetches = 0;
+    const app = new Hono().get('/sync', (context) => context.text('ok'));
+    const service = defineService({
+      id: 'inline',
+      namespaces: [defineNamespace({ app, prefix: '/', visibility: 'internal' })],
+      title: 'Inline',
+      version: '0.0.1',
+    });
+    const registry = createServiceRegistry({
+      services: [
+        cloudflareServiceBinding({
+          binding: {
+            fetch: (request) => {
+              discoveryFetches += 1;
+              return app.fetch(request);
+            },
+          },
+          discovery: serviceDiscoveryDocument(service),
+          id: 'inline',
+        }),
+      ],
+    });
+
+    await expect(registry.match('GET', '/sync')).resolves.toMatchObject({
+      path: '/sync',
+      serviceId: 'inline',
+      visibility: 'internal',
+    });
+    expect(discoveryFetches).toBe(0);
+  });
+
+  it('prefers the most restrictive matching route when route patterns overlap', async () => {
+    const app = new Hono().get('/admin', (context) => context.text('admin'));
+    const registry = createServiceRegistry({
+      services: [
+        cloudflareServiceBinding({
+          binding: { fetch: (request) => app.fetch(request) },
+          discovery: {
+            id: 'example',
+            routes: [
+              { method: 'GET', path: '/:slug', visibility: 'public' },
+              { method: 'GET', path: '/admin', visibility: 'internal' },
+            ],
+            title: 'Example',
+            version: '0.0.1',
+          },
+          id: 'example',
+        }),
+      ],
+    });
+
+    await expect(registry.match('GET', '/admin')).resolves.toMatchObject({
+      path: '/admin',
+      visibility: 'internal',
+    });
+  });
+
+  it('fails closed on discovery documents with invalid paths', async () => {
+    const app = new Hono().get('/safe', (context) => context.text('safe'));
+    const registry = createServiceRegistry({
+      services: [
+        cloudflareServiceBinding({
+          binding: { fetch: (request) => app.fetch(request) },
+          discovery: {
+            id: 'example',
+            routes: [
+              { method: 'GET', path: '__proto__', visibility: 'public' },
+              { method: 'GET', path: '/safe', visibility: 'public' },
+            ],
+            title: 'Example',
+            version: '0.0.1',
+          },
+          id: 'example',
+        }),
+      ],
+    });
+
+    await expect(registry.match('GET', '/safe')).resolves.toBeUndefined();
+    await expect(registry.discover()).resolves.toMatchObject({
+      routes: [],
+    });
   });
 });

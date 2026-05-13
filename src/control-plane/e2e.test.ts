@@ -1,19 +1,34 @@
-import { describe, expect, it } from 'vitest';
 import { Hono } from 'hono';
+import { describe, expect, it } from 'vitest';
+import { capability, capabilityAuth, capabilityIdentity, defineCapabilities } from '../service/capabilities.js';
 import { defineNamespace, defineService, mountDiscovery } from '../service/discovery.js';
-import { machineAuth } from '../service/auth.js';
+import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
+import { createCapabilityIssuer, defineServiceGrants } from './capabilities.js';
 import { cloudflareServiceBinding } from './endpoints.js';
-import { createServiceRegistry } from './registry.js';
 import { createControlPlaneProxy } from './proxy.js';
-import { signMachineRequest } from './auth.js';
+import { createServiceRegistry } from './registry.js';
 
-const SECRET = 'shared-service-plane-secret';
-const SIGNED_AT = new Date('2026-05-09T12:00:00.000Z');
+const ISSUED_AT = new Date('2026-05-09T12:00:00.000Z');
 const VERIFIED_AT = new Date('2026-05-09T12:00:01.000Z');
 
 describe('service-plane end-to-end topology', () => {
-  it('runs one control plane against three Hono services with signed worker traffic only', async () => {
-    const services = ['alpha', 'bravo', 'charlie'].map(createMicroservice);
+  it('runs one control plane against three Hono services with STS-scoped worker traffic only', async () => {
+    const keys = await testKeys();
+    const services = ['alpha', 'bravo', 'charlie'].map((id) => createMicroservice(id, keys));
+    const issuer = createCapabilityIssuer({
+      capabilities: services.map((service) => service.capabilities),
+      grants: defineServiceGrants({
+        grants: services.map((service) => ({
+          caller: 'control-plane',
+          scopes: [`${service.id}.events.ingest`, `${service.id}.console.read`],
+          target: service.id,
+        })),
+      }),
+      issuer: 'control-plane',
+      keyId: 'test-key',
+      now: () => ISSUED_AT,
+      privateJwk: keys.privateJwk,
+    });
     let controlPlaneAuthChecks = 0;
 
     const registry = createServiceRegistry({
@@ -31,19 +46,28 @@ describe('service-plane end-to-end topology', () => {
       createControlPlaneProxy({
         authorizeAuthRoute: (context) => {
           controlPlaneAuthChecks += 1;
-          const principal = context.req.header('authorization')?.replace(/^Bearer\s+/iu, '').trim();
+          const principal = context.req
+            .header('authorization')
+            ?.replace(/^Bearer\s+/iu, '')
+            .trim();
           if (!principal) return context.json({ error: 'Unauthorized' }, 401);
         },
+        capabilityToken: async (_context, route) =>
+          (
+            await issuer.issueCapabilityToken({
+              callerServiceId: 'control-plane',
+              scopes: route.requiredScopes ?? [],
+              targetServiceId: route.serviceId,
+            })
+          ).token,
         forwardHeaders: (context) => {
-          const principal = context.req.header('authorization')?.replace(/^Bearer\s+/iu, '').trim();
+          const principal = context.req
+            .header('authorization')
+            ?.replace(/^Bearer\s+/iu, '')
+            .trim();
           return principal ? { 'x-user-id': principal } : undefined;
         },
         registry,
-        signer: (request) =>
-          signMachineRequest(request, {
-            now: SIGNED_AT,
-            secret: SECRET,
-          }),
       }),
     );
 
@@ -57,53 +81,35 @@ describe('service-plane end-to-end topology', () => {
       });
       await expect(publicViaControl.json()).resolves.toEqual({
         body: `${service.id}-payload`,
+        caller: 'control-plane',
         service: service.id,
         type: 'public',
         userId: null,
       });
       expect(service.calls.public).toBe(1);
-
-      const signedDirectPublic = await signMachineRequest(
-        new Request(`https://${service.id}.internal/events/${service.id}/created`, {
-          body: 'direct-signed-public',
-          method: 'POST',
-        }),
-        { now: SIGNED_AT, secret: SECRET },
-      );
-      expect((await service.app.fetch(signedDirectPublic)).status).toBe(200);
-      expect(service.calls.public).toBe(2);
     }
 
-    const alpha = services[0]!;
+    const [alpha] = services;
+    if (!alpha) throw new Error('Missing alpha service fixture');
     expect((await alpha.app.request('/console/alpha/summary')).status).toBe(401);
     expect(alpha.calls.auth).toBe(0);
-
-    const signedDirectAuth = await signMachineRequest(new Request('https://alpha.internal/console/alpha/summary'), {
-      now: SIGNED_AT,
-      secret: SECRET,
-    });
-    await expect((await alpha.app.fetch(signedDirectAuth)).json()).resolves.toEqual({
-      service: 'alpha',
-      type: 'auth',
-      userId: null,
-    });
-    expect(alpha.calls.auth).toBe(1);
     expect(controlPlaneAuthChecks).toBe(0);
 
     const unauthorizedControlAuth = await controlPlane.request('/console/alpha/summary');
     expect(unauthorizedControlAuth.status).toBe(401);
-    expect(alpha.calls.auth).toBe(1);
+    expect(alpha.calls.auth).toBe(0);
     expect(controlPlaneAuthChecks).toBe(1);
 
     const authorizedControlAuth = await controlPlane.request('/console/alpha/summary', {
       headers: { authorization: 'Bearer user-123' },
     });
     await expect(authorizedControlAuth.json()).resolves.toEqual({
+      caller: 'control-plane',
       service: 'alpha',
       type: 'auth',
       userId: 'user-123',
     });
-    expect(alpha.calls.auth).toBe(2);
+    expect(alpha.calls.auth).toBe(1);
     expect(controlPlaneAuthChecks).toBe(2);
 
     const internalViaControl = await controlPlane.request('/internal/alpha/reindex', { method: 'POST' });
@@ -112,46 +118,46 @@ describe('service-plane end-to-end topology', () => {
 
     expect((await alpha.app.request('/internal/alpha/reindex', { method: 'POST' })).status).toBe(401);
     expect(alpha.calls.internal).toBe(0);
-
-    const signedDirectInternal = await signMachineRequest(
-      new Request('https://alpha.internal/internal/alpha/reindex', { method: 'POST' }),
-      { now: SIGNED_AT, secret: SECRET },
-    );
-    await expect((await alpha.app.fetch(signedDirectInternal)).json()).resolves.toEqual({
-      service: 'alpha',
-      type: 'internal',
-    });
-    expect(alpha.calls.internal).toBe(1);
   });
 });
 
-function createMicroservice(id: string) {
+function createMicroservice(id: string, keys: { publicJwk: JsonWebKey }) {
   const calls = {
     auth: 0,
     internal: 0,
     public: 0,
   };
+  const capabilities = defineCapabilities({
+    scopes: [
+      { id: `${id}.events.ingest`, title: `Ingest ${id} events` },
+      { id: `${id}.console.read`, title: `Read ${id} console` },
+      { id: `${id}.internal.reindex`, title: `Reindex ${id}` },
+    ],
+    serviceId: id,
+  });
 
-  const publicRoutes = new Hono().post(`/events/${id}/:event`, async (context) => {
+  const publicRoutes = new Hono().post(`/events/${id}/:event`, capability(`${id}.events.ingest`), async (context) => {
     calls.public += 1;
     return context.json({
       body: await context.req.text(),
+      caller: capabilityIdentity(context)?.serviceId,
       service: id,
       type: 'public',
       userId: context.req.header('x-user-id') ?? null,
     });
   });
 
-  const authRoutes = new Hono().get(`/console/${id}/summary`, (context) => {
+  const authRoutes = new Hono().get(`/console/${id}/summary`, capability(`${id}.console.read`), (context) => {
     calls.auth += 1;
     return context.json({
+      caller: capabilityIdentity(context)?.serviceId,
       service: id,
       type: 'auth',
       userId: context.req.header('x-user-id') ?? null,
     });
   });
 
-  const internalRoutes = new Hono().post(`/internal/${id}/reindex`, (context) => {
+  const internalRoutes = new Hono().post(`/internal/${id}/reindex`, capability(`${id}.internal.reindex`), (context) => {
     calls.internal += 1;
     return context.json({
       service: id,
@@ -160,6 +166,7 @@ function createMicroservice(id: string) {
   });
 
   const service = defineService({
+    capabilities,
     id,
     namespaces: [
       defineNamespace({ app: publicRoutes, prefix: '/', visibility: 'public' }),
@@ -167,21 +174,32 @@ function createMicroservice(id: string) {
       defineNamespace({ app: internalRoutes, prefix: '/', visibility: 'internal' }),
     ],
     title: id.toUpperCase(),
-    version: '0.0.1',
+    version: '0.1.0',
   });
 
   const app = new Hono();
   mountDiscovery(app, service);
   app.use(
     '*',
-    machineAuth({
+    capabilityAuth({
+      expectedAudience: id,
+      issuer: 'control-plane',
+      jwks: { keys: [keys.publicJwk] },
       now: VERIFIED_AT,
-      resolveSecret: () => SECRET,
     }),
   );
   app.route('/', publicRoutes);
   app.route('/', authRoutes);
   app.route('/', internalRoutes);
 
-  return { app, calls, id };
+  return { app, calls, capabilities, id };
+}
+
+async function testKeys() {
+  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+  const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
+  return {
+    privateJwk,
+    publicJwk: publicJwkFromPrivateJwk(privateJwk, 'test-key'),
+  };
 }
