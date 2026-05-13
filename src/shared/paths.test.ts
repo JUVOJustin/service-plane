@@ -6,4 +6,10 @@ describe('path matching', () => {
     expect(pathMatches('/users/:id{[0-9]+}', '/users/123')).toBe(true);
     expect(pathMatches('/users/:id{[0-9]+}', '/users/admin')).toBe(false);
   });
+
+  it('honors Hono wildcard route segments', () => {
+    expect(pathMatches('/*', '/users/123')).toBe(true);
+    expect(pathMatches('/users/*', '/users/123/settings')).toBe(true);
+    expect(pathMatches('/users/*', '/teams/123')).toBe(false);
+  });
 });

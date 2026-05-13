@@ -13,6 +13,7 @@ import { defineNamespace, defineService, mountDiscovery } from '../service/disco
 import { ServicePlaneService } from '../service/service.js';
 import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
 import { signServicePlaneHmacRequest } from '../shared/hmac-auth.js';
+import { memoryRegistryCache } from '../testing/memory-cache.js';
 import { hashServiceClientSecret, hmacServiceClientAuth, serviceClientCredentialsAuth } from './caller-auth.js';
 import { ServicePlaneControlPlane } from './control-plane.js';
 import { cloudflareServiceBinding } from './endpoints.js';
@@ -169,6 +170,62 @@ describe('ServicePlaneControlPlane', () => {
     ).resolves.toEqual({
       caller: 'control-plane',
       requestId: 'edge-to-worker-1',
+    });
+  });
+
+  it('keys proxy registry cache entries by dynamic service set', async () => {
+    const tenantOneRoutes = new Hono().get('/tenant-one', (context) => context.json({ tenant: 'one' }));
+    const tenantOne = new Hono();
+    mountDiscovery(
+      tenantOne,
+      defineService({
+        id: 'example',
+        namespaces: [defineNamespace({ app: tenantOneRoutes, prefix: '/', visibility: 'public' })],
+        title: 'Example Tenant One',
+        version: '0.1.0',
+      }),
+    );
+    tenantOne.route('/', tenantOneRoutes);
+
+    const tenantTwoRoutes = new Hono().get('/tenant-two', (context) => context.json({ tenant: 'two' }));
+    const tenantTwo = new Hono();
+    mountDiscovery(
+      tenantTwo,
+      defineService({
+        id: 'example',
+        namespaces: [defineNamespace({ app: tenantTwoRoutes, prefix: '/', visibility: 'public' })],
+        title: 'Example Tenant Two',
+        version: '0.1.0',
+      }),
+    );
+    tenantTwo.route('/', tenantTwoRoutes);
+
+    const controlPlane = new ServicePlaneControlPlane({
+      proxy: { cache: memoryRegistryCache() },
+      services: (context) =>
+        context.req.header('x-tenant') === 'two'
+          ? [
+              cloudflareServiceBinding({
+                binding: { fetch: (request) => tenantTwo.fetch(request) },
+                id: 'example',
+                origin: 'https://tenant-two.internal',
+              }),
+            ]
+          : [
+              cloudflareServiceBinding({
+                binding: { fetch: (request) => tenantOne.fetch(request) },
+                id: 'example',
+                origin: 'https://tenant-one.internal',
+              }),
+            ],
+      signingSecret: () => 'unused-for-unscoped-routes',
+    });
+
+    await expect((await controlPlane.app.request('/tenant-one', { headers: { 'x-tenant': 'one' } })).json()).resolves.toEqual({
+      tenant: 'one',
+    });
+    await expect((await controlPlane.app.request('/tenant-two', { headers: { 'x-tenant': 'two' } })).json()).resolves.toEqual({
+      tenant: 'two',
     });
   });
 

@@ -12,6 +12,9 @@ type ServicePlaneControlPlaneEnv<TEnv extends Env> = TEnv & {
 };
 
 type ServicePlaneRequestIdOptions = NonNullable<Parameters<typeof requestId>[0]>;
+type RegistryCacheKeyResolver<TEnv extends Env> =
+  | string
+  | ((context: Context<TEnv>, services: ServiceEndpoint[]) => Promise<string> | string);
 
 export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
   app?: Hono<TEnv>;
@@ -22,6 +25,7 @@ export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
     | false
     | (Omit<ControlPlaneProxyOptions, 'capabilityToken' | 'registry'> & {
         cache?: RegistryCache;
+        cacheKey?: RegistryCacheKeyResolver<TEnv>;
       });
   requestId?: ServicePlaneRequestIdOptions;
   services: (context: Context<TEnv>) => ServiceEndpoint[] | Promise<ServiceEndpoint[]>;
@@ -54,10 +58,15 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       this.app.use('*', async (context, next) => {
         const services = await options.services(context as Context<TEnv>);
         const registry = createServiceRegistry({
-          ...(proxyOptions.cache ? { cache: proxyOptions.cache } : {}),
+          ...(proxyOptions.cache
+            ? {
+                cache: proxyOptions.cache,
+                cacheKey: await resolveRegistryCacheKey(proxyOptions.cacheKey, context as Context<TEnv>, services),
+              }
+            : {}),
           services,
         });
-        const { cache: _cache, ...controlPlaneProxyOptions } = proxyOptions;
+        const { cache: _cache, cacheKey: _cacheKey, ...controlPlaneProxyOptions } = proxyOptions;
         return createControlPlaneProxy({
           ...controlPlaneProxyOptions,
           capabilityToken: async (_capabilityContext, route) => {
@@ -135,6 +144,25 @@ function missingAuthenticateCaller(context: Context): Response {
 function requestIdFromContext(context: Context): string | undefined {
   const value = context.get('requestId' as never) as unknown;
   return typeof value === 'string' ? value : undefined;
+}
+
+async function resolveRegistryCacheKey<TEnv extends Env>(
+  resolver: RegistryCacheKeyResolver<TEnv> | undefined,
+  context: Context<TEnv>,
+  services: ServiceEndpoint[],
+): Promise<string> {
+  if (typeof resolver === 'function') return resolver(context, services);
+  if (typeof resolver === 'string') return resolver;
+  return `service-plane:registry:${JSON.stringify(services.map(registryCacheKeyServicePart))}`;
+}
+
+function registryCacheKeyServicePart(service: ServiceEndpoint): unknown {
+  return {
+    discovery: typeof service.discovery === 'function' ? '[dynamic]' : (service.discovery ?? null),
+    grants: service.grants ?? [],
+    id: service.id,
+    origin: service.origin,
+  };
 }
 
 async function discoverServiceCapabilities(services: ServiceEndpoint[]) {

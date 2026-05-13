@@ -16,6 +16,19 @@ createServiceRegistry({
 });
 ```
 
+When `ServicePlaneControlPlane` proxying uses a registry cache, it derives the cache key from the current service set by default. If your `services(context)` callback depends on tenant, account, deployment, or another value that is not visible in the service ids, origins, static discovery documents, or grants, pass `proxy.cacheKey`:
+
+```ts
+const controlPlane = new ServicePlaneControlPlane({
+  proxy: {
+    cache: kvRegistryCache(env.SERVICE_REGISTRY_CACHE),
+    cacheKey: (context) => `tenant:${context.req.header('x-tenant-id') ?? 'default'}`,
+  },
+  services: (context) => servicesForTenant(context),
+  signingSecret: (env) => env.STS_SIGNING_SECRET,
+});
+```
+
 ## Recommended Defaults
 
 - No cache for tests and small local setups.

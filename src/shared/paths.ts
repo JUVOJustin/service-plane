@@ -34,6 +34,8 @@ function pathPattern(path: string): string | undefined {
 }
 
 function pathPartPattern(part: string): string | undefined {
+  if (part === '*') return '.*';
+
   const param = /^:([^{}]+)(?:\{(.+)\})?$/u.exec(part);
   if (!param) return escapeRegExp(part);
 

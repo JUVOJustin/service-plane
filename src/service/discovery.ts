@@ -1,6 +1,6 @@
 import type { Context } from 'hono';
 import { CapabilityAuthError } from '../shared/errors.js';
-import { joinPaths, normalizePath } from '../shared/paths.js';
+import { joinPaths, normalizePath, pathMatches } from '../shared/paths.js';
 import {
   type DefineServiceOptions,
   SERVICE_DISCOVERY_PATH,
@@ -9,6 +9,11 @@ import {
   type ServiceNamespaceDefinition,
 } from '../shared/types.js';
 import { routeRequiredScopes } from './capabilities.js';
+
+type NamespaceRoute = ServiceDiscoveryDocument['routes'][number] & {
+  requiredScopes: string[];
+  routeIndex: number;
+};
 
 export function defineNamespace(namespace: ServiceNamespaceDefinition): ServiceNamespaceDefinition {
   return {
@@ -31,17 +36,12 @@ export function defineService(service: ServiceDefinition, options: DefineService
 
 export function serviceDiscoveryDocument(service: ServiceDefinition): ServiceDiscoveryDocument {
   const routes = service.namespaces.flatMap((namespace) =>
-    namespace.app.routes
-      .map((route) => {
-        const requiredScopes = routeRequiredScopes(route.handler);
-        return {
-          method: route.method.toUpperCase(),
-          path: joinPaths(namespace.prefix, route.path),
-          requiredScopes,
-          visibility: namespace.visibility,
-        };
-      })
-      .filter((route) => route.path !== SERVICE_DISCOVERY_PATH),
+    namespaceRoutes(namespace).map((route) => ({
+      method: route.method,
+      path: route.path,
+      requiredScopes: route.requiredScopes,
+      visibility: route.visibility,
+    })),
   );
   const uniqueRoutes = [
     ...routes
@@ -89,13 +89,7 @@ function validateServiceDefinition(service: ServiceDefinition, options: DefineSe
     if (!Array.isArray(namespace.app.routes)) {
       throw new CapabilityAuthError('Service-Plane namespace app must expose Hono routes', 500);
     }
-    const routes = namespace.app.routes
-      .map((route) => ({
-        method: route.method.toUpperCase(),
-        path: joinPaths(namespace.prefix, route.path),
-        requiredScopes: routeRequiredScopes(route.handler),
-      }))
-      .filter((route) => route.path !== SERVICE_DISCOVERY_PATH);
+    const routes = namespaceRoutes(namespace);
     const routesByKey = routes.reduce((merged, route) => {
       const key = `${route.method} ${route.path}`;
       const existing = merged.get(key) ?? [];
@@ -130,6 +124,29 @@ function validateServiceDefinition(service: ServiceDefinition, options: DefineSe
       }
     }
   }
+}
+
+function namespaceRoutes(namespace: ServiceNamespaceDefinition): NamespaceRoute[] {
+  const routes = namespace.app.routes
+    .map((route, routeIndex) => ({
+      method: route.method.toUpperCase(),
+      path: joinPaths(namespace.prefix, route.path),
+      requiredScopes: routeRequiredScopes(route.handler),
+      routeIndex,
+      visibility: namespace.visibility,
+    }))
+    .filter((route) => route.path !== SERVICE_DISCOVERY_PATH);
+  const scopedMiddlewareRoutes = routes.filter((route) => route.method === 'ALL' && route.requiredScopes.length > 0);
+
+  return routes.map((route) => {
+    const inheritedScopes = scopedMiddlewareRoutes
+      .filter((middleware) => middleware.routeIndex < route.routeIndex && pathMatches(middleware.path, route.path))
+      .flatMap((middleware) => middleware.requiredScopes);
+    return {
+      ...route,
+      requiredScopes: [...new Set([...inheritedScopes, ...route.requiredScopes])],
+    };
+  });
 }
 
 function normalizeValue(value: string, field: string): string {

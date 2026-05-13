@@ -187,6 +187,43 @@ describe('capability issuer', () => {
     expect(zeroResponse.status).toBe(400);
   });
 
+  it('rejects malformed token endpoint scopes as bad requests', async () => {
+    const keys = await testKeys();
+    const issuer = createCapabilityIssuer({
+      capabilities: [fizzyCapabilities],
+      grants: defineServiceGrants({
+        grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
+      }),
+      issuer: 'control-plane',
+      keyId: 'test-key',
+      privateJwk: keys.privateJwk,
+    });
+    const app = new Hono();
+    mountCapabilityTokenEndpoint(app, issuer, {
+      authenticateCaller: () => 'moco',
+    });
+
+    const emptyScopeResponse = await app.request('/.well-known/service-plane/capability-token', {
+      body: JSON.stringify({
+        scopes: [' '],
+        targetServiceId: 'fizzy',
+      }),
+      headers: { 'content-type': 'application/json' },
+      method: 'POST',
+    });
+    const wildcardScopeResponse = await app.request('/.well-known/service-plane/capability-token', {
+      body: JSON.stringify({
+        scopes: ['fizzy.*'],
+        targetServiceId: 'fizzy',
+      }),
+      headers: { 'content-type': 'application/json' },
+      method: 'POST',
+    });
+
+    expect(emptyScopeResponse.status).toBe(400);
+    expect(wildcardScopeResponse.status).toBe(400);
+  });
+
   it('can mount token and JWKS endpoints together', async () => {
     const keys = await testKeys();
     const issuer = createCapabilityIssuer({

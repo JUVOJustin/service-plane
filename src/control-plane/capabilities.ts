@@ -240,14 +240,14 @@ function normalizeScopes(scopes: string[], status: number): string[] {
   if (scopes.length === 0) {
     throw new CapabilityAuthError('Service-Plane capability token requires at least one scope', status);
   }
-  const normalized = scopes.map(normalizeScope);
+  const normalized = scopes.map((scope) => normalizeScope(scope, status));
   return [...new Set(normalized)];
 }
 
-function normalizeScope(scope: string): string {
+function normalizeScope(scope: string, status = 500): string {
   const normalized = scope.trim();
-  if (!normalized) throw new CapabilityAuthError('Service-Plane capability scope cannot be empty', 500);
-  if (normalized.includes('*')) throw new CapabilityAuthError('Service-Plane capability wildcards are not supported', 500);
+  if (!normalized) throw new CapabilityAuthError('Service-Plane capability scope cannot be empty', status);
+  if (normalized.includes('*')) throw new CapabilityAuthError('Service-Plane capability wildcards are not supported', status);
   return normalized;
 }
 

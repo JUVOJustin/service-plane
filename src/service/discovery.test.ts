@@ -47,6 +47,33 @@ describe('service discovery', () => {
     ).toThrow('Service-Plane route requires unknown scope: moco.sync.run');
   });
 
+  it('propagates scoped Hono middleware to concrete routes', () => {
+    const routes = new Hono();
+    routes.use('*', capability('moco.sync.run'));
+    routes.post('/v1/sync', (context) => context.json({ ok: true }));
+    const capabilities = defineCapabilities({
+      scopes: [{ id: 'moco.sync.run' }],
+      serviceId: 'moco',
+    });
+    const service = defineService(
+      {
+        capabilities,
+        id: 'moco',
+        namespaces: [defineNamespace({ app: routes, prefix: '/providers/moco', visibility: 'internal' })],
+        title: 'MOCO',
+        version: '0.1.0',
+      },
+      { requireRouteScopes: true },
+    );
+
+    expect(serviceDiscoveryDocument(service).routes).toContainEqual({
+      method: 'POST',
+      path: '/providers/moco/v1/sync',
+      requiredScopes: ['moco.sync.run'],
+      visibility: 'internal',
+    });
+  });
+
   it('can require every service route to use capability annotations', () => {
     const routes = new Hono().post('/v1/sync', (context) => context.json({ ok: true }));
 
