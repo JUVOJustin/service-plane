@@ -1,104 +1,22 @@
-import type { Context, MiddlewareHandler } from 'hono';
-
 export const SERVICE_DISCOVERY_PATH = '/.well-known/service-plane/service.json';
+export const SERVICE_PLANE_OPENAPI_PATH = '/openapi.json';
+export const SERVICE_PLANE_SWAGGER_PATH = '/swagger';
 export const SERVICE_PLANE_CAPABILITY_JWKS_PATH = '/.well-known/service-plane/jwks.json';
 export const SERVICE_PLANE_CAPABILITY_TOKEN_PATH = '/.well-known/service-plane/capability-token';
+export const SERVICE_PLANE_MCP_PATH = '/rpc/mcp';
+
 export const DEFAULT_REGISTRY_CACHE_TTL_SECONDS = 30;
 export const DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS = 120;
 export const MAX_CAPABILITY_TOKEN_TTL_SECONDS = 24 * 60 * 60;
 export const DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS = 300;
-export const SERVICE_PLANE_CAPABILITY_CONTEXT = 'servicePlaneCapability';
-export const SERVICE_PLANE_CAPABILITY_VERIFIER = 'servicePlaneCapabilityVerifier';
+
 export const SERVICE_PLANE_AUTHORIZATION_SCHEME = 'ServicePlane';
 export const SERVICE_PLANE_REQUEST_ID_HEADER = 'X-Request-Id';
 
-export type ServiceRouteVisibility = 'public' | 'auth' | 'internal';
-
-export type RouteSource = {
-  routes: Array<{
-    handler?: unknown;
-    method: string;
-    path: string;
-  }>;
-};
-
-export type HonoAppLike = RouteSource;
-
-export type ServiceNamespaceDefinition = {
-  app: HonoAppLike;
-  openapi?: unknown;
-  prefix: string;
-  visibility: ServiceRouteVisibility;
-};
-
-export type ServiceDefinition = {
-  capabilities?: CapabilityCatalog;
-  id: string;
-  namespaces: ServiceNamespaceDefinition[];
-  title: string;
-  version: string;
-};
-
-export type DefineServiceOptions = {
-  requireRouteScopes?: boolean;
-};
-
-export type ServiceRouteDiscovery = {
-  method: string;
-  path: string;
-  requiredScopes?: string[];
-  visibility: ServiceRouteVisibility;
-};
-
-export type ServiceDiscoveryDocument = {
-  capabilities?: CapabilityCatalog;
-  id: string;
-  routes: ServiceRouteDiscovery[];
-  title: string;
-  version: string;
-};
-
-export type DiscoveredServiceRoute = ServiceRouteDiscovery & {
-  service: ServiceEndpoint;
-  serviceId: string;
-  serviceTitle: string;
-  serviceVersion: string;
-};
-
-export type FetchLike = {
-  fetch(request: Request): Promise<Response>;
-};
-
-export type ServiceEndpoint = {
-  discovery?: ServiceDiscoveryDocument | (() => Promise<ServiceDiscoveryDocument> | ServiceDiscoveryDocument);
-  fetch(request: Request): Promise<Response>;
-  grants?: ServiceEndpointGrant[];
-  id: string;
-  origin: string;
-};
-
-export type ServiceRegistrySnapshot = {
-  discoveredAt: string;
-  routes: DiscoveredServiceRoute[];
-  services: ServiceDiscoveryDocument[];
-  stale?: boolean;
-};
-
-export type ServiceDiscoverySnapshot = {
-  discoveredAt: string;
-  services: ServiceDiscoveryDocument[];
-  stale?: boolean;
-};
-
-export type RegistryCache = {
-  get(key: string): Promise<ServiceDiscoverySnapshot | undefined>;
-  set(key: string, value: ServiceDiscoverySnapshot, ttlSeconds: number): Promise<void>;
-};
-
-export type ServiceRegistry = {
-  discover(): Promise<ServiceRegistrySnapshot>;
-  match(method: string, path: string): Promise<DiscoveredServiceRoute | undefined>;
-};
+export type AbilityAuth = 'anonymous' | 'service' | 'user';
+export type AbilityExposure = 'private' | 'published';
+export type AbilityTransport = 'cloudflare-binding-rpc' | 'http-batch' | 'websocket';
+export type ServiceHttpMethod = 'delete' | 'get' | 'patch' | 'post' | 'put';
 
 export type CapabilityScopeDefinition = {
   description?: string;
@@ -109,6 +27,63 @@ export type CapabilityScopeDefinition = {
 export type CapabilityCatalog = {
   scopes: CapabilityScopeDefinition[];
   serviceId: string;
+};
+
+export type OpenApiObject = Record<string, unknown>;
+
+export type ServiceAbilityRpcDiscovery = {
+  path: string;
+  transports: AbilityTransport[];
+};
+
+export type ServiceAbilityRestProjection = {
+  description?: string;
+  method: ServiceHttpMethod;
+  operationId?: string;
+  path: string;
+  summary?: string;
+  tags?: string[];
+};
+
+export type ServiceAbilityMcpProjection = {
+  description?: string;
+  name: string;
+};
+
+export type ServiceAbilityMethodDiscovery = {
+  inputSchema: OpenApiObject;
+  mcp?: ServiceAbilityMcpProjection;
+  outputSchema: OpenApiObject;
+  rest?: ServiceAbilityRestProjection;
+  scopes: string[];
+};
+
+export type ServiceAbilityDiscovery = {
+  auth: AbilityAuth;
+  description?: string;
+  exposure: AbilityExposure;
+  id: string;
+  methods: Record<string, ServiceAbilityMethodDiscovery>;
+  rpc: ServiceAbilityRpcDiscovery;
+  scopes: string[];
+  title?: string;
+};
+
+export type ServiceCallerAuthDiscovery = {
+  jwks: CapabilityJwks;
+};
+
+export type ServiceDiscoveryDocument = {
+  abilities: ServiceAbilityDiscovery[];
+  callerAuth?: ServiceCallerAuthDiscovery;
+  capabilities?: CapabilityCatalog;
+  id: string;
+  title: string;
+  version: string;
+};
+
+export type FetchLike = {
+  fetch(request: Request): Promise<Response>;
 };
 
 export type ServiceGrant = {
@@ -123,6 +98,80 @@ export type ServiceEndpointGrant = Omit<ServiceGrant, 'target'> & {
 
 export type ServiceGrantDefinition = {
   grants: ServiceGrant[];
+};
+
+export type ServiceEndpoint = {
+  discovery?: ServiceDiscoveryDocument | (() => Promise<ServiceDiscoveryDocument> | ServiceDiscoveryDocument);
+  fetch(request: Request): Promise<Response>;
+  grants?: ServiceEndpointGrant[];
+  id: string;
+  origin: string;
+};
+
+export type DiscoveredServiceAbility = ServiceAbilityDiscovery & {
+  service: ServiceEndpoint;
+  serviceId: string;
+  serviceTitle: string;
+  serviceVersion: string;
+};
+
+export type ServiceDiscoverySnapshot = {
+  discoveredAt: string;
+  etags?: Record<string, string>;
+  services: ServiceDiscoveryDocument[];
+  stale?: boolean;
+};
+
+export type ServiceRegistrySnapshot = ServiceDiscoverySnapshot & {
+  abilities: DiscoveredServiceAbility[];
+};
+
+export type RegistryCache = {
+  get(key: string): Promise<ServiceDiscoverySnapshot | undefined>;
+  getStale?(key: string): Promise<ServiceDiscoverySnapshot | undefined>;
+  set(key: string, value: ServiceDiscoverySnapshot, ttlSeconds: number): Promise<void>;
+};
+
+export type ServiceRegistry = {
+  abilities(): Promise<DiscoveredServiceAbility[]>;
+  ability(serviceId: string, abilityId: string): Promise<DiscoveredServiceAbility | undefined>;
+  discover(): Promise<ServiceRegistrySnapshot>;
+  endpoint(id: string): ServiceEndpoint | undefined;
+};
+
+export type OpenApiDocument = {
+  components?: OpenApiObject;
+  info: {
+    description?: string;
+    title: string;
+    version: string;
+  };
+  openapi: '3.1.0';
+  paths: Record<string, Record<string, OpenApiObject>>;
+  servers?: OpenApiObject[];
+  tags?: Array<{ description?: string; name: string }>;
+};
+
+export type OpenApiDocumentCache = {
+  get(key: string): Promise<OpenApiDocument | undefined>;
+  set(key: string, value: OpenApiDocument, ttlSeconds: number): Promise<void>;
+};
+
+export type McpToolDiscovery = {
+  description?: string;
+  inputSchema: OpenApiObject;
+  name: string;
+  outputSchema: OpenApiObject;
+  scopes: string[];
+  servicePlane: {
+    abilityId: string;
+    method: string;
+    serviceId: string;
+  };
+};
+
+export type McpDiscoveryDocument = {
+  tools: McpToolDiscovery[];
 };
 
 export type CapabilityClaims = {
@@ -151,6 +200,16 @@ export type CapabilityJwks = {
 
 export type CapabilityJwksResolver = CapabilityJwks | (() => Promise<CapabilityJwks> | CapabilityJwks);
 
+export type CapabilityJwksCacheEntry = {
+  expiresAt: Date | string;
+  jwks: CapabilityJwks;
+};
+
+export type CapabilityJwksCache = {
+  get(key: string): Promise<CapabilityJwksCacheEntry | undefined>;
+  set(key: string, value: CapabilityJwksCacheEntry, ttlSeconds: number): Promise<void>;
+};
+
 export type VerifyCapabilityTokenOptions = {
   expectedAudience: string;
   issuer?: string;
@@ -160,17 +219,6 @@ export type VerifyCapabilityTokenOptions = {
 };
 
 export type CapabilityVerifierOptions = Omit<VerifyCapabilityTokenOptions, 'requiredScopes'>;
-
-export type CapabilityAuthVariables = {
-  Variables: {
-    [SERVICE_PLANE_CAPABILITY_CONTEXT]?: CapabilityIdentity;
-    [SERVICE_PLANE_CAPABILITY_VERIFIER]?: CapabilityVerifierOptions;
-  };
-};
-
-export type CapabilityAuthMiddleware = MiddlewareHandler<CapabilityAuthVariables>;
-
-export type CapabilityContextSource = Context<CapabilityAuthVariables>;
 
 export type IssueCapabilityTokenInput = {
   callerServiceId: string;

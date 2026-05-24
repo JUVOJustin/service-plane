@@ -1,115 +1,221 @@
-import { Hono } from 'hono';
 import { describe, expect, it } from 'vitest';
-import { capability, defineCapabilities } from './capabilities.js';
-import { defineNamespace, defineService, serviceDiscoveryDocument } from './discovery.js';
+import * as z from 'zod';
+import { defineCapabilities, RpcTarget } from './capabilities.js';
+import { abilityMethod, defineAbility, defineAbilityService, serviceDiscoveryDocument } from './discovery.js';
 
-describe('service discovery', () => {
-  it('builds a discovery document from explicit Hono namespaces', () => {
-    const publicApp = new Hono().post('/events/:source', (context) => context.text(context.req.param('source')));
-    const internalApp = new Hono().post('/v1/sync', (context) => context.json({ ok: true }));
+describe('ability service discovery', () => {
+  const capabilities = defineCapabilities({
+    scopes: [{ id: 'example.search' }, { id: 'example.sync.run' }],
+    serviceId: 'example',
+  });
 
-    const service = defineService({
-      id: 'moco',
-      namespaces: [
-        defineNamespace({ app: publicApp, prefix: '/', visibility: 'public' }),
-        defineNamespace({ app: internalApp, prefix: '/providers/moco', visibility: 'internal' }),
+  const searchAbility = defineAbility({
+    auth: 'user',
+    exposure: 'published',
+    id: 'example.search',
+    methods: {
+      search: abilityMethod({
+        input: z.object({ query: z.string() }),
+        mcp: { name: 'example_search' },
+        output: z.object({ results: z.array(z.string()) }),
+        rest: { method: 'get', path: '/examples/search', summary: 'Search examples' },
+        scopes: ['example.search'],
+      }),
+    },
+    scopes: ['example.search'],
+    handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
+    title: 'Example Search',
+  });
+
+  it('builds a discovery document from explicit abilities', () => {
+    const service = defineAbilityService({
+      abilities: [
+        searchAbility,
+        defineAbility({
+          id: 'example.sync',
+          methods: {
+            runSync: abilityMethod({
+              input: z.object({ since: z.string().optional() }),
+              output: z.object({ ok: z.literal(true) }),
+              scopes: ['example.sync.run'],
+            }),
+          },
+          rpc: { transports: ['http-batch', 'websocket'] },
+          scopes: ['example.sync.run'],
+          handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
+        }),
       ],
-      title: 'MOCO',
-      version: '0.0.1',
+      capabilities,
+      id: 'example',
+      title: 'Example',
+      version: '0.1.0',
     });
 
-    expect(serviceDiscoveryDocument(service)).toEqual({
-      id: 'moco',
-      routes: [
-        { method: 'POST', path: '/events/:source', visibility: 'public' },
-        { method: 'POST', path: '/providers/moco/v1/sync', visibility: 'internal' },
+    expect(serviceDiscoveryDocument(service)).toMatchObject({
+      abilities: [
+        {
+          auth: 'user',
+          exposure: 'published',
+          id: 'example.search',
+          methods: {
+            search: {
+              inputSchema: { properties: { query: { type: 'string' } }, required: ['query'], type: 'object' },
+              mcp: { name: 'example_search' },
+              outputSchema: {
+                properties: { results: { items: { type: 'string' }, type: 'array' } },
+                required: ['results'],
+                type: 'object',
+              },
+              rest: { method: 'get', operationId: 'example.search.search', path: '/examples/search' },
+              scopes: ['example.search'],
+            },
+          },
+          rpc: { path: '/rpc/example.search', transports: ['http-batch'] },
+          scopes: ['example.search'],
+        },
+        {
+          auth: 'service',
+          exposure: 'private',
+          id: 'example.sync',
+          rpc: { path: '/rpc/example.sync', transports: ['http-batch', 'websocket'] },
+        },
       ],
-      title: 'MOCO',
-      version: '0.0.1',
+      id: 'example',
     });
   });
 
-  it('validates route capability annotations against the service catalog', () => {
-    const routes = new Hono().post('/v1/sync', capability('moco.sync.run'), (context) => context.json({ ok: true }));
-    const capabilities = defineCapabilities({
-      scopes: [{ id: 'moco.connections.read' }],
-      serviceId: 'moco',
-    });
-
+  it('rejects duplicate ability ids, unknown scopes, and unscoped abilities', () => {
     expect(() =>
-      defineService({
+      defineAbilityService({
+        abilities: [searchAbility, searchAbility],
         capabilities,
-        id: 'moco',
-        namespaces: [defineNamespace({ app: routes, prefix: '/providers/moco', visibility: 'internal' })],
-        title: 'MOCO',
+        id: 'example',
+        title: 'Example',
         version: '0.1.0',
       }),
-    ).toThrow('Service-Plane route requires unknown scope: moco.sync.run');
-  });
+    ).toThrow('Duplicate Service-Plane ability: example.search');
 
-  it('propagates scoped Hono middleware to concrete routes', () => {
-    const routes = new Hono();
-    routes.use('*', capability('moco.sync.run'));
-    routes.post('/v1/sync', (context) => context.json({ ok: true }));
-    const capabilities = defineCapabilities({
-      scopes: [{ id: 'moco.sync.run' }],
-      serviceId: 'moco',
-    });
-    const service = defineService(
-      {
+    expect(() =>
+      defineAbilityService({
+        abilities: [
+          defineAbility({
+            id: 'example.unknown',
+            methods: {
+              run: abilityMethod({ input: z.object({}), output: z.object({}), scopes: ['example.unknown'] }),
+            },
+            scopes: ['example.unknown'],
+            handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
+          }),
+        ],
         capabilities,
-        id: 'moco',
-        namespaces: [defineNamespace({ app: routes, prefix: '/providers/moco', visibility: 'internal' })],
-        title: 'MOCO',
+        id: 'example',
+        title: 'Example',
         version: '0.1.0',
-      },
-      { requireRouteScopes: true },
-    );
-
-    expect(serviceDiscoveryDocument(service).routes).toContainEqual({
-      method: 'POST',
-      path: '/providers/moco/v1/sync',
-      requiredScopes: ['moco.sync.run'],
-      visibility: 'internal',
-    });
-  });
-
-  it('can require every service route to use capability annotations', () => {
-    const routes = new Hono().post('/v1/sync', (context) => context.json({ ok: true }));
+      }),
+    ).toThrow('Service-Plane ability requires unknown scope: example.unknown');
 
     expect(() =>
-      defineService(
-        {
-          id: 'moco',
-          namespaces: [defineNamespace({ app: routes, prefix: '/providers/moco', visibility: 'internal' })],
-          title: 'MOCO',
-          version: '0.1.0',
-        },
-        { requireRouteScopes: true },
-      ),
-    ).toThrow('Service-Plane route is missing capability(...) annotation: POST /providers/moco/v1/sync');
-  });
-
-  it('rejects duplicate route chains that can terminate before capability middleware', () => {
-    const routes = new Hono();
-    routes.get('/v1/sync', (context) => context.json({ unscoped: true }));
-    routes.get('/v1/sync', capability('moco.sync.run'), (context) => context.json({ scoped: true }));
-    const capabilities = defineCapabilities({
-      scopes: [{ id: 'moco.sync.run' }],
-      serviceId: 'moco',
-    });
+      defineAbilityService({
+        abilities: [
+          defineAbility({
+            id: 'example.unscoped',
+            methods: { run: abilityMethod({ input: z.object({}), output: z.object({}) }) },
+            handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
+          }),
+        ],
+        capabilities,
+        id: 'example',
+        title: 'Example',
+        version: '0.1.0',
+      }),
+    ).toThrow('Service-Plane ability is missing required scopes: example.unscoped');
 
     expect(() =>
-      defineService(
-        {
-          capabilities,
-          id: 'moco',
-          namespaces: [defineNamespace({ app: routes, prefix: '/providers/moco', visibility: 'internal' })],
-          title: 'MOCO',
-          version: '0.1.0',
+      defineAbilityService({
+        abilities: [
+          defineAbility({
+            id: 'example.unscoped-method',
+            methods: { run: abilityMethod({ input: z.object({}), output: z.object({}) }) },
+            scopes: ['example.sync.run'],
+            handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
+          }),
+        ],
+        capabilities,
+        id: 'example',
+        title: 'Example',
+        version: '0.1.0',
+      }),
+    ).toThrow('Service-Plane ability method is missing required scopes: example.unscoped-method/run');
+  });
+
+  it('defaults abilities to private service auth', () => {
+    const service = defineAbilityService({
+      abilities: [
+        defineAbility({
+          id: 'example.sync',
+          methods: {
+            run: abilityMethod({ input: z.object({}), output: z.object({}), scopes: ['example.sync.run'] }),
+          },
+          scopes: ['example.sync.run'],
+          handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
+        }),
+      ],
+      capabilities,
+      id: 'example',
+      title: 'Example',
+      version: '0.1.0',
+    });
+
+    expect(serviceDiscoveryDocument(service).abilities[0]).toMatchObject({ auth: 'service', exposure: 'private' });
+  });
+
+  it('rejects abilities without a handler factory', () => {
+    expect(() =>
+      defineAbilityService({
+        abilities: [
+          defineAbility({
+            handler: undefined as never,
+            id: 'example.sync',
+            methods: {
+              run: abilityMethod({ input: z.object({}), output: z.object({}), scopes: ['example.sync.run'] }),
+            },
+            scopes: ['example.sync.run'],
+          }),
+        ],
+        capabilities,
+        id: 'example',
+        title: 'Example',
+        version: '0.1.0',
+      }),
+    ).toThrow('Service-Plane ability requires a handler factory: example.sync');
+  });
+
+  it('does not publish private caller-auth key material', () => {
+    expect(() =>
+      defineAbilityService({
+        abilities: [
+          defineAbility({
+            id: 'example.sync',
+            methods: {
+              run: abilityMethod({ input: z.object({}), output: z.object({}), scopes: ['example.sync.run'] }),
+            },
+            scopes: ['example.sync.run'],
+            handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
+          }),
+        ],
+        callerAuth: {
+          jwks: {
+            keys: [
+              { d: 'private', kid: 'caller' },
+              { kid: 'caller-rsa', oth: [{ d: 'private' }] },
+            ],
+          },
         },
-        { requireRouteScopes: true },
-      ),
-    ).toThrow('Service-Plane route must begin with capability(...) annotation: GET /providers/moco/v1/sync');
+        capabilities,
+        id: 'example',
+        title: 'Example',
+        version: '0.1.0',
+      }),
+    ).toThrow('Service-Plane caller-auth JWKS must not include private key material');
   });
 });

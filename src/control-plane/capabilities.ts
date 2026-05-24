@@ -1,7 +1,9 @@
 import type { Context, Handler } from 'hono';
+import { etag } from 'hono/etag';
 import { createFactory } from 'hono/factory';
 import { publicJwkFromPrivateJwk, signCapabilityToken, verifyCapabilityToken } from '../shared/capability-tokens.js';
 import { CapabilityAuthError } from '../shared/errors.js';
+import { generateServicePlaneJwkSigningKey } from '../shared/jwk-auth.js';
 import {
   type CapabilityCatalog,
   type CapabilityJwks,
@@ -62,6 +64,7 @@ export type MountCapabilityEndpointsOptions = {
 type CapabilityEndpointApp = {
   get(path: string, ...handlers: Handler[]): unknown;
   post(path: string, ...handlers: Handler[]): unknown;
+  use(path: string, ...handlers: Handler[]): unknown;
 };
 
 export function defineServiceGrants(definition: ServiceGrantDefinition): ServiceGrantDefinition {
@@ -101,15 +104,7 @@ export function createCapabilityIssuer(options: CreateCapabilityIssuerOptions): 
     },
     async jwks() {
       return {
-        keys: [
-          {
-            ...publicJwk,
-            alg: 'ES256',
-            kid: keyId,
-            key_ops: ['verify'],
-            use: 'sig',
-          },
-        ],
+        keys: [publicJwk],
       };
     },
   };
@@ -127,15 +122,7 @@ export async function createCapabilityIssuerFromPrivateJwk(
 }
 
 export async function generateCapabilitySigningJwk(options: GenerateCapabilitySigningJwkOptions = {}): Promise<JsonWebKey> {
-  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
-  const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
-  return {
-    ...privateJwk,
-    alg: 'ES256',
-    ...(options.keyId ? { kid: options.keyId } : {}),
-    key_ops: ['sign'],
-    use: 'sig',
-  };
+  return generateServicePlaneJwkSigningKey(options);
 }
 
 export function mountCapabilityTokenEndpoint(
@@ -187,12 +174,15 @@ export function mountCapabilityEndpoints(
 export function mountCapabilityJwksEndpoint(
   app: {
     get(path: string, ...handlers: Handler[]): unknown;
+    use(path: string, ...handlers: Handler[]): unknown;
   },
   issuer: CapabilityIssuerResolver,
   options: MountCapabilityJwksEndpointOptions = {},
 ): void {
+  const path = options.path ?? SERVICE_PLANE_CAPABILITY_JWKS_PATH;
+  app.use(path, etag());
   app.get(
-    options.path ?? SERVICE_PLANE_CAPABILITY_JWKS_PATH,
+    path,
     ...endpointFactory.createHandlers(async (context) => {
       const resolvedIssuer = typeof issuer === 'function' ? await issuer(context) : issuer;
       return context.json(await resolvedIssuer.jwks());

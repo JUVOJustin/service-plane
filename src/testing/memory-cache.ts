@@ -16,11 +16,11 @@ export function memoryRegistryCache(now: () => number = () => Date.now()): Regis
     async get(key) {
       const entry = entries.get(key);
       if (!entry) return undefined;
-      if (entry.expiresAt <= now()) {
-        entries.delete(key);
-        return undefined;
-      }
+      if (entry.expiresAt <= now()) return undefined;
       return entry.value;
+    },
+    async getStale(key) {
+      return entries.get(key)?.value;
     },
     async set(key, value, ttlSeconds) {
       entries.set(key, {

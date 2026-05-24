@@ -1,14 +1,7 @@
 import type { Context } from 'hono';
 import { createMiddleware } from 'hono/factory';
-import { pathMatches } from '../shared/paths.js';
-import {
-  type CapabilityAuthVariables,
-  SERVICE_DISCOVERY_PATH,
-  SERVICE_PLANE_REQUEST_ID_HEADER,
-  type ServiceDefinition,
-  type ServiceRouteDiscovery,
-} from '../shared/types.js';
-import { capabilityIdentity } from './capabilities.js';
+import { SERVICE_DISCOVERY_PATH, SERVICE_PLANE_REQUEST_ID_HEADER, type ServiceAbilityDiscovery } from '../shared/types.js';
+import type { ServiceDefinition } from './discovery.js';
 import { serviceDiscoveryDocument } from './discovery.js';
 
 export type ServicePlaneLogLevel = 'info' | 'error';
@@ -20,9 +13,10 @@ export type ServicePlaneLogEvent = {
   method: string;
   path: string;
   requestId?: string;
-  route?: {
-    requiredScopes?: string[];
-    visibility: ServiceRouteDiscovery['visibility'];
+  ability?: {
+    exposure: string;
+    id: string;
+    scopes?: string[];
   };
   serviceId: string;
   status: number;
@@ -44,19 +38,16 @@ export function servicePlaneLogger(service: ServiceDefinition, options: ServiceP
   const discovery = serviceDiscoveryDocument(service);
   const write = options.log ?? defaultLog;
 
-  return createMiddleware<CapabilityAuthVariables>(async (context, next) => {
+  return createMiddleware(async (context, next) => {
     const startedAt = Date.now();
     const url = new URL(context.req.url);
-    const route = discovery.routes.find(
-      (candidate) => candidate.method === context.req.method.toUpperCase() && pathMatches(candidate.path, url.pathname),
-    );
+    const ability = discovery.abilities.find((candidate) => candidate.rpc.path === url.pathname);
     const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
     const requestId = options.requestId?.(context) ?? requestIdFromContext(context) ?? context.req.header(requestIdHeaderName) ?? undefined;
 
     try {
       await next();
       const durationMs = Date.now() - startedAt;
-      const identity = capabilityIdentity(context);
       const event: ServicePlaneLogEvent = {
         durationMs,
         event: url.pathname === SERVICE_DISCOVERY_PATH ? 'service_plane.discovery.served' : 'service_plane.request.completed',
@@ -66,9 +57,8 @@ export function servicePlaneLogger(service: ServiceDefinition, options: ServiceP
         serviceId: service.id,
         status: context.res.status,
       };
-      if (identity) event.callerServiceId = identity.serviceId;
       if (requestId) event.requestId = requestId;
-      if (route) event.route = compactRoute(route);
+      if (ability) event.ability = compactAbility(ability);
       write(event);
     } catch (error) {
       const durationMs = Date.now() - startedAt;
@@ -83,7 +73,7 @@ export function servicePlaneLogger(service: ServiceDefinition, options: ServiceP
         status: context.res.status >= 400 ? context.res.status : 500,
       };
       if (requestId) event.requestId = requestId;
-      if (route) event.route = compactRoute(route);
+      if (ability) event.ability = compactAbility(ability);
       write(event);
       throw error;
     }
@@ -104,9 +94,10 @@ function requestIdFromContext(context: Context): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
 
-function compactRoute(route: ServiceRouteDiscovery): NonNullable<ServicePlaneLogEvent['route']> {
+function compactAbility(ability: ServiceAbilityDiscovery): NonNullable<ServicePlaneLogEvent['ability']> {
   return {
-    ...(route.requiredScopes?.length ? { requiredScopes: route.requiredScopes } : {}),
-    visibility: route.visibility,
+    exposure: ability.exposure,
+    id: ability.id,
+    ...(ability.scopes.length ? { scopes: ability.scopes } : {}),
   };
 }

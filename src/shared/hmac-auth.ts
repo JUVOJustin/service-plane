@@ -1,4 +1,5 @@
 import { CapabilityAuthError } from './errors.js';
+import { boundedRequestBodyBytes } from './request-body.js';
 import { SERVICE_PLANE_REQUEST_ID_HEADER } from './types.js';
 
 export const SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME = 'ServicePlane-HMAC';
@@ -122,22 +123,8 @@ export function bytesToBase64Url(bytes: Uint8Array): string {
 }
 
 async function requestBodyBytes(request: Request, maxBodyBytes?: number): Promise<Uint8Array> {
-  if (maxBodyBytes !== undefined) {
-    if (!Number.isSafeInteger(maxBodyBytes) || maxBodyBytes <= 0) {
-      throw new CapabilityAuthError('Service-Plane HMAC max body size must be a positive integer', 500);
-    }
-    const contentLength = request.headers.get('content-length');
-    if (contentLength) {
-      const parsed = Number(contentLength);
-      if (Number.isFinite(parsed) && parsed > maxBodyBytes) {
-        throw new CapabilityAuthError('Service-Plane HMAC request body is too large', 413);
-      }
-    }
-  }
-
-  const bytes = new Uint8Array(await request.clone().arrayBuffer());
-  if (maxBodyBytes !== undefined && bytes.byteLength > maxBodyBytes) {
-    throw new CapabilityAuthError('Service-Plane HMAC request body is too large', 413);
-  }
-  return bytes;
+  return boundedRequestBodyBytes(request, maxBodyBytes, {
+    invalidMaxBodyBytesMessage: 'Service-Plane HMAC max body size must be a positive integer',
+    tooLargeMessage: 'Service-Plane HMAC request body is too large',
+  });
 }

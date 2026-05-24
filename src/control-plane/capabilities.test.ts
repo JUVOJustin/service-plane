@@ -255,6 +255,35 @@ describe('capability issuer', () => {
     ).toBe(200);
   });
 
+  it('serves JWKS with ETag revalidation', async () => {
+    const keys = await testKeys();
+    const issuer = createCapabilityIssuer({
+      capabilities: [fizzyCapabilities],
+      grants: defineServiceGrants({
+        grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
+      }),
+      issuer: 'control-plane',
+      keyId: 'test-key',
+      privateJwk: keys.privateJwk,
+    });
+    const app = new Hono();
+    mountCapabilityEndpoints(app, issuer, {
+      authenticateCaller: () => 'moco',
+    });
+
+    const first = await app.request('/.well-known/service-plane/jwks.json');
+    const etag = first.headers.get('etag');
+    expect(first.status).toBe(200);
+    expect(etag).toBeTruthy();
+
+    const revalidated = await app.request('/.well-known/service-plane/jwks.json', {
+      headers: { 'if-none-match': etag ?? '' },
+    });
+    expect(revalidated.status).toBe(304);
+    expect(revalidated.headers.get('etag')).toBe(etag);
+    expect(await revalidated.text()).toBe('');
+  });
+
   it('generates a private JWK and publishes public JWKS without extra config', async () => {
     const privateJwk = await generateCapabilitySigningJwk({ keyId: 'test-key' });
     const issuer = createCapabilityIssuer({

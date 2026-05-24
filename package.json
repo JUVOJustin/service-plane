@@ -1,7 +1,7 @@
 {
   "name": "service-plane",
-  "version": "0.1.0",
-  "description": "Opinionated Hono service-plane primitives for service discovery, STS capability tokens, route scopes, and control-plane proxying.",
+  "version": "0.2.0",
+  "description": "Ability-first Service Plane primitives for schema-backed Cap'n Web RPC, STS capability tokens, OpenAPI, and MCP projections.",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -49,25 +49,37 @@
     "prepare": "npm run build"
   },
   "keywords": [
+    "capnweb",
+    "cap-n-web",
     "hono",
     "microservices",
+    "rpc",
+    "object-capability",
     "control-plane",
     "service-discovery",
     "sts",
     "capabilities",
+    "abilities",
+    "zod",
     "cloudflare-workers"
   ],
   "peerDependencies": {
-    "hono": ">=4.10.3 <5.0.0"
+    "hono": ">=4.10.3 <5.0.0",
+    "zod": ">=4.0.0 <5.0.0"
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.15",
     "@types/node": "^25.0.0",
     "hono": "^4.12.18",
     "typescript": "^5.0.4",
-    "vitest": "^4.0.0"
+    "vitest": "^4.0.0",
+    "zod": "^4.4.3"
   },
   "engines": {
     "node": ">=18.14.1"
+  },
+  "dependencies": {
+    "@hono/capnweb": "^0.1.0",
+    "capnweb": "^0.8.0"
   }
 }

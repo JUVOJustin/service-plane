@@ -1,156 +1,441 @@
-import type { Context } from 'hono';
-import { CapabilityAuthError } from '../shared/errors.js';
-import { joinPaths, normalizePath, pathMatches } from '../shared/paths.js';
+import { RpcTarget } from 'capnweb';
+import type { Context, Env } from 'hono';
+import * as z from 'zod';
+import { AbilityValidationError, CapabilityAuthError } from '../shared/errors.js';
 import {
-  type DefineServiceOptions,
+  type AbilityAuth,
+  type AbilityExposure,
+  type AbilityTransport,
+  type CapabilityCatalog,
+  type CapabilityIdentity,
+  type OpenApiObject,
   SERVICE_DISCOVERY_PATH,
-  type ServiceDefinition,
+  type ServiceAbilityDiscovery,
+  type ServiceAbilityMcpProjection,
+  type ServiceAbilityMethodDiscovery,
+  type ServiceAbilityRestProjection,
+  type ServiceCallerAuthDiscovery,
   type ServiceDiscoveryDocument,
-  type ServiceNamespaceDefinition,
+  type ServiceHttpMethod,
 } from '../shared/types.js';
-import { routeRequiredScopes } from './capabilities.js';
+import { bindCapabilityIdentity, requireScopes } from './capabilities.js';
 
-type NamespaceRoute = ServiceDiscoveryDocument['routes'][number] & {
-  requiredScopes: string[];
-  routeIndex: number;
+export type AbilitySchema = z.ZodType;
+
+export type AbilityMethodDefinition<TInput extends AbilitySchema = AbilitySchema, TOutput extends AbilitySchema = AbilitySchema> = {
+  input: TInput;
+  mcp?: ServiceAbilityMcpProjection;
+  output: TOutput;
+  rest?: ServiceAbilityRestProjection;
+  scopes?: string[];
 };
 
-export function defineNamespace(namespace: ServiceNamespaceDefinition): ServiceNamespaceDefinition {
-  return {
-    ...namespace,
-    prefix: normalizePath(namespace.prefix),
+export type AbilityMethodDefinitions = Record<string, AbilityMethodDefinition>;
+
+export type ServiceAbilityHandlerFactoryInput<TEnv extends Env = Env> = {
+  abilityId: string;
+  context: Context<TEnv>;
+  identity: CapabilityIdentity;
+};
+
+export type AbilityImplementation<TAbility extends ServiceAbilityDefinition> = {
+  [TMethod in keyof TAbility['methods']]: (
+    input: z.output<TAbility['methods'][TMethod]['input']>,
+  ) =>
+    | Promise<z.input<TAbility['methods'][TMethod]['output']> | z.output<TAbility['methods'][TMethod]['output']>>
+    | z.input<TAbility['methods'][TMethod]['output']>
+    | z.output<TAbility['methods'][TMethod]['output']>;
+};
+
+export type AbilityRpc<TAbility extends ServiceAbilityDefinition> = {
+  [TMethod in keyof TAbility['methods']]: (
+    input: z.input<TAbility['methods'][TMethod]['input']>,
+  ) => Promise<z.output<TAbility['methods'][TMethod]['output']>>;
+};
+
+export type ServiceAbilityHandlerFactory<TEnv extends Env = Env> = (
+  input: ServiceAbilityHandlerFactoryInput<TEnv>,
+) => Promise<RpcTarget & Record<string, unknown>> | (RpcTarget & Record<string, unknown>);
+
+export type ServiceAbilityDefinition<TEnv extends Env = Env, TMethods extends AbilityMethodDefinitions = AbilityMethodDefinitions> = {
+  auth?: AbilityAuth;
+  description?: string;
+  exposure?: AbilityExposure;
+  id: string;
+  methods: TMethods;
+  rpc?: {
+    path?: string;
+    transports?: AbilityTransport[];
   };
+  scopes?: string[];
+  handler: ServiceAbilityHandlerFactory<TEnv>;
+  title?: string;
+};
+
+export type AnyServiceAbilityDefinition<TEnv extends Env = Env> = ServiceAbilityDefinition<TEnv, AbilityMethodDefinitions>;
+
+export type NormalizedAbilityMethodDefinition<
+  TInput extends AbilitySchema = AbilitySchema,
+  TOutput extends AbilitySchema = AbilitySchema,
+> = AbilityMethodDefinition<TInput, TOutput> & {
+  inputSchema: OpenApiObject;
+  outputSchema: OpenApiObject;
+  scopes: string[];
+};
+
+export type NormalizedServiceAbility<TEnv extends Env = Env> = Omit<
+  AnyServiceAbilityDefinition<TEnv>,
+  'auth' | 'exposure' | 'methods' | 'rpc' | 'scopes'
+> & {
+  auth: AbilityAuth;
+  exposure: AbilityExposure;
+  methods: Record<string, NormalizedAbilityMethodDefinition>;
+  rpc: {
+    path: string;
+    transports: AbilityTransport[];
+  };
+  scopes: string[];
+};
+
+export type ServiceDefinition<TEnv extends Env = Env> = {
+  abilities: NormalizedServiceAbility<TEnv>[];
+  callerAuth?: ServiceCallerAuthDiscovery;
+  capabilities?: CapabilityCatalog;
+  id: string;
+  title: string;
+  version: string;
+};
+
+export type DefineServiceInput<TEnv extends Env = Env> = Omit<ServiceDefinition<TEnv>, 'abilities'> & {
+  abilities: Array<AnyServiceAbilityDefinition<TEnv>>;
+};
+
+export type DefineServiceOptions = {
+  requireAbilityScopes?: boolean;
+};
+
+export function abilityMethod<TInput extends AbilitySchema, TOutput extends AbilitySchema>(
+  definition: AbilityMethodDefinition<TInput, TOutput>,
+): AbilityMethodDefinition<TInput, TOutput> {
+  return definition;
 }
 
-export function defineService(service: ServiceDefinition, options: DefineServiceOptions = {}): ServiceDefinition {
-  const normalized = {
-    ...service,
-    id: normalizeValue(service.id, 'service id'),
-    namespaces: service.namespaces.map(defineNamespace),
-    title: normalizeValue(service.title, 'service title'),
-    version: normalizeValue(service.version, 'service version'),
-  };
-  validateServiceDefinition(normalized, options);
-  return normalized;
+export function defineAbility<TEnv extends Env = Env, TMethods extends AbilityMethodDefinitions = AbilityMethodDefinitions>(
+  definition: ServiceAbilityDefinition<TEnv, TMethods>,
+): ServiceAbilityDefinition<TEnv, TMethods> {
+  return definition;
 }
 
-export function serviceDiscoveryDocument(service: ServiceDefinition): ServiceDiscoveryDocument {
-  const routes = service.namespaces.flatMap((namespace) =>
-    namespaceRoutes(namespace).map((route) => ({
-      method: route.method,
-      path: route.path,
-      requiredScopes: route.requiredScopes,
-      visibility: route.visibility,
-    })),
-  );
-  const uniqueRoutes = [
-    ...routes
-      .reduce((merged, route) => {
-        const key = `${route.method} ${route.path} ${route.visibility}`;
-        const existing = merged.get(key);
-        const requiredScopes = [...new Set([...(existing?.requiredScopes ?? []), ...route.requiredScopes])];
-        merged.set(key, {
-          method: route.method,
-          path: route.path,
-          ...(requiredScopes.length > 0 ? { requiredScopes } : {}),
-          visibility: route.visibility,
-        });
-        return merged;
-      }, new Map<string, ServiceDiscoveryDocument['routes'][number]>())
-      .values(),
-  ];
+export function defineAbilityService<TEnv extends Env = Env>(
+  input: DefineServiceInput<TEnv>,
+  options: DefineServiceOptions = {},
+): ServiceDefinition<TEnv> {
+  const serviceId = normalizeValue(input.id, 'service id');
+  const service: ServiceDefinition<TEnv> = {
+    abilities: normalizeAbilities(input.abilities, input.capabilities, options.requireAbilityScopes ?? true),
+    ...(input.callerAuth ? { callerAuth: input.callerAuth } : {}),
+    ...(input.capabilities ? { capabilities: input.capabilities } : {}),
+    id: serviceId,
+    title: normalizeValue(input.title, 'service title'),
+    version: normalizeValue(input.version, 'service version'),
+  };
+  validateCallerAuthDiscovery(service);
+  return service;
+}
 
+export function serviceDiscoveryDocument<TEnv extends Env = Env>(service: ServiceDefinition<TEnv>): ServiceDiscoveryDocument {
   return {
+    abilities: service.abilities.map(abilityDiscovery),
+    ...(service.callerAuth ? { callerAuth: service.callerAuth } : {}),
     ...(service.capabilities ? { capabilities: service.capabilities } : {}),
     id: service.id,
-    routes: uniqueRoutes,
     title: service.title,
     version: service.version,
   };
 }
 
-export function mountDiscovery(
-  app: {
-    get(path: string, handler: (context: Context) => Response | Promise<Response>): unknown;
-  },
-  service: ServiceDefinition,
-  path = SERVICE_DISCOVERY_PATH,
-): void {
-  app.get(path, (context) => context.json(serviceDiscoveryDocument(service), 200));
+export function defaultAbilityRpcPath(abilityId: string): string {
+  return `/rpc/${abilityId}`;
 }
 
-function validateServiceDefinition(service: ServiceDefinition, options: DefineServiceOptions): void {
-  if (service.namespaces.length === 0) {
-    throw new CapabilityAuthError('Service-Plane service must define at least one namespace', 500);
-  }
-  const knownScopes = new Set(service.capabilities?.scopes.map((scope) => normalizeValue(scope.id, 'scope')) ?? []);
+export function createValidatingAbilityHandler<TEnv extends Env>(
+  ability: NormalizedServiceAbility<TEnv>,
+  handler: RpcTarget & Record<string, unknown>,
+  identity: CapabilityIdentity,
+): RpcTarget {
+  bindCapabilityIdentity(handler, identity);
 
-  for (const namespace of service.namespaces) {
-    if (!Array.isArray(namespace.app.routes)) {
-      throw new CapabilityAuthError('Service-Plane namespace app must expose Hono routes', 500);
-    }
-    const routes = namespaceRoutes(namespace);
-    const routesByKey = routes.reduce((merged, route) => {
-      const key = `${route.method} ${route.path}`;
-      const existing = merged.get(key) ?? [];
-      existing.push(route);
-      merged.set(key, existing);
-      return merged;
-    }, new Map<string, typeof routes>());
+  class ValidatingAbilityHandler extends RpcTarget {
+    async invoke(methodName: string, args: unknown[]): Promise<unknown> {
+      const method = ability.methods[methodName];
+      if (!method) throw new AbilityValidationError(`Unknown Service-Plane ability method: ${methodName}`, 404);
+      if (args.length !== 1) {
+        throw new AbilityValidationError(`Service-Plane ability method expects a single input object: ${methodName}`, 422);
+      }
 
-    for (const [key, matchingRoutes] of routesByKey) {
-      const [method, ...pathParts] = key.split(' ');
-      const path = pathParts.join(' ');
-      const requiredScopes = [...new Set(matchingRoutes.flatMap((route) => route.requiredScopes))];
-      if (options.requireRouteScopes && requiredScopes.length === 0) {
-        throw new CapabilityAuthError(`Service-Plane route is missing capability(...) annotation: ${method?.toUpperCase()} ${path}`, 500);
+      requireScopes(this, ...method.scopes);
+      const implementation = handler[methodName];
+      if (typeof implementation !== 'function') {
+        throw new AbilityValidationError(`Service-Plane ability handler does not implement method: ${methodName}`, 500);
       }
-      if (options.requireRouteScopes && matchingRoutes[0]?.requiredScopes.length === 0) {
-        throw new CapabilityAuthError(
-          `Service-Plane route must begin with capability(...) annotation: ${method?.toUpperCase()} ${path}`,
-          500,
-        );
-      }
-      if (requiredScopes.length > 0 && !service.capabilities) {
-        throw new CapabilityAuthError(
-          `Service-Plane route requires scopes but service has no capability catalog: ${method?.toUpperCase()} ${path}`,
-          500,
-        );
-      }
-      for (const scope of requiredScopes) {
-        if (!knownScopes.has(scope)) {
-          throw new CapabilityAuthError(`Service-Plane route requires unknown scope: ${scope}`, 500);
-        }
-      }
+
+      const input = await method.input.parseAsync(args[0]);
+      const output = await implementation.call(handler, input);
+      return method.output.parseAsync(output);
     }
   }
+
+  for (const methodName of Object.keys(ability.methods)) {
+    Object.defineProperty(ValidatingAbilityHandler.prototype, methodName, {
+      async value(this: ValidatingAbilityHandler, ...args: unknown[]) {
+        return this.invoke(methodName, args);
+      },
+    });
+  }
+
+  return bindCapabilityIdentity(new ValidatingAbilityHandler(), identity);
 }
 
-function namespaceRoutes(namespace: ServiceNamespaceDefinition): NamespaceRoute[] {
-  const routes = namespace.app.routes
-    .map((route, routeIndex) => ({
-      method: route.method.toUpperCase(),
-      path: joinPaths(namespace.prefix, route.path),
-      requiredScopes: routeRequiredScopes(route.handler),
-      routeIndex,
-      visibility: namespace.visibility,
-    }))
-    .filter((route) => route.path !== SERVICE_DISCOVERY_PATH);
-  const scopedMiddlewareRoutes = routes.filter((route) => route.method === 'ALL' && route.requiredScopes.length > 0);
+export { SERVICE_DISCOVERY_PATH };
 
-  return routes.map((route) => {
-    const inheritedScopes = scopedMiddlewareRoutes
-      .filter((middleware) => middleware.routeIndex < route.routeIndex && pathMatches(middleware.path, route.path))
-      .flatMap((middleware) => middleware.requiredScopes);
+function normalizeAbilities<TEnv extends Env>(
+  abilities: Array<AnyServiceAbilityDefinition<TEnv>>,
+  capabilities: CapabilityCatalog | undefined,
+  requireAbilityScopes: boolean,
+): NormalizedServiceAbility<TEnv>[] {
+  if (abilities.length === 0) {
+    throw new CapabilityAuthError('Service-Plane service must define at least one ability', 500);
+  }
+
+  const knownScopes = new Set(capabilities?.scopes.map((scope) => normalizeScope(scope.id)) ?? []);
+  const seenIds = new Set<string>();
+  const seenPaths = new Set<string>();
+
+  return abilities.map((ability) => {
+    const id = normalizeValue(ability.id, 'ability id');
+    if (seenIds.has(id)) throw new CapabilityAuthError(`Duplicate Service-Plane ability: ${id}`, 500);
+    seenIds.add(id);
+    if (typeof ability.handler !== 'function') {
+      throw new CapabilityAuthError(`Service-Plane ability requires a handler factory: ${id}`, 500);
+    }
+
+    const scopes = normalizeScopes(ability.scopes ?? []);
+    if (requireAbilityScopes && scopes.length === 0) {
+      throw new CapabilityAuthError(`Service-Plane ability is missing required scopes: ${id}`, 500);
+    }
+    validateKnownScopes(scopes, knownScopes, capabilities, `Service-Plane ability requires unknown scope`);
+
+    const methods = normalizeMethods(id, ability.methods, knownScopes, capabilities, requireAbilityScopes);
+    const path = normalizePath(ability.rpc?.path ?? defaultAbilityRpcPath(id), id);
+    if (seenPaths.has(path)) throw new CapabilityAuthError(`Duplicate Service-Plane ability RPC path: ${path}`, 500);
+    seenPaths.add(path);
+
     return {
-      ...route,
-      requiredScopes: [...new Set([...inheritedScopes, ...route.requiredScopes])],
+      ...ability,
+      auth: normalizeAbilityAuth(ability.auth ?? 'service', id),
+      exposure: normalizeAbilityExposure(ability.exposure ?? 'private', id),
+      id,
+      methods,
+      rpc: {
+        path,
+        transports: normalizeAbilityTransports(ability.rpc?.transports ?? ['http-batch']),
+      },
+      scopes,
     };
   });
+}
+
+function normalizeMethods(
+  abilityId: string,
+  methods: AbilityMethodDefinitions,
+  knownScopes: Set<string>,
+  capabilities: CapabilityCatalog | undefined,
+  requireAbilityScopes: boolean,
+): Record<string, NormalizedAbilityMethodDefinition> {
+  const names = Object.keys(methods);
+  if (names.length === 0) throw new CapabilityAuthError(`Service-Plane ability must define at least one method: ${abilityId}`, 500);
+
+  return Object.fromEntries(
+    names.map((methodName) => {
+      const name = normalizeValue(methodName, `method name for ${abilityId}`);
+      const method = methods[methodName];
+      if (!method) throw new CapabilityAuthError(`Service-Plane ability method is missing: ${abilityId}/${methodName}`, 500);
+      const scopes = normalizeScopes(method.scopes ?? []);
+      if (requireAbilityScopes && scopes.length === 0) {
+        throw new CapabilityAuthError(`Service-Plane ability method is missing required scopes: ${abilityId}/${name}`, 500);
+      }
+      validateKnownScopes(scopes, knownScopes, capabilities, `Service-Plane ability method requires unknown scope`);
+      const rest = method.rest ? normalizeRestProjection(abilityId, name, method.rest) : undefined;
+      const mcp = method.mcp ? normalizeMcpProjection(abilityId, name, method.mcp) : undefined;
+      return [
+        name,
+        {
+          ...method,
+          inputSchema: zodToJsonSchema(method.input, 'input', `${abilityId}/${name}`),
+          ...(mcp ? { mcp } : {}),
+          outputSchema: zodToJsonSchema(method.output, 'output', `${abilityId}/${name}`),
+          ...(rest ? { rest } : {}),
+          scopes,
+        },
+      ];
+    }),
+  );
+}
+
+function abilityDiscovery<TEnv extends Env>(ability: NormalizedServiceAbility<TEnv>): ServiceAbilityDiscovery {
+  return {
+    auth: ability.auth,
+    ...(ability.description ? { description: ability.description } : {}),
+    exposure: ability.exposure,
+    id: ability.id,
+    methods: Object.fromEntries(
+      Object.entries(ability.methods).map(([methodName, method]) => [
+        methodName,
+        {
+          inputSchema: method.inputSchema,
+          ...(method.mcp ? { mcp: method.mcp } : {}),
+          outputSchema: method.outputSchema,
+          ...(method.rest ? { rest: method.rest } : {}),
+          scopes: method.scopes,
+        } satisfies ServiceAbilityMethodDiscovery,
+      ]),
+    ),
+    rpc: ability.rpc,
+    scopes: ability.scopes,
+    ...(ability.title ? { title: ability.title } : {}),
+  };
+}
+
+function normalizeRestProjection(abilityId: string, methodName: string, rest: ServiceAbilityRestProjection): ServiceAbilityRestProjection {
+  return {
+    ...rest,
+    method: normalizeHttpMethod(rest.method),
+    operationId: rest.operationId
+      ? normalizeValue(rest.operationId, `REST operation id for ${abilityId}/${methodName}`)
+      : `${abilityId}.${methodName}`,
+    path: normalizePath(rest.path, `${abilityId}/${methodName}`),
+    ...(rest.tags ? { tags: normalizeTags(rest.tags, `${abilityId}/${methodName}`) } : {}),
+  };
+}
+
+function normalizeMcpProjection(abilityId: string, methodName: string, mcp: ServiceAbilityMcpProjection): ServiceAbilityMcpProjection {
+  return {
+    ...mcp,
+    name: normalizeValue(mcp.name, `MCP tool name for ${abilityId}/${methodName}`),
+  };
+}
+
+function validateCallerAuthDiscovery(service: Pick<ServiceDefinition, 'callerAuth'>): void {
+  if (!service.callerAuth) return;
+  for (const key of service.callerAuth.jwks.keys) {
+    if (containsPrivateJwkMaterial(key)) {
+      throw new CapabilityAuthError('Service-Plane caller-auth JWKS must not include private key material', 500);
+    }
+  }
+}
+
+function containsPrivateJwkMaterial(key: JsonWebKey): boolean {
+  return (
+    typeof key.d === 'string' ||
+    typeof key.dp === 'string' ||
+    typeof key.dq === 'string' ||
+    typeof key.k === 'string' ||
+    key.oth !== undefined ||
+    typeof key.p === 'string' ||
+    typeof key.q === 'string' ||
+    typeof key.qi === 'string'
+  );
+}
+
+function normalizeAbilityTransports(transports: AbilityTransport[]): AbilityTransport[] {
+  if (transports.length === 0) throw new CapabilityAuthError('Service-Plane ability must enable at least one transport', 500);
+  const normalized = [...new Set(transports)];
+  for (const transport of normalized) {
+    if (transport !== 'cloudflare-binding-rpc' && transport !== 'http-batch' && transport !== 'websocket') {
+      throw new CapabilityAuthError(`Unknown Service-Plane ability transport: ${transport as string}`, 500);
+    }
+  }
+  return normalized;
+}
+
+function normalizePath(path: string, source: string): string {
+  const normalized = path.trim();
+  if (!normalized.startsWith('/')) {
+    throw new CapabilityAuthError(`Service-Plane path must start with /: ${source}`, 500);
+  }
+  if (normalized.includes('?') || normalized.includes('#')) {
+    throw new CapabilityAuthError(`Service-Plane path must not include query or fragment: ${source}`, 500);
+  }
+  return normalized.replace(/\/+$/u, '') || '/';
+}
+
+function normalizeHttpMethod(method: ServiceHttpMethod): ServiceHttpMethod {
+  if (typeof method !== 'string') throw new CapabilityAuthError('Service-Plane REST method cannot be empty', 500);
+  const normalized = method.toLowerCase() as ServiceHttpMethod;
+  if (normalized !== 'delete' && normalized !== 'get' && normalized !== 'patch' && normalized !== 'post' && normalized !== 'put') {
+    throw new CapabilityAuthError(`Unknown Service-Plane REST method: ${method as string}`, 500);
+  }
+  return normalized;
+}
+
+function normalizeAbilityExposure(exposure: AbilityExposure, abilityId: string): AbilityExposure {
+  if (exposure !== 'private' && exposure !== 'published') {
+    throw new CapabilityAuthError(`Unknown Service-Plane ability exposure for ${abilityId}: ${String(exposure)}`, 500);
+  }
+  return exposure;
+}
+
+function normalizeAbilityAuth(auth: AbilityAuth, abilityId: string): AbilityAuth {
+  if (auth !== 'anonymous' && auth !== 'service' && auth !== 'user') {
+    throw new CapabilityAuthError(`Unknown Service-Plane ability auth for ${abilityId}: ${String(auth)}`, 500);
+  }
+  return auth;
+}
+
+function normalizeTags(tags: string[], source: string): string[] {
+  const normalized = [...new Set(tags.map((tag) => normalizeValue(tag, `REST tag for ${source}`)))];
+  if (normalized.length === 0) throw new CapabilityAuthError(`Service-Plane REST projection has an empty tag list: ${source}`, 500);
+  return normalized;
+}
+
+function normalizeScopes(scopes: string[]): string[] {
+  return [...new Set(scopes.map(normalizeScope))];
+}
+
+function normalizeScope(scope: string): string {
+  const normalized = scope.trim();
+  if (!normalized) throw new CapabilityAuthError('Service-Plane capability scope cannot be empty', 500);
+  if (normalized.includes('*')) throw new CapabilityAuthError('Service-Plane capability wildcards are not supported', 500);
+  return normalized;
+}
+
+function validateKnownScopes(
+  scopes: string[],
+  knownScopes: Set<string>,
+  capabilities: CapabilityCatalog | undefined,
+  message: string,
+): void {
+  if (scopes.length > 0 && !capabilities) {
+    throw new CapabilityAuthError('Service-Plane ability requires scopes but service has no capability catalog', 500);
+  }
+  for (const scope of scopes) {
+    if (!knownScopes.has(scope)) throw new CapabilityAuthError(`${message}: ${scope}`, 500);
+  }
 }
 
 function normalizeValue(value: string, field: string): string {
   const normalized = value.trim();
   if (!normalized) throw new CapabilityAuthError(`Service-Plane ${field} cannot be empty`, 500);
   return normalized;
+}
+
+function zodToJsonSchema(schema: AbilitySchema, io: 'input' | 'output', source: string): OpenApiObject {
+  try {
+    return z.toJSONSchema(schema, { io }) as OpenApiObject;
+  } catch (error) {
+    throw new CapabilityAuthError(
+      `Service-Plane ability schema cannot be represented as JSON Schema for ${source}: ${error instanceof Error ? error.message : String(error)}`,
+      500,
+    );
+  }
 }

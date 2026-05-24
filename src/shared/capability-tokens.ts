@@ -1,5 +1,13 @@
-import { decode, sign, verifyWithJwks } from 'hono/jwt';
+import { sign } from 'hono/jwt';
 import { CapabilityAuthError } from './errors.js';
+import {
+  decodeServicePlaneJwkToken,
+  publicJwkFromPrivateJwk,
+  randomServicePlaneJwkId,
+  SERVICE_PLANE_JWK_ALGORITHM,
+  servicePlaneJwkSigningKey,
+  verifyServicePlaneJwkSignature,
+} from './jwk-auth.js';
 import {
   type CapabilityClaims,
   type CapabilityIdentity,
@@ -11,10 +19,11 @@ import {
   type VerifyCapabilityTokenOptions,
 } from './types.js';
 
-const JWS_ALGORITHM = 'ES256';
 const MAX_CAPABILITY_TOKEN_LENGTH = 8192;
 const MAX_CAPABILITY_CLAIM_STRING_LENGTH = 512;
 const MAX_CAPABILITY_SCOPE_COUNT = 128;
+
+export { publicJwkFromPrivateJwk };
 
 export type SignCapabilityTokenOptions = {
   claims: Omit<CapabilityClaims, 'exp' | 'iat' | 'jti' | 'nbf'> & Partial<Pick<CapabilityClaims, 'jti'>>;
@@ -33,21 +42,13 @@ export async function signCapabilityToken(options: SignCapabilityTokenOptions): 
     ...options.claims,
     exp: expiresAtSeconds,
     iat: issuedAt,
-    jti: options.claims.jti ?? randomId(),
+    jti: options.claims.jti ?? randomServicePlaneJwkId(),
     nbf: issuedAt,
-  };
-
-  const signingKey = {
-    ...options.privateJwk,
-    alg: JWS_ALGORITHM,
-    kid: options.keyId,
-    key_ops: ['sign'],
-    use: 'sig',
   };
 
   return {
     expiresAt: new Date(expiresAtSeconds * 1000),
-    token: await sign(claims, signingKey, JWS_ALGORITHM),
+    token: await sign(claims, servicePlaneJwkSigningKey(options.privateJwk, options.keyId), SERVICE_PLANE_JWK_ALGORITHM),
   };
 }
 
@@ -58,7 +59,7 @@ export async function verifyCapabilityToken(token: string, options: VerifyCapabi
   if (parts.length !== 3 || !parts[0] || !parts[1] || !parts[2]) throw new CapabilityAuthError('Invalid Service-Plane capability token');
 
   const { header, payload } = decodeCapabilityToken(token);
-  if (!isRecord(header) || header.alg !== JWS_ALGORITHM || typeof header.kid !== 'string') {
+  if (!isRecord(header) || header.alg !== SERVICE_PLANE_JWK_ALGORITHM || typeof header.kid !== 'string') {
     throw new CapabilityAuthError('Invalid Service-Plane capability token header');
   }
 
@@ -106,27 +107,12 @@ export function decodeCapabilityTokenPayload(token: string): CapabilityClaims {
   return parseCapabilityClaims(decodeCapabilityToken(token).payload);
 }
 
-export function publicJwkFromPrivateJwk(privateJwk: JsonWebKey, keyId: string): JsonWebKey & { kid?: string } {
-  const { d: _d, ...publicJwk } = privateJwk;
-  return {
-    ...publicJwk,
-    alg: JWS_ALGORITHM,
-    kid: keyId,
-    key_ops: ['verify'],
-    use: 'sig',
-  };
-}
-
 async function resolveJwks(jwks: VerifyCapabilityTokenOptions['jwks']): Promise<CapabilityJwks> {
   return typeof jwks === 'function' ? jwks() : jwks;
 }
 
 function decodeCapabilityToken(token: string): { header: unknown; payload: unknown } {
-  try {
-    return decode(token);
-  } catch {
-    throw new CapabilityAuthError('Invalid Service-Plane capability token encoding');
-  }
+  return decodeServicePlaneJwkToken(token, 'Invalid Service-Plane capability token encoding');
 }
 
 function parseCapabilityClaims(value: unknown): CapabilityClaims {
@@ -167,22 +153,9 @@ function isBoundedClaimString(value: string): boolean {
   return value.length > 0 && value.length <= MAX_CAPABILITY_CLAIM_STRING_LENGTH;
 }
 
-function randomId(): string {
-  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
-  return Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, '0')).join('');
-}
-
 async function verifyTokenSignature(token: string, jwks: CapabilityJwks): Promise<void> {
   try {
-    await verifyWithJwks(token, {
-      allowedAlgorithms: [JWS_ALGORITHM],
-      keys: jwks.keys,
-      verification: {
-        exp: false,
-        iat: false,
-        nbf: false,
-      },
-    });
+    await verifyServicePlaneJwkSignature(token, jwks);
   } catch {
     throw new CapabilityAuthError('Invalid Service-Plane capability signature');
   }

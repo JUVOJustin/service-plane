@@ -1,8 +1,25 @@
+import { newRpcResponse } from '@hono/capnweb';
 import { type Context, type Env, Hono } from 'hono';
 import { type RequestIdVariables, requestId } from 'hono/request-id';
-import { type RegistryCache, SERVICE_PLANE_REQUEST_ID_HEADER, type ServiceEndpoint, type ServiceGrant } from '../shared/types.js';
+import type { UpgradeWebSocket } from 'hono/ws';
+import {
+  type RegistryCache,
+  SERVICE_PLANE_OPENAPI_PATH,
+  SERVICE_PLANE_REQUEST_ID_HEADER,
+  SERVICE_PLANE_SWAGGER_PATH,
+  type ServiceEndpoint,
+  type ServiceGrant,
+} from '../shared/types.js';
+import { type BrokerCaller, createControlPlaneRpcBroker } from './broker.js';
 import { type CapabilityIssuer, type MountCapabilityEndpointsOptions, mountCapabilityEndpoints } from './capabilities.js';
-import { type ControlPlaneProxyOptions, createControlPlaneProxy } from './proxy.js';
+import { createControlPlaneMcpBroker, DEFAULT_MCP_PATH } from './mcp.js';
+import {
+  type ControlPlaneOpenApiOptions,
+  controlPlaneOpenApiCacheKey,
+  DEFAULT_OPENAPI_CACHE_TTL_SECONDS,
+  generateControlPlaneOpenApi,
+  swaggerUiHtml,
+} from './openapi.js';
 import { createServiceRegistry } from './registry.js';
 import { type IssueCapabilityTokenForCallerInput, issueCapabilityTokenForCaller, type RpcIssuedCapabilityToken } from './rpc.js';
 import { createCapabilityIssuerFromSigningSecret } from './signing-secret.js';
@@ -12,28 +29,37 @@ type ServicePlaneControlPlaneEnv<TEnv extends Env> = TEnv & {
 };
 
 type ServicePlaneRequestIdOptions = NonNullable<Parameters<typeof requestId>[0]>;
-type RegistryCacheKeyResolver<TEnv extends Env> =
-  | string
-  | ((context: Context<TEnv>, services: ServiceEndpoint[]) => Promise<string> | string);
 
 export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
   app?: Hono<TEnv>;
   authenticateCaller?: MountCapabilityEndpointsOptions['authenticateCaller'];
+  broker?:
+    | false
+    | {
+        cache?: RegistryCache;
+        caller?: (context: Context<TEnv>) => BrokerCaller | Promise<BrokerCaller | undefined> | undefined;
+        path?: string;
+        upgradeWebSocket?: UpgradeWebSocket;
+      };
+  controlPlaneServiceId?: string;
   issuer?: string;
   keyId?: string;
-  proxy?:
+  mcp?:
     | false
-    | (Omit<ControlPlaneProxyOptions, 'capabilityToken' | 'registry'> & {
+    | {
         cache?: RegistryCache;
-        cacheKey?: RegistryCacheKeyResolver<TEnv>;
-      });
+        caller?: (context: Context<TEnv>) => BrokerCaller | Promise<BrokerCaller | undefined> | undefined;
+        path?: string;
+        upgradeWebSocket?: UpgradeWebSocket;
+      };
+  openapi?: false | ControlPlaneOpenApiOptions;
   requestId?: ServicePlaneRequestIdOptions;
   services: (context: Context<TEnv>) => ServiceEndpoint[] | Promise<ServiceEndpoint[]>;
   signingSecret: (bindings: TEnv['Bindings'], context: Context<TEnv>) => string | Promise<string>;
   ttlSeconds?: number;
 };
 
-// Provides the default control-plane wiring: STS endpoints, registry discovery, and public/auth proxying.
+// ServicePlaneControlPlane is now only STS/JWKS plus an optional Cap'n Web broker.
 export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   readonly app: Hono<ServicePlaneControlPlaneEnv<TEnv>>;
   private readonly issuers = new Map<string, Promise<CapabilityIssuer>>();
@@ -53,35 +79,16 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       authenticateCaller: options.authenticateCaller ?? missingAuthenticateCaller,
     });
 
-    if (options.proxy !== false) {
-      const proxyOptions = options.proxy ?? {};
-      this.app.use('*', async (context, next) => {
-        const services = await options.services(context as Context<TEnv>);
-        const registry = createServiceRegistry({
-          ...(proxyOptions.cache
-            ? {
-                cache: proxyOptions.cache,
-                cacheKey: await resolveRegistryCacheKey(proxyOptions.cacheKey, context as Context<TEnv>, services),
-              }
-            : {}),
-          services,
-        });
-        const { cache: _cache, cacheKey: _cacheKey, ...controlPlaneProxyOptions } = proxyOptions;
-        return createControlPlaneProxy({
-          ...controlPlaneProxyOptions,
-          capabilityToken: async (_capabilityContext, route) => {
-            const issuer = await this.issuerFor(context as Context<TEnv>, services);
-            const issued = await issuer.issueCapabilityToken({
-              callerServiceId: 'control-plane',
-              scopes: route.requiredScopes ?? [],
-              targetServiceId: route.serviceId,
-            });
-            return issued.token;
-          },
-          requestIdHeaderName: options.requestId?.headerName ?? SERVICE_PLANE_REQUEST_ID_HEADER,
-          registry,
-        })(context, next);
-      });
+    if (options.openapi !== false) {
+      this.mountOpenApi(options.openapi ?? {});
+    }
+
+    if (options.broker) {
+      this.mountBroker(options.broker);
+    }
+
+    if (options.mcp !== false) {
+      this.mountMcp(options.mcp ?? {});
     }
   }
 
@@ -94,6 +101,83 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   ): Promise<RpcIssuedCapabilityToken> {
     const context = { env: bindings } as Context<TEnv>;
     return issueCapabilityTokenForCaller(await this.issuerFor(context), callerServiceId, input);
+  }
+
+  private mountBroker(brokerOptions: Exclude<ServicePlaneControlPlaneOptions<TEnv>['broker'], false | undefined>): void {
+    const path = brokerOptions.path ?? '/rpc/broker';
+    this.app.all(path, async (context) => {
+      const services = await this.options.services(context as Context<TEnv>);
+      const issuer = await this.issuerFor(context as Context<TEnv>, services);
+      const registry = createServiceRegistry({
+        ...(brokerOptions.cache ? { cache: brokerOptions.cache } : {}),
+        services,
+      });
+      const broker = createControlPlaneRpcBroker({
+        controlPlaneServiceId: this.options.controlPlaneServiceId ?? 'control-plane',
+        issuer,
+        registry,
+      });
+      const caller = await brokerOptions.caller?.(context as Context<TEnv>);
+      return newRpcResponse(
+        context,
+        broker.rootCapability(caller),
+        brokerOptions.upgradeWebSocket ? { upgradeWebSocket: brokerOptions.upgradeWebSocket } : undefined,
+      );
+    });
+  }
+
+  private mountMcp(mcpOptions: Exclude<ServicePlaneControlPlaneOptions<TEnv>['mcp'], false | undefined>): void {
+    const path = mcpOptions.path ?? DEFAULT_MCP_PATH;
+    this.app.all(path, async (context) => {
+      const services = await this.options.services(context as Context<TEnv>);
+      const issuer = await this.issuerFor(context as Context<TEnv>, services);
+      const registry = createServiceRegistry({
+        ...(mcpOptions.cache ? { cache: mcpOptions.cache } : {}),
+        services,
+      });
+      const caller = await mcpOptions.caller?.(context as Context<TEnv>);
+      const broker = createControlPlaneMcpBroker({
+        ...(caller ? { caller } : {}),
+        controlPlaneServiceId: this.options.controlPlaneServiceId ?? 'control-plane',
+        issuer,
+        registry,
+      });
+      return newRpcResponse(
+        context,
+        broker.rootCapability(),
+        mcpOptions.upgradeWebSocket ? { upgradeWebSocket: mcpOptions.upgradeWebSocket } : undefined,
+      );
+    });
+  }
+
+  private mountOpenApi(openApiOptions: ControlPlaneOpenApiOptions): void {
+    const path = openApiOptions.path ?? SERVICE_PLANE_OPENAPI_PATH;
+    this.app.get(path, async (context) => {
+      const services = await this.options.services(context as Context<TEnv>);
+      const cacheKey = openApiOptions.cacheKey ?? controlPlaneOpenApiCacheKey(services, openApiOptions);
+      const cached = await openApiOptions.cache?.get(cacheKey);
+      if (cached) return context.json(cached);
+
+      const snapshot = await createServiceRegistry({ services }).discover();
+      const document = generateControlPlaneOpenApi({
+        ...(openApiOptions.description ? { description: openApiOptions.description } : {}),
+        ...(openApiOptions.servers ? { servers: openApiOptions.servers } : {}),
+        snapshot,
+        ...(openApiOptions.title ? { title: openApiOptions.title } : {}),
+        ...(openApiOptions.version ? { version: openApiOptions.version } : {}),
+      });
+      await openApiOptions.cache?.set(cacheKey, document, openApiOptions.cacheTtlSeconds ?? DEFAULT_OPENAPI_CACHE_TTL_SECONDS);
+      return context.json(document);
+    });
+
+    const swagger = openApiOptions.swagger;
+    if (swagger !== false) {
+      const swaggerPath = swagger?.path ?? SERVICE_PLANE_SWAGGER_PATH;
+      this.app.get(swaggerPath, (context) => {
+        const title = swagger?.title ?? openApiOptions.title;
+        return context.html(swaggerUiHtml({ openApiPath: path, ...(title ? { title } : {}) }));
+      });
+    }
   }
 
   private async issuerFor(context: Context<TEnv>, services?: ServiceEndpoint[]): Promise<CapabilityIssuer> {
@@ -144,25 +228,6 @@ function missingAuthenticateCaller(context: Context): Response {
 function requestIdFromContext(context: Context): string | undefined {
   const value = context.get('requestId' as never) as unknown;
   return typeof value === 'string' ? value : undefined;
-}
-
-async function resolveRegistryCacheKey<TEnv extends Env>(
-  resolver: RegistryCacheKeyResolver<TEnv> | undefined,
-  context: Context<TEnv>,
-  services: ServiceEndpoint[],
-): Promise<string> {
-  if (typeof resolver === 'function') return resolver(context, services);
-  if (typeof resolver === 'string') return resolver;
-  return `service-plane:registry:${JSON.stringify(services.map(registryCacheKeyServicePart))}`;
-}
-
-function registryCacheKeyServicePart(service: ServiceEndpoint): unknown {
-  return {
-    discovery: typeof service.discovery === 'function' ? '[dynamic]' : (service.discovery ?? null),
-    grants: service.grants ?? [],
-    id: service.id,
-    origin: service.origin,
-  };
 }
 
 async function discoverServiceCapabilities(services: ServiceEndpoint[]) {

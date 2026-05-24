@@ -1,24 +1,35 @@
-export { mergeServiceOpenApi, type OpenApiDocument } from '../shared/openapi.js';
 export type {
+  AbilityAuth,
+  AbilityExposure,
+  AbilityTransport,
   CapabilityCatalog,
   CapabilityClaims,
   CapabilityJwks,
   CapabilityScopeDefinition,
-  DiscoveredServiceRoute,
+  DiscoveredServiceAbility,
   FetchLike,
   IssueCapabilityTokenInput,
   IssuedCapabilityToken,
+  McpDiscoveryDocument,
+  McpToolDiscovery,
+  OpenApiDocument,
+  OpenApiDocumentCache,
+  OpenApiObject,
   RegistryCache,
+  ServiceAbilityDiscovery,
+  ServiceAbilityMcpProjection,
+  ServiceAbilityMethodDiscovery,
+  ServiceAbilityRestProjection,
+  ServiceCallerAuthDiscovery,
   ServiceDiscoveryDocument,
   ServiceDiscoverySnapshot,
   ServiceEndpoint,
   ServiceEndpointGrant,
   ServiceGrant,
   ServiceGrantDefinition,
+  ServiceHttpMethod,
   ServiceRegistry,
   ServiceRegistrySnapshot,
-  ServiceRouteDiscovery,
-  ServiceRouteVisibility,
 } from '../shared/types.js';
 export {
   DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
@@ -28,20 +39,28 @@ export {
   SERVICE_PLANE_AUTHORIZATION_SCHEME,
   SERVICE_PLANE_CAPABILITY_JWKS_PATH,
   SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
+  SERVICE_PLANE_MCP_PATH,
+  SERVICE_PLANE_OPENAPI_PATH,
   SERVICE_PLANE_REQUEST_ID_HEADER,
+  SERVICE_PLANE_SWAGGER_PATH,
 } from '../shared/types.js';
 export {
-  generateServiceClientSecret,
+  type BrokerCaller,
+  type ControlPlaneRpcBroker,
+  type CreateControlPlaneRpcBrokerOptions,
+  createControlPlaneRpcBroker,
+} from './broker.js';
+export {
+  generateHmacClientSecret,
   type HmacServiceClient,
   type HmacServiceClientAuthLogEvent,
   type HmacServiceClientAuthOptions,
   type HmacServiceClientReplayCache,
-  hashServiceClientSecret,
   hmacServiceClientAuth,
-  type ServiceClientCredential,
-  type ServiceClientCredentialsAuthLogEvent,
-  type ServiceClientCredentialsAuthOptions,
-  serviceClientCredentialsAuth,
+  type JwkServiceClient,
+  type JwkServiceClientAuthLogEvent,
+  type JwkServiceClientAuthOptions,
+  jwkServiceClientAuth,
 } from './caller-auth.js';
 export {
   type CapabilityIssuer,
@@ -70,9 +89,21 @@ export {
   serviceDiscoveryRequest,
 } from './endpoints.js';
 export {
-  type ControlPlaneProxyOptions,
-  createControlPlaneProxy,
-} from './proxy.js';
+  type ControlPlaneMcpBroker,
+  type ControlPlaneMcpBrokerOptions,
+  type ControlPlaneMcpOptions,
+  createControlPlaneMcpBroker,
+  DEFAULT_MCP_PATH,
+  generateMcpDiscovery,
+} from './mcp.js';
+export {
+  type ControlPlaneOpenApiOptions,
+  controlPlaneOpenApiCacheKey,
+  DEFAULT_OPENAPI_CACHE_TTL_SECONDS,
+  type GenerateControlPlaneOpenApiOptions,
+  generateControlPlaneOpenApi,
+  swaggerUiHtml,
+} from './openapi.js';
 export {
   type CreateServiceRegistryOptions,
   createServiceRegistry,

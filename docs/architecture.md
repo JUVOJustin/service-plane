@@ -1,79 +1,96 @@
 # Architecture
 
-`service-plane` models a system with a public control plane and independently owned service routers.
+Goal: understand what Service Plane adds, where Cap'n Web fits, and which layer owns auth and validation.
 
-The control plane owns public ingress, global authentication, docs, service grants, and STS token issuance. Each service owns its Hono routes, internal APIs, workflows, storage, provider-specific validation, and capability scope catalog.
+The smallest useful setup has three pieces:
 
-## Runtime Shape
+- A service defines abilities.
+- A control plane issues short-lived tokens and aggregates discovery metadata.
+- A caller opens an ability session and invokes methods.
+
+## Why Service Plane Exists
+
+Normal service APIs often split into REST routes, internal RPC, OpenAPI files, custom auth checks, and separate tool metadata. Service Plane keeps those concerns tied to one source of truth: the ability.
+
+An ability is a schema-backed RPC surface owned by a service. Each method declares:
+
+- one Zod input schema
+- one Zod output schema
+- required scopes
+- optional REST metadata
+- optional MCP metadata
+
+The schemas power runtime validation, service discovery, OpenAPI generation, and MCP tool metadata.
+
+## Request Flow
 
 ```mermaid
 sequenceDiagram
-  participant Target as Target Service
-  participant Control as Control Plane STS
-  participant Caller as Caller Service
+  participant Caller as Caller
+  participant Plane as Control Plane
+  participant Service as Service
+  participant Handler as Ability Handler
 
-  Target-->>Control: Discovery document with routes and required scopes
-  Note over Control: Code grants caller -> target scopes
-  Caller->>Control: Request token for target and scopes
-  Control->>Control: Validate caller, target, scopes, and grant
-  Control-->>Caller: Short-lived ES256 JWS capability token
-  Caller->>Target: Direct Service Binding, Worker RPC, or HTTPS call with token
-  Target->>Target: capability(...) verifies signature, audience, expiry, and scope
-  Target-->>Caller: Response
+  Caller->>Plane: Request token<br/>caller, service, scopes
+  Plane->>Plane: Check grants
+  Plane-->>Caller: Short-lived ServicePlane token
+  Caller->>Service: Open /rpc/asana.tasks
+  Caller->>Service: authenticate(token)
+  Service->>Service: Verify issuer, audience, expiry, signature
+  Service-->>Caller: Validating ability RPC object
+  Caller->>Service: createTask(input)
+  Service->>Service: Validate input and scopes
+  Service->>Handler: createTask(validInput)
+  Handler-->>Service: output
+  Service->>Service: Validate output
+  Service-->>Caller: result
 ```
 
-The control plane is on the token issuance path, not the request data path. Cloudflare-internal services can call each other directly through Service Bindings or Worker RPC. External Hono services use HTTPS with the same token verifier.
+## What Cap'n Web Does
 
-Token verification is local once the service has the control plane public JWKS. `jwksFromServiceBinding(...)` and `jwksFromUrl(...)` cache that public key set in memory, so services do not need JWKS in their Worker config. Caller-side token caching only reduces repeated token issuance calls to the control plane. The default cache is in-memory, and high-throughput Cloudflare Workers can provide a Cache API or KV adapter without adding a separate cache service.
+Cap'n Web is the RPC engine. It lets callers invoke methods on remote objects through HTTP-batch, WebSocket, or Cloudflare RPC-style bindings.
 
-## Primitives
+Service Plane uses Cap'n Web for the method call transport, then adds the service model around it:
 
-**Service**
-
-A service is a runtime unit with an id, title, version, and one or more route namespaces.
-
-**Namespace**
-
-A namespace binds one Hono app to a visibility level and path prefix.
-
-```ts
-defineNamespace({
-  app: routes,
-  prefix: '/providers/example',
-  visibility: 'internal',
-});
+```mermaid
+flowchart TD
+  Hono["Hono shell"] --> Middleware["HTTP middleware<br/>CORS, request ids, logging, rate limits"]
+  Middleware --> Endpoint["/rpc/<abilityId>"]
+  Endpoint --> CapnWeb["Cap'n Web RPC"]
+  CapnWeb --> Auth["authenticate(token)"]
+  Auth --> Wrapper["Service Plane ability wrapper"]
+  Wrapper --> ZodIn["Zod input validation"]
+  ZodIn --> Scopes["Scope check"]
+  Scopes --> Handler["Handler method"]
+  Handler --> ZodOut["Zod output validation"]
 ```
 
-**Discovery document**
+Hono middleware sees the HTTP or WebSocket request. Cap'n Web sees the logical method call. That is why method auth and validation live in the Service Plane RPC wrapper, not in Hono middleware.
 
-Every service can expose `/.well-known/service-plane/service.json`. The document is generated from its namespaces, Hono route table, route capability annotations, and optional capability catalog.
+## Discovery And Projections
 
-**Capability catalog**
+Services publish metadata at `/.well-known/service-plane/service.json`. The control plane fetches that metadata, validates grants, and builds projections.
 
-A service defines operation-level scopes such as `fizzy.users.lookup`. Scopes are owned by the target service, not by the caller.
+```mermaid
+flowchart LR
+  Asana["Asana service<br/>abilities + schemas"] --> Registry["Control plane registry"]
+  ClickUp["ClickUp service<br/>abilities + schemas"] --> Registry
+  Moco["Moco service<br/>abilities + schemas"] --> Registry
+  Registry --> OpenAPI["/openapi.json<br/>/swagger"]
+  Registry --> MCP["/rpc/mcp<br/>MCP tools"]
+  Registry --> Grants["STS grants<br/>scope checks"]
+```
 
-**Capability route annotation**
+Only `exposure: 'published'` methods with REST metadata enter OpenAPI. Only published methods with MCP metadata enter MCP. Private abilities remain available for service-to-service calls and grant validation, but they are not user-facing projections.
 
-`capability('fizzy.users.lookup')` is both the route annotation and the runtime guard. It adds required scope metadata to discovery and verifies incoming STS tokens when the route runs.
+## Core Terms
 
-**Control-plane STS**
+- Ability: schema-backed API surface owned by a service.
+- Method: one callable operation on an ability.
+- Handler: implementation object returned by the ability factory.
+- Context: runtime access such as Hono context, env, bindings, and execution context.
+- Identity: verified caller, user, tenant, connection, and scope claims.
+- Private: service-to-service ability, excluded from OpenAPI and MCP.
+- Published: ability eligible for OpenAPI, Swagger, MCP, or user-facing transports.
 
-The control plane issues short-lived ES256 JWS capability tokens. Grants are code-first: caller, target, and allowed scopes are explicitly listed.
-
-The STS private key is not shared with services. Services verify tokens with the public JWKS published by the control plane, so a caller cannot mint or alter its own token.
-
-**Control-plane registry**
-
-The registry fetches discovery documents from configured service endpoints. Endpoints may be Cloudflare Service Bindings or normal HTTPS services.
-
-**Control-plane proxy**
-
-The proxy routes matching requests to services. It never proxies `internal` routes publicly.
-
-**Control-plane proxy tokens**
-
-When the control plane proxies a route with `requiredScopes`, it attaches an STS token for the target service. The service verifies the token the same way it verifies direct service-to-service calls.
-
-## What This Package Does Not Own
-
-`service-plane` does not own connection storage, workflow engines, tenant databases, or provider SDKs. Those stay service-local. A future optional connections layer can be added if the pattern proves reusable across services.
+Next: [create a service](service-creation.md), then [create a control plane](plane-creation.md).

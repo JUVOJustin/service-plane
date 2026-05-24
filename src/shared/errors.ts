@@ -14,3 +14,10 @@ export class CapabilityAuthError extends ServicePlaneError {
     this.name = 'CapabilityAuthError';
   }
 }
+
+export class AbilityValidationError extends ServicePlaneError {
+  constructor(message: string, status = 422) {
+    super(message, status);
+    this.name = 'AbilityValidationError';
+  }
+}
