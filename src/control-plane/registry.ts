@@ -26,9 +26,9 @@ export type CreateServiceRegistryOptions = {
 };
 
 export function createServiceRegistry(options: CreateServiceRegistryOptions): ServiceRegistry {
-  const cacheKey = options.cacheKey ?? 'service-plane:registry';
-  const cacheTtlSeconds = options.cacheTtlSeconds ?? DEFAULT_REGISTRY_CACHE_TTL_SECONDS;
   const discoveryPath = options.discoveryPath ?? SERVICE_DISCOVERY_PATH;
+  const cacheKey = options.cacheKey ?? serviceRegistryCacheKey(options.services, discoveryPath);
+  const cacheTtlSeconds = options.cacheTtlSeconds ?? DEFAULT_REGISTRY_CACHE_TTL_SECONDS;
   const endpointsById = new Map(options.services.map((endpoint) => [endpoint.id, endpoint] as const));
 
   return {
@@ -60,6 +60,19 @@ export function createServiceRegistry(options: CreateServiceRegistryOptions): Se
       return endpointsById.get(id);
     },
   };
+}
+
+export function serviceRegistryCacheKey(services: ServiceEndpoint[], discoveryPath = SERVICE_DISCOVERY_PATH): string {
+  return JSON.stringify({
+    discoveryPath,
+    namespace: 'service-plane:registry',
+    services: services
+      .map((service) => ({
+        id: service.id,
+        origin: service.origin,
+      }))
+      .sort((left, right) => `${left.id}\u0000${left.origin}`.localeCompare(`${right.id}\u0000${right.origin}`)),
+  });
 }
 
 type DiscoveredDocument = {

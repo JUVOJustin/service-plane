@@ -225,7 +225,7 @@ function normalizeAbilities<TEnv extends Env>(
     }
     validateKnownScopes(scopes, knownScopes, capabilities, `Service-Plane ability requires unknown scope`);
 
-    const methods = normalizeMethods(id, ability.methods, knownScopes, capabilities, requireAbilityScopes);
+    const methods = normalizeMethods(id, ability.methods, scopes, knownScopes, capabilities, requireAbilityScopes);
     const path = normalizePath(ability.rpc?.path ?? defaultAbilityRpcPath(id), id);
     if (seenPaths.has(path)) throw new CapabilityAuthError(`Duplicate Service-Plane ability RPC path: ${path}`, 500);
     seenPaths.add(path);
@@ -248,6 +248,7 @@ function normalizeAbilities<TEnv extends Env>(
 function normalizeMethods(
   abilityId: string,
   methods: AbilityMethodDefinitions,
+  abilityScopes: string[],
   knownScopes: Set<string>,
   capabilities: CapabilityCatalog | undefined,
   requireAbilityScopes: boolean,
@@ -265,6 +266,7 @@ function normalizeMethods(
         throw new CapabilityAuthError(`Service-Plane ability method is missing required scopes: ${abilityId}/${name}`, 500);
       }
       validateKnownScopes(scopes, knownScopes, capabilities, `Service-Plane ability method requires unknown scope`);
+      validateMethodScopesDeclaredByAbility(abilityId, name, scopes, abilityScopes);
       const rest = method.rest ? normalizeRestProjection(abilityId, name, method.rest) : undefined;
       const mcp = method.mcp ? normalizeMcpProjection(abilityId, name, method.mcp) : undefined;
       return [
@@ -280,6 +282,22 @@ function normalizeMethods(
       ];
     }),
   );
+}
+
+function validateMethodScopesDeclaredByAbility(
+  abilityId: string,
+  methodName: string,
+  methodScopes: string[],
+  abilityScopes: string[],
+): void {
+  const declared = new Set(abilityScopes);
+  const missing = methodScopes.find((scope) => !declared.has(scope));
+  if (missing) {
+    throw new CapabilityAuthError(
+      `Service-Plane ability method requires scope not declared by ability: ${abilityId}/${methodName} -> ${missing}`,
+      500,
+    );
+  }
 }
 
 function abilityDiscovery<TEnv extends Env>(ability: NormalizedServiceAbility<TEnv>): ServiceAbilityDiscovery {

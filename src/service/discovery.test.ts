@@ -146,6 +146,25 @@ describe('ability service discovery', () => {
         version: '0.1.0',
       }),
     ).toThrow('Service-Plane ability method is missing required scopes: example.unscoped-method/run');
+
+    expect(() =>
+      defineAbilityService({
+        abilities: [
+          defineAbility({
+            id: 'example.scope-mismatch',
+            methods: {
+              run: abilityMethod({ input: z.object({}), output: z.object({}), scopes: ['example.sync.run'] }),
+            },
+            scopes: ['example.search'],
+            handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
+          }),
+        ],
+        capabilities,
+        id: 'example',
+        title: 'Example',
+        version: '0.1.0',
+      }),
+    ).toThrow('Service-Plane ability method requires scope not declared by ability: example.scope-mismatch/run -> example.sync.run');
   });
 
   it('defaults abilities to private service auth', () => {

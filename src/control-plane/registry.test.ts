@@ -75,6 +75,50 @@ describe('service registry', () => {
     expect(fetches).toBe(2);
   });
 
+  it('namespaces the default cache key by resolved service set', async () => {
+    const cache = memoryRegistryCache();
+    let exampleFetches = 0;
+    let otherFetches = 0;
+    const otherDocument: ServiceDiscoveryDocument = {
+      ...document,
+      capabilities: { scopes: [{ id: 'other.sync.run' }], serviceId: 'other' },
+      id: 'other',
+      title: 'Other',
+    };
+
+    const example = createServiceRegistry({
+      cache,
+      services: [
+        httpsService({
+          baseUrl: 'https://example.internal',
+          fetch: async () => {
+            exampleFetches += 1;
+            return Response.json(document);
+          },
+          id: 'example',
+        }),
+      ],
+    });
+    const other = createServiceRegistry({
+      cache,
+      services: [
+        httpsService({
+          baseUrl: 'https://other.internal',
+          fetch: async () => {
+            otherFetches += 1;
+            return Response.json(otherDocument);
+          },
+          id: 'other',
+        }),
+      ],
+    });
+
+    await expect(example.discover()).resolves.toMatchObject({ services: [{ id: 'example' }] });
+    await expect(other.discover()).resolves.toMatchObject({ services: [{ id: 'other' }] });
+    expect(exampleFetches).toBe(1);
+    expect(otherFetches).toBe(1);
+  });
+
   it('uses inline discovery and omits malformed documents', async () => {
     const registry = createServiceRegistry({
       services: [
