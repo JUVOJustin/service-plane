@@ -8,12 +8,14 @@ import {
   SERVICE_PLANE_CAPABILITY_JWKS_PATH,
   SERVICE_PLANE_MCP_PATH,
   type ServiceAbilityDiscovery,
+  type ServiceEndpoint,
+  type ServiceRegistrySnapshot,
 } from '../shared/types.js';
 import type { BrokerCaller } from './broker.js';
 import type { CapabilityIssuer } from './capabilities.js';
 import { ServicePlaneControlPlane } from './control-plane.js';
 import { cloudflareServiceBinding } from './endpoints.js';
-import { handleControlPlaneMcpRequest, MCP_PROTOCOL_VERSION } from './mcp.js';
+import { generateMcpDiscovery, handleControlPlaneMcpRequest, MCP_PROTOCOL_VERSION } from './mcp.js';
 import { createServiceRegistry } from './registry.js';
 import { generateCapabilitySigningSecret } from './signing-secret.js';
 
@@ -969,5 +971,63 @@ describe('handleControlPlaneMcpRequest protocol plumbing', () => {
     const body = (await response.json()) as { error?: { code: number }; result?: { isError?: boolean } };
     // The unreachable endpoint fails during the call, which is reported as a tool execution failure.
     expect(body.result?.isError ?? body.error !== undefined).toBe(true);
+  });
+});
+
+describe('generateMcpDiscovery uniqueness', () => {
+  const endpoint: ServiceEndpoint = {
+    fetch: async () => new Response(null, { status: 404 }),
+    id: 'example',
+    origin: 'https://example.internal',
+  };
+
+  function publishedMcpAbility(id: string, method: Record<string, unknown>): ServiceRegistrySnapshot['abilities'][number] {
+    return {
+      access: 'plane',
+      exposure: 'published',
+      id,
+      methods: {
+        search: {
+          inputSchema: { type: 'object' },
+          outputSchema: { type: 'object' },
+          scopes: [],
+          ...method,
+        },
+      },
+      rpc: { path: `/rpc/${id}`, transports: ['http-batch'] },
+      scopes: [],
+      service: endpoint,
+      serviceId: 'example',
+      serviceTitle: 'Example',
+      serviceVersion: '0.1.0',
+    } as ServiceRegistrySnapshot['abilities'][number];
+  }
+
+  function snapshotOf(abilities: ServiceRegistrySnapshot['abilities']): ServiceRegistrySnapshot {
+    return { abilities, discoveredAt: '2026-07-21T12:00:00.000Z', services: [] };
+  }
+
+  it('rejects duplicate tool names across published methods', () => {
+    const snapshot = snapshotOf([
+      publishedMcpAbility('example.a', { mcp: { name: 'example_search' } }),
+      publishedMcpAbility('example.b', { mcp: { name: 'example_search' } }),
+    ]);
+    expect(() => generateMcpDiscovery(snapshot)).toThrow('Duplicate MCP tool name across published methods: example_search');
+  });
+
+  it('rejects duplicate prompt names across published methods', () => {
+    const snapshot = snapshotOf([
+      publishedMcpAbility('example.a', { mcpPrompt: { name: 'example_prompt' } }),
+      publishedMcpAbility('example.b', { mcpPrompt: { name: 'example_prompt' } }),
+    ]);
+    expect(() => generateMcpDiscovery(snapshot)).toThrow('Duplicate MCP prompt name across published methods: example_prompt');
+  });
+
+  it('rejects duplicate resource uris across published methods', () => {
+    const snapshot = snapshotOf([
+      publishedMcpAbility('example.a', { mcpResource: { name: 'Readme', uri: 'doc://example/readme' } }),
+      publishedMcpAbility('example.b', { mcpResource: { name: 'Other', uri: 'doc://example/readme' } }),
+    ]);
+    expect(() => generateMcpDiscovery(snapshot)).toThrow('Duplicate MCP resource uri across published methods: doc://example/readme');
   });
 });

@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import * as z from 'zod';
+import type { CapabilityIdentity } from '../shared/types.js';
 import { defineCapabilities, RpcTarget } from './capabilities.js';
-import { abilityMethod, defineAbility, defineAbilityService, serviceDiscoveryDocument } from './discovery.js';
+import {
+  abilityMethod,
+  createValidatingAbilityHandler,
+  defineAbility,
+  defineAbilityService,
+  serviceDiscoveryDocument,
+} from './discovery.js';
 
 describe('ability service discovery', () => {
   const capabilities = defineCapabilities({
@@ -340,5 +347,79 @@ describe('ability service discovery', () => {
         version: '0.1.0',
       }),
     ).toThrow('Service-Plane caller-auth JWKS must not include private key material');
+  });
+});
+
+describe('ability handler safety', () => {
+  const capabilities = defineCapabilities({
+    scopes: [{ id: 'example.search' }],
+    serviceId: 'example',
+  });
+
+  const identity = (tokenId: string): CapabilityIdentity => ({
+    audience: 'example',
+    expiresAt: new Date('2100-01-01T00:00:00Z'),
+    issuer: 'control-plane',
+    scopes: ['example.search'],
+    serviceId: 'caller',
+    tokenId,
+  });
+
+  const searchService = () =>
+    defineAbilityService({
+      abilities: [
+        defineAbility({
+          id: 'example.search',
+          methods: {
+            search: abilityMethod({
+              input: z.object({ query: z.string() }),
+              output: z.object({ results: z.array(z.string()) }),
+              scopes: ['example.search'],
+            }),
+          },
+          scopes: ['example.search'],
+          handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
+        }),
+      ],
+      capabilities,
+      id: 'example',
+      title: 'Example',
+      version: '0.1.0',
+    });
+
+  it('rejects ability methods with reserved names', () => {
+    expect(() =>
+      defineAbilityService({
+        abilities: [
+          defineAbility({
+            id: 'example.bad',
+            methods: {
+              invoke: abilityMethod({
+                input: z.object({}),
+                output: z.object({}),
+                scopes: ['example.search'],
+              }),
+            },
+            scopes: ['example.search'],
+            handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
+          }),
+        ],
+        capabilities,
+        id: 'example',
+        title: 'Example',
+        version: '0.1.0',
+      }),
+    ).toThrow('Service-Plane ability method name is reserved: example.bad/invoke');
+  });
+
+  it('rejects handler factories that return a shared instance across sessions', () => {
+    const ability = searchService().abilities[0];
+    if (!ability) throw new Error('missing ability');
+    const shared = new RpcTarget() as RpcTarget & Record<string, unknown>;
+
+    expect(createValidatingAbilityHandler(ability, shared, identity('cap_1'))).toBeDefined();
+    expect(() => createValidatingAbilityHandler(ability, shared, identity('cap_2'))).toThrow(
+      'Service-Plane ability handler factory must return a new instance per call: example.search',
+    );
   });
 });

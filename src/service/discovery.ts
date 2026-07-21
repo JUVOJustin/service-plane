@@ -20,7 +20,7 @@ import {
   type ServiceDiscoveryDocument,
   type ServiceHttpMethod,
 } from '../shared/types.js';
-import { bindCapabilityIdentity, requireScopes } from './capabilities.js';
+import { bindCapabilityIdentity, capabilityIdentity, requireScopes } from './capabilities.js';
 
 export type AbilitySchema = z.ZodType;
 
@@ -167,6 +167,11 @@ export function createValidatingAbilityHandler<TEnv extends Env>(
   handler: RpcTarget & Record<string, unknown>,
   identity: CapabilityIdentity,
 ): RpcTarget {
+  // A handler instance carries one caller's identity; a factory that returns a shared
+  // instance would let concurrent sessions overwrite each other's identity and scopes.
+  if (capabilityIdentity(handler)) {
+    throw new CapabilityAuthError(`Service-Plane ability handler factory must return a new instance per call: ${ability.id}`, 500);
+  }
   bindCapabilityIdentity(handler, identity);
 
   class ValidatingAbilityHandler extends RpcTarget {
@@ -249,6 +254,10 @@ function normalizeAbilities<TEnv extends Env>(
   });
 }
 
+// Members of the validating wrapper itself; an ability method with one of these names
+// would shadow the dispatcher and recurse instead of reaching the handler.
+const RESERVED_METHOD_NAMES = new Set(['constructor', 'invoke']);
+
 function normalizeMethods(
   abilityId: string,
   methods: AbilityMethodDefinitions,
@@ -263,6 +272,9 @@ function normalizeMethods(
   return Object.fromEntries(
     names.map((methodName) => {
       const name = normalizeValue(methodName, `method name for ${abilityId}`);
+      if (RESERVED_METHOD_NAMES.has(name)) {
+        throw new CapabilityAuthError(`Service-Plane ability method name is reserved: ${abilityId}/${name}`, 500);
+      }
       const method = methods[methodName];
       if (!method) throw new CapabilityAuthError(`Service-Plane ability method is missing: ${abilityId}/${methodName}`, 500);
       const scopes = normalizeScopes(method.scopes ?? []);

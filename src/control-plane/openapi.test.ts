@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { DiscoveredServiceAbility, ServiceEndpoint, ServiceRegistrySnapshot } from '../shared/types.js';
-import { generateControlPlaneOpenApi } from './openapi.js';
+import { controlPlaneOpenApiCacheKey, generateControlPlaneOpenApi } from './openapi.js';
 
 const endpoint: ServiceEndpoint = {
   fetch: async () => new Response(null, { status: 404 }),
@@ -77,5 +77,59 @@ describe('generateControlPlaneOpenApi', () => {
 
     expect(Object.keys(document.paths)).toHaveLength(0);
     expect(document.components).toBeUndefined();
+  });
+});
+
+describe('generateControlPlaneOpenApi operation ids', () => {
+  it('defaults operation ids to service-qualified names', () => {
+    const ability = publishedAbility({
+      methods: {
+        search: {
+          inputSchema: { type: 'object' },
+          outputSchema: { type: 'object' },
+          rest: { method: 'post', path: '/examples/search' },
+          scopes: [],
+        },
+      },
+    });
+
+    const document = generateControlPlaneOpenApi({ snapshot: snapshotOf([ability]) });
+    const operation = document.paths['/examples/search']?.post as Record<string, unknown> | undefined;
+    expect(operation?.operationId).toBe('example.example.search.search');
+  });
+
+  it('rejects duplicate operation ids across published methods', () => {
+    const other = publishedAbility({
+      id: 'example.other',
+      methods: {
+        search: {
+          inputSchema: { type: 'object' },
+          outputSchema: { type: 'object' },
+          rest: { method: 'post', operationId: 'searchExamples', path: '/examples/other' },
+          scopes: [],
+        },
+      },
+      rpc: { path: '/rpc/example.other', transports: ['http-batch'] },
+    });
+
+    expect(() => generateControlPlaneOpenApi({ snapshot: snapshotOf([publishedAbility(), other]) })).toThrow(
+      'Duplicate OpenAPI operationId across published methods: searchExamples',
+    );
+  });
+});
+
+describe('controlPlaneOpenApiCacheKey', () => {
+  it('namespaces the cache key by endpoint origin', () => {
+    const eu = [{ id: 'example', origin: 'https://eu.example.internal' }];
+    const us = [{ id: 'example', origin: 'https://us.example.internal' }];
+    expect(controlPlaneOpenApiCacheKey(eu, {})).not.toBe(controlPlaneOpenApiCacheKey(us, {}));
+  });
+
+  it('is insensitive to endpoint order', () => {
+    const services = [
+      { id: 'alpha', origin: 'https://alpha.internal' },
+      { id: 'beta', origin: 'https://beta.internal' },
+    ];
+    expect(controlPlaneOpenApiCacheKey(services, {})).toBe(controlPlaneOpenApiCacheKey([...services].reverse(), {}));
   });
 });

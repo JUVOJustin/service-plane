@@ -60,6 +60,11 @@ export function generateMcpDiscovery(snapshot: ServiceRegistrySnapshot): McpDisc
   const resources: McpResourceDiscovery[] = [];
   const resourceTemplates: McpResourceTemplateDiscovery[] = [];
   const tools: McpToolDiscovery[] = [];
+  // Dispatch resolves by first name/uri match, so duplicates across services would make
+  // routing order-dependent and silently shadow one projection behind another.
+  const seenToolNames = new Set<string>();
+  const seenPromptNames = new Set<string>();
+  const seenResourceUris = new Set<string>();
 
   for (const ability of snapshot.abilities) {
     if (ability.exposure !== 'published') continue;
@@ -73,6 +78,10 @@ export function generateMcpDiscovery(snapshot: ServiceRegistrySnapshot): McpDisc
         },
       };
       if (method.mcp) {
+        if (seenToolNames.has(method.mcp.name)) {
+          throw new Error(`Duplicate MCP tool name across published methods: ${method.mcp.name}`);
+        }
+        seenToolNames.add(method.mcp.name);
         tools.push({
           _meta: meta,
           ...(method.mcp.description ? { description: method.mcp.description } : {}),
@@ -83,6 +92,10 @@ export function generateMcpDiscovery(snapshot: ServiceRegistrySnapshot): McpDisc
       }
       if (method.mcpResource) {
         const { uri, ...metadata } = method.mcpResource;
+        if (seenResourceUris.has(uri)) {
+          throw new Error(`Duplicate MCP resource uri across published methods: ${uri}`);
+        }
+        seenResourceUris.add(uri);
         if (isResourceTemplateUri(uri)) {
           resourceTemplates.push({ _meta: meta, ...metadata, uriTemplate: uri });
         } else {
@@ -90,6 +103,10 @@ export function generateMcpDiscovery(snapshot: ServiceRegistrySnapshot): McpDisc
         }
       }
       if (method.mcpPrompt) {
+        if (seenPromptNames.has(method.mcpPrompt.name)) {
+          throw new Error(`Duplicate MCP prompt name across published methods: ${method.mcpPrompt.name}`);
+        }
+        seenPromptNames.add(method.mcpPrompt.name);
         const args = method.mcpPrompt.arguments ?? derivePromptArguments(method.inputSchema);
         prompts.push({
           _meta: meta,
