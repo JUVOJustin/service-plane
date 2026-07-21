@@ -16,10 +16,12 @@ export type {
   AbilityAccess,
   AbilityExposure,
   AbilityTransport,
+  CapabilityActorClaim,
   CapabilityCatalog,
   CapabilityClaims,
   CapabilityJwks,
   CapabilityScopeDefinition,
+  CapabilitySubject,
   DiscoveredServiceAbility,
   FetchLike,
   IssueCapabilityTokenInput,
@@ -68,6 +70,7 @@ export {
 } from '../shared/types.js';
 export {
   type BrokerCaller,
+  brokerCallerSubject,
   type ControlPlaneRpcBroker,
   type CreateControlPlaneRpcBrokerOptions,
   createControlPlaneRpcBroker,

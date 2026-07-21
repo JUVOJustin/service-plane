@@ -8,7 +8,7 @@ import {
   RpcTarget,
   type RpcTransport,
 } from 'capnweb';
-import { decodeCapabilityTokenPayload, verifyCapabilityToken } from '../shared/capability-tokens.js';
+import { decodeCapabilityTokenPayload, normalizeCapabilitySubject, verifyCapabilityToken } from '../shared/capability-tokens.js';
 import { CapabilityAuthError } from '../shared/errors.js';
 import { SERVICE_PLANE_HMAC_CLIENT_HEADER, SERVICE_PLANE_HMAC_TIMESTAMP_HEADER, signServicePlaneHmacRequest } from '../shared/hmac-auth.js';
 import {
@@ -24,6 +24,7 @@ import {
   type CapabilityJwksCache,
   type CapabilityJwksResolver,
   type CapabilityScopeDefinition,
+  type CapabilitySubject,
   type CapabilityTokenCache,
   type CapabilityTokenProvider,
   type CapabilityVerifierOptions,
@@ -67,6 +68,7 @@ export type CreateCapabilityTokenProviderOptions = {
   refreshSkewSeconds?: number;
   requestToken(input: IssueCapabilityTokenInput): Promise<IssuedCapabilityToken | { expiresAt: Date | string; token: string }>;
   scopes: string[];
+  subject?: CapabilitySubject;
   targetServiceId: string;
   ttlSeconds?: number;
 };
@@ -242,15 +244,21 @@ export function createCapabilityTokenProvider(options: CreateCapabilityTokenProv
   const targetServiceId = normalizeValue(options.targetServiceId, 'target service id');
   const scopes = normalizeScopes(options.scopes);
   const ttlSeconds = options.ttlSeconds === undefined ? undefined : normalizeTtlSeconds(options.ttlSeconds);
-  const cacheKey =
-    options.cacheKey ??
-    capabilityTokenCacheKey({
-      ...(options.abilityId ? { abilityId: normalizeValue(options.abilityId, 'ability id') } : {}),
-      callerServiceId,
-      scopes,
-      targetServiceId,
-      ...(ttlSeconds === undefined ? {} : { ttlSeconds }),
-    });
+  const subject = options.subject === undefined ? undefined : normalizeCapabilitySubject(options.subject);
+  // A caller-supplied cacheKey is still partitioned by the delegated subject: services authorize
+  // per user from identity.subject, so one user's cached token must never serve another.
+  const cacheKey = options.cacheKey
+    ? subject
+      ? `${options.cacheKey}:subject:${encodeURIComponent(JSON.stringify({ id: subject.id, orgId: subject.orgId ?? null }))}`
+      : options.cacheKey
+    : capabilityTokenCacheKey({
+        ...(options.abilityId ? { abilityId: normalizeValue(options.abilityId, 'ability id') } : {}),
+        callerServiceId,
+        scopes,
+        ...(subject ? { subject } : {}),
+        targetServiceId,
+        ...(ttlSeconds === undefined ? {} : { ttlSeconds }),
+      });
 
   return {
     async token() {
@@ -266,6 +274,7 @@ export function createCapabilityTokenProvider(options: CreateCapabilityTokenProv
       const issued = await options.requestToken({
         callerServiceId,
         scopes,
+        ...(subject ? { subject } : {}),
         targetServiceId,
         ...(ttlSeconds === undefined ? {} : { ttlSeconds }),
       });
@@ -283,6 +292,7 @@ export function capabilityTokenCacheKey(input: {
   abilityId?: string;
   callerServiceId: string;
   scopes: string[];
+  subject?: CapabilitySubject;
   targetServiceId: string;
   ttlSeconds?: number;
 }): string {
@@ -290,6 +300,9 @@ export function capabilityTokenCacheKey(input: {
     abilityId: input.abilityId ?? null,
     callerServiceId: input.callerServiceId,
     scopes: [...input.scopes].sort(),
+    // Included conditionally so subject-less keys stay byte-identical with earlier releases; tokens
+    // delegated to a subject must never be shared across subjects through the token cache.
+    ...(input.subject ? { subject: { id: input.subject.id, orgId: input.subject.orgId ?? null } } : {}),
     targetServiceId: input.targetServiceId,
     ttlSeconds: input.ttlSeconds ?? null,
   };
@@ -376,6 +389,7 @@ export function controlPlaneHmacTokenRequester(
   const timestampHeaderName = options.timestampHeaderName ?? SERVICE_PLANE_HMAC_TIMESTAMP_HEADER;
 
   return async (input) => {
+    rejectRequesterSubject(input);
     const headers = new Headers(typeof options.headers === 'function' ? await options.headers() : options.headers);
     headers.set('content-type', 'application/json');
     const requestId = await resolveRequestId(options.requestId);
@@ -413,6 +427,7 @@ export function controlPlaneJwkTokenRequester(
   const keyIdHeaderName = options.keyIdHeaderName ?? SERVICE_PLANE_JWK_KEY_ID_HEADER;
 
   return async (input) => {
+    rejectRequesterSubject(input);
     const headers = new Headers(typeof options.headers === 'function' ? await options.headers() : options.headers);
     headers.set('content-type', 'application/json');
     const requestId = await resolveRequestId(options.requestId);
@@ -448,6 +463,7 @@ export function controlPlaneRpcTokenRequester(
   options: ControlPlaneRpcTokenRequesterOptions,
 ): CreateCapabilityTokenProviderOptions['requestToken'] {
   return async (input) => {
+    rejectRequesterSubject(input);
     if ('issueCapabilityTokenForCaller' in options.binding) {
       if (!options.callerServiceId) throw new CapabilityAuthError('Service-Plane RPC token requester requires callerServiceId', 500);
       return parseIssuedCapabilityToken(
@@ -460,6 +476,17 @@ export function controlPlaneRpcTokenRequester(
     }
     return parseIssuedCapabilityToken(await options.binding.issueCapabilityToken(input));
   };
+}
+
+// Shipped requesters are service-side callers, and callers cannot assert subject delegation.
+// Fail fast here with a clear error instead of transmitting the subject and surfacing a remote
+// 403 — this also keeps subjects away from raw issuer bindings that would honor them.
+function rejectRequesterSubject(input: IssueCapabilityTokenInput): void {
+  if (input.subject === undefined) return;
+  throw new CapabilityAuthError(
+    'Service-Plane token requesters cannot assert a delegated subject; only control-plane code may mint one',
+    403,
+  );
 }
 
 export function tokenExpiresAt(token: string): Date {

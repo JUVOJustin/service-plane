@@ -240,7 +240,21 @@ export type McpDiscoveryDocument = {
   tools: McpToolDiscovery[];
 };
 
+// Control-plane-verified end-user delegation following RFC 8693: on delegated tokens `sub` is the
+// end user the call is made on behalf of, `act` names the acting service, and `spo` carries the
+// subject's org. Attribution for audit and per-user decisions; never a substitute for scope or
+// grant authorization.
+export type CapabilitySubject = {
+  id: string;
+  orgId?: string;
+};
+
+export type CapabilityActorClaim = {
+  sub: string;
+};
+
 export type CapabilityClaims = {
+  act?: CapabilityActorClaim;
   aud: string;
   exp: number;
   iat: number;
@@ -249,6 +263,7 @@ export type CapabilityClaims = {
   nbf: number;
   scp: string[];
   spb?: string;
+  spo?: string;
   sub: string;
 };
 
@@ -259,6 +274,7 @@ export type CapabilityIdentity = {
   issuer: string;
   scopes: string[];
   serviceId: string;
+  subject?: CapabilitySubject;
   tokenId: string;
 };
 
@@ -291,6 +307,7 @@ export type CapabilityVerifierOptions = Omit<VerifyCapabilityTokenOptions, 'requ
 export type IssueCapabilityTokenInput = {
   callerServiceId: string;
   scopes: string[];
+  subject?: CapabilitySubject;
   targetServiceId: string;
   ttlSeconds?: number;
 };

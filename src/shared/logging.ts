@@ -33,6 +33,7 @@ export type ServicePlaneBrokerLogEvent = {
   brokered?: boolean;
   callerId?: string;
   callerKind?: 'service' | 'user';
+  callerOrgId?: string;
   durationMs?: number;
   error?: {
     message: string;

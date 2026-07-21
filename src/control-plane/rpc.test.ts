@@ -36,5 +36,13 @@ describe('control-plane RPC token helpers', () => {
         targetServiceId: 'fizzy',
       }),
     ).rejects.toThrow('Caller service mismatch');
+
+    await expect(
+      issueCapabilityTokenForCaller(issuer, 'moco', {
+        scopes: ['fizzy.users.lookup'],
+        subject: { id: 'user-7' },
+        targetServiceId: 'fizzy',
+      }),
+    ).rejects.toThrow('Service-Plane capability token subject cannot be asserted by callers');
   });
 });

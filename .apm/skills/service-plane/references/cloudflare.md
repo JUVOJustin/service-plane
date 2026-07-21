@@ -65,7 +65,7 @@ The service ability stays stateless. The Durable Object owns provider state:
 - per-connection rate-limit state
 - webhook dedupe state
 
-Use identity claims such as `tenantId`, `userId`, and `connectionId` to route to the Durable Object. Do not pass provider credentials through Dynamic Workflow metadata or Service Plane identity.
+Use `identity.subject` (when the control plane delegates the call to an end user) together with validated input fields such as `connectionId` to route to the Durable Object. Do not pass provider credentials through Dynamic Workflow metadata or Service Plane identity.
 
 ## Dynamic Workers And Workflows
 
@@ -86,7 +86,7 @@ Behind that binding:
 3. The binding opens an ability session to `asana.tasks`.
 4. The Asana service routes the call to the right Durable Object.
 
-This keeps workflow code simple and keeps credentials outside user-authored workflow code. Service Plane secures the plane-to-service call; the implementor owns how user and tenant context is represented in the validated input or project-specific claims.
+This keeps workflow code simple and keeps credentials outside user-authored workflow code. Service Plane secures the plane-to-service call and can delegate it to an end-user subject per RFC 8693; the implementor owns any further user and tenant context in the validated input.
 
 ## Caching Metadata At The Edge
 

@@ -1,7 +1,12 @@
 import type { Context, Handler } from 'hono';
 import { etag } from 'hono/etag';
 import { createFactory } from 'hono/factory';
-import { publicJwkFromPrivateJwk, signCapabilityToken, verifyCapabilityToken } from '../shared/capability-tokens.js';
+import {
+  normalizeCapabilitySubject,
+  publicJwkFromPrivateJwk,
+  signCapabilityToken,
+  verifyCapabilityToken,
+} from '../shared/capability-tokens.js';
 import { CapabilityAuthError } from '../shared/errors.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
 import { generateServicePlaneJwkSigningKey } from '../shared/jwk-auth.js';
@@ -17,7 +22,7 @@ import {
   type ServiceGrant,
   type ServiceGrantDefinition,
 } from '../shared/types.js';
-import { issuedCapabilityTokenRpcResponse } from './rpc.js';
+import { issuedCapabilityTokenRpcResponse, rejectCallerAssertedSubject } from './rpc.js';
 
 const endpointFactory = createFactory();
 const DEFAULT_CAPABILITY_KEY_ID = 'default';
@@ -134,14 +139,18 @@ function issueCapabilityToken(options: {
     options.input.ttlSeconds === undefined
       ? options.maxTtlSeconds
       : Math.min(normalizeTtlSeconds(options.input.ttlSeconds, 400), options.maxTtlSeconds);
+  const subject = options.input.subject === undefined ? undefined : normalizeCapabilitySubject(options.input.subject);
 
+  // RFC 8693 delegation: with a subject, sub carries the end user and act names the acting service.
   return signCapabilityToken({
     claims: {
+      ...(subject ? { act: { sub: options.input.callerServiceId } } : {}),
       aud: options.input.targetServiceId,
       iss: options.issuer,
       scp: requestedScopes,
       ...(options.brokerServiceId ? { spb: options.brokerServiceId } : {}),
-      sub: options.input.callerServiceId,
+      ...(subject?.orgId ? { spo: subject.orgId } : {}),
+      sub: subject ? subject.id : options.input.callerServiceId,
     },
     keyId: options.keyId,
     privateJwk: options.privateJwk,
@@ -304,6 +313,7 @@ async function readTokenRequest(request: Request): Promise<IssueCapabilityTokenI
 
   if (!body || typeof body !== 'object') throw new CapabilityAuthError('Invalid Service-Plane capability token request', 400);
   const record = body as Record<string, unknown>;
+  rejectCallerAssertedSubject(record.subject);
   const scopes = record.scopes;
   if (typeof record.targetServiceId !== 'string' || !Array.isArray(scopes) || !scopes.every((scope) => typeof scope === 'string')) {
     throw new CapabilityAuthError('Invalid Service-Plane capability token request', 400);

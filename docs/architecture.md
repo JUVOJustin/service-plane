@@ -97,7 +97,8 @@ Only `exposure: 'published'` methods with REST metadata enter OpenAPI. Only publ
 - Method: one callable operation on an ability.
 - Handler: implementation object returned by the ability factory.
 - Context: runtime access such as Hono context, env, bindings, and execution context.
-- Identity: verified Service Plane caller and scope claims.
+- Identity: verified Service Plane caller and scope claims, plus the delegated end-user subject on user-brokered calls.
+- Subject: the end user (and org) a delegated call is made on behalf of, carried per RFC 8693 (`sub` = user, `act` = acting service, `spo` = org).
 - Access: whether an ability is plane-callable or restricted to service callers.
 - Private: ability excluded from OpenAPI and MCP.
 - Published: ability eligible for OpenAPI, MCP, or user-facing transports.

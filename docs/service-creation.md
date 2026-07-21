@@ -106,7 +106,7 @@ export class AsanaTasksHandler extends RpcTarget {
 
 `context` is runtime access, such as Hono context, environment bindings, storage, and execution context.
 
-`identity` is the verified Service Plane caller and granted scopes. Product-level user or tenant context is application-owned; pass it in validated input or project-specific token claims if the service needs it. Do not put provider OAuth tokens in identity. Store credentials in a service-owned store such as a Durable Object.
+`identity` is the verified Service Plane caller and granted scopes. When the control plane brokers a call for an authenticated end user, `identity.subject` carries that user's id and org as an RFC 8693 delegated subject (see [auth](auth.md#subject-delegation)). Any other product-level connection context is application-owned; pass it in validated method input if the service needs it. Do not put provider OAuth tokens in identity. Store credentials in a service-owned store such as a Durable Object.
 
 ## 5. Mount The Service
 

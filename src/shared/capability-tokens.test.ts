@@ -35,6 +35,144 @@ describe('STS capability tokens', () => {
     });
   });
 
+  it('surfaces RFC 8693 delegated subjects with the acting service from the act claim', async () => {
+    const keys = await testKeys();
+    const issued = await signCapabilityToken({
+      claims: {
+        act: { sub: 'control-plane' },
+        aud: 'fizzy',
+        iss: 'control-plane',
+        scp: ['fizzy.users.lookup'],
+        spo: 'org-42',
+        sub: 'user-7',
+      },
+      keyId: 'test-key',
+      now: NOW,
+      privateJwk: keys.privateJwk,
+    });
+
+    await expect(
+      verifyCapabilityToken(issued.token, {
+        expectedAudience: 'fizzy',
+        issuer: 'control-plane',
+        jwks: keys.jwks,
+        now: new Date('2026-05-09T12:01:00.000Z'),
+      }),
+    ).resolves.toMatchObject({
+      serviceId: 'control-plane',
+      subject: { id: 'user-7', orgId: 'org-42' },
+    });
+  });
+
+  it('omits the subject for tokens without an act claim', async () => {
+    const keys = await testKeys();
+    const issued = await signCapabilityToken({
+      claims: {
+        aud: 'fizzy',
+        iss: 'control-plane',
+        scp: ['fizzy.users.lookup'],
+        sub: 'moco',
+      },
+      keyId: 'test-key',
+      now: NOW,
+      privateJwk: keys.privateJwk,
+    });
+
+    const identity = await verifyCapabilityToken(issued.token, {
+      expectedAudience: 'fizzy',
+      jwks: keys.jwks,
+      now: new Date('2026-05-09T12:01:00.000Z'),
+    });
+    expect(identity.serviceId).toBe('moco');
+    expect(identity.subject).toBeUndefined();
+  });
+
+  it('rejects malformed actor claims and org claims without delegation', async () => {
+    const keys = await testKeys();
+    const malformedActors: unknown[] = ['control-plane', {}, { sub: '' }, { sub: 42 }, { sub: 'x'.repeat(600) }];
+
+    for (const act of malformedActors) {
+      const issued = await signCapabilityToken({
+        claims: {
+          act: act as never,
+          aud: 'fizzy',
+          iss: 'control-plane',
+          scp: ['fizzy.users.lookup'],
+          sub: 'user-7',
+        },
+        keyId: 'test-key',
+        now: NOW,
+        privateJwk: keys.privateJwk,
+      });
+
+      await expect(
+        verifyCapabilityToken(issued.token, {
+          expectedAudience: 'fizzy',
+          jwks: keys.jwks,
+          now: new Date('2026-05-09T12:01:00.000Z'),
+        }),
+      ).rejects.toThrow('Invalid Service-Plane capability actor claim');
+    }
+
+    // Our signer refuses to mint spo without act, so craft the payload by hand; the verifier
+    // checks claims before the signature, so the splice never reaches signature validation.
+    const signable = await signCapabilityToken({
+      claims: {
+        aud: 'fizzy',
+        iss: 'control-plane',
+        scp: ['fizzy.users.lookup'],
+        sub: 'moco',
+      },
+      keyId: 'test-key',
+      now: NOW,
+      privateJwk: keys.privateJwk,
+    });
+    const [header, , signature] = signable.token.split('.');
+    const orgWithoutActPayload = btoa(
+      JSON.stringify({
+        aud: 'fizzy',
+        exp: 9999999999,
+        iat: 1,
+        iss: 'control-plane',
+        jti: 'x',
+        nbf: 1,
+        scp: ['fizzy.users.lookup'],
+        spo: 'org-42',
+        sub: 'moco',
+      }),
+    )
+      .replace(/\+/gu, '-')
+      .replace(/\//gu, '_')
+      .replace(/=+$/u, '');
+
+    await expect(
+      verifyCapabilityToken(`${header}.${orgWithoutActPayload}.${signature}`, {
+        expectedAudience: 'fizzy',
+        jwks: keys.jwks,
+        now: new Date('2026-05-09T12:01:00.000Z'),
+      }),
+    ).rejects.toThrow('Invalid Service-Plane capability claims');
+  });
+
+  it('refuses to sign an spo claim without an act claim', async () => {
+    const keys = await testKeys();
+
+    await expect(
+      signCapabilityToken({
+        claims: {
+          aud: 'fizzy',
+          iss: 'control-plane',
+          scp: ['fizzy.users.lookup'],
+          spo: 'org-42',
+          sub: 'moco',
+        },
+        keyId: 'test-key',
+        now: NOW,
+        privateJwk: keys.privateJwk,
+      }),
+    ).rejects.toThrow('Service-Plane capability spo claim requires an act claim');
+  });
+
   it('rejects invalid signatures', async () => {
     const keys = await testKeys();
     const issued = await signCapabilityToken({

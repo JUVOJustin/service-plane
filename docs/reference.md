@@ -147,6 +147,42 @@ Token requesters:
 - `controlPlaneJwkTokenRequester(...)`
 - `controlPlaneHmacTokenRequester(...)`
 
+## Capability Token Claims
+
+Capability tokens are ES256 JWS tokens with a closed claim set. Unknown claims are dropped at verification.
+
+Tokens come in two shapes, and `sub` always answers the same question: who is this token about. A plain service-to-service token is about the calling service. A delegated token (RFC 8693) is about the end user; the calling service does not disappear — it moves into the `act` (actor) claim. The presence of `act` is what switches the interpretation, and the verifier resolves it for you: `identity.serviceId` is always the calling service, and `identity.subject` is set only when a user is delegated.
+
+Plain service token:
+
+```json
+{ "iss": "control-plane", "sub": "workflow-runner", "aud": "asana", "scp": ["asana.tasks.write"] }
+```
+
+→ `identity.serviceId = 'workflow-runner'`, no `identity.subject`.
+
+Delegated (user-brokered) token:
+
+```json
+{ "iss": "control-plane", "sub": "user-7", "act": { "sub": "control-plane" }, "spo": "org-42", "aud": "asana", "scp": ["asana.tasks.write"] }
+```
+
+→ `identity.serviceId = 'control-plane'` (from `act.sub`), `identity.subject = { id: 'user-7', orgId: 'org-42' }`.
+
+| Claim | Plain service token | Delegated token (`act` present) |
+| --- | --- | --- |
+| `sub` | calling service → `identity.serviceId` | end user → `identity.subject.id` |
+| `act` | absent | acting service, `{ sub }` → `identity.serviceId` |
+| `spo` | rejected at verification | subject's org → `identity.subject.orgId` |
+| `iss` | control-plane issuer → `identity.issuer` | same |
+| `aud` | target service id → `identity.audience` | same |
+| `scp` | granted scopes → `identity.scopes` | same |
+| `spb` | broker service id on brokered (ingress) tokens → `identity.brokerServiceId` | same |
+| `jti` | token id → `identity.tokenId` | same |
+| `exp` | expiry → `identity.expiresAt`; `iat`/`nbf` are also enforced | same |
+
+Delegated subjects are minted only by control-plane code — the broker/MCP caller resolver (a `BrokerCaller` with `kind: 'user'` and optional `orgId`) or a direct `issueCapabilityToken({ subject, ... })` call. The capability-token endpoint and `issueCapabilityTokenForCaller` reject caller-supplied subjects with 403, and the shipped token requesters fail fast locally instead of transmitting one. Direct issue mints a non-brokered token, so ingress-required targets must be reached through the broker, which selects `issueBrokeredCapabilityToken` automatically. See [auth](auth.md#subject-delegation).
+
 ## Logging And Request Correlation
 
 Every request that enters a `ServicePlaneControlPlane` gets an `X-Request-Id` (incoming header value or a generated UUID, via `hono/request-id`). The broker and MCP endpoints forward that id on every outbound call to a service: as the `X-Request-Id` header for HTTP-batch and service-binding transports, as the `request_id` query parameter for WebSocket transports (`SERVICE_PLANE_REQUEST_ID_QUERY_PARAM`), and as the `requestId` field on `connectAbility(...)` for Cloudflare native RPC. `ServicePlaneService` adopts the propagated id into its own `requestId` context variable and echoes it on responses, so one id correlates plane and service logs end to end.
@@ -195,7 +231,7 @@ Use separate caches for:
 - caller capability tokens
 - HMAC or JWK replay protection
 
-Token cache keys include caller id, target service id, ability id, normalized scopes, and optional TTL.
+Token cache keys include caller id, target service id, ability id, normalized scopes, optional TTL, and the delegated subject when present — a token minted for one end user is never served for another.
 
 HTTP edge caching of the metadata GET routes (discovery, OpenAPI, JWKS) is separate from these data caches and is controlled by the `httpCache` option on `ServicePlaneService` and `ServicePlaneControlPlane`:
 

@@ -1,15 +1,37 @@
 import { type RpcStub, RpcTarget } from 'capnweb';
 import { abilitySession, cloudflareServiceBindingRpc, websocketRpc } from '../service/capabilities.js';
+import { normalizeCapabilitySubject } from '../shared/capability-tokens.js';
 import { CapabilityAuthError } from '../shared/errors.js';
 import type { ServicePlaneBrokerLogEvent } from '../shared/logging.js';
-import type { DiscoveredServiceAbility, ServiceEndpoint, ServiceRegistry } from '../shared/types.js';
+import type { CapabilitySubject, DiscoveredServiceAbility, ServiceEndpoint, ServiceRegistry } from '../shared/types.js';
 import type { CapabilityIssuer } from './capabilities.js';
 import { createServiceRegistry } from './registry.js';
 
 export type BrokerCaller = {
   id: string;
   kind: 'service' | 'user';
+  orgId?: string;
 };
+
+// User callers become the RFC 8693 delegated subject (`sub` = user, `act` = brokering service) so
+// target services see verified end-user attribution; service callers already ride in `sub` alone.
+// A blank orgId from the resolver is dropped rather than failing the call; a blank id still fails
+// closed, but here at the boundary with a clear error instead of deep inside token minting.
+export function brokerCallerSubject(caller: BrokerCaller | undefined): CapabilitySubject | undefined {
+  if (caller?.kind !== 'user') return undefined;
+  const orgId = caller.orgId?.trim();
+  return normalizeCapabilitySubject({ id: caller.id, ...(orgId ? { orgId } : {}) });
+}
+
+// One projection for caller audit fields so broker and MCP log events cannot drift.
+export function brokerCallerLogFields(caller: BrokerCaller | undefined): {
+  callerId?: string;
+  callerKind?: BrokerCaller['kind'];
+  callerOrgId?: string;
+} {
+  if (!caller) return {};
+  return { callerId: caller.id, callerKind: caller.kind, ...(caller.orgId ? { callerOrgId: caller.orgId } : {}) };
+}
 
 export type CreateControlPlaneRpcBrokerOptions = {
   controlPlaneServiceId: string;
@@ -111,9 +133,11 @@ class BrokeredAbility extends RpcTarget {
       }
 
       const brokered = Boolean(this.input.ability.serviceIngress?.required);
+      const subject = brokerCallerSubject(this.input.caller);
       const session = (await abilitySession<unknown>({
         abilityId: this.input.ability.id,
         callerServiceId: this.input.callerServiceId,
+        ...(subject ? { subject } : {}),
         ...(this.input.requestId ? { requestId: this.input.requestId } : {}),
         requestToken: (input) =>
           brokered
@@ -126,7 +150,7 @@ class BrokeredAbility extends RpcTarget {
       this.input.log?.({
         abilityId: this.input.ability.id,
         brokered,
-        ...(this.input.caller ? { callerId: this.input.caller.id, callerKind: this.input.caller.kind } : {}),
+        ...brokerCallerLogFields(this.input.caller),
         event: 'service_plane.broker.connect.completed',
         level: 'info',
         ...(this.input.requestId ? { requestId: this.input.requestId } : {}),
@@ -147,7 +171,7 @@ function brokerConnectFailedEvent(
 ): ServicePlaneBrokerLogEvent {
   return {
     abilityId: context.abilityId,
-    ...(context.caller ? { callerId: context.caller.id, callerKind: context.caller.kind } : {}),
+    ...brokerCallerLogFields(context.caller),
     error: error instanceof Error ? { message: error.message, name: error.name } : { message: String(error), name: 'Error' },
     event: 'service_plane.broker.connect.failed',
     level: 'warn',

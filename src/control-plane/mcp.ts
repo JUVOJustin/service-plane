@@ -16,7 +16,7 @@ import {
   type ServiceRegistry,
   type ServiceRegistrySnapshot,
 } from '../shared/types.js';
-import type { BrokerCaller } from './broker.js';
+import { type BrokerCaller, brokerCallerLogFields, brokerCallerSubject } from './broker.js';
 import type { CapabilityIssuer } from './capabilities.js';
 
 export type ControlPlaneMcpServerInfo = {
@@ -272,9 +272,11 @@ async function getPrompt(id: JsonRpcId, params: unknown, options: ControlPlaneMc
 // ability, mint the scoped (or brokered) token, and invoke the method over the service's RPC transport.
 async function invokeMethod(match: McpMethodMatch, input: unknown, options: ControlPlaneMcpHandlerOptions): Promise<unknown> {
   authorizePublishedAbility(match.ability, options.caller);
+  const subject = brokerCallerSubject(options.caller);
   const api = await abilitySession<Record<string, (methodInput: unknown) => Promise<unknown>>>({
     abilityId: match.ability.id,
     callerServiceId: options.caller?.kind === 'service' ? options.caller.id : options.controlPlaneServiceId,
+    ...(subject ? { subject } : {}),
     ...(options.requestId ? { requestId: options.requestId } : {}),
     requestToken: (tokenInput) =>
       match.ability.serviceIngress?.required
@@ -397,7 +399,7 @@ function logMcpCompleted(
 ): void {
   options.log?.({
     abilityId: match.ability.id,
-    ...(options.caller ? { callerId: options.caller.id, callerKind: options.caller.kind } : {}),
+    ...brokerCallerLogFields(options.caller),
     durationMs: Date.now() - startedAt,
     event,
     level: 'info',
@@ -416,7 +418,7 @@ function logMcpFailed(
   startedAt: number,
 ): void {
   options.log?.({
-    ...(options.caller ? { callerId: options.caller.id, callerKind: options.caller.kind } : {}),
+    ...brokerCallerLogFields(options.caller),
     durationMs: Date.now() - startedAt,
     error: error instanceof Error ? { message: error.message, name: error.name } : { message: String(error), name: 'Error' },
     event,
