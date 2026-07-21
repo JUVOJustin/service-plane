@@ -9,9 +9,11 @@ import {
   verifyServicePlaneJwkSignature,
 } from './jwk-auth.js';
 import {
+  type CapabilityActorClaim,
   type CapabilityClaims,
   type CapabilityIdentity,
   type CapabilityJwks,
+  type CapabilitySubject,
   DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
   type IssuedCapabilityToken,
   MAX_CAPABILITY_TOKEN_TTL_SECONDS,
@@ -34,6 +36,11 @@ export type SignCapabilityTokenOptions = {
 };
 
 export async function signCapabilityToken(options: SignCapabilityTokenOptions): Promise<IssuedCapabilityToken> {
+  // Mirror the verifier's delegation invariant at signing so a mis-built token fails here with a
+  // clear error instead of signing cleanly and being rejected by every verifier.
+  if (options.claims.spo !== undefined && options.claims.act === undefined) {
+    throw new CapabilityAuthError('Service-Plane capability spo claim requires an act claim', 500);
+  }
   const now = options.now ?? new Date();
   const issuedAt = Math.floor(now.getTime() / 1000);
   const ttlSeconds = normalizeTtlSeconds(options.ttlSeconds ?? DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS);
@@ -81,15 +88,34 @@ export async function verifyCapabilityToken(token: string, options: VerifyCapabi
 
   await verifyTokenSignature(token, jwks);
 
+  // RFC 8693 delegation: with an act claim, sub is the end-user subject and act.sub is the acting
+  // service; without one, sub is the calling service itself.
+  const { serviceId, subject } = claims.act
+    ? { serviceId: claims.act.sub, subject: toCapabilitySubject(claims.sub, claims.spo) }
+    : { serviceId: claims.sub, subject: undefined };
   return {
     audience: claims.aud,
     ...(claims.spb ? { brokerServiceId: claims.spb } : {}),
     expiresAt: new Date(claims.exp * 1000),
     issuer: claims.iss,
     scopes: claims.scp,
-    serviceId: claims.sub,
+    serviceId,
+    ...(subject ? { subject } : {}),
     tokenId: claims.jti,
   };
+}
+
+export function normalizeCapabilitySubject(subject: CapabilitySubject): CapabilitySubject {
+  const id = subject.id.trim();
+  const orgId = subject.orgId?.trim();
+  if (!isBoundedClaimString(id) || (orgId !== undefined && !isBoundedClaimString(orgId))) {
+    throw new CapabilityAuthError('Invalid Service-Plane capability subject', 400);
+  }
+  return toCapabilitySubject(id, orgId);
+}
+
+function toCapabilitySubject(id: string, orgId: string | undefined): CapabilitySubject {
+  return { id, ...(orgId ? { orgId } : {}) };
 }
 
 export function servicePlaneAuthorization(token: string): string {
@@ -118,7 +144,7 @@ function decodeCapabilityToken(token: string): { header: unknown; payload: unkno
 
 function parseCapabilityClaims(value: unknown): CapabilityClaims {
   if (!isRecord(value)) throw new CapabilityAuthError('Invalid Service-Plane capability claims');
-  const { aud, exp, iat, iss, jti, nbf, scp, spb, sub } = value;
+  const { act, aud, exp, iat, iss, jti, nbf, scp, spb, spo, sub } = value;
   if (
     typeof aud !== 'string' ||
     typeof exp !== 'number' ||
@@ -145,7 +171,25 @@ function parseCapabilityClaims(value: unknown): CapabilityClaims {
   ) {
     throw new CapabilityAuthError('Invalid Service-Plane capability claims');
   }
-  return { aud, exp, iat, iss, jti, nbf, scp, ...(spb ? { spb } : {}), sub };
+  const actor = parseActorClaim(act);
+  // A subject-org claim is only meaningful on delegated tokens; reject it without an act claim
+  // so a plain service token cannot smuggle tenant context.
+  if (spo !== undefined) {
+    if (actor === undefined || typeof spo !== 'string' || !isBoundedClaimString(spo)) {
+      throw new CapabilityAuthError('Invalid Service-Plane capability claims');
+    }
+  }
+  return { ...(actor ? { act: actor } : {}), aud, exp, iat, iss, jti, nbf, scp, ...(spb ? { spb } : {}), ...(spo ? { spo } : {}), sub };
+}
+
+function parseActorClaim(value: unknown): CapabilityActorClaim | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw new CapabilityAuthError('Invalid Service-Plane capability actor claim');
+  const { sub } = value;
+  if (typeof sub !== 'string' || !isBoundedClaimString(sub)) {
+    throw new CapabilityAuthError('Invalid Service-Plane capability actor claim');
+  }
+  return { sub };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

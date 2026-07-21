@@ -88,10 +88,62 @@ context.env.CONTROL_PLANE
   audience: 'asana',
   scopes: ['asana.tasks.write'],
   tokenId: 'cap_123',
+  subject: { id: 'user-7', orgId: 'org-42' }, // only on delegated (user-brokered) calls
 }
 ```
 
-Keep identity small. It carries Service Plane caller and authorization claims. Product-level user, tenant, or connection context is application-owned; pass it through validated input or project-specific token claims if the service needs it. Store provider credentials in the service's own storage.
+Keep identity small. It carries Service Plane caller and authorization claims, plus the delegated end-user subject on user-brokered calls. Any other product-level connection context is application-owned; pass it through validated method input if the service needs it. Store provider credentials in the service's own storage.
+
+## Subject Delegation
+
+When the control plane brokers a call for an authenticated end user, the token follows RFC 8693 delegation semantics: `sub` carries the end user, the `act` (actor) claim names the acting service, and `spo` carries the user's org. Services read the user as `identity.subject`, while `identity.serviceId` stays the acting service.
+
+The flow with an application identity provider such as Supabase:
+
+```mermaid
+sequenceDiagram
+  participant App
+  participant Plane as Control Plane
+  participant Service
+
+  App->>Plane: Request with Supabase JWT
+  Plane->>Plane: Verify JWT, resolve user + org
+  Plane->>Plane: Mint token: sub = user, act = plane, spo = org
+  Plane->>Service: Brokered ability call
+  Service->>Service: Verify token, read identity.subject
+```
+
+Return the resolved user from the broker (or MCP) caller resolver:
+
+```ts
+const plane = new ServicePlaneControlPlane({
+  broker: {
+    caller: async (context) => {
+      const user = await verifySupabaseJwt(context); // application-owned verification
+      if (!user) return undefined;
+      return { id: user.id, kind: 'user', orgId: user.orgId };
+    },
+  },
+  // ...
+});
+```
+
+Every capability token brokered for that caller then carries `sub: 'user-7'`, `act: { sub: 'control-plane' }`, and `spo: 'org-42'`, and handlers see the user on the verified identity:
+
+```ts
+async createTask(input: CreateTaskInput) {
+  const identity = requireScopes(this, 'asana.tasks.write');
+  if (identity.subject) audit.log({ userId: identity.subject.id, orgId: identity.subject.orgId });
+}
+```
+
+Boundaries to keep in mind:
+
+- The subject is delegation the control plane vouches for. It rides the same issuer/JWKS trust chain as every other claim, so services may rely on it for auditing and per-user decisions.
+- The subject does not replace scope or grant checks. Ability authorization stays with scopes, grants, and ingress. Tenancy authorization stays with the service that owns the data.
+- Only control-plane code asserts subjects: the broker caller resolver or direct `issueCapabilityToken({ subject, ... })` calls. The HTTP token endpoint rejects caller-supplied `subject` fields, and the shipped token requesters (`controlPlaneHmacTokenRequester`, `controlPlaneJwkTokenRequester`, `controlPlaneRpcTokenRequester`) refuse to send one, so an authenticated service cannot claim it acts for an arbitrary user. The `subject` option on `createCapabilityTokenProvider` therefore only works with a `requestToken` that calls the issuer in-process.
+- Direct `issueCapabilityToken({ subject, ... })` mints a non-brokered token. For a target with `ingress` required, delegate through the broker instead — it selects `issueBrokeredCapabilityToken` automatically; a directly issued token is rejected by the ingress check.
+- Tokens delegated to a subject are cached per subject. `capabilityTokenCacheKey` includes the subject, so a token minted for one user is never served for another.
 
 ## Scope Checks
 

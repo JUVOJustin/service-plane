@@ -73,6 +73,45 @@ describe('capability issuer', () => {
     ).resolves.toMatchObject({ brokerServiceId: 'control-plane', serviceId: 'moco' });
   });
 
+  it('mints delegated subjects with the caller as the RFC 8693 acting service', async () => {
+    const keys = await testKeys();
+    const issuer = createCapabilityIssuer({
+      capabilities: [fizzyCapabilities],
+      grants: defineServiceGrants({
+        grants: [{ caller: 'control-plane', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
+      }),
+      issuer: 'control-plane',
+      keyId: 'test-key',
+      now: () => new Date('2026-05-09T12:00:00.000Z'),
+      privateJwk: keys.privateJwk,
+    });
+
+    const issued = await issuer.issueCapabilityToken({
+      callerServiceId: 'control-plane',
+      scopes: ['fizzy.users.lookup'],
+      subject: { id: 'user-7', orgId: 'org-42' },
+      targetServiceId: 'fizzy',
+    });
+
+    await expect(
+      verifyCapabilityToken(issued.token, {
+        expectedAudience: 'fizzy',
+        issuer: 'control-plane',
+        jwks: await issuer.jwks(),
+        now: new Date('2026-05-09T12:00:01.000Z'),
+      }),
+    ).resolves.toMatchObject({ serviceId: 'control-plane', subject: { id: 'user-7', orgId: 'org-42' } });
+
+    await expect(
+      issuer.issueCapabilityToken({
+        callerServiceId: 'control-plane',
+        scopes: ['fizzy.users.lookup'],
+        subject: { id: '  ' },
+        targetServiceId: 'fizzy',
+      }),
+    ).rejects.toThrow('Invalid Service-Plane capability subject');
+  });
+
   it('rejects unknown scopes and unauthorized grants', async () => {
     const keys = await testKeys();
 
@@ -252,6 +291,36 @@ describe('capability issuer', () => {
 
     expect(emptyScopeResponse.status).toBe(400);
     expect(wildcardScopeResponse.status).toBe(400);
+  });
+
+  it('rejects caller-asserted subjects at the token endpoint', async () => {
+    const keys = await testKeys();
+    const issuer = createCapabilityIssuer({
+      capabilities: [fizzyCapabilities],
+      grants: defineServiceGrants({
+        grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
+      }),
+      issuer: 'control-plane',
+      keyId: 'test-key',
+      privateJwk: keys.privateJwk,
+    });
+    const app = new Hono();
+    mountCapabilityTokenEndpoint(app, issuer, {
+      authenticateCaller: () => 'moco',
+    });
+
+    const response = await app.request('/.well-known/service-plane/capability-token', {
+      body: JSON.stringify({
+        scopes: ['fizzy.users.lookup'],
+        subject: { id: 'user-7' },
+        targetServiceId: 'fizzy',
+      }),
+      headers: { 'content-type': 'application/json' },
+      method: 'POST',
+    });
+
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ error: 'Service-Plane capability token subject cannot be asserted by callers' });
   });
 
   it('can mount token and JWKS endpoints together', async () => {

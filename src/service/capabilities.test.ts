@@ -9,6 +9,7 @@ import {
   capabilityRpcSession,
   capabilityTokenCacheKey,
   cloudflareServiceBindingRpc,
+  controlPlaneHmacTokenRequester,
   controlPlaneRpcTokenRequester,
   createCapabilityTokenProvider,
   defineCapabilities,
@@ -138,6 +139,63 @@ describe('Cap’n Web service capabilities', () => {
     expect(capabilityTokenCacheKey({ callerServiceId: 'moco', scopes: ['b', 'a'], targetServiceId: 'example' })).toBe(
       capabilityTokenCacheKey({ callerServiceId: 'moco', scopes: ['a', 'b'], targetServiceId: 'example' }),
     );
+  });
+
+  it('never shares cached tokens across delegated subjects', async () => {
+    expect(
+      capabilityTokenCacheKey({ callerServiceId: 'moco', scopes: ['a'], subject: { id: 'user-7' }, targetServiceId: 'example' }),
+    ).not.toBe(capabilityTokenCacheKey({ callerServiceId: 'moco', scopes: ['a'], targetServiceId: 'example' }));
+    expect(
+      capabilityTokenCacheKey({ callerServiceId: 'moco', scopes: ['a'], subject: { id: 'user-7' }, targetServiceId: 'example' }),
+    ).not.toBe(capabilityTokenCacheKey({ callerServiceId: 'moco', scopes: ['a'], subject: { id: 'user-8' }, targetServiceId: 'example' }));
+
+    const cache = memoryCapabilityTokenCache(() => new Date('2026-05-09T12:00:00.000Z').getTime());
+    let issuedCount = 0;
+    const providerFor = (subjectId: string) =>
+      createCapabilityTokenProvider({
+        cache,
+        callerServiceId: 'control-plane',
+        now: () => new Date('2026-05-09T12:00:00.000Z'),
+        requestToken: async (input) => {
+          issuedCount += 1;
+          expect(input.subject).toEqual({ id: subjectId, orgId: 'org-42' });
+          return { expiresAt: new Date('2026-05-09T12:05:00.000Z'), token: `token-${subjectId}` };
+        },
+        scopes: ['example.users.lookup'],
+        subject: { id: subjectId, orgId: 'org-42' },
+        targetServiceId: 'example',
+      });
+
+    await expect(providerFor('user-7').token()).resolves.toBe('token-user-7');
+    await expect(providerFor('user-8').token()).resolves.toBe('token-user-8');
+    expect(issuedCount).toBe(2);
+  });
+
+  it('rejects delegated subjects on shipped token requesters before anything is sent', async () => {
+    const input = {
+      callerServiceId: 'moco',
+      scopes: ['example.users.lookup'],
+      subject: { id: 'user-7' },
+      targetServiceId: 'example',
+    };
+    const rpcRequester = controlPlaneRpcTokenRequester({
+      binding: {
+        async issueCapabilityToken() {
+          throw new Error('raw binding must not be reached');
+        },
+      },
+    });
+    const hmacRequester = controlPlaneHmacTokenRequester({
+      clientId: 'moco',
+      clientSecret: 'secret',
+      controlPlaneUrl: 'https://plane.example.com',
+      fetch: async () => {
+        throw new Error('token endpoint must not be reached');
+      },
+    });
+
+    await expect(rpcRequester(input)).rejects.toThrow('Service-Plane token requesters cannot assert a delegated subject');
+    await expect(hmacRequester(input)).rejects.toThrow('Service-Plane token requesters cannot assert a delegated subject');
   });
 
   it('requests capability tokens from a private RPC binding', async () => {

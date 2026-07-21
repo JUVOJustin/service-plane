@@ -21,6 +21,7 @@ export type {
   CapabilityJwksCacheEntry,
   CapabilityJwksResolver,
   CapabilityScopeDefinition,
+  CapabilitySubject,
   CapabilityTokenCache,
   CapabilityTokenCacheEntry,
   CapabilityTokenProvider,
