@@ -171,6 +171,30 @@ describe('Cap’n Web service capabilities', () => {
     expect(issuedCount).toBe(2);
   });
 
+  it('partitions caller-supplied cache keys by delegated subject', async () => {
+    const cache = memoryCapabilityTokenCache(() => new Date('2026-05-09T12:00:00.000Z').getTime());
+    let issuedCount = 0;
+    const providerFor = (subjectId: string) =>
+      createCapabilityTokenProvider({
+        cache,
+        cacheKey: 'shared-key',
+        callerServiceId: 'control-plane',
+        now: () => new Date('2026-05-09T12:00:00.000Z'),
+        requestToken: async () => {
+          issuedCount += 1;
+          return { expiresAt: new Date('2026-05-09T12:05:00.000Z'), token: `token-${subjectId}-${issuedCount}` };
+        },
+        scopes: ['example.users.lookup'],
+        subject: { id: subjectId },
+        targetServiceId: 'example',
+      });
+
+    await expect(providerFor('user-7').token()).resolves.toBe('token-user-7-1');
+    await expect(providerFor('user-8').token()).resolves.toBe('token-user-8-2');
+    await expect(providerFor('user-7').token()).resolves.toBe('token-user-7-1');
+    expect(issuedCount).toBe(2);
+  });
+
   it('rejects delegated subjects on shipped token requesters before anything is sent', async () => {
     const input = {
       callerServiceId: 'moco',

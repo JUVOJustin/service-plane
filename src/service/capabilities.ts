@@ -245,16 +245,20 @@ export function createCapabilityTokenProvider(options: CreateCapabilityTokenProv
   const scopes = normalizeScopes(options.scopes);
   const ttlSeconds = options.ttlSeconds === undefined ? undefined : normalizeTtlSeconds(options.ttlSeconds);
   const subject = options.subject === undefined ? undefined : normalizeCapabilitySubject(options.subject);
-  const cacheKey =
-    options.cacheKey ??
-    capabilityTokenCacheKey({
-      ...(options.abilityId ? { abilityId: normalizeValue(options.abilityId, 'ability id') } : {}),
-      callerServiceId,
-      scopes,
-      ...(subject ? { subject } : {}),
-      targetServiceId,
-      ...(ttlSeconds === undefined ? {} : { ttlSeconds }),
-    });
+  // A caller-supplied cacheKey is still partitioned by the delegated subject: services authorize
+  // per user from identity.subject, so one user's cached token must never serve another.
+  const cacheKey = options.cacheKey
+    ? subject
+      ? `${options.cacheKey}:subject:${encodeURIComponent(JSON.stringify({ id: subject.id, orgId: subject.orgId ?? null }))}`
+      : options.cacheKey
+    : capabilityTokenCacheKey({
+        ...(options.abilityId ? { abilityId: normalizeValue(options.abilityId, 'ability id') } : {}),
+        callerServiceId,
+        scopes,
+        ...(subject ? { subject } : {}),
+        targetServiceId,
+        ...(ttlSeconds === undefined ? {} : { ttlSeconds }),
+      });
 
   return {
     async token() {
