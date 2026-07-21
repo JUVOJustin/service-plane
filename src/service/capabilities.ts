@@ -35,6 +35,7 @@ import {
   SERVICE_PLANE_CAPABILITY_JWKS_PATH,
   SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
   SERVICE_PLANE_REQUEST_ID_HEADER,
+  SERVICE_PLANE_REQUEST_ID_QUERY_PARAM,
 } from '../shared/types.js';
 
 const identityByTarget = new WeakMap<object, CapabilityIdentity>();
@@ -116,7 +117,11 @@ export type ControlPlaneRpcTokenRequesterOptions = {
 };
 
 export type CloudflareAbilityRpcBinding = {
-  connectAbility(input: { abilityId: string; token: string }): Promise<Record<string, unknown>> | Record<string, unknown>;
+  connectAbility(input: {
+    abilityId: string;
+    requestId?: string;
+    token: string;
+  }): Promise<Record<string, unknown>> | Record<string, unknown>;
 };
 
 export interface AuthenticatedRoot<Scoped> {
@@ -139,6 +144,8 @@ export type CapabilityRpcSessionOptions<Scoped> = (
 ) & {
   abilityId?: string;
   authenticate?: (root: RpcStub<AuthenticatedRoot<Scoped>>, token: string) => RpcStub<Scoped>;
+  requestId?: string;
+  requestIdHeaderName?: string;
   rpcSessionOptions?: RpcSessionOptions;
   transport: CapabilityRpcTransport;
 };
@@ -304,6 +311,7 @@ export async function capabilityRpcSession<Scoped extends RpcCompatible<Scoped>>
         if (options.transport.kind === 'cloudflare-binding-rpc') {
           nativeBinding ??= options.transport.binding.connectAbility({
             abilityId: options.abilityId ?? missingAbilityId(),
+            ...(options.requestId ? { requestId: options.requestId } : {}),
             token: await tokenProvider.token(),
           });
           const target = await nativeBinding;
@@ -316,11 +324,11 @@ export async function capabilityRpcSession<Scoped extends RpcCompatible<Scoped>>
         let scoped: RpcStub<Scoped>;
         if (options.transport.kind === 'http-batch' || options.transport.kind === 'fetch') {
           const token = await tokenProvider.token();
-          scoped = authenticate(openSession<Scoped>(options.transport, options.rpcSessionOptions, options.abilityId), token);
+          scoped = authenticate(openSession<Scoped>(options), token);
         } else {
           if (!persistent) {
             const token = await tokenProvider.token();
-            persistent = authenticate(openSession<Scoped>(options.transport, options.rpcSessionOptions, options.abilityId), token);
+            persistent = authenticate(openSession<Scoped>(options), token);
           }
           scoped = persistent;
         }
@@ -465,26 +473,57 @@ function defaultAuthenticate<Scoped>(root: RpcStub<AuthenticatedRoot<Scoped>>, t
   return root.authenticate(token) as unknown as RpcStub<Scoped>;
 }
 
-function openSession<Scoped extends RpcCompatible<Scoped>>(
-  transport: CapabilityRpcTransport,
-  rpcSessionOptions?: RpcSessionOptions,
-  abilityId?: string,
-): RpcStub<AuthenticatedRoot<Scoped>> {
+function openSession<Scoped extends RpcCompatible<Scoped>>(options: {
+  abilityId?: string;
+  requestId?: string;
+  requestIdHeaderName?: string;
+  rpcSessionOptions?: RpcSessionOptions;
+  transport: CapabilityRpcTransport;
+}): RpcStub<AuthenticatedRoot<Scoped>> {
+  const { abilityId, requestId, rpcSessionOptions, transport } = options;
+  const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
   if (transport.kind === 'http-batch') {
-    return newHttpBatchRpcSession<AuthenticatedRoot<Scoped>>(httpBatchUrl(transport, abilityId), rpcSessionOptions);
+    return newHttpBatchRpcSession<AuthenticatedRoot<Scoped>>(
+      withRequestIdHeader(httpBatchUrl(transport, abilityId), requestId, requestIdHeaderName),
+      rpcSessionOptions,
+    );
   }
   if (transport.kind === 'websocket') {
-    return newWebSocketRpcSession<AuthenticatedRoot<Scoped>>(transport.url, undefined, rpcSessionOptions);
+    return newWebSocketRpcSession<AuthenticatedRoot<Scoped>>(
+      withRequestIdQueryParam(transport.url, requestId),
+      undefined,
+      rpcSessionOptions,
+    );
   }
   if (transport.kind === 'cloudflare-binding-rpc') {
     throw new CapabilityAuthError('Cloudflare native RPC transport does not open a Cap’n Web session', 500);
   }
   const rpcTransport =
     transport.kind === 'fetch'
-      ? createFetchBatchTransport(transport.fetcher, fetchTransportUrl(transport, abilityId))
+      ? createFetchBatchTransport(
+          transport.fetcher,
+          fetchTransportUrl(transport, abilityId),
+          requestId ? { [requestIdHeaderName]: requestId } : undefined,
+        )
       : transport.transport;
   const session = new RpcSession<AuthenticatedRoot<Scoped>>(rpcTransport, undefined, rpcSessionOptions);
   return session.getRemoteMain();
+}
+
+// Cap'n Web sends the batch as `fetch(urlOrRequest, { method, body })`, so a bodyless template
+// Request keeps its headers across batches and carries the correlation id to the service.
+function withRequestIdHeader(url: Request | string, requestId: string | undefined, headerName: string): Request | string {
+  if (!requestId) return url;
+  const request = url instanceof Request ? new Request(url) : new Request(url, { method: 'POST' });
+  request.headers.set(headerName, requestId);
+  return request;
+}
+
+function withRequestIdQueryParam(url: string, requestId: string | undefined): string {
+  if (!requestId) return url;
+  const parsed = new URL(url);
+  parsed.searchParams.set(SERVICE_PLANE_REQUEST_ID_QUERY_PARAM, requestId);
+  return parsed.toString();
 }
 
 function httpBatchUrl(transport: Extract<CapabilityRpcTransport, { kind: 'http-batch' }>, abilityId?: string): Request | string {
@@ -508,7 +547,7 @@ function missingAbilityId(): never {
   throw new CapabilityAuthError('Service-Plane abilityId is required for Cloudflare native RPC transport', 500);
 }
 
-function createFetchBatchTransport(fetcher: FetchLike, url: string): RpcTransport {
+function createFetchBatchTransport(fetcher: FetchLike, url: string, headers?: Record<string, string>): RpcTransport {
   let batchToSend: string[] | null = [];
   let batchToReceive: string[] | undefined;
   let aborted: unknown;
@@ -517,7 +556,7 @@ function createFetchBatchTransport(fetcher: FetchLike, url: string): RpcTranspor
     if (aborted !== undefined) throw aborted;
     const batch = batchToSend ?? [];
     batchToSend = null;
-    const response = await fetcher.fetch(new Request(url, { body: batch.join('\n'), method: 'POST' }));
+    const response = await fetcher.fetch(new Request(url, { body: batch.join('\n'), ...(headers ? { headers } : {}), method: 'POST' }));
     if (!response.ok) {
       response.body?.cancel();
       throw new CapabilityAuthError(`Cap'n Web HTTP-batch transport failed: ${response.status}`, response.status);

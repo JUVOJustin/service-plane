@@ -35,9 +35,10 @@ This mounts:
 POST /.well-known/service-plane/capability-token
 GET  /.well-known/service-plane/jwks.json
 GET  /openapi.json
-GET  /swagger
-ALL  /rpc/mcp
+POST /rpc/mcp                                    (MCP streamable HTTP)
 ```
+
+To serve a documentation UI, mount a Hono renderer on `plane.app` against `/openapi.json` — see [OpenAPI and MCP: Docs UI](openapi-mcp.md#docs-ui).
 
 ## What The Plane Does
 
@@ -46,11 +47,27 @@ flowchart TD
   Services["Configured services"] --> Discovery["Fetch service discovery"]
   Discovery --> Catalog["Build ability + scope catalog"]
   Catalog --> STS["Issue scoped capability tokens"]
-  Catalog --> OpenAPI["Build /openapi.json and /swagger"]
+  Catalog --> OpenAPI["Build /openapi.json"]
   Catalog --> MCP["Build /rpc/mcp tool list"]
 ```
 
 The plane does not implement Asana, ClickUp, or Moco logic. It only knows how to discover those services, validate grants, issue tokens, and project published metadata.
+
+Every inbound request gets an `X-Request-Id` (adopted from the caller or generated), and the broker and MCP surfaces forward it to services on every brokered call. Broker connects, MCP tool calls, and configuration errors are logged as structured JSON events; pass `log` to redirect them to your own sink or `log: false` to silence them. See the logging section in [the reference](reference.md).
+
+## Service-Plane Ingress
+
+If services must reject direct application calls, configure `ServicePlaneService` with `ingress: {}` and send callers through the control-plane broker.
+
+```ts
+cloudflareServiceBinding({
+  id: 'asana',
+  binding: c.env.ASANA,
+  grants: [{ caller: 'workflow-runner', scopes: ['asana.tasks.write'] }],
+});
+```
+
+The broker uses the existing capability issuer to mint a signed brokered token. A caller that sends a valid non-brokered capability token directly to `/rpc/<abilityId>` gets `403` before any ability handler is created.
 
 ## Grants
 
@@ -99,18 +116,28 @@ const plane = new ServicePlaneControlPlane({
 });
 ```
 
-The bundle is derived from published ability metadata. Individual services do not serve Swagger files.
+The document is derived from published ability metadata. Individual services do not serve OpenAPI files.
 
 ## Optional Broker
 
-The broker is useful when one caller wants to discover and connect to abilities through the plane.
+The broker lets a caller discover and connect to abilities through the plane. The broker and MCP endpoints are **fail closed**: you must supply a `caller` resolver that authenticates the request and returns the caller identity. A request with no configured resolver returns `500`; a resolver that returns no caller returns `401`. Nothing is brokered without an authenticated caller.
 
 ```ts
 new ServicePlaneControlPlane({
-  broker: { path: '/rpc/broker' },
+  broker: {
+    path: '/rpc/broker',
+    // Authenticate the request however your deployment does (gateway header, session,
+    // mTLS, service binding). Return undefined to reject with 401.
+    caller: (c) => {
+      const serviceId = c.req.header('x-authenticated-service');
+      return serviceId ? { id: serviceId, kind: 'service' } : undefined;
+    },
+  },
   // ...
 });
 ```
+
+`caller` returns a `BrokerCaller` — `{ id, kind: 'service' | 'user' }`. Service callers (`kind: 'service'`) can reach `access: 'service'` abilities and are brokered under their own service id; other callers are brokered under the control-plane identity for `access: 'plane'` abilities. To intentionally allow anonymous access, return a fixed caller from the resolver — it is always an explicit choice, never a default.
 
 The broker connects by ability:
 
@@ -118,6 +145,6 @@ The broker connects by ability:
 broker.ability('asana', 'asana.tasks').connect(['asana.tasks.write']);
 ```
 
-Most service-to-service calls can skip the broker and call the service directly with `abilitySession(...)`.
+When service-plane ingress protection is enabled, callers must use the broker or another approved service-plane component that can mint brokered capability tokens.
 
 Next: [auth](auth.md), [OpenAPI and MCP](openapi-mcp.md), and [Cloudflare](cloudflare.md).

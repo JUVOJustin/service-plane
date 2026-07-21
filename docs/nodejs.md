@@ -22,6 +22,7 @@ const service = new ServicePlaneService({
     issuer: 'control-plane',
     jwks: jwksFromUrl('https://plane.example.com/.well-known/service-plane/jwks.json'),
   },
+  ingress: {},
   capabilities,
   abilities: [asanaTasks],
 });
@@ -69,6 +70,8 @@ await asana.createTask({
   projectId: 'proj_456',
 });
 ```
+
+If the service enables `ingress`, direct HTTP-batch callers must not be used. Send calls through the control-plane broker so the token carries the signed broker claim.
 
 ## HMAC Fallback
 

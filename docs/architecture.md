@@ -67,6 +67,14 @@ flowchart TD
 
 Hono middleware sees the HTTP or WebSocket request. Cap'n Web sees the logical method call. That is why method auth and validation live in the Service Plane RPC wrapper, not in Hono middleware.
 
+Services that must only process brokered traffic can enable service-plane ingress protection. In that mode, `/rpc/<abilityId>` rejects valid but non-brokered capability tokens before input validation or handler creation. The broker mints a signed broker claim with the same capability issuer and JWKS trust chain the service already uses.
+
+## Observability
+
+One request id follows a call across the whole plane. The control plane assigns or adopts `X-Request-Id` on every inbound request, and its broker and MCP surfaces forward that id on every outbound service call (header for HTTP transports, `request_id` query parameter for WebSocket upgrades, `requestId` field for native bindings). The service shell adopts the propagated id into its Hono `requestId` variable, echoes it on responses, and includes it in its log events, so plane and service logs correlate without extra plumbing.
+
+Both shells emit typed, token-safe JSON log events (requests, broker connects, MCP tool calls, caller-auth rejections) to the console by default. The package never owns the application logger: every surface accepts a `log` callback that forwards events to whatever logger the app uses, and events are also exposed on the Hono context for app middleware. See the logging section in [the reference](reference.md).
+
 ## Discovery And Projections
 
 Services publish metadata at `/.well-known/service-plane/service.json`. The control plane fetches that metadata, validates grants, and builds projections.
@@ -76,12 +84,12 @@ flowchart LR
   Asana["Asana service<br/>abilities + schemas"] --> Registry["Control plane registry"]
   ClickUp["ClickUp service<br/>abilities + schemas"] --> Registry
   Moco["Moco service<br/>abilities + schemas"] --> Registry
-  Registry --> OpenAPI["/openapi.json<br/>/swagger"]
+  Registry --> OpenAPI["/openapi.json"]
   Registry --> MCP["/rpc/mcp<br/>MCP tools"]
   Registry --> Grants["STS grants<br/>scope checks"]
 ```
 
-Only `exposure: 'published'` methods with REST metadata enter OpenAPI. Only published methods with MCP metadata enter MCP. Private abilities remain available for service-to-service calls and grant validation, but they are not user-facing projections.
+Only `exposure: 'published'` methods with REST metadata enter OpenAPI. Only published methods with MCP metadata enter MCP. Private abilities remain available for broker routing and grant validation, but they are not user-facing projections.
 
 ## Core Terms
 
@@ -89,8 +97,9 @@ Only `exposure: 'published'` methods with REST metadata enter OpenAPI. Only publ
 - Method: one callable operation on an ability.
 - Handler: implementation object returned by the ability factory.
 - Context: runtime access such as Hono context, env, bindings, and execution context.
-- Identity: verified caller, user, tenant, connection, and scope claims.
-- Private: service-to-service ability, excluded from OpenAPI and MCP.
-- Published: ability eligible for OpenAPI, Swagger, MCP, or user-facing transports.
+- Identity: verified Service Plane caller and scope claims.
+- Access: whether an ability is plane-callable or restricted to service callers.
+- Private: ability excluded from OpenAPI and MCP.
+- Published: ability eligible for OpenAPI, MCP, or user-facing transports.
 
 Next: [create a service](service-creation.md), then [create a control plane](plane-creation.md).

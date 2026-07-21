@@ -1,6 +1,5 @@
 export const SERVICE_DISCOVERY_PATH = '/.well-known/service-plane/service.json';
 export const SERVICE_PLANE_OPENAPI_PATH = '/openapi.json';
-export const SERVICE_PLANE_SWAGGER_PATH = '/swagger';
 export const SERVICE_PLANE_CAPABILITY_JWKS_PATH = '/.well-known/service-plane/jwks.json';
 export const SERVICE_PLANE_CAPABILITY_TOKEN_PATH = '/.well-known/service-plane/capability-token';
 export const SERVICE_PLANE_MCP_PATH = '/rpc/mcp';
@@ -12,8 +11,10 @@ export const DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS = 300;
 
 export const SERVICE_PLANE_AUTHORIZATION_SCHEME = 'ServicePlane';
 export const SERVICE_PLANE_REQUEST_ID_HEADER = 'X-Request-Id';
+// WebSocket upgrades cannot carry custom headers portably, so request ids ride a query parameter there.
+export const SERVICE_PLANE_REQUEST_ID_QUERY_PARAM = 'request_id';
 
-export type AbilityAuth = 'anonymous' | 'service' | 'user';
+export type AbilityAccess = 'plane' | 'service';
 export type AbilityExposure = 'private' | 'published';
 export type AbilityTransport = 'cloudflare-binding-rpc' | 'http-batch' | 'websocket';
 export type ServiceHttpMethod = 'delete' | 'get' | 'patch' | 'post' | 'put';
@@ -50,16 +51,41 @@ export type ServiceAbilityMcpProjection = {
   name: string;
 };
 
+// A `{var}` URI declares a resource template; template variables become the method input.
+export type ServiceAbilityMcpResourceProjection = {
+  description?: string;
+  mimeType?: string;
+  name: string;
+  title?: string;
+  uri: string;
+};
+
+export type ServiceAbilityMcpPromptArgument = {
+  description?: string;
+  name: string;
+  required?: boolean;
+};
+
+// Prompt arguments default to the method input schema's top-level properties when omitted.
+export type ServiceAbilityMcpPromptProjection = {
+  arguments?: ServiceAbilityMcpPromptArgument[];
+  description?: string;
+  name: string;
+  title?: string;
+};
+
 export type ServiceAbilityMethodDiscovery = {
   inputSchema: OpenApiObject;
   mcp?: ServiceAbilityMcpProjection;
+  mcpPrompt?: ServiceAbilityMcpPromptProjection;
+  mcpResource?: ServiceAbilityMcpResourceProjection;
   outputSchema: OpenApiObject;
   rest?: ServiceAbilityRestProjection;
   scopes: string[];
 };
 
 export type ServiceAbilityDiscovery = {
-  auth: AbilityAuth;
+  access: AbilityAccess;
   description?: string;
   exposure: AbilityExposure;
   id: string;
@@ -78,6 +104,7 @@ export type ServiceDiscoveryDocument = {
   callerAuth?: ServiceCallerAuthDiscovery;
   capabilities?: CapabilityCatalog;
   id: string;
+  ingress?: ServiceIngressDiscovery;
   title: string;
   version: string;
 };
@@ -111,8 +138,13 @@ export type ServiceEndpoint = {
 export type DiscoveredServiceAbility = ServiceAbilityDiscovery & {
   service: ServiceEndpoint;
   serviceId: string;
+  serviceIngress?: ServiceIngressDiscovery;
   serviceTitle: string;
   serviceVersion: string;
+};
+
+export type ServiceIngressDiscovery = {
+  required: true;
 };
 
 export type ServiceDiscoverySnapshot = {
@@ -157,20 +189,54 @@ export type OpenApiDocumentCache = {
   set(key: string, value: OpenApiDocument, ttlSeconds: number): Promise<void>;
 };
 
-export type McpToolDiscovery = {
-  description?: string;
-  inputSchema: OpenApiObject;
-  name: string;
-  outputSchema: OpenApiObject;
-  scopes: string[];
+// Spec-shaped MCP projections: only `_meta` carries Service-Plane routing data so stock clients see standard objects.
+export type McpServicePlaneMeta = {
   servicePlane: {
     abilityId: string;
     method: string;
+    scopes: string[];
     serviceId: string;
   };
 };
 
+export type McpToolDiscovery = {
+  _meta: McpServicePlaneMeta;
+  description?: string;
+  inputSchema: OpenApiObject;
+  name: string;
+  outputSchema: OpenApiObject;
+};
+
+export type McpResourceDiscovery = {
+  _meta: McpServicePlaneMeta;
+  description?: string;
+  mimeType?: string;
+  name: string;
+  title?: string;
+  uri: string;
+};
+
+export type McpResourceTemplateDiscovery = {
+  _meta: McpServicePlaneMeta;
+  description?: string;
+  mimeType?: string;
+  name: string;
+  title?: string;
+  uriTemplate: string;
+};
+
+export type McpPromptDiscovery = {
+  _meta: McpServicePlaneMeta;
+  arguments?: ServiceAbilityMcpPromptArgument[];
+  description?: string;
+  name: string;
+  title?: string;
+};
+
 export type McpDiscoveryDocument = {
+  prompts: McpPromptDiscovery[];
+  resourceTemplates: McpResourceTemplateDiscovery[];
+  resources: McpResourceDiscovery[];
   tools: McpToolDiscovery[];
 };
 
@@ -182,11 +248,13 @@ export type CapabilityClaims = {
   jti: string;
   nbf: number;
   scp: string[];
+  spb?: string;
   sub: string;
 };
 
 export type CapabilityIdentity = {
   audience: string;
+  brokerServiceId?: string;
   expiresAt: Date;
   issuer: string;
   scopes: string[];

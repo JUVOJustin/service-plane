@@ -17,12 +17,6 @@ export type ControlPlaneOpenApiOptions = {
   description?: string;
   path?: string;
   servers?: OpenApiObject[];
-  swagger?:
-    | false
-    | {
-        path?: string;
-        title?: string;
-      };
   title?: string;
   version?: string;
 };
@@ -104,33 +98,6 @@ export function controlPlaneOpenApiCacheKey(
   });
 }
 
-export function swaggerUiHtml(options: { openApiPath?: string; title?: string } = {}): string {
-  const title = escapeHtml(options.title ?? 'Service Plane API');
-  const openApiPath = jsonScriptString(options.openApiPath ?? SERVICE_PLANE_OPENAPI_PATH);
-  return `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>${title}</title>
-    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
-  </head>
-  <body>
-    <div id="swagger-ui"></div>
-    <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
-    <script>
-      window.ui = SwaggerUIBundle({
-        url: ${openApiPath},
-        dom_id: '#swagger-ui',
-        deepLinking: true,
-        presets: [SwaggerUIBundle.presets.apis],
-        layout: 'BaseLayout',
-      });
-    </script>
-  </body>
-</html>`;
-}
-
 function openApiOperation(ability: ServiceRegistrySnapshot['abilities'][number], methodName: string): OpenApiObject {
   const method = ability.methods[methodName];
   if (!method?.rest) throw new Error(`Missing REST projection for ${ability.serviceId}/${ability.id}/${methodName}`);
@@ -159,8 +126,8 @@ function openApiOperation(ability: ServiceRegistrySnapshot['abilities'][number],
     ...(method.rest.summary ? { summary: method.rest.summary } : {}),
     tags: method.rest.tags && method.rest.tags.length > 0 ? method.rest.tags : [ability.serviceTitle],
     'x-service-plane': {
+      access: ability.access,
       abilityId: ability.id,
-      auth: ability.auth,
       method: methodName,
       scopes: method.scopes,
       serviceId: ability.serviceId,
@@ -168,12 +135,4 @@ function openApiOperation(ability: ServiceRegistrySnapshot['abilities'][number],
       serviceVersion: ability.serviceVersion,
     },
   };
-}
-
-function escapeHtml(value: string): string {
-  return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
-}
-
-function jsonScriptString(value: string): string {
-  return JSON.stringify(value).replaceAll('<', '\\u003c');
 }

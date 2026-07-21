@@ -1,15 +1,81 @@
 import { describe, expect, it } from 'vitest';
-import { swaggerUiHtml } from './openapi.js';
+import type { DiscoveredServiceAbility, ServiceEndpoint, ServiceRegistrySnapshot } from '../shared/types.js';
+import { generateControlPlaneOpenApi } from './openapi.js';
 
-describe('control-plane OpenAPI helpers', () => {
-  it('escapes Swagger UI path strings for script context', () => {
-    const html = swaggerUiHtml({
-      openApiPath: '</script><script>alert(1)</script>',
-      title: '<Service Plane>',
+const endpoint: ServiceEndpoint = {
+  fetch: async () => new Response(null, { status: 404 }),
+  id: 'example',
+  origin: 'https://example.internal',
+};
+
+function publishedAbility(overrides: Partial<DiscoveredServiceAbility> = {}): DiscoveredServiceAbility {
+  return {
+    access: 'plane',
+    exposure: 'published',
+    id: 'example.search',
+    methods: {
+      search: {
+        inputSchema: { properties: { query: { type: 'string' } }, type: 'object' },
+        outputSchema: { type: 'object' },
+        rest: { method: 'post', operationId: 'searchExamples', path: '/examples/search', summary: 'Search examples' },
+        scopes: ['example.search'],
+      },
+    },
+    rpc: { path: '/rpc/example.search', transports: ['http-batch'] },
+    scopes: ['example.search'],
+    service: endpoint,
+    serviceId: 'example',
+    serviceTitle: 'Example',
+    serviceVersion: '0.1.0',
+    ...overrides,
+  };
+}
+
+function snapshotOf(abilities: DiscoveredServiceAbility[]): ServiceRegistrySnapshot {
+  return { abilities, discoveredAt: '2026-05-09T12:00:00.000Z', services: [] };
+}
+
+describe('generateControlPlaneOpenApi', () => {
+  it('projects published REST methods from Zod-derived schemas into an OpenAPI 3.1 document', () => {
+    const document = generateControlPlaneOpenApi({
+      snapshot: snapshotOf([publishedAbility()]),
+      title: 'Control Plane APIs',
+      version: '2026.05.23',
     });
 
-    expect(html).toContain('&lt;Service Plane&gt;');
-    expect(html).toContain('"\\u003c/script>\\u003cscript>alert(1)\\u003c/script>"');
-    expect(html).not.toContain('</script><script>alert(1)</script>');
+    expect(document.openapi).toBe('3.1.0');
+    expect(document.info).toMatchObject({ title: 'Control Plane APIs', version: '2026.05.23' });
+
+    const operation = document.paths['/examples/search']?.post as Record<string, unknown> | undefined;
+    expect(operation?.operationId).toBe('searchExamples');
+    expect(operation?.security).toEqual([{ ServicePlane: [] }]);
+
+    const requestBody = operation?.requestBody as { content?: Record<string, { schema?: unknown }> } | undefined;
+    expect(requestBody?.content?.['application/json']?.schema).toMatchObject({
+      properties: { query: { type: 'string' } },
+      type: 'object',
+    });
+
+    // A security scheme is emitted only because a projected operation declares scopes.
+    expect(document.components).toMatchObject({
+      securitySchemes: { ServicePlane: { scheme: 'bearer', type: 'http' } },
+    });
+  });
+
+  it('excludes private abilities and methods without REST metadata', () => {
+    const document = generateControlPlaneOpenApi({
+      snapshot: snapshotOf([
+        publishedAbility({ exposure: 'private' }),
+        publishedAbility({
+          id: 'example.rpc-only',
+          methods: { run: { inputSchema: { type: 'object' }, outputSchema: { type: 'object' }, scopes: [] } },
+          rpc: { path: '/rpc/example.rpc-only', transports: ['http-batch'] },
+          scopes: [],
+        }),
+      ]),
+    });
+
+    expect(Object.keys(document.paths)).toHaveLength(0);
+    expect(document.components).toBeUndefined();
   });
 });

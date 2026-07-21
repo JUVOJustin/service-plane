@@ -83,6 +83,7 @@ export async function verifyCapabilityToken(token: string, options: VerifyCapabi
 
   return {
     audience: claims.aud,
+    ...(claims.spb ? { brokerServiceId: claims.spb } : {}),
     expiresAt: new Date(claims.exp * 1000),
     issuer: claims.iss,
     scopes: claims.scp,
@@ -117,7 +118,7 @@ function decodeCapabilityToken(token: string): { header: unknown; payload: unkno
 
 function parseCapabilityClaims(value: unknown): CapabilityClaims {
   if (!isRecord(value)) throw new CapabilityAuthError('Invalid Service-Plane capability claims');
-  const { aud, exp, iat, iss, jti, nbf, scp, sub } = value;
+  const { aud, exp, iat, iss, jti, nbf, scp, spb, sub } = value;
   if (
     typeof aud !== 'string' ||
     typeof exp !== 'number' ||
@@ -126,6 +127,7 @@ function parseCapabilityClaims(value: unknown): CapabilityClaims {
     typeof jti !== 'string' ||
     typeof nbf !== 'number' ||
     typeof sub !== 'string' ||
+    !(spb === undefined || typeof spb === 'string') ||
     !Array.isArray(scp) ||
     scp.length === 0 ||
     !scp.every((scope) => typeof scope === 'string')
@@ -137,12 +139,13 @@ function parseCapabilityClaims(value: unknown): CapabilityClaims {
     !isBoundedClaimString(iss) ||
     !isBoundedClaimString(jti) ||
     !isBoundedClaimString(sub) ||
+    !(spb === undefined || isBoundedClaimString(spb)) ||
     scp.length > MAX_CAPABILITY_SCOPE_COUNT ||
     !scp.every(isBoundedClaimString)
   ) {
     throw new CapabilityAuthError('Invalid Service-Plane capability claims');
   }
-  return { aud, exp, iat, iss, jti, nbf, scp, sub };
+  return { aud, exp, iat, iss, jti, nbf, scp, ...(spb ? { spb } : {}), sub };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

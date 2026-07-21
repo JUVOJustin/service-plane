@@ -1,5 +1,17 @@
+export {
+  DEFAULT_HTTP_CACHE_MAX_AGE_SECONDS,
+  DEFAULT_HTTP_CACHE_STALE_WHILE_REVALIDATE_SECONDS,
+  type ServicePlaneHttpCacheOption,
+  type ServicePlaneHttpCacheOptions,
+  servicePlaneHttpCacheHeaders,
+} from '../shared/http-cache.js';
+export {
+  defaultServicePlaneLogSink,
+  type ServicePlaneLoggableEvent,
+  type ServicePlaneLogSink,
+} from '../shared/logging.js';
 export type {
-  AbilityAuth,
+  AbilityAccess,
   AbilityExposure,
   AbilityTransport,
   CapabilityCatalog,
@@ -17,15 +29,23 @@ export type {
   IssueCapabilityTokenInput,
   IssuedCapabilityToken,
   McpDiscoveryDocument,
+  McpPromptDiscovery,
+  McpResourceDiscovery,
+  McpResourceTemplateDiscovery,
+  McpServicePlaneMeta,
   McpToolDiscovery,
   OpenApiObject,
   ServiceAbilityDiscovery,
   ServiceAbilityMcpProjection,
+  ServiceAbilityMcpPromptArgument,
+  ServiceAbilityMcpPromptProjection,
+  ServiceAbilityMcpResourceProjection,
   ServiceAbilityMethodDiscovery,
   ServiceAbilityRestProjection,
   ServiceCallerAuthDiscovery,
   ServiceDiscoveryDocument,
   ServiceHttpMethod,
+  ServiceIngressDiscovery,
 } from '../shared/types.js';
 export {
   DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
@@ -37,7 +57,7 @@ export {
   SERVICE_PLANE_MCP_PATH,
   SERVICE_PLANE_OPENAPI_PATH,
   SERVICE_PLANE_REQUEST_ID_HEADER,
-  SERVICE_PLANE_SWAGGER_PATH,
+  SERVICE_PLANE_REQUEST_ID_QUERY_PARAM,
 } from '../shared/types.js';
 export {
   type GenerateServiceCallerSigningJwkOptions,
@@ -113,10 +133,13 @@ export {
   type ServicePlaneLogEvent,
   type ServicePlaneLoggerOptions,
   type ServicePlaneLogLevel,
+  type ServicePlaneLogVariables,
+  servicePlaneLogEvents,
   servicePlaneLogger,
 } from './logger.js';
 export {
   ServicePlaneService,
   type ServicePlaneServiceAuthOptions,
+  type ServicePlaneServiceIngressOptions,
   type ServicePlaneServiceOptions,
 } from './service.js';

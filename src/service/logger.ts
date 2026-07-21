@@ -1,10 +1,16 @@
 import type { Context } from 'hono';
 import { createMiddleware } from 'hono/factory';
-import { SERVICE_DISCOVERY_PATH, SERVICE_PLANE_REQUEST_ID_HEADER, type ServiceAbilityDiscovery } from '../shared/types.js';
+import { defaultServicePlaneLogSink, type ServicePlaneLogLevel } from '../shared/logging.js';
+import {
+  SERVICE_DISCOVERY_PATH,
+  SERVICE_PLANE_REQUEST_ID_HEADER,
+  SERVICE_PLANE_REQUEST_ID_QUERY_PARAM,
+  type ServiceAbilityDiscovery,
+} from '../shared/types.js';
 import type { ServiceDefinition } from './discovery.js';
 import { serviceDiscoveryDocument } from './discovery.js';
 
-export type ServicePlaneLogLevel = 'info' | 'error';
+export type { ServicePlaneLogLevel } from '../shared/logging.js';
 
 export type ServicePlaneLogEvent = {
   durationMs: number;
@@ -27,8 +33,14 @@ export type ServicePlaneLogEvent = {
   };
 };
 
+// Hono context variables the logger maintains so app middleware mounted outside it
+// can read the emitted events after `await next()`.
+export type ServicePlaneLogVariables = {
+  servicePlaneLogEvents?: ServicePlaneLogEvent[];
+};
+
 export type ServicePlaneLoggerOptions = {
-  log?: (event: ServicePlaneLogEvent) => void;
+  log?: (event: ServicePlaneLogEvent, context?: Context) => void;
   requestIdHeaderName?: string;
   requestId?: (context: Context) => string | undefined;
 };
@@ -36,14 +48,13 @@ export type ServicePlaneLoggerOptions = {
 // Emits structured, token-safe logs for service requests without owning the app logger.
 export function servicePlaneLogger(service: ServiceDefinition, options: ServicePlaneLoggerOptions = {}) {
   const discovery = serviceDiscoveryDocument(service);
-  const write = options.log ?? defaultLog;
+  const write = options.log ?? defaultServicePlaneLogSink;
 
   return createMiddleware(async (context, next) => {
     const startedAt = Date.now();
     const url = new URL(context.req.url);
     const ability = discovery.abilities.find((candidate) => candidate.rpc.path === url.pathname);
-    const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
-    const requestId = options.requestId?.(context) ?? requestIdFromContext(context) ?? context.req.header(requestIdHeaderName) ?? undefined;
+    const requestId = resolveRequestId(context, options);
 
     try {
       await next();
@@ -59,7 +70,8 @@ export function servicePlaneLogger(service: ServiceDefinition, options: ServiceP
       };
       if (requestId) event.requestId = requestId;
       if (ability) event.ability = compactAbility(ability);
-      write(event);
+      stashLogEvent(context, event);
+      write(event, context);
     } catch (error) {
       const durationMs = Date.now() - startedAt;
       const event: ServicePlaneLogEvent = {
@@ -74,19 +86,38 @@ export function servicePlaneLogger(service: ServiceDefinition, options: ServiceP
       };
       if (requestId) event.requestId = requestId;
       if (ability) event.ability = compactAbility(ability);
-      write(event);
+      stashLogEvent(context, event);
+      write(event, context);
       throw error;
     }
   });
 }
 
-function defaultLog(event: ServicePlaneLogEvent): void {
-  const message = JSON.stringify(event);
-  if (event.level === 'error') {
-    console.error(message);
+export function servicePlaneLogEvents(context: Context): ServicePlaneLogEvent[] {
+  const value = context.get('servicePlaneLogEvents' as never) as unknown;
+  return Array.isArray(value) ? (value as ServicePlaneLogEvent[]) : [];
+}
+
+// Incoming header (and its WebSocket query-param fallback) wins over the context variable so
+// brokered request ids survive even when a local request-id middleware generated a fresh id.
+function resolveRequestId(context: Context, options: ServicePlaneLoggerOptions): string | undefined {
+  const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
+  return (
+    options.requestId?.(context) ??
+    (context.req.header(requestIdHeaderName)?.trim() || undefined) ??
+    (context.req.query(SERVICE_PLANE_REQUEST_ID_QUERY_PARAM)?.trim() || undefined) ??
+    requestIdFromContext(context) ??
+    undefined
+  );
+}
+
+function stashLogEvent(context: Context, event: ServicePlaneLogEvent): void {
+  const events = context.get('servicePlaneLogEvents' as never) as ServicePlaneLogEvent[] | undefined;
+  if (Array.isArray(events)) {
+    events.push(event);
     return;
   }
-  console.log(message);
+  context.set('servicePlaneLogEvents' as never, [event] as never);
 }
 
 function requestIdFromContext(context: Context): string | undefined {

@@ -8,7 +8,7 @@ describe('service registry', () => {
   const document: ServiceDiscoveryDocument = {
     abilities: [
       {
-        auth: 'service',
+        access: 'service',
         exposure: 'private',
         id: 'example.sync',
         methods: {

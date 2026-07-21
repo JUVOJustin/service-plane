@@ -3,7 +3,7 @@ import type { Context, Env } from 'hono';
 import * as z from 'zod';
 import { AbilityValidationError, CapabilityAuthError } from '../shared/errors.js';
 import {
-  type AbilityAuth,
+  type AbilityAccess,
   type AbilityExposure,
   type AbilityTransport,
   type CapabilityCatalog,
@@ -12,6 +12,8 @@ import {
   SERVICE_DISCOVERY_PATH,
   type ServiceAbilityDiscovery,
   type ServiceAbilityMcpProjection,
+  type ServiceAbilityMcpPromptProjection,
+  type ServiceAbilityMcpResourceProjection,
   type ServiceAbilityMethodDiscovery,
   type ServiceAbilityRestProjection,
   type ServiceCallerAuthDiscovery,
@@ -25,6 +27,8 @@ export type AbilitySchema = z.ZodType;
 export type AbilityMethodDefinition<TInput extends AbilitySchema = AbilitySchema, TOutput extends AbilitySchema = AbilitySchema> = {
   input: TInput;
   mcp?: ServiceAbilityMcpProjection;
+  mcpPrompt?: ServiceAbilityMcpPromptProjection;
+  mcpResource?: ServiceAbilityMcpResourceProjection;
   output: TOutput;
   rest?: ServiceAbilityRestProjection;
   scopes?: string[];
@@ -58,7 +62,7 @@ export type ServiceAbilityHandlerFactory<TEnv extends Env = Env> = (
 ) => Promise<RpcTarget & Record<string, unknown>> | (RpcTarget & Record<string, unknown>);
 
 export type ServiceAbilityDefinition<TEnv extends Env = Env, TMethods extends AbilityMethodDefinitions = AbilityMethodDefinitions> = {
-  auth?: AbilityAuth;
+  access?: AbilityAccess;
   description?: string;
   exposure?: AbilityExposure;
   id: string;
@@ -85,9 +89,9 @@ export type NormalizedAbilityMethodDefinition<
 
 export type NormalizedServiceAbility<TEnv extends Env = Env> = Omit<
   AnyServiceAbilityDefinition<TEnv>,
-  'auth' | 'exposure' | 'methods' | 'rpc' | 'scopes'
+  'access' | 'exposure' | 'methods' | 'rpc' | 'scopes'
 > & {
-  auth: AbilityAuth;
+  access: AbilityAccess;
   exposure: AbilityExposure;
   methods: Record<string, NormalizedAbilityMethodDefinition>;
   rpc: {
@@ -232,7 +236,7 @@ function normalizeAbilities<TEnv extends Env>(
 
     return {
       ...ability,
-      auth: normalizeAbilityAuth(ability.auth ?? 'service', id),
+      access: normalizeAbilityAccess(ability.access ?? 'plane', id),
       exposure: normalizeAbilityExposure(ability.exposure ?? 'private', id),
       id,
       methods,
@@ -269,12 +273,16 @@ function normalizeMethods(
       validateMethodScopesDeclaredByAbility(abilityId, name, scopes, abilityScopes);
       const rest = method.rest ? normalizeRestProjection(abilityId, name, method.rest) : undefined;
       const mcp = method.mcp ? normalizeMcpProjection(abilityId, name, method.mcp) : undefined;
+      const mcpPrompt = method.mcpPrompt ? normalizeMcpPromptProjection(abilityId, name, method.mcpPrompt) : undefined;
+      const mcpResource = method.mcpResource ? normalizeMcpResourceProjection(abilityId, name, method.mcpResource) : undefined;
       return [
         name,
         {
           ...method,
           inputSchema: zodToJsonSchema(method.input, 'input', `${abilityId}/${name}`),
           ...(mcp ? { mcp } : {}),
+          ...(mcpPrompt ? { mcpPrompt } : {}),
+          ...(mcpResource ? { mcpResource } : {}),
           outputSchema: zodToJsonSchema(method.output, 'output', `${abilityId}/${name}`),
           ...(rest ? { rest } : {}),
           scopes,
@@ -302,7 +310,7 @@ function validateMethodScopesDeclaredByAbility(
 
 function abilityDiscovery<TEnv extends Env>(ability: NormalizedServiceAbility<TEnv>): ServiceAbilityDiscovery {
   return {
-    auth: ability.auth,
+    access: ability.access,
     ...(ability.description ? { description: ability.description } : {}),
     exposure: ability.exposure,
     id: ability.id,
@@ -312,6 +320,8 @@ function abilityDiscovery<TEnv extends Env>(ability: NormalizedServiceAbility<TE
         {
           inputSchema: method.inputSchema,
           ...(method.mcp ? { mcp: method.mcp } : {}),
+          ...(method.mcpPrompt ? { mcpPrompt: method.mcpPrompt } : {}),
+          ...(method.mcpResource ? { mcpResource: method.mcpResource } : {}),
           outputSchema: method.outputSchema,
           ...(method.rest ? { rest: method.rest } : {}),
           scopes: method.scopes,
@@ -341,6 +351,54 @@ function normalizeMcpProjection(abilityId: string, methodName: string, mcp: Serv
     ...mcp,
     name: normalizeValue(mcp.name, `MCP tool name for ${abilityId}/${methodName}`),
   };
+}
+
+function normalizeMcpPromptProjection(
+  abilityId: string,
+  methodName: string,
+  prompt: ServiceAbilityMcpPromptProjection,
+): ServiceAbilityMcpPromptProjection {
+  return {
+    ...prompt,
+    ...(prompt.arguments
+      ? {
+          arguments: prompt.arguments.map((argument) => ({
+            ...argument,
+            name: normalizeValue(argument.name, `MCP prompt argument name for ${abilityId}/${methodName}`),
+          })),
+        }
+      : {}),
+    name: normalizeValue(prompt.name, `MCP prompt name for ${abilityId}/${methodName}`),
+  };
+}
+
+function normalizeMcpResourceProjection(
+  abilityId: string,
+  methodName: string,
+  resource: ServiceAbilityMcpResourceProjection,
+): ServiceAbilityMcpResourceProjection {
+  const uri = normalizeValue(resource.uri, `MCP resource URI for ${abilityId}/${methodName}`);
+  validateMcpResourceUriTemplate(uri, abilityId, methodName);
+  return {
+    ...resource,
+    name: normalizeValue(resource.name, `MCP resource name for ${abilityId}/${methodName}`),
+    uri,
+  };
+}
+
+// Only simple `{var}` template expressions are supported; the plane matches them and passes variables as method input.
+function validateMcpResourceUriTemplate(uri: string, abilityId: string, methodName: string): void {
+  const expressions = uri.match(/\{[^}]*\}|\{|\}/gu) ?? [];
+  let balance = 0;
+  for (const char of uri) {
+    if (char === '{') balance += 1;
+    if (char === '}') balance -= 1;
+    if (balance < 0) break;
+  }
+  const allSimple = expressions.every((expression) => /^\{[A-Za-z_][\w]*\}$/u.test(expression));
+  if (balance !== 0 || !allSimple) {
+    throw new CapabilityAuthError(`Service-Plane MCP resource URI has an invalid template expression: ${abilityId}/${methodName}`, 500);
+  }
 }
 
 function validateCallerAuthDiscovery(service: Pick<ServiceDefinition, 'callerAuth'>): void {
@@ -403,11 +461,11 @@ function normalizeAbilityExposure(exposure: AbilityExposure, abilityId: string):
   return exposure;
 }
 
-function normalizeAbilityAuth(auth: AbilityAuth, abilityId: string): AbilityAuth {
-  if (auth !== 'anonymous' && auth !== 'service' && auth !== 'user') {
-    throw new CapabilityAuthError(`Unknown Service-Plane ability auth for ${abilityId}: ${String(auth)}`, 500);
+function normalizeAbilityAccess(access: AbilityAccess, abilityId: string): AbilityAccess {
+  if (access !== 'plane' && access !== 'service') {
+    throw new CapabilityAuthError(`Unknown Service-Plane ability access for ${abilityId}: ${String(access)}`, 500);
   }
-  return auth;
+  return access;
 }
 
 function normalizeTags(tags: string[], source: string): string[] {

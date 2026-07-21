@@ -4,7 +4,7 @@ Goal: understand how callers are authenticated, how tokens are issued, and where
 
 Service Plane uses three layers:
 
-- Hono middleware handles HTTP policy: CORS, logging, request ids, rate limits, and user sessions.
+- Hono middleware handles HTTP policy: CORS, logging, request ids, rate limits, and deployment-specific sessions.
 - `authenticate(token)` verifies a ServicePlane token inside Cap'n Web.
 - The ability wrapper validates method input, checks scopes, calls the handler, and validates output.
 
@@ -85,15 +85,13 @@ context.env.CONTROL_PLANE
 ```ts
 {
   serviceId: 'workflow-runner',
-  targetServiceId: 'asana',
+  audience: 'asana',
   scopes: ['asana.tasks.write'],
-  tenantId: 'tenant_123',
-  userId: 'user_456',
-  connectionId: 'conn_789'
+  tokenId: 'cap_123',
 }
 ```
 
-Keep identity small. It should carry routing and authorization claims, not provider OAuth tokens. Store provider credentials in the service's own storage.
+Keep identity small. It carries Service Plane caller and authorization claims. Product-level user, tenant, or connection context is application-owned; pass it through validated input or project-specific token claims if the service needs it. Store provider credentials in the service's own storage.
 
 ## Scope Checks
 
@@ -114,7 +112,7 @@ import { requireScopes } from 'service-plane/service';
 
 async createTask(input: CreateTaskInput) {
   const identity = requireScopes(this, 'asana.tasks.write');
-  // use identity.tenantId, identity.userId, identity.connectionId
+  // use identity.serviceId or identity.scopes for Service Plane decisions
 }
 ```
 

@@ -1,5 +1,19 @@
+export {
+  DEFAULT_HTTP_CACHE_MAX_AGE_SECONDS,
+  DEFAULT_HTTP_CACHE_STALE_WHILE_REVALIDATE_SECONDS,
+  type ServicePlaneHttpCacheOption,
+  type ServicePlaneHttpCacheOptions,
+  servicePlaneHttpCacheHeaders,
+} from '../shared/http-cache.js';
+export {
+  defaultServicePlaneLogSink,
+  type ServicePlaneBrokerLogEvent,
+  type ServicePlaneControlPlaneLogEvent,
+  type ServicePlaneLoggableEvent,
+  type ServicePlaneLogSink,
+} from '../shared/logging.js';
 export type {
-  AbilityAuth,
+  AbilityAccess,
   AbilityExposure,
   AbilityTransport,
   CapabilityCatalog,
@@ -11,6 +25,10 @@ export type {
   IssueCapabilityTokenInput,
   IssuedCapabilityToken,
   McpDiscoveryDocument,
+  McpPromptDiscovery,
+  McpResourceDiscovery,
+  McpResourceTemplateDiscovery,
+  McpServicePlaneMeta,
   McpToolDiscovery,
   OpenApiDocument,
   OpenApiDocumentCache,
@@ -18,6 +36,9 @@ export type {
   RegistryCache,
   ServiceAbilityDiscovery,
   ServiceAbilityMcpProjection,
+  ServiceAbilityMcpPromptArgument,
+  ServiceAbilityMcpPromptProjection,
+  ServiceAbilityMcpResourceProjection,
   ServiceAbilityMethodDiscovery,
   ServiceAbilityRestProjection,
   ServiceCallerAuthDiscovery,
@@ -28,6 +49,7 @@ export type {
   ServiceGrant,
   ServiceGrantDefinition,
   ServiceHttpMethod,
+  ServiceIngressDiscovery,
   ServiceRegistry,
   ServiceRegistrySnapshot,
 } from '../shared/types.js';
@@ -42,7 +64,7 @@ export {
   SERVICE_PLANE_MCP_PATH,
   SERVICE_PLANE_OPENAPI_PATH,
   SERVICE_PLANE_REQUEST_ID_HEADER,
-  SERVICE_PLANE_SWAGGER_PATH,
+  SERVICE_PLANE_REQUEST_ID_QUERY_PARAM,
 } from '../shared/types.js';
 export {
   type BrokerCaller,
@@ -89,12 +111,12 @@ export {
   serviceDiscoveryRequest,
 } from './endpoints.js';
 export {
-  type ControlPlaneMcpBroker,
-  type ControlPlaneMcpBrokerOptions,
-  type ControlPlaneMcpOptions,
-  createControlPlaneMcpBroker,
+  type ControlPlaneMcpHandlerOptions,
+  type ControlPlaneMcpServerInfo,
   DEFAULT_MCP_PATH,
   generateMcpDiscovery,
+  handleControlPlaneMcpRequest,
+  MCP_PROTOCOL_VERSION,
 } from './mcp.js';
 export {
   type ControlPlaneOpenApiOptions,
@@ -102,7 +124,6 @@ export {
   DEFAULT_OPENAPI_CACHE_TTL_SECONDS,
   type GenerateControlPlaneOpenApiOptions,
   generateControlPlaneOpenApi,
-  swaggerUiHtml,
 } from './openapi.js';
 export {
   type CreateServiceRegistryOptions,

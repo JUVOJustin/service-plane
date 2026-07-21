@@ -40,6 +40,8 @@ export const CreateTaskOutput = z.object({
 
 The same schemas are used for RPC validation, discovery, OpenAPI, and MCP metadata.
 
+Besides `mcp` (an MCP tool), a published method can declare `mcpResource` (a static or `{variable}`-templated MCP resource) and `mcpPrompt` (an MCP prompt). See [OpenAPI and MCP](openapi-mcp.md#mcp) for how the control plane projects and serves them.
+
 ## 3. Define An Ability
 
 An ability is the service API surface. A method is one callable operation.
@@ -53,7 +55,7 @@ export const asanaTasks = defineAbility({
   id: 'asana.tasks',
   title: 'Asana Tasks',
   exposure: 'published',
-  auth: 'user',
+  access: 'plane',
   scopes: ['asana.tasks.write'],
   methods: {
     createTask: abilityMethod({
@@ -69,6 +71,8 @@ export const asanaTasks = defineAbility({
 ```
 
 `handler` returns the implementation object. The object can implement many methods, but only methods declared in `ability.methods` are callable through Service Plane.
+
+`access: 'plane'` is the default Service Plane path: the control plane or gateway decides whether an upstream product user, API key, or anonymous request may invoke the ability. Use `access: 'service'` only for abilities that should be brokered for authenticated service callers.
 
 ## 4. Implement The Handler
 
@@ -91,7 +95,7 @@ export class AsanaTasksHandler extends RpcTarget {
   }
 
   async createTask(input: { connectionId: string; name: string; projectId: string }) {
-    const connectionName = `${this.identity.tenantId}:${input.connectionId}`;
+    const connectionName = `${this.identity.serviceId}:${input.connectionId}`;
     const id = this.env.ASANA_CONNECTIONS.idFromName(connectionName);
     const connection = this.env.ASANA_CONNECTIONS.get(id);
 
@@ -102,7 +106,7 @@ export class AsanaTasksHandler extends RpcTarget {
 
 `context` is runtime access, such as Hono context, environment bindings, storage, and execution context.
 
-`identity` is the verified caller and authorization data, such as service id, tenant id, user id, connection id, and granted scopes. Do not put provider OAuth tokens in identity. Store credentials in a service-owned store such as a Durable Object.
+`identity` is the verified Service Plane caller and granted scopes. Product-level user or tenant context is application-owned; pass it in validated input or project-specific token claims if the service needs it. Do not put provider OAuth tokens in identity. Store credentials in a service-owned store such as a Durable Object.
 
 ## 5. Mount The Service
 
@@ -127,16 +131,21 @@ export default new ServicePlaneService<{ Bindings: Env }>({
     issuer: 'control-plane',
     jwks: (c) => jwksFromServiceBinding(c.env.CONTROL_PLANE),
   },
+  ingress: {},
   capabilities,
   abilities: [asanaTasks],
 });
 ```
 
-This mounts:
+This mounts discovery and an ingress-protected RPC endpoint:
 
 ```txt
 GET /.well-known/service-plane/service.json
 ALL /rpc/asana.tasks
 ```
+
+When `ingress` is configured, ability RPC requests must use a brokered capability token issued by the control plane. Normal capability tokens still verify cryptographically, but they are rejected before input validation or handler creation.
+
+The service shell also mounts `hono/request-id` and a structured JSON request logger by default. Request ids propagated by the control-plane broker are adopted and echoed on responses, so service logs correlate with plane logs. Pass `logger: { log: (event) => ... }` to forward events to your own logger, or `logger: false` to disable request logging; request-id assignment is always on because brokered-call correlation depends on it.
 
 Next: [create a control plane](plane-creation.md) and [configure auth](auth.md).

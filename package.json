@@ -44,9 +44,11 @@
     "check:write": "biome check --write .",
     "format": "biome format --write .",
     "lint": "biome lint .",
+    "sync:skill-docs": "cp docs/*.md .apm/skills/service-plane/references/",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "test:coverage": "vitest run --coverage"
   },
   "keywords": [
     "capnweb",
@@ -68,18 +70,19 @@
     "zod": ">=4.0.0 <5.0.0"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.4.15",
-    "@types/node": "^25.0.0",
-    "hono": "^4.12.18",
-    "typescript": "^5.0.4",
-    "vitest": "^4.0.0",
+    "@biomejs/biome": "2.5.4",
+    "@types/node": "^26.1.1",
+    "@vitest/coverage-v8": "^4.1.10",
+    "hono": "^4.12.31",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10",
     "zod": "^4.4.3"
   },
   "engines": {
-    "node": ">=18.14.1"
+    "node": ">=20.0.0"
   },
   "dependencies": {
     "@hono/capnweb": "^0.1.0",
-    "capnweb": "^0.8.0"
+    "capnweb": "^0.10.0"
   }
 }

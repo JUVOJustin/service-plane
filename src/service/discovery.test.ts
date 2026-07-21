@@ -10,7 +10,7 @@ describe('ability service discovery', () => {
   });
 
   const searchAbility = defineAbility({
-    auth: 'user',
+    access: 'plane',
     exposure: 'published',
     id: 'example.search',
     methods: {
@@ -54,7 +54,7 @@ describe('ability service discovery', () => {
     expect(serviceDiscoveryDocument(service)).toMatchObject({
       abilities: [
         {
-          auth: 'user',
+          access: 'plane',
           exposure: 'published',
           id: 'example.search',
           methods: {
@@ -74,7 +74,7 @@ describe('ability service discovery', () => {
           scopes: ['example.search'],
         },
         {
-          auth: 'service',
+          access: 'plane',
           exposure: 'private',
           id: 'example.sync',
           rpc: { path: '/rpc/example.sync', transports: ['http-batch', 'websocket'] },
@@ -82,6 +82,110 @@ describe('ability service discovery', () => {
       ],
       id: 'example',
     });
+  });
+
+  it('publishes MCP resource and prompt projections in discovery', () => {
+    const service = defineAbilityService({
+      abilities: [
+        defineAbility({
+          access: 'plane',
+          exposure: 'published',
+          id: 'example.search',
+          methods: {
+            item: abilityMethod({
+              input: z.object({ itemId: z.string() }),
+              mcpResource: { description: 'One item', name: 'item', uri: 'example://items/{itemId}' },
+              output: z.object({ id: z.string() }),
+              scopes: ['example.search'],
+            }),
+            readme: abilityMethod({
+              input: z.object({}),
+              mcpResource: { mimeType: 'text/markdown', name: 'readme', title: 'Readme', uri: ' example://docs/readme ' },
+              output: z.string(),
+              scopes: ['example.search'],
+            }),
+            summarize: abilityMethod({
+              input: z.object({ topic: z.string() }),
+              mcpPrompt: {
+                arguments: [{ description: 'What to summarize', name: ' topic ', required: true }],
+                description: 'Summarize a topic',
+                name: 'example_summarize',
+              },
+              output: z.string(),
+              scopes: ['example.search'],
+            }),
+          },
+          scopes: ['example.search'],
+          handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
+        }),
+      ],
+      capabilities,
+      id: 'example',
+      title: 'Example',
+      version: '0.1.0',
+    });
+
+    expect(serviceDiscoveryDocument(service)).toMatchObject({
+      abilities: [
+        {
+          id: 'example.search',
+          methods: {
+            item: { mcpResource: { description: 'One item', name: 'item', uri: 'example://items/{itemId}' } },
+            readme: { mcpResource: { mimeType: 'text/markdown', name: 'readme', title: 'Readme', uri: 'example://docs/readme' } },
+            summarize: {
+              mcpPrompt: {
+                arguments: [{ description: 'What to summarize', name: 'topic', required: true }],
+                description: 'Summarize a topic',
+                name: 'example_summarize',
+              },
+            },
+          },
+        },
+      ],
+    });
+  });
+
+  it('rejects invalid MCP resource and prompt metadata', () => {
+    const abilityWith = (methods: Parameters<typeof defineAbility>[0]['methods']) => () =>
+      defineAbilityService({
+        abilities: [
+          defineAbility({
+            access: 'plane',
+            exposure: 'published',
+            id: 'example.search',
+            methods,
+            scopes: ['example.search'],
+            handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
+          }),
+        ],
+        capabilities,
+        id: 'example',
+        title: 'Example',
+        version: '0.1.0',
+      });
+    const base = { input: z.object({}), output: z.string(), scopes: ['example.search'] };
+
+    expect(abilityWith({ read: abilityMethod({ ...base, mcpResource: { name: 'item', uri: 'example://items/{item-id}' } }) })).toThrow(
+      'invalid template expression',
+    );
+    expect(abilityWith({ read: abilityMethod({ ...base, mcpResource: { name: 'item', uri: 'example://items/{itemId' } }) })).toThrow(
+      'invalid template expression',
+    );
+    expect(abilityWith({ read: abilityMethod({ ...base, mcpResource: { name: 'item', uri: 'example://items/}itemId{' } }) })).toThrow(
+      'invalid template expression',
+    );
+    expect(abilityWith({ read: abilityMethod({ ...base, mcpResource: { name: 'item', uri: '  ' } }) })).toThrow(
+      'MCP resource URI for example.search/read cannot be empty',
+    );
+    expect(abilityWith({ read: abilityMethod({ ...base, mcpResource: { name: ' ', uri: 'example://items' } }) })).toThrow(
+      'MCP resource name for example.search/read cannot be empty',
+    );
+    expect(abilityWith({ read: abilityMethod({ ...base, mcpPrompt: { name: ' ' } }) })).toThrow(
+      'MCP prompt name for example.search/read cannot be empty',
+    );
+    expect(abilityWith({ read: abilityMethod({ ...base, mcpPrompt: { arguments: [{ name: ' ' }], name: 'example_prompt' } }) })).toThrow(
+      'MCP prompt argument name for example.search/read cannot be empty',
+    );
   });
 
   it('rejects duplicate ability ids, unknown scopes, and unscoped abilities', () => {
@@ -167,7 +271,7 @@ describe('ability service discovery', () => {
     ).toThrow('Service-Plane ability method requires scope not declared by ability: example.scope-mismatch/run -> example.sync.run');
   });
 
-  it('defaults abilities to private service auth', () => {
+  it('defaults abilities to private plane access', () => {
     const service = defineAbilityService({
       abilities: [
         defineAbility({
@@ -185,7 +289,7 @@ describe('ability service discovery', () => {
       version: '0.1.0',
     });
 
-    expect(serviceDiscoveryDocument(service).abilities[0]).toMatchObject({ auth: 'service', exposure: 'private' });
+    expect(serviceDiscoveryDocument(service).abilities[0]).toMatchObject({ access: 'plane', exposure: 'private' });
   });
 
   it('rejects abilities without a handler factory', () => {

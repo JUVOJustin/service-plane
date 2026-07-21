@@ -1,5 +1,5 @@
 import {
-  type AbilityAuth,
+  type AbilityAccess,
   type AbilityExposure,
   type AbilityTransport,
   DEFAULT_REGISTRY_CACHE_TTL_SECONDS,
@@ -148,6 +148,7 @@ function discoveredAbility(
     ...ability,
     service: endpoint,
     serviceId: service.id,
+    ...(service.ingress ? { serviceIngress: service.ingress } : {}),
     serviceTitle: service.title,
     serviceVersion: service.version,
   };
@@ -171,7 +172,8 @@ function isServiceDiscoveryDocument(value: unknown): value is ServiceDiscoveryDo
         typeof document.callerAuth === 'object' &&
         !!document.callerAuth.jwks &&
         typeof document.callerAuth.jwks === 'object' &&
-        Array.isArray(document.callerAuth.jwks.keys)))
+        Array.isArray(document.callerAuth.jwks.keys))) &&
+    (document.ingress === undefined || (!!document.ingress && typeof document.ingress === 'object' && document.ingress.required === true))
   );
 }
 
@@ -180,8 +182,8 @@ function isAbilityDiscovery(value: unknown): value is ServiceAbilityDiscovery {
   const ability = value as ServiceAbilityDiscovery;
   return (
     typeof ability.id === 'string' &&
+    isAbilityAccess(ability.access) &&
     isAbilityExposure(ability.exposure) &&
-    isAbilityAuth(ability.auth) &&
     Array.isArray(ability.scopes) &&
     ability.scopes.every((scope) => typeof scope === 'string') &&
     !!ability.rpc &&
@@ -216,8 +218,8 @@ function isAbilityExposure(value: unknown): value is AbilityExposure {
   return value === 'private' || value === 'published';
 }
 
-function isAbilityAuth(value: unknown): value is AbilityAuth {
-  return value === 'anonymous' || value === 'service' || value === 'user';
+function isAbilityAccess(value: unknown): value is AbilityAccess {
+  return value === 'plane' || value === 'service';
 }
 
 function isAbilityTransport(value: unknown): value is AbilityTransport {
