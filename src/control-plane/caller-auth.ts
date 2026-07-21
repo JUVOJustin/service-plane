@@ -1,4 +1,5 @@
 import type { Context } from 'hono';
+import { jwk } from 'hono/jwk';
 import { CapabilityAuthError } from '../shared/errors.js';
 import {
   extractServicePlaneHmacSignature,
@@ -8,33 +9,24 @@ import {
   servicePlaneHmacSignature,
   timingSafeEqual,
 } from '../shared/hmac-auth.js';
-import { SERVICE_PLANE_REQUEST_ID_HEADER } from '../shared/types.js';
+import {
+  decodeServicePlaneJwkAssertion,
+  extractServicePlaneJwkAssertion,
+  SERVICE_PLANE_JWK_ALGORITHM,
+  SERVICE_PLANE_JWK_ASSERTION_AUDIENCE,
+  SERVICE_PLANE_JWK_CLIENT_HEADER,
+  SERVICE_PLANE_JWK_KEY_ID_HEADER,
+  servicePlaneJwkRequestParts,
+} from '../shared/jwk-auth.js';
+import { type CapabilityJwks, type RegistryCache, SERVICE_PLANE_REQUEST_ID_HEADER, type ServiceEndpoint } from '../shared/types.js';
+import { createServiceRegistry } from './registry.js';
 
-const SERVICE_CLIENT_SECRET_BYTES = 32;
-const SERVICE_CLIENT_SECRET_HASH_PREFIX = 'sha256:';
+const HMAC_CLIENT_SECRET_BYTES = 32;
 const DEFAULT_HMAC_MAX_SKEW_SECONDS = 60;
 const DEFAULT_HMAC_MAX_BODY_BYTES = 64 * 1024;
-
-export type ServiceClientCredential = {
-  secretHash: string;
-  serviceId: string;
-};
-
-export type ServiceClientCredentialsAuthLogEvent = {
-  event: 'service_plane.caller_auth.unauthorized';
-  level: 'warn';
-  message: string;
-  path: string;
-  reason: 'invalid_credentials' | 'missing_credentials';
-  requestId?: string;
-};
-
-export type ServiceClientCredentialsAuthOptions = {
-  credentials: ServiceClientCredential[] | ((context: Context) => Promise<ServiceClientCredential[]> | ServiceClientCredential[]);
-  header?: string;
-  log?: (event: ServiceClientCredentialsAuthLogEvent) => void;
-  scheme?: string;
-};
+const DEFAULT_JWK_MAX_SKEW_SECONDS = 60;
+const DEFAULT_JWK_MAX_BODY_BYTES = 64 * 1024;
+const DEFAULT_JWK_MAX_ASSERTION_TTL_SECONDS = 300;
 
 export type HmacServiceClient = {
   clientId: string;
@@ -70,49 +62,62 @@ export type HmacServiceClientAuthOptions = {
   timestampHeader?: string;
 };
 
-export type HmacServiceClientReplayCache = {
-  get(key: string): Promise<boolean> | boolean;
-  set(key: string, ttlSeconds: number): Promise<void> | void;
+export type HmacServiceClientReplayCache =
+  | {
+      reserve(key: string, ttlSeconds: number): Promise<boolean> | boolean;
+    }
+  | {
+      get(key: string): Promise<boolean> | boolean;
+      set(key: string, ttlSeconds: number): Promise<void> | void;
+    };
+
+export type JwkServiceClient = {
+  clientId: string;
+  jwks: CapabilityJwks | (() => Promise<CapabilityJwks> | CapabilityJwks);
+  serviceId?: string;
 };
 
-// Generates the caller-side secret for authenticating to the control-plane token endpoint.
-export function generateServiceClientSecret(): string {
-  const bytes = new Uint8Array(SERVICE_CLIENT_SECRET_BYTES);
+export type JwkServiceClientAuthLogEvent = {
+  event: 'service_plane.caller_auth.jwk_unauthorized';
+  level: 'warn';
+  message: string;
+  path: string;
+  reason:
+    | 'client_not_found'
+    | 'invalid_assertion'
+    | 'invalid_claims'
+    | 'invalid_timestamp'
+    | 'missing_client'
+    | 'missing_key'
+    | 'missing_signature'
+    | 'replayed_assertion'
+    | 'timestamp_skew';
+  requestId?: string;
+};
+
+export type JwkServiceClientAuthOptions = {
+  assertionAudience?: string | ((context: Context) => Promise<string> | string);
+  clientIdHeader?: string;
+  clients?: JwkServiceClient[] | ((context: Context) => Promise<JwkServiceClient[]> | JwkServiceClient[]);
+  keyIdHeader?: string;
+  log?: (event: JwkServiceClientAuthLogEvent) => void;
+  maxAssertionTtlSeconds?: number;
+  maxBodyBytes?: number;
+  maxSkewSeconds?: number;
+  now?: () => Date;
+  registryCache?: RegistryCache;
+  registryCacheKey?: string;
+  registryCacheTtlSeconds?: number;
+  replayCache?: HmacServiceClientReplayCache;
+  requestIdHeader?: string;
+  services?: ServiceEndpoint[] | ((context: Context) => Promise<ServiceEndpoint[]> | ServiceEndpoint[]);
+};
+
+// Generates the caller-side HMAC secret for authenticating to the control-plane token endpoint.
+export function generateHmacClientSecret(): string {
+  const bytes = new Uint8Array(HMAC_CLIENT_SECRET_BYTES);
   crypto.getRandomValues(bytes);
   return bytesToBase64Url(bytes);
-}
-
-// Stores only a hash in the control plane; the raw secret belongs to the caller service.
-export async function hashServiceClientSecret(secret: string): Promise<string> {
-  const value = secret.trim();
-  if (!value) throw new Error('Service-Plane service client secret cannot be empty');
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
-  return `${SERVICE_CLIENT_SECRET_HASH_PREFIX}${bytesToBase64Url(new Uint8Array(digest))}`;
-}
-
-// Authenticates callers with a bearer service secret and returns the matched service id.
-export function serviceClientCredentialsAuth(options: ServiceClientCredentialsAuthOptions) {
-  const header = options.header ?? 'authorization';
-  const scheme = options.scheme ?? 'Bearer';
-  const log = options.log ?? defaultCallerAuthLog;
-
-  return async (context: Context): Promise<Response | string> => {
-    const credential = extractCredential(context, header, scheme);
-    if (!credential) {
-      log(unauthorizedEvent(context, 'missing_credentials', `Missing ${scheme} service client credentials`));
-      return context.json({ error: 'Unauthorized' }, 401);
-    }
-
-    const credentialHash = await hashServiceClientSecret(credential);
-    const credentials = typeof options.credentials === 'function' ? await options.credentials(context) : options.credentials;
-    const match = findMatchingCredential(credentialHash, credentials);
-    if (!match) {
-      log(unauthorizedEvent(context, 'invalid_credentials', 'Invalid service client credentials'));
-      return context.json({ error: 'Unauthorized' }, 401);
-    }
-
-    return match.serviceId;
-  };
 }
 
 // Authenticates token requests with an HMAC signature bound to method, path, body, timestamp, client id, and request id.
@@ -189,40 +194,102 @@ export function hmacServiceClientAuth(options: HmacServiceClientAuthOptions) {
   };
 }
 
-function extractCredential(context: Context, header: string, scheme: string): string | undefined {
-  const value = context.req.header(header)?.trim();
-  if (!value) return undefined;
-  const [actualScheme, credential] = value.split(/\s+/u, 2);
-  if (actualScheme !== scheme || !credential) return undefined;
-  return credential;
-}
+// Authenticates token requests with a short-lived asymmetric JWT assertion verified by Hono's JWK middleware.
+export function jwkServiceClientAuth(options: JwkServiceClientAuthOptions) {
+  const clientIdHeader = options.clientIdHeader ?? SERVICE_PLANE_JWK_CLIENT_HEADER;
+  const keyIdHeader = options.keyIdHeader ?? SERVICE_PLANE_JWK_KEY_ID_HEADER;
+  const requestIdHeader = options.requestIdHeader ?? SERVICE_PLANE_REQUEST_ID_HEADER;
+  const maxSkewSeconds = options.maxSkewSeconds ?? DEFAULT_JWK_MAX_SKEW_SECONDS;
+  const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_JWK_MAX_BODY_BYTES;
+  const maxAssertionTtlSeconds = options.maxAssertionTtlSeconds ?? DEFAULT_JWK_MAX_ASSERTION_TTL_SECONDS;
+  const log = options.log ?? defaultJwkCallerAuthLog;
 
-function findMatchingCredential(secretHash: string, credentials: ServiceClientCredential[]): ServiceClientCredential | undefined {
-  let match: ServiceClientCredential | undefined;
-  for (const credential of credentials) {
-    if (timingSafeEqual(secretHash, credential.secretHash)) match = credential;
-  }
-  return match;
-}
+  return async (context: Context): Promise<Response | string> => {
+    const clientId = context.req.header(clientIdHeader)?.trim();
+    if (!clientId) {
+      log(jwkUnauthorizedEvent(context, 'missing_client', 'Missing Service-Plane JWK client id'));
+      return context.json({ error: 'Unauthorized' }, 401);
+    }
 
-function unauthorizedEvent(
-  context: Context,
-  reason: ServiceClientCredentialsAuthLogEvent['reason'],
-  message: string,
-): ServiceClientCredentialsAuthLogEvent {
-  const requestId = requestIdFromContext(context) ?? context.req.header(SERVICE_PLANE_REQUEST_ID_HEADER) ?? undefined;
-  return {
-    event: 'service_plane.caller_auth.unauthorized',
-    level: 'warn',
-    message,
-    path: new URL(context.req.url).pathname,
-    reason,
-    ...(requestId ? { requestId } : {}),
+    let assertion: string;
+    try {
+      assertion = extractServicePlaneJwkAssertion(context.req.raw);
+    } catch (error) {
+      if (error instanceof CapabilityAuthError) {
+        log(jwkUnauthorizedEvent(context, 'missing_signature', error.message));
+        return context.json({ error: 'Unauthorized' }, 401);
+      }
+      throw error;
+    }
+
+    const client = await resolveJwkServiceClient(context, options, clientId);
+    if (!client) {
+      log(jwkUnauthorizedEvent(context, 'client_not_found', 'Unknown Service-Plane JWK client'));
+      return context.json({ error: 'Unauthorized' }, 401);
+    }
+
+    const jwks = await resolveJwkClientJwks(client);
+    if (jwks.keys.length === 0) {
+      log(jwkUnauthorizedEvent(context, 'missing_key', 'Service-Plane JWK client has no verification keys'));
+      return context.json({ error: 'Unauthorized' }, 401);
+    }
+
+    try {
+      const auth = jwk({
+        alg: [SERVICE_PLANE_JWK_ALGORITHM],
+        keys: jwks.keys,
+        verification: {
+          exp: false,
+          iat: false,
+          nbf: false,
+        },
+      });
+      await auth(context, async () => undefined);
+
+      const { header, payload } = decodeServicePlaneJwkAssertion(assertion);
+      const claims = parseJwkAssertionClaims(payload);
+      const keyId = context.req.header(keyIdHeader)?.trim();
+      if (!keyId) {
+        log(jwkUnauthorizedEvent(context, 'missing_key', 'Missing Service-Plane JWK key id'));
+        return context.json({ error: 'Unauthorized' }, 401);
+      }
+      const headerKeyId = validateJwkAssertionHeader(header, keyId);
+      const audience = await resolveJwkAssertionAudience(context, options);
+      const now = options.now?.() ?? new Date();
+      await validateJwkAssertionClaims(context, claims, {
+        audience,
+        clientId,
+        headerKeyId,
+        keyId,
+        maxAssertionTtlSeconds,
+        maxBodyBytes,
+        maxSkewSeconds,
+        now,
+        requestIdHeader,
+      });
+      if (
+        options.replayCache &&
+        (await isCallerAuthReplay(
+          options.replayCache,
+          clientId,
+          claims.requestId ?? claims.jti,
+          jwkReplayTtlSeconds(claims, now, maxSkewSeconds),
+        ))
+      ) {
+        log(jwkUnauthorizedEvent(context, 'replayed_assertion', 'Replayed Service-Plane JWK assertion'));
+        return context.json({ error: 'Unauthorized' }, 401);
+      }
+
+      return client.serviceId ?? client.clientId;
+    } catch (error) {
+      if (error instanceof CapabilityAuthError) {
+        log(jwkUnauthorizedEvent(context, 'invalid_claims', error.message));
+        return context.json({ error: 'Unauthorized' }, 401);
+      }
+      log(jwkUnauthorizedEvent(context, 'invalid_assertion', 'Invalid Service-Plane JWK assertion'));
+      return context.json({ error: 'Unauthorized' }, 401);
+    }
   };
-}
-
-function defaultCallerAuthLog(event: ServiceClientCredentialsAuthLogEvent): void {
-  console.warn(JSON.stringify(event));
 }
 
 function hmacUnauthorizedEvent(
@@ -245,6 +312,26 @@ function defaultHmacCallerAuthLog(event: HmacServiceClientAuthLogEvent): void {
   console.warn(JSON.stringify(event));
 }
 
+function jwkUnauthorizedEvent(
+  context: Context,
+  reason: JwkServiceClientAuthLogEvent['reason'],
+  message: string,
+): JwkServiceClientAuthLogEvent {
+  const requestId = requestIdFromContext(context) ?? context.req.header(SERVICE_PLANE_REQUEST_ID_HEADER) ?? undefined;
+  return {
+    event: 'service_plane.caller_auth.jwk_unauthorized',
+    level: 'warn',
+    message,
+    path: new URL(context.req.url).pathname,
+    reason,
+    ...(requestId ? { requestId } : {}),
+  };
+}
+
+function defaultJwkCallerAuthLog(event: JwkServiceClientAuthLogEvent): void {
+  console.warn(JSON.stringify(event));
+}
+
 function validateHmacTimestamp(timestamp: string, now: Date, maxSkewSeconds: number): 'invalid_timestamp' | 'timestamp_skew' | undefined {
   const parsed = new Date(timestamp);
   if (Number.isNaN(parsed.getTime())) return 'invalid_timestamp';
@@ -259,6 +346,162 @@ function hmacTimestampMessage(reason: 'invalid_timestamp' | 'timestamp_skew'): s
     : 'Service-Plane HMAC timestamp is outside the allowed skew';
 }
 
+async function resolveJwkServiceClient(
+  context: Context,
+  options: JwkServiceClientAuthOptions,
+  clientId: string,
+): Promise<JwkServiceClient | undefined> {
+  const clients = typeof options.clients === 'function' ? await options.clients(context) : (options.clients ?? []);
+  const configured = clients.find((candidate) => timingSafeEqual(candidate.clientId, clientId));
+  if (configured) return configured;
+
+  if (!options.services) return undefined;
+  const services = typeof options.services === 'function' ? await options.services(context) : options.services;
+  const registry = createServiceRegistry({
+    ...(options.registryCache
+      ? {
+          cache: options.registryCache,
+          ...(options.registryCacheKey ? { cacheKey: options.registryCacheKey } : {}),
+          ...(options.registryCacheTtlSeconds ? { cacheTtlSeconds: options.registryCacheTtlSeconds } : {}),
+        }
+      : {}),
+    services,
+  });
+  const snapshot = await registry.discover();
+  const service = snapshot.services.find((candidate) => timingSafeEqual(candidate.id, clientId));
+  if (!service?.callerAuth?.jwks) return undefined;
+  return {
+    clientId: service.id,
+    jwks: service.callerAuth.jwks,
+    serviceId: service.id,
+  };
+}
+
+async function resolveJwkClientJwks(client: JwkServiceClient): Promise<CapabilityJwks> {
+  return typeof client.jwks === 'function' ? client.jwks() : client.jwks;
+}
+
+async function resolveJwkAssertionAudience(context: Context, options: JwkServiceClientAuthOptions): Promise<string> {
+  if (typeof options.assertionAudience === 'function') return options.assertionAudience(context);
+  return options.assertionAudience ?? SERVICE_PLANE_JWK_ASSERTION_AUDIENCE;
+}
+
+type ParsedJwkAssertionClaims = {
+  aud: string;
+  bodyHash: string;
+  exp: number;
+  iat: number;
+  iss: string;
+  jti: string;
+  keyId: string;
+  method: string;
+  nbf: number;
+  path: string;
+  requestId?: string;
+  sub: string;
+};
+
+function parseJwkAssertionClaims(value: unknown): ParsedJwkAssertionClaims {
+  if (!isRecord(value)) throw new CapabilityAuthError('Invalid Service-Plane JWK assertion claims', 401);
+  const { aud, bodyHash, exp, iat, iss, jti, keyId, method, nbf, path, requestId, sub } = value;
+  if (
+    typeof aud !== 'string' ||
+    typeof bodyHash !== 'string' ||
+    typeof exp !== 'number' ||
+    typeof iat !== 'number' ||
+    typeof iss !== 'string' ||
+    typeof jti !== 'string' ||
+    typeof keyId !== 'string' ||
+    typeof method !== 'string' ||
+    typeof nbf !== 'number' ||
+    typeof path !== 'string' ||
+    typeof sub !== 'string' ||
+    (requestId !== undefined && typeof requestId !== 'string')
+  ) {
+    throw new CapabilityAuthError('Invalid Service-Plane JWK assertion claims', 401);
+  }
+  return { aud, bodyHash, exp, iat, iss, jti, keyId, method, nbf, path, ...(requestId ? { requestId } : {}), sub };
+}
+
+function validateJwkAssertionHeader(header: unknown, expectedKeyId: string): string {
+  if (!isRecord(header) || header.alg !== SERVICE_PLANE_JWK_ALGORITHM || typeof header.kid !== 'string') {
+    throw new CapabilityAuthError('Invalid Service-Plane JWK assertion header', 401);
+  }
+  if (header.kid !== expectedKeyId) {
+    throw new CapabilityAuthError('Invalid Service-Plane JWK key id', 401);
+  }
+  return header.kid;
+}
+
+async function validateJwkAssertionClaims(
+  context: Context,
+  claims: ParsedJwkAssertionClaims,
+  options: {
+    audience: string;
+    clientId: string;
+    headerKeyId: string;
+    keyId: string;
+    maxAssertionTtlSeconds: number;
+    maxBodyBytes: number;
+    maxSkewSeconds: number;
+    now: Date;
+    requestIdHeader: string;
+  },
+): Promise<void> {
+  if (claims.iss !== options.clientId || claims.sub !== options.clientId) {
+    throw new CapabilityAuthError('Service-Plane JWK caller mismatch', 401);
+  }
+  if (claims.aud !== options.audience) throw new CapabilityAuthError('Invalid Service-Plane JWK audience', 401);
+  if (claims.keyId !== options.keyId || claims.keyId !== options.headerKeyId) {
+    throw new CapabilityAuthError('Invalid Service-Plane JWK key id', 401);
+  }
+  const requestId = context.req.header(options.requestIdHeader)?.trim() || undefined;
+  if ((claims.requestId || undefined) !== requestId) throw new CapabilityAuthError('Invalid Service-Plane JWK request id', 401);
+
+  validateJwkAssertionTimestamps(claims, options.now, options.maxSkewSeconds, options.maxAssertionTtlSeconds);
+
+  const parts = await servicePlaneJwkRequestParts(
+    context.req.raw,
+    options.clientId,
+    claims.keyId,
+    options.requestIdHeader,
+    options.maxBodyBytes,
+  );
+  if (
+    claims.method !== parts.method ||
+    claims.path !== parts.pathWithQuery ||
+    claims.bodyHash !== parts.bodyHash ||
+    claims.keyId !== parts.keyId
+  ) {
+    throw new CapabilityAuthError('Service-Plane JWK request binding mismatch', 401);
+  }
+}
+
+function jwkReplayTtlSeconds(claims: Pick<ParsedJwkAssertionClaims, 'exp'>, now: Date, maxSkewSeconds: number): number {
+  const nowSeconds = Math.floor(now.getTime() / 1000);
+  return Math.max(1, claims.exp + maxSkewSeconds - nowSeconds);
+}
+
+function validateJwkAssertionTimestamps(
+  claims: Pick<ParsedJwkAssertionClaims, 'exp' | 'iat' | 'nbf'>,
+  now: Date,
+  maxSkewSeconds: number,
+  maxAssertionTtlSeconds: number,
+): void {
+  const nowSeconds = Math.floor(now.getTime() / 1000);
+  if (claims.nbf > nowSeconds + maxSkewSeconds) throw new CapabilityAuthError('Service-Plane JWK assertion is not active yet', 401);
+  if (claims.iat > nowSeconds + maxSkewSeconds)
+    throw new CapabilityAuthError('Service-Plane JWK assertion issued-at is in the future', 401);
+  if (claims.exp <= nowSeconds - maxSkewSeconds) throw new CapabilityAuthError('Expired Service-Plane JWK assertion', 401);
+  if (claims.exp <= claims.iat || claims.exp - claims.iat > maxAssertionTtlSeconds) {
+    throw new CapabilityAuthError('Invalid Service-Plane JWK assertion lifetime', 401);
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
 async function isHmacReplay(
   replayCache: HmacServiceClientReplayCache,
   clientId: string,
@@ -266,6 +509,20 @@ async function isHmacReplay(
   ttlSeconds: number,
 ): Promise<boolean> {
   const key = `service-plane:hmac:${clientId}:${idempotencyKey}`;
+  if ('reserve' in replayCache) return !(await replayCache.reserve(key, ttlSeconds));
+  if (await replayCache.get(key)) return true;
+  await replayCache.set(key, ttlSeconds);
+  return false;
+}
+
+async function isCallerAuthReplay(
+  replayCache: HmacServiceClientReplayCache,
+  clientId: string,
+  idempotencyKey: string,
+  ttlSeconds: number,
+): Promise<boolean> {
+  const key = `service-plane:jwk:${clientId}:${idempotencyKey}`;
+  if ('reserve' in replayCache) return !(await replayCache.reserve(key, ttlSeconds));
   if (await replayCache.get(key)) return true;
   await replayCache.set(key, ttlSeconds);
   return false;

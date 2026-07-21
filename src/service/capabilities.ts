@@ -1,19 +1,27 @@
-import { createMiddleware } from 'hono/factory';
 import {
-  decodeCapabilityTokenPayload,
-  extractServicePlaneToken,
-  servicePlaneAuthorization,
-  verifyCapabilityToken,
-} from '../shared/capability-tokens.js';
+  newHttpBatchRpcSession,
+  newWebSocketRpcSession,
+  type RpcCompatible,
+  RpcSession,
+  type RpcSessionOptions,
+  type RpcStub,
+  RpcTarget,
+  type RpcTransport,
+} from 'capnweb';
+import { decodeCapabilityTokenPayload, verifyCapabilityToken } from '../shared/capability-tokens.js';
 import { CapabilityAuthError } from '../shared/errors.js';
 import { SERVICE_PLANE_HMAC_CLIENT_HEADER, SERVICE_PLANE_HMAC_TIMESTAMP_HEADER, signServicePlaneHmacRequest } from '../shared/hmac-auth.js';
 import {
-  type CapabilityAuthMiddleware,
-  type CapabilityAuthVariables,
+  SERVICE_PLANE_JWK_ASSERTION_AUDIENCE,
+  SERVICE_PLANE_JWK_CLIENT_HEADER,
+  SERVICE_PLANE_JWK_KEY_ID_HEADER,
+  signServicePlaneJwkRequest,
+} from '../shared/jwk-auth.js';
+import {
   type CapabilityCatalog,
-  type CapabilityContextSource,
   type CapabilityIdentity,
   type CapabilityJwks,
+  type CapabilityJwksCache,
   type CapabilityJwksResolver,
   type CapabilityScopeDefinition,
   type CapabilityTokenCache,
@@ -21,24 +29,24 @@ import {
   type CapabilityVerifierOptions,
   DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
   type FetchLike,
-  type HonoAppLike,
   type IssueCapabilityTokenInput,
   type IssuedCapabilityToken,
   MAX_CAPABILITY_TOKEN_TTL_SECONDS,
-  SERVICE_PLANE_CAPABILITY_CONTEXT,
   SERVICE_PLANE_CAPABILITY_JWKS_PATH,
   SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
-  SERVICE_PLANE_CAPABILITY_VERIFIER,
   SERVICE_PLANE_REQUEST_ID_HEADER,
+  SERVICE_PLANE_REQUEST_ID_QUERY_PARAM,
 } from '../shared/types.js';
 
-const routeCapabilities = new WeakMap<object, string[]>();
+const identityByTarget = new WeakMap<object, CapabilityIdentity>();
 const serviceBindingJwksResolvers = new WeakMap<object, Map<string, CapabilityJwksResolver>>();
 const urlJwksResolvers = new Map<string, CapabilityJwksResolver>();
 
 export type RemoteJwksFetch = typeof fetch | FetchLike;
 
 export type JwksFromUrlOptions = {
+  cache?: CapabilityJwksCache;
+  cacheKey?: string;
   cacheTtlSeconds?: number;
   fetch?: RemoteJwksFetch;
   headers?: HeadersInit | (() => HeadersInit | Promise<HeadersInit>);
@@ -51,6 +59,7 @@ export type JwksFromServiceBindingOptions = Omit<JwksFromUrlOptions, 'fetch'> & 
 };
 
 export type CreateCapabilityTokenProviderOptions = {
+  abilityId?: string;
   cache?: CapabilityTokenCache;
   cacheKey?: string;
   callerServiceId: string;
@@ -62,26 +71,16 @@ export type CreateCapabilityTokenProviderOptions = {
   ttlSeconds?: number;
 };
 
-export type CapabilityFetchOptions = CreateCapabilityTokenProviderOptions & {
-  fetch?: typeof fetch;
-};
-
-export type CapabilityFetchWithProviderOptions = {
-  fetch?: typeof fetch;
-  tokenProvider: CapabilityTokenProvider;
-};
-
-export type ControlPlaneTokenRequesterOptions = {
+type ControlPlaneTokenRequestOptions = {
   controlPlaneUrl: string | URL;
   fetch?: typeof fetch | FetchLike;
   headers?: HeadersInit | (() => HeadersInit | Promise<HeadersInit>);
   requestId?: string | (() => string | Promise<string | undefined> | undefined);
   requestIdHeaderName?: string;
-  serviceClientSecret: string | (() => Promise<string> | string);
   tokenPath?: string;
 };
 
-export type ControlPlaneHmacTokenRequesterOptions = Omit<ControlPlaneTokenRequesterOptions, 'serviceClientSecret'> & {
+export type ControlPlaneHmacTokenRequesterOptions = ControlPlaneTokenRequestOptions & {
   clientId: string;
   clientIdHeaderName?: string;
   clientSecret: string | (() => Promise<string> | string);
@@ -89,8 +88,70 @@ export type ControlPlaneHmacTokenRequesterOptions = Omit<ControlPlaneTokenReques
   timestampHeaderName?: string;
 };
 
+export type ControlPlaneJwkTokenRequesterOptions = ControlPlaneTokenRequestOptions & {
+  assertionAudience?: string;
+  assertionTtlSeconds?: number;
+  clientId: string;
+  clientIdHeaderName?: string;
+  keyId: string;
+  keyIdHeaderName?: string;
+  maxBodyBytes?: number;
+  now?: () => Date;
+  privateJwk: JsonWebKey | (() => Promise<JsonWebKey> | JsonWebKey);
+};
+
 export type ControlPlaneRpcTokenBinding = {
   issueCapabilityToken(input: IssueCapabilityTokenInput): Promise<IssuedCapabilityToken | { expiresAt: Date | string; token: string }>;
+};
+
+export type ControlPlaneRpcCallerTokenBinding = {
+  issueCapabilityTokenForCaller(
+    callerServiceId: string,
+    input: Omit<IssueCapabilityTokenInput, 'callerServiceId'> & { callerServiceId?: string },
+  ): Promise<IssuedCapabilityToken | { expiresAt: Date | string; token: string }>;
+};
+
+export type ControlPlaneRpcTokenRequesterOptions = {
+  binding: ControlPlaneRpcCallerTokenBinding | ControlPlaneRpcTokenBinding;
+  callerServiceId?: string;
+};
+
+export type CloudflareAbilityRpcBinding = {
+  connectAbility(input: {
+    abilityId: string;
+    requestId?: string;
+    token: string;
+  }): Promise<Record<string, unknown>> | Record<string, unknown>;
+};
+
+export interface AuthenticatedRoot<Scoped> {
+  authenticate(token: string): Scoped;
+}
+
+export type CapabilityRpcTransport =
+  | { binding: CloudflareAbilityRpcBinding; kind: 'cloudflare-binding-rpc' }
+  | { kind: 'custom'; transport: RpcTransport }
+  | { kind: 'fetch'; fetcher: FetchLike; origin: string; path?: string }
+  | { kind: 'http-batch'; path?: string; url: Request | string | URL }
+  | { kind: 'websocket'; url: string };
+
+export type CapabilityRpcSessionOptions<Scoped> = (
+  | (CreateCapabilityTokenProviderOptions & { tokenProvider?: undefined })
+  | ({ tokenProvider: CapabilityTokenProvider } & Pick<
+      CreateCapabilityTokenProviderOptions,
+      'callerServiceId' | 'scopes' | 'targetServiceId'
+    >)
+) & {
+  abilityId?: string;
+  authenticate?: (root: RpcStub<AuthenticatedRoot<Scoped>>, token: string) => RpcStub<Scoped>;
+  requestId?: string;
+  requestIdHeaderName?: string;
+  rpcSessionOptions?: RpcSessionOptions;
+  transport: CapabilityRpcTransport;
+};
+
+export type AbilitySessionOptions<Scoped> = CapabilityRpcSessionOptions<Scoped> & {
+  abilityId: string;
 };
 
 export function defineCapabilities(catalog: CapabilityCatalog): CapabilityCatalog {
@@ -103,110 +164,75 @@ export function defineCapabilities(catalog: CapabilityCatalog): CapabilityCatalo
   };
 }
 
-export function capability(...requiredScopes: string[]): CapabilityAuthMiddleware {
-  const scopes = normalizeScopes(requiredScopes);
-  const middleware = createMiddleware<CapabilityAuthVariables>(async (context, next) => {
-    const verifier = context.get(SERVICE_PLANE_CAPABILITY_VERIFIER);
-    if (!verifier) return context.json({ error: 'Service-Plane capability auth is not configured' }, 500);
-
-    try {
-      const identity = await verifyCapabilityToken(extractServicePlaneToken(context.req.raw), {
-        ...verifier,
-        requiredScopes: scopes,
-      });
-      context.set(SERVICE_PLANE_CAPABILITY_CONTEXT, identity);
-      await next();
-    } catch (error) {
-      if (error instanceof CapabilityAuthError) return context.json({ error: error.message }, error.status as 400 | 401 | 403 | 500);
-      throw error;
-    }
-  });
-  routeCapabilities.set(middleware, scopes);
-  return middleware;
+export function bindCapabilityIdentity<T extends object>(target: T, identity: CapabilityIdentity): T {
+  identityByTarget.set(target, identity);
+  return target;
 }
 
-export function capabilityAuth(options: CapabilityVerifierOptions): CapabilityAuthMiddleware {
-  return createMiddleware<CapabilityAuthVariables>(async (context, next) => {
-    context.set(SERVICE_PLANE_CAPABILITY_VERIFIER, options);
-    await next();
-  });
+export function capabilityIdentity(target: object): CapabilityIdentity | undefined {
+  return identityByTarget.get(target);
+}
+
+export function requireScopes(target: object, ...scopes: string[]): CapabilityIdentity {
+  const identity = identityByTarget.get(target);
+  if (!identity) {
+    throw new CapabilityAuthError('Service-Plane capability identity is not bound to this RPC target', 401);
+  }
+  const required = normalizeScopes(scopes);
+  for (const scope of required) {
+    if (!identity.scopes.includes(scope)) {
+      throw new CapabilityAuthError(`Missing Service-Plane capability scope: ${scope}`, 403);
+    }
+  }
+  return identity;
+}
+
+export async function verifyAuthenticationToken(token: string, verifier: CapabilityVerifierOptions): Promise<CapabilityIdentity> {
+  if (typeof token !== 'string' || token.length === 0) {
+    throw new CapabilityAuthError('Service-Plane capability token is required', 401);
+  }
+  return verifyCapabilityToken(token, verifier);
 }
 
 export function jwksFromUrl(url: string | URL, options: JwksFromUrlOptions = {}): CapabilityJwksResolver {
+  requireExplicitJwksCacheKeyForVariantSources(options, 'headers');
   const key = JSON.stringify({
     cacheTtlSeconds: options.cacheTtlSeconds ?? DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
     url: String(url),
   });
-  if (!options.fetch && !options.headers && !options.now) {
+  if (!options.cache && !options.cacheKey && !options.fetch && !options.headers && !options.now) {
     const existing = urlJwksResolvers.get(key);
     if (existing) return existing;
   }
 
-  const resolver = createRemoteJwksResolver({
-    ...options,
-    url,
-  });
-  if (!options.fetch && !options.headers && !options.now) urlJwksResolvers.set(key, resolver);
+  const resolver = createRemoteJwksResolver({ ...options, url });
+  if (!options.cache && !options.cacheKey && !options.fetch && !options.headers && !options.now) urlJwksResolvers.set(key, resolver);
   return resolver;
 }
 
 export function jwksFromServiceBinding(binding: FetchLike, options: JwksFromServiceBindingOptions = {}): CapabilityJwksResolver {
+  requireExplicitJwksCacheKeyForVariantSources(options, 'binding');
   const origin = options.origin ?? 'https://service-plane-control-plane.internal';
   const path = options.path ?? SERVICE_PLANE_CAPABILITY_JWKS_PATH;
   const url = new URL(path, origin);
-  if (options.headers || options.now) {
-    return createRemoteJwksResolver({
-      ...options,
-      fetch: binding,
-      url,
-    });
+  if (options.cache || options.cacheKey || options.headers || options.now) {
+    return createRemoteJwksResolver({ ...options, fetch: binding, url });
   }
 
   const key = JSON.stringify({
     cacheTtlSeconds: options.cacheTtlSeconds ?? DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
     url: String(url),
   });
-
   let resolvers = serviceBindingJwksResolvers.get(binding);
   if (!resolvers) {
     resolvers = new Map();
     serviceBindingJwksResolvers.set(binding, resolvers);
   }
-
   const existing = resolvers.get(key);
   if (existing) return existing;
-
-  const resolver = createRemoteJwksResolver({
-    ...options,
-    fetch: binding,
-    url,
-  });
+  const resolver = createRemoteJwksResolver({ ...options, fetch: binding, url });
   resolvers.set(key, resolver);
   return resolver;
-}
-
-export function capabilityIdentity(context: CapabilityContextSource): CapabilityIdentity | undefined {
-  return context.get(SERVICE_PLANE_CAPABILITY_CONTEXT);
-}
-
-export { verifyCapabilityToken };
-
-export function routeRequiredScopes(handler: unknown): string[] {
-  return typeof handler === 'function' || (typeof handler === 'object' && handler !== null) ? (routeCapabilities.get(handler) ?? []) : [];
-}
-
-export function serviceCapabilities(
-  app: HonoAppLike,
-  catalog: CapabilityCatalog,
-): CapabilityCatalog & { routes: Array<{ method: string; path: string; requiredScopes: string[] }> } {
-  return {
-    ...catalog,
-    routes: app.routes.flatMap((route) => {
-      const requiredScopes = routeRequiredScopes(route.handler);
-      if (requiredScopes.length === 0) return [];
-      return [{ method: route.method.toUpperCase(), path: route.path, requiredScopes }];
-    }),
-  };
 }
 
 export function createCapabilityTokenProvider(options: CreateCapabilityTokenProviderOptions): CapabilityTokenProvider {
@@ -218,7 +244,13 @@ export function createCapabilityTokenProvider(options: CreateCapabilityTokenProv
   const ttlSeconds = options.ttlSeconds === undefined ? undefined : normalizeTtlSeconds(options.ttlSeconds);
   const cacheKey =
     options.cacheKey ??
-    capabilityTokenCacheKey({ callerServiceId, scopes, targetServiceId, ...(ttlSeconds === undefined ? {} : { ttlSeconds }) });
+    capabilityTokenCacheKey({
+      ...(options.abilityId ? { abilityId: normalizeValue(options.abilityId, 'ability id') } : {}),
+      callerServiceId,
+      scopes,
+      targetServiceId,
+      ...(ttlSeconds === undefined ? {} : { ttlSeconds }),
+    });
 
   return {
     async token() {
@@ -248,12 +280,14 @@ export function createCapabilityTokenProvider(options: CreateCapabilityTokenProv
 }
 
 export function capabilityTokenCacheKey(input: {
+  abilityId?: string;
   callerServiceId: string;
   scopes: string[];
   targetServiceId: string;
   ttlSeconds?: number;
 }): string {
   const parts = {
+    abilityId: input.abilityId ?? null,
     callerServiceId: input.callerServiceId,
     scopes: [...input.scopes].sort(),
     targetServiceId: input.targetServiceId,
@@ -262,38 +296,74 @@ export function capabilityTokenCacheKey(input: {
   return `service-plane:capability-token:${encodeURIComponent(JSON.stringify(parts))}`;
 }
 
-export function controlPlaneTokenRequester(
-  options: ControlPlaneTokenRequesterOptions,
-): CreateCapabilityTokenProviderOptions['requestToken'] {
-  const fetcher = options.fetch ?? fetch;
-  const tokenUrl = new URL(options.tokenPath ?? SERVICE_PLANE_CAPABILITY_TOKEN_PATH, options.controlPlaneUrl);
-  const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
+export async function capabilityRpcSession<Scoped extends RpcCompatible<Scoped>>(
+  options: CapabilityRpcSessionOptions<Scoped>,
+): Promise<RpcStub<Scoped>> {
+  const tokenProvider = options.tokenProvider ?? createCapabilityTokenProvider(options as CreateCapabilityTokenProviderOptions);
+  const authenticate = options.authenticate ?? defaultAuthenticate<Scoped>;
+  let persistent: RpcStub<Scoped> | undefined;
+  let nativeBinding: Promise<Record<string, unknown>> | Record<string, unknown> | undefined;
+  return new Proxy(Object.create(null), {
+    get(_target, property) {
+      if (property === 'then') return undefined;
+      if (typeof property !== 'string') return undefined;
+      return async (...args: unknown[]) => {
+        if (options.transport.kind === 'cloudflare-binding-rpc') {
+          nativeBinding ??= options.transport.binding.connectAbility({
+            abilityId: options.abilityId ?? missingAbilityId(),
+            ...(options.requestId ? { requestId: options.requestId } : {}),
+            token: await tokenProvider.token(),
+          });
+          const target = await nativeBinding;
+          const method = target[property];
+          if (typeof method !== 'function')
+            throw new CapabilityAuthError(`Service-Plane ability method is not available: ${property}`, 500);
+          return method.apply(target, args);
+        }
 
-  return async (input) => {
-    const headers = new Headers(typeof options.headers === 'function' ? await options.headers() : options.headers);
-    headers.set('authorization', `Bearer ${await resolveServiceClientSecret(options.serviceClientSecret)}`);
-    headers.set('content-type', 'application/json');
-    const requestId = await resolveRequestId(options.requestId);
-    if (requestId) headers.set(requestIdHeaderName, requestId);
+        let scoped: RpcStub<Scoped>;
+        if (options.transport.kind === 'http-batch' || options.transport.kind === 'fetch') {
+          const token = await tokenProvider.token();
+          scoped = authenticate(openSession<Scoped>(options), token);
+        } else {
+          if (!persistent) {
+            const token = await tokenProvider.token();
+            persistent = authenticate(openSession<Scoped>(options), token);
+          }
+          scoped = persistent;
+        }
+        return (scoped as Record<string, (...methodArgs: unknown[]) => unknown>)[property]?.(...args);
+      };
+    },
+  }) as RpcStub<Scoped>;
+}
 
-    const response = await fetchToken(
-      fetcher,
-      new Request(tokenUrl, {
-        body: JSON.stringify(input),
-        headers,
-        method: 'POST',
-      }),
-    );
-    if (!response.ok) throw new CapabilityAuthError(`Unable to fetch Service-Plane capability token: ${response.status}`, response.status);
+export function abilitySession<Scoped extends RpcCompatible<Scoped>>(options: AbilitySessionOptions<Scoped>): Promise<RpcStub<Scoped>> {
+  return capabilityRpcSession(options);
+}
 
-    let body: unknown;
-    try {
-      body = await response.json();
-    } catch {
-      throw new CapabilityAuthError('Invalid Service-Plane capability token response', 500);
-    }
-    return parseIssuedCapabilityToken(body);
-  };
+export function httpBatchRpc(url: Request | string | URL, path?: string): CapabilityRpcTransport {
+  return { kind: 'http-batch', ...(path ? { path } : {}), url };
+}
+
+export function websocketRpc(url: string): CapabilityRpcTransport {
+  return { kind: 'websocket', url };
+}
+
+export function cloudflareServiceBindingRpc(
+  binding: FetchLike,
+  path?: string,
+  origin = 'https://service-plane-service.internal',
+): CapabilityRpcTransport {
+  return { fetcher: binding, kind: 'fetch', origin, ...(path ? { path } : {}) };
+}
+
+export function cloudflareNativeRpc(binding: CloudflareAbilityRpcBinding): CapabilityRpcTransport {
+  return { binding, kind: 'cloudflare-binding-rpc' };
+}
+
+export function customRpcTransport(transport: RpcTransport): CapabilityRpcTransport {
+  return { kind: 'custom', transport };
 }
 
 export function controlPlaneHmacTokenRequester(
@@ -321,7 +391,7 @@ export function controlPlaneHmacTokenRequester(
         clientId: options.clientId,
         clientIdHeaderName,
         requestIdHeaderName,
-        secret: await resolveServiceClientSecret(options.clientSecret),
+        secret: await resolveClientSecret(options.clientSecret),
         timestampHeaderName,
         ...(options.now ? { now: options.now() } : {}),
       },
@@ -329,39 +399,196 @@ export function controlPlaneHmacTokenRequester(
 
     const response = await fetchToken(fetcher, request);
     if (!response.ok) throw new CapabilityAuthError(`Unable to fetch Service-Plane capability token: ${response.status}`, response.status);
-
-    let body: unknown;
-    try {
-      body = await response.json();
-    } catch {
-      throw new CapabilityAuthError('Invalid Service-Plane capability token response', 500);
-    }
-    return parseIssuedCapabilityToken(body);
+    return parseIssuedCapabilityToken(await readJson(response, 'Invalid Service-Plane capability token response'));
   };
 }
 
-export function controlPlaneRpcTokenRequester(binding: ControlPlaneRpcTokenBinding): CreateCapabilityTokenProviderOptions['requestToken'] {
-  return async (input) => parseIssuedCapabilityToken(await binding.issueCapabilityToken(input));
-}
-
-export function capabilityFetch(options: CapabilityFetchOptions | CapabilityFetchWithProviderOptions): typeof fetch {
+export function controlPlaneJwkTokenRequester(
+  options: ControlPlaneJwkTokenRequesterOptions,
+): CreateCapabilityTokenProviderOptions['requestToken'] {
   const fetcher = options.fetch ?? fetch;
-  const tokenProvider = 'tokenProvider' in options ? options.tokenProvider : createCapabilityTokenProvider(options);
-  return async (input, init) => {
-    const token = await tokenProvider.token();
-    const request = withCapabilityAuthorization(new Request(input, init), token);
-    return fetcher(request);
+  const tokenUrl = new URL(options.tokenPath ?? SERVICE_PLANE_CAPABILITY_TOKEN_PATH, options.controlPlaneUrl);
+  const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
+  const clientIdHeaderName = options.clientIdHeaderName ?? SERVICE_PLANE_JWK_CLIENT_HEADER;
+  const keyIdHeaderName = options.keyIdHeaderName ?? SERVICE_PLANE_JWK_KEY_ID_HEADER;
+
+  return async (input) => {
+    const headers = new Headers(typeof options.headers === 'function' ? await options.headers() : options.headers);
+    headers.set('content-type', 'application/json');
+    const requestId = await resolveRequestId(options.requestId);
+    if (requestId) headers.set(requestIdHeaderName, requestId);
+
+    const request = await signServicePlaneJwkRequest(
+      new Request(tokenUrl, {
+        body: JSON.stringify(input),
+        headers,
+        method: 'POST',
+      }),
+      {
+        audience: options.assertionAudience ?? SERVICE_PLANE_JWK_ASSERTION_AUDIENCE,
+        clientId: options.clientId,
+        clientIdHeaderName,
+        keyId: options.keyId,
+        keyIdHeaderName,
+        ...(options.assertionTtlSeconds === undefined ? {} : { assertionTtlSeconds: options.assertionTtlSeconds }),
+        ...(options.maxBodyBytes === undefined ? {} : { maxBodyBytes: options.maxBodyBytes }),
+        ...(options.now ? { now: options.now() } : {}),
+        privateJwk: await resolvePrivateJwk(options.privateJwk),
+        requestIdHeaderName,
+      },
+    );
+
+    const response = await fetchToken(fetcher, request);
+    if (!response.ok) throw new CapabilityAuthError(`Unable to fetch Service-Plane capability token: ${response.status}`, response.status);
+    return parseIssuedCapabilityToken(await readJson(response, 'Invalid Service-Plane capability token response'));
   };
 }
 
-export function withCapabilityAuthorization(request: Request, token: string): Request {
-  const headers = new Headers(request.headers);
-  headers.set('authorization', servicePlaneAuthorization(token));
-  return new Request(request, { headers });
+export function controlPlaneRpcTokenRequester(
+  options: ControlPlaneRpcTokenRequesterOptions,
+): CreateCapabilityTokenProviderOptions['requestToken'] {
+  return async (input) => {
+    if ('issueCapabilityTokenForCaller' in options.binding) {
+      if (!options.callerServiceId) throw new CapabilityAuthError('Service-Plane RPC token requester requires callerServiceId', 500);
+      return parseIssuedCapabilityToken(
+        await options.binding.issueCapabilityTokenForCaller(options.callerServiceId, {
+          scopes: input.scopes,
+          targetServiceId: input.targetServiceId,
+          ...(input.ttlSeconds === undefined ? {} : { ttlSeconds: input.ttlSeconds }),
+        }),
+      );
+    }
+    return parseIssuedCapabilityToken(await options.binding.issueCapabilityToken(input));
+  };
 }
 
 export function tokenExpiresAt(token: string): Date {
   return new Date(decodeCapabilityTokenPayload(token).exp * 1000);
+}
+
+export type { RpcCompatible, RpcSessionOptions, RpcStub, RpcTransport };
+export { RpcTarget };
+
+function defaultAuthenticate<Scoped>(root: RpcStub<AuthenticatedRoot<Scoped>>, token: string): RpcStub<Scoped> {
+  return root.authenticate(token) as unknown as RpcStub<Scoped>;
+}
+
+function openSession<Scoped extends RpcCompatible<Scoped>>(options: {
+  abilityId?: string;
+  requestId?: string;
+  requestIdHeaderName?: string;
+  rpcSessionOptions?: RpcSessionOptions;
+  transport: CapabilityRpcTransport;
+}): RpcStub<AuthenticatedRoot<Scoped>> {
+  const { abilityId, requestId, rpcSessionOptions, transport } = options;
+  const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
+  if (transport.kind === 'http-batch') {
+    return newHttpBatchRpcSession<AuthenticatedRoot<Scoped>>(
+      withRequestIdHeader(httpBatchUrl(transport, abilityId), requestId, requestIdHeaderName),
+      rpcSessionOptions,
+    );
+  }
+  if (transport.kind === 'websocket') {
+    return newWebSocketRpcSession<AuthenticatedRoot<Scoped>>(
+      withRequestIdQueryParam(transport.url, requestId),
+      undefined,
+      rpcSessionOptions,
+    );
+  }
+  if (transport.kind === 'cloudflare-binding-rpc') {
+    throw new CapabilityAuthError('Cloudflare native RPC transport does not open a Cap’n Web session', 500);
+  }
+  const rpcTransport =
+    transport.kind === 'fetch'
+      ? createFetchBatchTransport(
+          transport.fetcher,
+          fetchTransportUrl(transport, abilityId),
+          requestId ? { [requestIdHeaderName]: requestId } : undefined,
+        )
+      : transport.transport;
+  const session = new RpcSession<AuthenticatedRoot<Scoped>>(rpcTransport, undefined, rpcSessionOptions);
+  return session.getRemoteMain();
+}
+
+// Cap'n Web sends the batch as `fetch(urlOrRequest, { method, body })`, so a bodyless template
+// Request keeps its headers across batches and carries the correlation id to the service.
+function withRequestIdHeader(url: Request | string, requestId: string | undefined, headerName: string): Request | string {
+  if (!requestId) return url;
+  const request = url instanceof Request ? new Request(url) : new Request(url, { method: 'POST' });
+  request.headers.set(headerName, requestId);
+  return request;
+}
+
+function withRequestIdQueryParam(url: string, requestId: string | undefined): string {
+  if (!requestId) return url;
+  const parsed = new URL(url);
+  parsed.searchParams.set(SERVICE_PLANE_REQUEST_ID_QUERY_PARAM, requestId);
+  return parsed.toString();
+}
+
+function httpBatchUrl(transport: Extract<CapabilityRpcTransport, { kind: 'http-batch' }>, abilityId?: string): Request | string {
+  if (transport.url instanceof Request) return transport.url;
+  if (!transport.path && !abilityId) return transport.url instanceof URL ? transport.url.toString() : transport.url;
+  const url = new URL(transport.url instanceof URL ? transport.url.toString() : String(transport.url));
+  url.pathname = transport.path ?? defaultAbilityPath(abilityId);
+  return url.toString();
+}
+
+function fetchTransportUrl(transport: Extract<CapabilityRpcTransport, { kind: 'fetch' }>, abilityId?: string): string {
+  return new URL(transport.path ?? defaultAbilityPath(abilityId), transport.origin).toString();
+}
+
+function defaultAbilityPath(abilityId?: string): string {
+  if (!abilityId) throw new CapabilityAuthError('Service-Plane abilityId is required when transport path is omitted', 500);
+  return `/rpc/${abilityId}`;
+}
+
+function missingAbilityId(): never {
+  throw new CapabilityAuthError('Service-Plane abilityId is required for Cloudflare native RPC transport', 500);
+}
+
+function createFetchBatchTransport(fetcher: FetchLike, url: string, headers?: Record<string, string>): RpcTransport {
+  let batchToSend: string[] | null = [];
+  let batchToReceive: string[] | undefined;
+  let aborted: unknown;
+  const scheduled = (async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    if (aborted !== undefined) throw aborted;
+    const batch = batchToSend ?? [];
+    batchToSend = null;
+    const response = await fetcher.fetch(new Request(url, { body: batch.join('\n'), ...(headers ? { headers } : {}), method: 'POST' }));
+    if (!response.ok) {
+      response.body?.cancel();
+      throw new CapabilityAuthError(`Cap'n Web HTTP-batch transport failed: ${response.status}`, response.status);
+    }
+    const body = await response.text();
+    batchToReceive = body === '' ? [] : body.split('\n');
+  })();
+
+  return {
+    async send(message) {
+      batchToSend?.push(message);
+    },
+    async receive() {
+      if (!batchToReceive) await scheduled;
+      const message = batchToReceive?.shift();
+      if (message !== undefined) return message;
+      throw new Error('Batch RPC request ended.');
+    },
+    abort(reason) {
+      aborted = reason;
+    },
+  };
+}
+
+function requireExplicitJwksCacheKeyForVariantSources(options: JwksFromUrlOptions, source: 'binding' | 'headers'): void {
+  if (!options.cache || options.cacheKey) return;
+  if (source === 'binding') {
+    throw new CapabilityAuthError('Service-Plane JWKS cacheKey is required when using a shared cache with service bindings', 500);
+  }
+  if (options.headers) {
+    throw new CapabilityAuthError('Service-Plane JWKS cacheKey is required when using a shared cache with JWKS request headers', 500);
+  }
 }
 
 function normalizeScopeDefinition(scope: CapabilityScopeDefinition): CapabilityScopeDefinition {
@@ -414,6 +641,7 @@ function firstDuplicate(values: string[]): string | undefined {
 
 function createRemoteJwksResolver(options: JwksFromUrlOptions & { url: string | URL }): CapabilityJwksResolver {
   const cacheTtlSeconds = normalizeCacheTtlSeconds(options.cacheTtlSeconds ?? DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS);
+  const cacheKey = options.cacheKey ?? capabilityJwksCacheKey(options.url);
   const fetcher = options.fetch ?? fetch;
   let cached: { expiresAt: number; jwks: CapabilityJwks } | undefined;
   let inFlight: Promise<CapabilityJwks> | undefined;
@@ -421,6 +649,14 @@ function createRemoteJwksResolver(options: JwksFromUrlOptions & { url: string | 
   return async () => {
     const now = (options.now?.() ?? new Date()).getTime();
     if (cached && cached.expiresAt > now) return cached.jwks;
+    const shared = await readCapabilityJwksCache(options.cache, cacheKey, new Date(now));
+    if (shared) {
+      cached = {
+        expiresAt: shared.expiresAt,
+        jwks: shared.jwks,
+      };
+      return shared.jwks;
+    }
     if (inFlight) return inFlight;
 
     inFlight = (async () => {
@@ -430,19 +666,12 @@ function createRemoteJwksResolver(options: JwksFromUrlOptions & { url: string | 
       if (!response.ok) {
         throw new CapabilityAuthError(`Unable to fetch Service-Plane JWKS: ${response.status}`, 500);
       }
-
-      let body: unknown;
-      try {
-        body = await response.json();
-      } catch {
-        throw new CapabilityAuthError('Invalid Service-Plane JWKS response', 500);
-      }
-
-      const jwks = parseRemoteJwks(body);
+      const jwks = parseRemoteJwks(await readJson(response, 'Invalid Service-Plane JWKS response'));
       cached = {
         expiresAt: now + cacheTtlSeconds * 1000,
         jwks,
       };
+      await writeCapabilityJwksCache(options.cache, cacheKey, jwks, new Date(now), cacheTtlSeconds);
       return jwks;
     })();
 
@@ -454,6 +683,10 @@ function createRemoteJwksResolver(options: JwksFromUrlOptions & { url: string | 
   };
 }
 
+function capabilityJwksCacheKey(url: string | URL): string {
+  return `service-plane:jwks:${encodeURIComponent(String(url))}`;
+}
+
 function fetchJwks(fetcher: RemoteJwksFetch, request: Request): Promise<Response> {
   return typeof fetcher === 'function' ? fetcher(request) : fetcher.fetch(request);
 }
@@ -462,14 +695,28 @@ function fetchToken(fetcher: typeof fetch | FetchLike, request: Request): Promis
   return typeof fetcher === 'function' ? fetcher(request) : fetcher.fetch(request);
 }
 
-async function resolveServiceClientSecret(secret: ControlPlaneTokenRequesterOptions['serviceClientSecret']): Promise<string> {
+async function readJson(response: Response, message: string): Promise<unknown> {
+  try {
+    return await response.json();
+  } catch {
+    throw new CapabilityAuthError(message, 500);
+  }
+}
+
+async function resolveClientSecret(secret: ControlPlaneHmacTokenRequesterOptions['clientSecret']): Promise<string> {
   const resolved = typeof secret === 'function' ? await secret() : secret;
   const normalized = resolved.trim();
-  if (!normalized) throw new CapabilityAuthError('Service-Plane service client secret cannot be empty', 500);
+  if (!normalized) throw new CapabilityAuthError('Service-Plane HMAC client secret cannot be empty', 500);
   return normalized;
 }
 
-async function resolveRequestId(requestId: ControlPlaneTokenRequesterOptions['requestId']): Promise<string | undefined> {
+async function resolvePrivateJwk(privateJwk: ControlPlaneJwkTokenRequesterOptions['privateJwk']): Promise<JsonWebKey> {
+  const resolved = typeof privateJwk === 'function' ? await privateJwk() : privateJwk;
+  if (typeof resolved !== 'object' || resolved === null) throw new CapabilityAuthError('Service-Plane JWK private key is invalid', 500);
+  return resolved;
+}
+
+async function resolveRequestId(requestId: ControlPlaneTokenRequestOptions['requestId']): Promise<string | undefined> {
   const resolved = typeof requestId === 'function' ? await requestId() : requestId;
   const normalized = resolved?.trim();
   return normalized || undefined;
@@ -531,6 +778,45 @@ async function writeCapabilityTokenCache(
   if (ttlSeconds <= 0) return;
   try {
     await cache.set(key, value, ttlSeconds);
+  } catch {
+    return;
+  }
+}
+
+async function readCapabilityJwksCache(
+  cache: CapabilityJwksCache | undefined,
+  key: string,
+  now: Date,
+): Promise<{ expiresAt: number; jwks: CapabilityJwks } | undefined> {
+  if (!cache) return undefined;
+  try {
+    const value = await cache.get(key);
+    if (!value) return undefined;
+    const expiresAt = value.expiresAt instanceof Date ? value.expiresAt : new Date(value.expiresAt);
+    if (expiresAt.getTime() <= now.getTime()) return undefined;
+    return { expiresAt: expiresAt.getTime(), jwks: parseRemoteJwks(value.jwks) };
+  } catch {
+    return undefined;
+  }
+}
+
+async function writeCapabilityJwksCache(
+  cache: CapabilityJwksCache | undefined,
+  key: string,
+  jwks: CapabilityJwks,
+  now: Date,
+  ttlSeconds: number,
+): Promise<void> {
+  if (!cache) return;
+  try {
+    await cache.set(
+      key,
+      {
+        expiresAt: new Date(now.getTime() + ttlSeconds * 1000),
+        jwks,
+      },
+      ttlSeconds,
+    );
   } catch {
     return;
   }

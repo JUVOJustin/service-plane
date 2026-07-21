@@ -8,5 +8,6 @@ describe('package metadata', () => {
     };
 
     expect(packageJson.peerDependencies?.hono).toBe('>=4.10.3 <5.0.0');
+    expect(packageJson.peerDependencies?.zod).toBe('>=4.0.0 <5.0.0');
   });
 });

@@ -43,6 +43,36 @@ describe('capability issuer', () => {
     ).resolves.toMatchObject({ serviceId: 'moco' });
   });
 
+  it('issues brokered tokens without changing the granted caller identity', async () => {
+    const keys = await testKeys();
+    const issuer = createCapabilityIssuer({
+      capabilities: [fizzyCapabilities],
+      grants: defineServiceGrants({
+        grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
+      }),
+      issuer: 'control-plane',
+      keyId: 'test-key',
+      now: () => new Date('2026-05-09T12:00:00.000Z'),
+      privateJwk: keys.privateJwk,
+    });
+
+    const issued = await issuer.issueBrokeredCapabilityToken({
+      brokerServiceId: 'control-plane',
+      callerServiceId: 'moco',
+      scopes: ['fizzy.users.lookup'],
+      targetServiceId: 'fizzy',
+    });
+
+    await expect(
+      verifyCapabilityToken(issued.token, {
+        expectedAudience: 'fizzy',
+        issuer: 'control-plane',
+        jwks: await issuer.jwks(),
+        now: new Date('2026-05-09T12:00:01.000Z'),
+      }),
+    ).resolves.toMatchObject({ brokerServiceId: 'control-plane', serviceId: 'moco' });
+  });
+
   it('rejects unknown scopes and unauthorized grants', async () => {
     const keys = await testKeys();
 
@@ -253,6 +283,35 @@ describe('capability issuer', () => {
         })
       ).status,
     ).toBe(200);
+  });
+
+  it('serves JWKS with ETag revalidation', async () => {
+    const keys = await testKeys();
+    const issuer = createCapabilityIssuer({
+      capabilities: [fizzyCapabilities],
+      grants: defineServiceGrants({
+        grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
+      }),
+      issuer: 'control-plane',
+      keyId: 'test-key',
+      privateJwk: keys.privateJwk,
+    });
+    const app = new Hono();
+    mountCapabilityEndpoints(app, issuer, {
+      authenticateCaller: () => 'moco',
+    });
+
+    const first = await app.request('/.well-known/service-plane/jwks.json');
+    const etag = first.headers.get('etag');
+    expect(first.status).toBe(200);
+    expect(etag).toBeTruthy();
+
+    const revalidated = await app.request('/.well-known/service-plane/jwks.json', {
+      headers: { 'if-none-match': etag ?? '' },
+    });
+    expect(revalidated.status).toBe(304);
+    expect(revalidated.headers.get('etag')).toBe(etag);
+    expect(await revalidated.text()).toBe('');
   });
 
   it('generates a private JWK and publishes public JWKS without extra config', async () => {

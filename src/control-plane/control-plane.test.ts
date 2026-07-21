@@ -1,488 +1,487 @@
-import { Hono } from 'hono';
+import { RpcTarget } from 'capnweb';
 import { describe, expect, it } from 'vitest';
+import * as z from 'zod';
 import {
-  capability,
-  capabilityAuth,
-  capabilityFetch,
-  capabilityIdentity,
+  abilityMethod,
   controlPlaneHmacTokenRequester,
-  controlPlaneRpcTokenRequester,
+  defineAbility,
   defineCapabilities,
-} from '../service/capabilities.js';
-import { defineNamespace, defineService, mountDiscovery } from '../service/discovery.js';
-import { ServicePlaneService } from '../service/service.js';
-import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
-import { signServicePlaneHmacRequest } from '../shared/hmac-auth.js';
-import { memoryRegistryCache } from '../testing/memory-cache.js';
-import { hashServiceClientSecret, hmacServiceClientAuth, serviceClientCredentialsAuth } from './caller-auth.js';
+  requireScopes,
+  ServicePlaneService,
+} from '../service/index.js';
+import {
+  type CapabilityJwks,
+  type OpenApiDocument,
+  type OpenApiDocumentCache,
+  SERVICE_PLANE_CAPABILITY_JWKS_PATH,
+  SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
+  SERVICE_PLANE_MCP_PATH,
+  SERVICE_PLANE_OPENAPI_PATH,
+  type ServiceDiscoveryDocument,
+} from '../shared/types.js';
+import { hmacServiceClientAuth } from './caller-auth.js';
 import { ServicePlaneControlPlane } from './control-plane.js';
 import { cloudflareServiceBinding } from './endpoints.js';
-import { generateCapabilitySigningSecret, privateJwkFromCapabilitySigningSecret } from './signing-secret.js';
+import { generateCapabilitySigningSecret } from './signing-secret.js';
+
+const discovery: ServiceDiscoveryDocument = {
+  abilities: [
+    {
+      access: 'service',
+      exposure: 'private',
+      id: 'example.sync',
+      methods: {
+        runSync: {
+          inputSchema: { type: 'object' },
+          outputSchema: { type: 'object' },
+          scopes: ['example.sync.run'],
+        },
+      },
+      rpc: { path: '/rpc/example.sync', transports: ['http-batch'] },
+      scopes: ['example.sync.run'],
+    },
+    {
+      access: 'plane',
+      exposure: 'published',
+      id: 'example.search',
+      methods: {
+        search: {
+          inputSchema: { properties: { query: { type: 'string' } }, type: 'object' },
+          mcp: { name: 'example_search' },
+          outputSchema: { properties: { results: { type: 'array' } }, type: 'object' },
+          rest: { method: 'post', operationId: 'searchExamples', path: '/examples/search', summary: 'Search examples' },
+          scopes: ['example.search'],
+        },
+      },
+      rpc: { path: '/rpc/example.search', transports: ['http-batch'] },
+      scopes: ['example.search'],
+    },
+  ],
+  capabilities: { scopes: [{ id: 'example.sync.run' }, { id: 'example.search' }], serviceId: 'example' },
+  id: 'example',
+  title: 'Example',
+  version: '0.1.0',
+};
 
 describe('ServicePlaneControlPlane', () => {
-  it('fails closed and logs when caller authentication is not configured', async () => {
-    const signingSecret = await generateCapabilitySigningSecret();
-    const service = new Hono();
-    mountDiscovery(
-      service,
-      defineService({
-        capabilities: defineCapabilities({
-          scopes: [{ id: 'example.events.ingest' }],
-          serviceId: 'example',
-        }),
-        id: 'example',
-        namespaces: [
-          defineNamespace({ app: new Hono().post('/events', capability('example.events.ingest')), prefix: '/', visibility: 'internal' }),
-        ],
-        title: 'Example',
-        version: '0.1.0',
-      }),
-    );
-    const controlPlane = new ServicePlaneControlPlane({
-      services: () => [cloudflareServiceBinding({ binding: { fetch: (request) => service.fetch(request) }, id: 'example' })],
-      signingSecret: () => signingSecret,
+  it('fails closed when caller authentication is not configured', async () => {
+    const plane = new ServicePlaneControlPlane({
+      services: () => [serviceEndpoint()],
+      signingSecret: async () => generateCapabilitySigningSecret(),
     });
-    const errors: string[] = [];
-    const originalError = console.error;
-    console.error = (message) => {
-      errors.push(String(message));
-    };
 
-    try {
-      const response = await controlPlane.app.request('/.well-known/service-plane/capability-token', {
-        body: JSON.stringify({ scopes: ['example.events.ingest'], targetServiceId: 'example' }),
-        headers: { 'content-type': 'application/json', 'x-request-id': 'caller-auth-missing-1' },
+    const response = await plane.fetch(
+      new Request(`https://plane.internal${SERVICE_PLANE_CAPABILITY_TOKEN_PATH}`, {
+        body: JSON.stringify({ scopes: ['example.sync.run'], targetServiceId: 'example' }),
+        headers: { 'content-type': 'application/json' },
         method: 'POST',
-      });
+      }),
+    );
 
-      expect(response.status).toBe(500);
-      await expect(response.json()).resolves.toEqual({ error: 'Service-Plane caller authentication is not configured' });
-      expect(errors).toEqual([
-        JSON.stringify({
-          event: 'service_plane.caller_auth.not_configured',
-          level: 'error',
-          message: 'Service-Plane caller authentication is not configured',
-          path: '/.well-known/service-plane/capability-token',
-          requestId: 'caller-auth-missing-1',
-        }),
-      ]);
-    } finally {
-      console.error = originalError;
-    }
+    expect(response.status).toBe(500);
   });
 
-  it('mounts token/JWKS endpoints and proxies scoped public routes with default STS tokens', async () => {
+  it('mounts token and JWKS endpoints and authenticates HMAC-signed token requests', async () => {
     const signingSecret = await generateCapabilitySigningSecret();
-    const capabilities = defineCapabilities({
-      scopes: [{ id: 'example.events.ingest' }],
-      serviceId: 'example',
-    });
-    const publicJwk = publicJwkFromPrivateJwk(privateJwkFromCapabilitySigningSecret(signingSecret), 'default');
-    const routes = new Hono().post('/events/example', capability('example.events.ingest'), (context) =>
-      context.json({
-        caller: capabilityIdentity(context)?.serviceId,
-        requestId: context.req.header('x-request-id'),
-      }),
-    );
-    const provider = new Hono();
-    mountDiscovery(
-      provider,
-      defineService({
-        capabilities,
-        id: 'example',
-        namespaces: [defineNamespace({ app: routes, prefix: '/', visibility: 'public' })],
-        title: 'Example',
-        version: '0.1.0',
-      }),
-    );
-    provider.use('*', capabilityAuth({ expectedAudience: 'example', issuer: 'control-plane', jwks: { keys: [publicJwk] } }));
-    provider.route('/', routes);
-
-    const callerSecret = 'moco-client-secret';
-    const controlPlane = new ServicePlaneControlPlane({
-      authenticateCaller: serviceClientCredentialsAuth({
-        credentials: [{ secretHash: await hashServiceClientSecret(callerSecret), serviceId: 'moco' }],
-      }),
-      services: () => [
-        cloudflareServiceBinding({
-          binding: { fetch: (request) => provider.fetch(request) },
-          grants: [
-            { caller: 'control-plane', scopes: ['example.events.ingest'] },
-            { caller: 'moco', scopes: ['example.events.ingest'] },
-          ],
-          id: 'example',
-        }),
-      ],
-      signingSecret: () => signingSecret,
-    });
-
-    expect((await controlPlane.app.request('/.well-known/service-plane/jwks.json')).status).toBe(200);
-    const warnings: string[] = [];
-    const originalWarn = console.warn;
-    console.warn = (message) => {
-      warnings.push(String(message));
-    };
-    try {
-      const unauthorizedToken = await controlPlane.app.request('/.well-known/service-plane/capability-token', {
-        body: JSON.stringify({ scopes: ['example.events.ingest'], targetServiceId: 'example' }),
-        headers: { 'content-type': 'application/json', 'x-request-id': 'missing-service-credentials-1' },
-        method: 'POST',
-      });
-      await expect(unauthorizedToken.json()).resolves.toEqual({ error: 'Unauthorized' });
-      expect(unauthorizedToken.status).toBe(401);
-      expect(warnings).toEqual([
-        JSON.stringify({
-          event: 'service_plane.caller_auth.unauthorized',
-          level: 'warn',
-          message: 'Missing Bearer service client credentials',
-          path: '/.well-known/service-plane/capability-token',
-          reason: 'missing_credentials',
-          requestId: 'missing-service-credentials-1',
-        }),
-      ]);
-    } finally {
-      console.warn = originalWarn;
-    }
-
-    expect(
-      (
-        await controlPlane.app.request('/.well-known/service-plane/capability-token', {
-          body: JSON.stringify({ scopes: ['example.events.ingest'], targetServiceId: 'example' }),
-          headers: { authorization: `Bearer ${callerSecret}`, 'content-type': 'application/json' },
-          method: 'POST',
-        })
-      ).status,
-    ).toBe(200);
-
-    const generatedRequestIdResponse = await controlPlane.app.request('/events/example', { method: 'POST' });
-    const generatedRequestIdBody = (await generatedRequestIdResponse.json()) as { caller: string; requestId: string };
-    expect(generatedRequestIdBody.caller).toBe('control-plane');
-    expect(generatedRequestIdBody.requestId).toBe(generatedRequestIdResponse.headers.get('x-request-id'));
-    expect(generatedRequestIdBody.requestId).toMatch(/^[\w\-=]+$/u);
-
-    await expect(
-      (
-        await controlPlane.app.request('/events/example', {
-          headers: { 'x-request-id': 'edge-to-worker-1' },
-          method: 'POST',
-        })
-      ).json(),
-    ).resolves.toEqual({
-      caller: 'control-plane',
-      requestId: 'edge-to-worker-1',
-    });
-  });
-
-  it('keys proxy registry cache entries by dynamic service set', async () => {
-    const tenantOneRoutes = new Hono().get('/tenant-one', (context) => context.json({ tenant: 'one' }));
-    const tenantOne = new Hono();
-    mountDiscovery(
-      tenantOne,
-      defineService({
-        id: 'example',
-        namespaces: [defineNamespace({ app: tenantOneRoutes, prefix: '/', visibility: 'public' })],
-        title: 'Example Tenant One',
-        version: '0.1.0',
-      }),
-    );
-    tenantOne.route('/', tenantOneRoutes);
-
-    const tenantTwoRoutes = new Hono().get('/tenant-two', (context) => context.json({ tenant: 'two' }));
-    const tenantTwo = new Hono();
-    mountDiscovery(
-      tenantTwo,
-      defineService({
-        id: 'example',
-        namespaces: [defineNamespace({ app: tenantTwoRoutes, prefix: '/', visibility: 'public' })],
-        title: 'Example Tenant Two',
-        version: '0.1.0',
-      }),
-    );
-    tenantTwo.route('/', tenantTwoRoutes);
-
-    const controlPlane = new ServicePlaneControlPlane({
-      proxy: { cache: memoryRegistryCache() },
-      services: (context) =>
-        context.req.header('x-tenant') === 'two'
-          ? [
-              cloudflareServiceBinding({
-                binding: { fetch: (request) => tenantTwo.fetch(request) },
-                id: 'example',
-                origin: 'https://tenant-two.internal',
-              }),
-            ]
-          : [
-              cloudflareServiceBinding({
-                binding: { fetch: (request) => tenantOne.fetch(request) },
-                id: 'example',
-                origin: 'https://tenant-one.internal',
-              }),
-            ],
-      signingSecret: () => 'unused-for-unscoped-routes',
-    });
-
-    await expect((await controlPlane.app.request('/tenant-one', { headers: { 'x-tenant': 'one' } })).json()).resolves.toEqual({
-      tenant: 'one',
-    });
-    await expect((await controlPlane.app.request('/tenant-two', { headers: { 'x-tenant': 'two' } })).json()).resolves.toEqual({
-      tenant: 'two',
-    });
-  });
-
-  it('authenticates token requests with HMAC signed service credentials', async () => {
-    const signingSecret = await generateCapabilitySigningSecret();
-    const capabilities = defineCapabilities({
-      scopes: [{ id: 'example.sync.run' }],
-      serviceId: 'example',
-    });
-    const service = new Hono();
-    mountDiscovery(
-      service,
-      defineService({
-        capabilities,
-        id: 'example',
-        namespaces: [
-          defineNamespace({ app: new Hono().post('/sync', capability('example.sync.run')), prefix: '/', visibility: 'internal' }),
-        ],
-        title: 'Example',
-        version: '0.1.0',
-      }),
-    );
-
-    const clientSecret = 'moco-hmac-secret';
-    const controlPlane = new ServicePlaneControlPlane({
+    const plane = new ServicePlaneControlPlane({
       authenticateCaller: hmacServiceClientAuth({
-        clients: [{ clientId: 'moco-client', secret: clientSecret, serviceId: 'moco' }],
-        now: () => new Date('2026-05-12T10:15:00.000Z'),
-        replayCache: memoryReplayCache(),
+        clients: [{ clientId: 'worker-a', secret: 'a'.repeat(43) }],
+        now: () => new Date('2026-05-09T12:00:00.000Z'),
       }),
-      services: () => [
-        cloudflareServiceBinding({
-          binding: { fetch: (request) => service.fetch(request) },
-          grants: [{ caller: 'moco', scopes: ['example.sync.run'] }],
-          id: 'example',
-        }),
-      ],
+      services: () => [serviceEndpoint()],
       signingSecret: () => signingSecret,
     });
+
+    const jwks = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_CAPABILITY_JWKS_PATH}`));
+    expect(jwks.status).toBe(200);
+    await expect(jwks.json()).resolves.toMatchObject({ keys: [{ kid: 'default' }] });
+
     const requestToken = controlPlaneHmacTokenRequester({
-      clientId: 'moco-client',
-      clientSecret,
-      controlPlaneUrl: 'https://control-plane.internal',
-      fetch: (request) => controlPlane.app.request(request),
-      now: () => new Date('2026-05-12T10:15:00.000Z'),
-      requestId: 'hmac-token-1',
+      clientId: 'worker-a',
+      clientSecret: 'a'.repeat(43),
+      controlPlaneUrl: 'https://plane.internal',
+      fetch: (request) => plane.fetch(request),
+      now: () => new Date('2026-05-09T12:00:00.000Z'),
+      requestId: 'req-1',
     });
 
     await expect(
       requestToken({
-        callerServiceId: 'moco',
+        callerServiceId: 'worker-a',
         scopes: ['example.sync.run'],
         targetServiceId: 'example',
       }),
     ).resolves.toMatchObject({ token: expect.any(String) });
-    await expect(
-      requestToken({
-        callerServiceId: 'moco',
-        scopes: ['example.sync.run'],
-        targetServiceId: 'example',
-      }),
-    ).rejects.toThrow('Unable to fetch Service-Plane capability token: 401');
-
-    const staleRequestToken = controlPlaneHmacTokenRequester({
-      clientId: 'moco-client',
-      clientSecret,
-      controlPlaneUrl: 'https://control-plane.internal',
-      fetch: (request) => controlPlane.app.request(request),
-      now: () => new Date('2026-05-12T10:12:00.000Z'),
-      requestId: 'hmac-token-stale-1',
-    });
-    await expect(
-      staleRequestToken({
-        callerServiceId: 'moco',
-        scopes: ['example.sync.run'],
-        targetServiceId: 'example',
-      }),
-    ).rejects.toThrow('Unable to fetch Service-Plane capability token: 401');
   });
 
-  it('rejects replayed HMAC token requests even when request ids are generated by middleware', async () => {
+  it('issues private RPC tokens for deployment-bound callers', async () => {
     const signingSecret = await generateCapabilitySigningSecret();
-    const capabilities = defineCapabilities({
-      scopes: [{ id: 'example.sync.run' }],
-      serviceId: 'example',
+    const plane = new ServicePlaneControlPlane({
+      services: () => [serviceEndpoint()],
+      signingSecret: () => signingSecret,
     });
-    const service = new Hono();
-    mountDiscovery(
-      service,
-      defineService({
-        capabilities,
-        id: 'example',
-        namespaces: [
-          defineNamespace({ app: new Hono().post('/sync', capability('example.sync.run')), prefix: '/', visibility: 'internal' }),
-        ],
-        title: 'Example',
-        version: '0.1.0',
+
+    await expect(
+      plane.issueCapabilityTokenForCaller(
+        'worker-a',
+        {
+          scopes: ['example.sync.run'],
+          targetServiceId: 'example',
+        },
+        {},
+      ),
+    ).resolves.toMatchObject({ token: expect.any(String), tokenType: 'ServicePlane' });
+  });
+
+  it('generates and caches centralized OpenAPI from published ability metadata', async () => {
+    const cache = memoryOpenApiDocumentCache();
+    let discoveryFetches = 0;
+    const plane = new ServicePlaneControlPlane({
+      openapi: {
+        cache,
+        title: 'Control Plane APIs',
+        version: '2026.05.23',
+      },
+      services: () => [
+        cloudflareServiceBinding({
+          binding: {
+            fetch: async () => {
+              discoveryFetches += 1;
+              return Response.json(discovery);
+            },
+          },
+          id: 'example',
+        }),
+      ],
+      signingSecret: async () => generateCapabilitySigningSecret(),
+    });
+
+    const response = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`));
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      info: { title: 'Control Plane APIs', version: '2026.05.23' },
+      openapi: '3.1.0',
+      paths: {
+        '/examples/search': {
+          post: {
+            operationId: 'searchExamples',
+            security: [{ ServicePlane: [] }],
+            'x-service-plane': {
+              abilityId: 'example.search',
+              method: 'search',
+              scopes: ['example.search'],
+              serviceId: 'example',
+            },
+          },
+        },
+      },
+    });
+
+    const cached = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`));
+    expect(cached.status).toBe(200);
+    expect(discoveryFetches).toBe(1);
+  });
+
+  it('emits cache headers on OpenAPI and JWKS when httpCache is enabled and never caches token responses', async () => {
+    const plane = new ServicePlaneControlPlane({
+      httpCache: true,
+      services: () => [serviceEndpoint()],
+      signingSecret: async () => generateCapabilitySigningSecret(),
+    });
+
+    const openapi = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`));
+    expect(openapi.status).toBe(200);
+    expect(openapi.headers.get('cache-control')).toBe('public, max-age=30, stale-while-revalidate=300');
+    expect(openapi.headers.get('cache-tag')).toBe('service-plane,service-plane:openapi');
+    expect(openapi.headers.get('etag')).toBeTruthy();
+
+    const jwks = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_CAPABILITY_JWKS_PATH}`));
+    expect(jwks.headers.get('cache-control')).toBe('public, max-age=30, stale-while-revalidate=300');
+    expect(jwks.headers.get('cache-tag')).toBe('service-plane,service-plane:jwks');
+
+    const token = await plane.fetch(
+      new Request(`https://plane.internal${SERVICE_PLANE_CAPABILITY_TOKEN_PATH}`, {
+        body: JSON.stringify({ scopes: ['example.sync.run'], targetServiceId: 'example' }),
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
       }),
     );
+    expect(token.headers.get('cache-control')).toBe('no-store');
 
-    const clientSecret = 'moco-hmac-secret';
-    const controlPlane = new ServicePlaneControlPlane({
-      authenticateCaller: hmacServiceClientAuth({
-        clients: [{ clientId: 'moco-client', secret: clientSecret, serviceId: 'moco' }],
-        now: () => new Date('2026-05-12T10:15:00.000Z'),
-        replayCache: memoryReplayCache(),
-      }),
+    const uncachedPlane = new ServicePlaneControlPlane({
+      services: () => [serviceEndpoint()],
+      signingSecret: async () => generateCapabilitySigningSecret(),
+    });
+    const uncachedOpenapi = await uncachedPlane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`));
+    expect(uncachedOpenapi.headers.get('cache-control')).toBeNull();
+  });
+
+  it('serves the OpenAPI document without a bundled UI', async () => {
+    const plane = new ServicePlaneControlPlane({
+      services: () => [serviceEndpoint()],
+      signingSecret: async () => generateCapabilitySigningSecret(),
+    });
+
+    const openapi = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`));
+    expect(openapi.status).toBe(200);
+    await expect(openapi.json()).resolves.toMatchObject({ openapi: '3.1.0' });
+
+    // The plane only projects the OpenAPI document; a docs UI (e.g. @hono/swagger-ui or
+    // @scalar/hono-api-reference) is mounted by the consumer on plane.app.
+    const noBundledUi = await plane.fetch(new Request('https://plane.internal/swagger'));
+    expect(noBundledUi.status).toBe(404);
+  });
+
+  it('fails closed on broker and MCP endpoints until caller authentication is configured', async () => {
+    const plane = new ServicePlaneControlPlane({
+      broker: {},
+      services: () => [serviceEndpoint()],
+      signingSecret: async () => generateCapabilitySigningSecret(),
+    });
+
+    const mcp = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_MCP_PATH}`, { method: 'POST' }));
+    expect(mcp.status).toBe(500);
+
+    const broker = await plane.fetch(new Request('https://plane.internal/rpc/broker', { method: 'POST' }));
+    expect(broker.status).toBe(500);
+  });
+
+  it('speaks the MCP streamable-HTTP protocol once a caller resolver is configured', async () => {
+    const plane = new ServicePlaneControlPlane({
+      mcp: { caller: () => ({ id: 'gateway', kind: 'user' }) },
+      services: () => [serviceEndpoint()],
+      signingSecret: async () => generateCapabilitySigningSecret(),
+    });
+
+    const initialize = await mcpRequest(plane, {
+      id: 1,
+      jsonrpc: '2.0',
+      method: 'initialize',
+      params: { capabilities: {}, clientInfo: { name: 'test', version: '1.0.0' }, protocolVersion: '2025-06-18' },
+    });
+    expect(initialize.status).toBe(200);
+    await expect(initialize.json()).resolves.toMatchObject({
+      id: 1,
+      jsonrpc: '2.0',
+      result: {
+        capabilities: { tools: { listChanged: false } },
+        protocolVersion: '2025-06-18',
+        serverInfo: { name: 'control-plane' },
+      },
+    });
+
+    const initialized = await mcpRequest(plane, { jsonrpc: '2.0', method: 'notifications/initialized' });
+    expect(initialized.status).toBe(202);
+
+    const tools = await mcpRequest(plane, { id: 2, jsonrpc: '2.0', method: 'tools/list' });
+    await expect(tools.json()).resolves.toMatchObject({
+      id: 2,
+      result: {
+        tools: [
+          {
+            _meta: { servicePlane: { abilityId: 'example.search', method: 'search', serviceId: 'example' } },
+            inputSchema: { properties: { query: { type: 'string' } }, type: 'object' },
+            name: 'example_search',
+          },
+        ],
+      },
+    });
+
+    const unknownTool = await mcpRequest(plane, {
+      id: 3,
+      jsonrpc: '2.0',
+      method: 'tools/call',
+      params: { arguments: {}, name: 'missing_tool' },
+    });
+    await expect(unknownTool.json()).resolves.toMatchObject({ error: { code: -32602 }, id: 3 });
+
+    const get = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_MCP_PATH}`));
+    expect(get.status).toBe(405);
+  });
+
+  it('uses the control-plane service id rather than the issuer when MCP brokers plane-access calls', async () => {
+    const capabilities = defineCapabilities({
+      scopes: [{ id: 'example.search' }],
+      serviceId: 'example',
+    });
+    let plane: ServicePlaneControlPlane | undefined;
+    const service = new ServicePlaneService({
+      abilities: [
+        defineAbility({
+          access: 'plane',
+          exposure: 'published',
+          id: 'example.search',
+          methods: {
+            search: abilityMethod({
+              input: z.object({ query: z.string() }),
+              mcp: { name: 'example_search' },
+              output: z.object({ caller: z.string(), results: z.array(z.string()) }),
+              scopes: ['example.search'],
+            }),
+          },
+          scopes: ['example.search'],
+          handler: () => new SearchApi() as SearchApi & Record<string, unknown>,
+        }),
+      ],
+      auth: {
+        issuer: 'https://issuer.example',
+        jwks: async () => {
+          if (!plane) throw new Error('Control plane is not initialized');
+          const response = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_CAPABILITY_JWKS_PATH}`));
+          return response.json() as Promise<CapabilityJwks>;
+        },
+      },
+      capabilities,
+      id: 'example',
+      title: 'Example',
+      version: '0.1.0',
+    });
+
+    const signingSecret = await generateCapabilitySigningSecret();
+    plane = new ServicePlaneControlPlane({
+      issuer: 'https://issuer.example',
+      mcp: { caller: () => ({ id: 'gateway', kind: 'user' }) },
       services: () => [
         cloudflareServiceBinding({
           binding: { fetch: (request) => service.fetch(request) },
-          grants: [{ caller: 'moco', scopes: ['example.sync.run'] }],
+          grants: [{ caller: 'control-plane', scopes: ['example.search'] }],
           id: 'example',
+          origin: 'https://example.internal',
         }),
       ],
       signingSecret: () => signingSecret,
     });
-    const signedRequest = await signServicePlaneHmacRequest(
-      new Request('https://control-plane.internal/.well-known/service-plane/capability-token', {
-        body: JSON.stringify({
-          callerServiceId: 'moco',
-          scopes: ['example.sync.run'],
-          targetServiceId: 'example',
-        }),
-        headers: { 'content-type': 'application/json' },
-        method: 'POST',
-      }),
-      {
-        clientId: 'moco-client',
-        now: new Date('2026-05-12T10:15:00.000Z'),
-        secret: clientSecret,
-      },
-    );
 
-    expect((await controlPlane.app.request(signedRequest.clone())).status).toBe(200);
-    expect((await controlPlane.app.request(signedRequest.clone())).status).toBe(401);
+    const response = await mcpRequest(plane, {
+      id: 1,
+      jsonrpc: '2.0',
+      method: 'tools/call',
+      params: { arguments: { query: 'blue' }, name: 'example_search' },
+    });
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      id: 1,
+      result: {
+        content: [{ text: JSON.stringify({ caller: 'control-plane', results: ['blue'] }), type: 'text' }],
+        structuredContent: { caller: 'control-plane', results: ['blue'] },
+      },
+    });
   });
 
-  it('issues RPC tokens for deployment-bound Cloudflare callers without service-client secrets', async () => {
-    const signingSecret = await generateCapabilitySigningSecret();
+  it('forwards the caller request id through the MCP broker to the service', async () => {
     const capabilities = defineCapabilities({
-      scopes: [{ id: 'example.sync.run' }],
+      scopes: [{ id: 'example.search' }],
       serviceId: 'example',
     });
-    const service = new Hono();
-    mountDiscovery(
-      service,
-      defineService({
-        capabilities,
-        id: 'example',
-        namespaces: [
-          defineNamespace({ app: new Hono().post('/sync', capability('example.sync.run')), prefix: '/', visibility: 'internal' }),
-        ],
-        title: 'Example',
-        version: '0.1.0',
-      }),
-    );
-    const controlPlane = new ServicePlaneControlPlane<{ Bindings: { STS_SIGNING_SECRET: string } }>({
-      services: () => [
-        cloudflareServiceBinding({
-          binding: { fetch: (request) => service.fetch(request) },
-          grants: [{ caller: 'moco', scopes: ['example.sync.run'] }],
-          id: 'example',
+    let plane: ServicePlaneControlPlane | undefined;
+    const service = new ServicePlaneService({
+      abilities: [
+        defineAbility({
+          access: 'plane',
+          exposure: 'published',
+          id: 'example.search',
+          methods: {
+            search: abilityMethod({
+              input: z.object({ query: z.string() }),
+              mcp: { name: 'example_search' },
+              output: z.object({ caller: z.string(), results: z.array(z.string()) }),
+              scopes: ['example.search'],
+            }),
+          },
+          scopes: ['example.search'],
+          handler: () => new SearchApi() as SearchApi & Record<string, unknown>,
         }),
       ],
-      signingSecret: (env) => env.STS_SIGNING_SECRET,
-    });
-
-    await expect(
-      controlPlane.issueCapabilityTokenForCaller(
-        'moco',
-        {
-          scopes: ['example.sync.run'],
-          targetServiceId: 'example',
+      auth: {
+        issuer: 'https://issuer.example',
+        jwks: async () => {
+          if (!plane) throw new Error('Control plane is not initialized');
+          const response = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_CAPABILITY_JWKS_PATH}`));
+          return response.json() as Promise<CapabilityJwks>;
         },
-        { STS_SIGNING_SECRET: signingSecret },
-      ),
-    ).resolves.toMatchObject({ token: expect.any(String), tokenType: 'ServicePlane' });
-
-    await expect(
-      controlPlane.issueCapabilityTokenForCaller(
-        'moco',
-        {
-          callerServiceId: 'other',
-          scopes: ['example.sync.run'],
-          targetServiceId: 'example',
-        },
-        { STS_SIGNING_SECRET: signingSecret },
-      ),
-    ).rejects.toThrow('Caller service mismatch');
-  });
-
-  it('runs the Cloudflare same-account fast path with inline discovery and RPC token issuance', async () => {
-    const signingSecret = await generateCapabilitySigningSecret();
-    const capabilities = defineCapabilities({
-      scopes: [{ id: 'example.sync.run' }],
-      serviceId: 'example',
-    });
-    const publicJwk = publicJwkFromPrivateJwk(privateJwkFromCapabilitySigningSecret(signingSecret), 'default');
-    const routes = new Hono().post('/sync', capability('example.sync.run'), (context) =>
-      context.json({
-        caller: capabilityIdentity(context)?.serviceId,
-        ok: true,
-      }),
-    );
-    const service = new ServicePlaneService({
-      auth: { jwks: { keys: [publicJwk] } },
+      },
       capabilities,
       id: 'example',
-      namespaces: [{ app: routes, visibility: 'internal' }],
       title: 'Example',
       version: '0.1.0',
     });
-    let serviceBindingFetches = 0;
-    const binding = {
-      fetch: (request: Request) => {
-        serviceBindingFetches += 1;
-        return service.fetch(request);
-      },
-    };
-    const controlPlane = new ServicePlaneControlPlane<{ Bindings: { STS_SIGNING_SECRET: string } }>({
-      proxy: false,
+
+    const seenRequests: Request[] = [];
+    const signingSecret = await generateCapabilitySigningSecret();
+    plane = new ServicePlaneControlPlane({
+      issuer: 'https://issuer.example',
+      log: false,
+      mcp: { caller: () => ({ id: 'gateway', kind: 'user' }) },
       services: () => [
         cloudflareServiceBinding({
-          binding,
-          discovery: service.discovery,
-          grants: [{ caller: 'moco', scopes: ['example.sync.run'] }],
+          binding: {
+            fetch: (request) => {
+              seenRequests.push(request);
+              return service.fetch(request);
+            },
+          },
+          grants: [{ caller: 'control-plane', scopes: ['example.search'] }],
           id: 'example',
+          origin: 'https://example.internal',
         }),
       ],
-      signingSecret: (env) => env.STS_SIGNING_SECRET,
-    });
-    const tokenBinding = {
-      issueCapabilityToken: (input: Parameters<ReturnType<typeof controlPlaneRpcTokenRequester>>[0]) =>
-        controlPlane.issueCapabilityTokenForCaller('moco', input, { STS_SIGNING_SECRET: signingSecret }),
-    };
-    const fetchWithCapability = capabilityFetch({
-      callerServiceId: 'moco',
-      fetch: (request) => binding.fetch(request),
-      requestToken: controlPlaneRpcTokenRequester(tokenBinding),
-      scopes: ['example.sync.run'],
-      targetServiceId: 'example',
+      signingSecret: () => signingSecret,
     });
 
-    await expect((await fetchWithCapability('https://example.internal/sync', { method: 'POST' })).json()).resolves.toEqual({
-      caller: 'moco',
-      ok: true,
+    const response = await mcpRequest(
+      plane,
+      {
+        id: 1,
+        jsonrpc: '2.0',
+        method: 'tools/call',
+        params: { arguments: { query: 'green' }, name: 'example_search' },
+      },
+      { 'X-Request-Id': 'req-mcp-9' },
+    );
+    await expect(response.json()).resolves.toMatchObject({
+      result: { structuredContent: { caller: 'control-plane', results: ['green'] } },
     });
-    expect(serviceBindingFetches).toBe(1);
+
+    const rpcRequest = seenRequests.find((request) => new URL(request.url).pathname === '/rpc/example.search');
+    expect(rpcRequest?.headers.get('X-Request-Id')).toBe('req-mcp-9');
   });
 });
 
-function memoryReplayCache() {
-  const seen = new Set<string>();
+class SearchApi extends RpcTarget {
+  async search(input: { query: string }) {
+    const caller = requireScopes(this, 'example.search');
+    return { caller: caller.serviceId, results: [input.query] };
+  }
+}
+
+function serviceEndpoint() {
+  return cloudflareServiceBinding({
+    binding: {
+      fetch: async () => Response.json(discovery),
+    },
+    grants: [{ caller: 'worker-a', scopes: ['example.sync.run'] }],
+    id: 'example',
+  });
+}
+
+function memoryOpenApiDocumentCache(): OpenApiDocumentCache {
+  const values = new Map<string, OpenApiDocument>();
   return {
-    get: (key: string) => seen.has(key),
-    set: (key: string) => {
-      seen.add(key);
+    async get(key) {
+      return values.get(key);
+    },
+    async set(key, value) {
+      values.set(key, value);
     },
   };
+}
+
+function mcpRequest(plane: ServicePlaneControlPlane, body: unknown, headers?: Record<string, string>): Promise<Response> {
+  return plane.fetch(
+    new Request(`https://plane.internal${SERVICE_PLANE_MCP_PATH}`, {
+      body: JSON.stringify(body),
+      headers: { 'content-type': 'application/json', ...headers },
+      method: 'POST',
+    }),
+  );
 }

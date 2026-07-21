@@ -1,7 +1,10 @@
 import type { Context, Handler } from 'hono';
+import { etag } from 'hono/etag';
 import { createFactory } from 'hono/factory';
 import { publicJwkFromPrivateJwk, signCapabilityToken, verifyCapabilityToken } from '../shared/capability-tokens.js';
 import { CapabilityAuthError } from '../shared/errors.js';
+import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
+import { generateServicePlaneJwkSigningKey } from '../shared/jwk-auth.js';
 import {
   type CapabilityCatalog,
   type CapabilityJwks,
@@ -20,6 +23,7 @@ const endpointFactory = createFactory();
 const DEFAULT_CAPABILITY_KEY_ID = 'default';
 
 export type CapabilityIssuer = {
+  issueBrokeredCapabilityToken(input: IssueCapabilityTokenInput & { brokerServiceId: string }): Promise<IssuedCapabilityToken>;
   issueCapabilityToken(input: IssueCapabilityTokenInput): Promise<IssuedCapabilityToken>;
   jwks(): Promise<CapabilityJwks>;
 };
@@ -50,11 +54,13 @@ export type MountCapabilityTokenEndpointOptions = {
 export type CapabilityIssuerResolver = CapabilityIssuer | ((context: Context) => Promise<CapabilityIssuer> | CapabilityIssuer);
 
 export type MountCapabilityJwksEndpointOptions = {
+  httpCache?: ServicePlaneHttpCacheOption;
   path?: string;
 };
 
 export type MountCapabilityEndpointsOptions = {
   authenticateCaller(context: Context): Promise<Response | string> | Response | string;
+  httpCache?: ServicePlaneHttpCacheOption;
   jwksPath?: string;
   tokenPath?: string;
 };
@@ -62,6 +68,7 @@ export type MountCapabilityEndpointsOptions = {
 type CapabilityEndpointApp = {
   get(path: string, ...handlers: Handler[]): unknown;
   post(path: string, ...handlers: Handler[]): unknown;
+  use(path: string, ...handlers: Handler[]): unknown;
 };
 
 export function defineServiceGrants(definition: ServiceGrantDefinition): ServiceGrantDefinition {
@@ -78,41 +85,69 @@ export function createCapabilityIssuer(options: CreateCapabilityIssuerOptions): 
   const maxTtlSeconds = normalizeTtlSeconds(options.ttlSeconds ?? DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS, 500);
 
   return {
-    async issueCapabilityToken(input) {
-      const requestedScopes = normalizeScopes(input.scopes, 400);
-      if (!isGranted(grants, input.callerServiceId, input.targetServiceId, requestedScopes)) {
-        throw new CapabilityAuthError('Service-Plane capability grant denied', 403);
-      }
-      const ttlSeconds =
-        input.ttlSeconds === undefined ? maxTtlSeconds : Math.min(normalizeTtlSeconds(input.ttlSeconds, 400), maxTtlSeconds);
-
-      return signCapabilityToken({
-        claims: {
-          aud: input.targetServiceId,
-          iss: options.issuer,
-          scp: requestedScopes,
-          sub: input.callerServiceId,
-        },
+    async issueBrokeredCapabilityToken(input) {
+      return issueCapabilityToken({
+        brokerServiceId: normalizeId(input.brokerServiceId, 'broker service id'),
+        input,
+        issuer: options.issuer,
+        grants,
         keyId,
+        maxTtlSeconds,
+        ...(options.now ? { now: options.now } : {}),
         privateJwk: options.privateJwk,
-        ttlSeconds,
-        ...(options.now ? { now: options.now() } : {}),
+      });
+    },
+    async issueCapabilityToken(input) {
+      return issueCapabilityToken({
+        input,
+        issuer: options.issuer,
+        grants,
+        keyId,
+        maxTtlSeconds,
+        ...(options.now ? { now: options.now } : {}),
+        privateJwk: options.privateJwk,
       });
     },
     async jwks() {
       return {
-        keys: [
-          {
-            ...publicJwk,
-            alg: 'ES256',
-            kid: keyId,
-            key_ops: ['verify'],
-            use: 'sig',
-          },
-        ],
+        keys: [publicJwk],
       };
     },
   };
+}
+
+function issueCapabilityToken(options: {
+  brokerServiceId?: string;
+  grants: ServiceGrant[];
+  input: IssueCapabilityTokenInput;
+  issuer: string;
+  keyId: string;
+  maxTtlSeconds: number;
+  now?: () => Date;
+  privateJwk: JsonWebKey;
+}): Promise<IssuedCapabilityToken> {
+  const requestedScopes = normalizeScopes(options.input.scopes, 400);
+  if (!isGranted(options.grants, options.input.callerServiceId, options.input.targetServiceId, requestedScopes)) {
+    throw new CapabilityAuthError('Service-Plane capability grant denied', 403);
+  }
+  const ttlSeconds =
+    options.input.ttlSeconds === undefined
+      ? options.maxTtlSeconds
+      : Math.min(normalizeTtlSeconds(options.input.ttlSeconds, 400), options.maxTtlSeconds);
+
+  return signCapabilityToken({
+    claims: {
+      aud: options.input.targetServiceId,
+      iss: options.issuer,
+      scp: requestedScopes,
+      ...(options.brokerServiceId ? { spb: options.brokerServiceId } : {}),
+      sub: options.input.callerServiceId,
+    },
+    keyId: options.keyId,
+    privateJwk: options.privateJwk,
+    ttlSeconds,
+    ...(options.now ? { now: options.now() } : {}),
+  });
 }
 
 export async function createCapabilityIssuerFromPrivateJwk(
@@ -127,15 +162,7 @@ export async function createCapabilityIssuerFromPrivateJwk(
 }
 
 export async function generateCapabilitySigningJwk(options: GenerateCapabilitySigningJwkOptions = {}): Promise<JsonWebKey> {
-  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
-  const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
-  return {
-    ...privateJwk,
-    alg: 'ES256',
-    ...(options.keyId ? { kid: options.keyId } : {}),
-    key_ops: ['sign'],
-    use: 'sig',
-  };
+  return generateServicePlaneJwkSigningKey(options);
 }
 
 export function mountCapabilityTokenEndpoint(
@@ -148,6 +175,8 @@ export function mountCapabilityTokenEndpoint(
   app.post(
     options.path ?? SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
     ...endpointFactory.createHandlers(async (context) => {
+      // Token responses carry bearer credentials; keep them out of shared caches (RFC 6749 §5.1).
+      context.header('cache-control', 'no-store');
       const caller = await options.authenticateCaller(context);
       if (caller instanceof Response) return caller;
       const resolvedIssuer = typeof issuer === 'function' ? await issuer(context) : issuer;
@@ -181,19 +210,27 @@ export function mountCapabilityEndpoints(
     authenticateCaller: options.authenticateCaller,
     ...(options.tokenPath ? { path: options.tokenPath } : {}),
   });
-  mountCapabilityJwksEndpoint(app, issuer, options.jwksPath ? { path: options.jwksPath } : {});
+  mountCapabilityJwksEndpoint(app, issuer, {
+    ...(options.httpCache === undefined ? {} : { httpCache: options.httpCache }),
+    ...(options.jwksPath ? { path: options.jwksPath } : {}),
+  });
 }
 
 export function mountCapabilityJwksEndpoint(
   app: {
     get(path: string, ...handlers: Handler[]): unknown;
+    use(path: string, ...handlers: Handler[]): unknown;
   },
   issuer: CapabilityIssuerResolver,
   options: MountCapabilityJwksEndpointOptions = {},
 ): void {
+  const path = options.path ?? SERVICE_PLANE_CAPABILITY_JWKS_PATH;
+  const cacheHeaders = servicePlaneHttpCacheHeaders(options.httpCache, ['service-plane', 'service-plane:jwks']);
+  app.use(path, etag());
   app.get(
-    options.path ?? SERVICE_PLANE_CAPABILITY_JWKS_PATH,
+    path,
     ...endpointFactory.createHandlers(async (context) => {
+      applyHttpCacheHeaders(cacheHeaders, (name, value) => context.header(name, value));
       const resolvedIssuer = typeof issuer === 'function' ? await issuer(context) : issuer;
       return context.json(await resolvedIssuer.jwks());
     }),

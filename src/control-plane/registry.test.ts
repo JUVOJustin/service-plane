@@ -1,150 +1,149 @@
-import { Hono } from 'hono';
 import { describe, expect, it } from 'vitest';
-import { defineNamespace, defineService, mountDiscovery, serviceDiscoveryDocument } from '../service/discovery.js';
-import { memoryRegistryCache } from '../testing/memory-cache.js';
-import { cloudflareServiceBinding } from './endpoints.js';
+import { SERVICE_DISCOVERY_PATH, type ServiceDiscoveryDocument } from '../shared/types.js';
+import { memoryRegistryCache } from '../testing/index.js';
+import { cloudflareServiceBinding, httpsService, serviceDiscoveryRequest } from './endpoints.js';
 import { createServiceRegistry } from './registry.js';
 
 describe('service registry', () => {
-  it('discovers routes from service endpoints', async () => {
-    const app = new Hono().get('/connections/example', (context) => context.json({ ok: true }));
-    mountDiscovery(
-      app,
-      defineService({
-        id: 'example',
-        namespaces: [defineNamespace({ app, prefix: '/', visibility: 'auth' })],
-        title: 'Example',
-        version: '0.0.1',
-      }),
-    );
+  const document: ServiceDiscoveryDocument = {
+    abilities: [
+      {
+        access: 'service',
+        exposure: 'private',
+        id: 'example.sync',
+        methods: {
+          runSync: {
+            inputSchema: { type: 'object' },
+            outputSchema: { type: 'object' },
+            scopes: ['example.sync.run'],
+          },
+        },
+        rpc: { path: '/rpc/example.sync', transports: ['http-batch'] },
+        scopes: ['example.sync.run'],
+      },
+    ],
+    capabilities: { scopes: [{ id: 'example.sync.run' }], serviceId: 'example' },
+    id: 'example',
+    title: 'Example',
+    version: '0.0.1',
+  };
+
+  it('discovers abilities from service endpoints and resolves abilities by id', async () => {
     const registry = createServiceRegistry({
-      services: [cloudflareServiceBinding({ binding: { fetch: (request) => app.fetch(request) }, id: 'example' })],
+      services: [
+        cloudflareServiceBinding({
+          binding: {
+            fetch: async (request) => {
+              expect(new URL(request.url).pathname).toBe(SERVICE_DISCOVERY_PATH);
+              return Response.json(document);
+            },
+          },
+          id: 'example',
+        }),
+      ],
     });
 
-    await expect(registry.match('GET', '/connections/example')).resolves.toMatchObject({
-      path: '/connections/example',
-      serviceId: 'example',
-      visibility: 'auth',
-    });
+    const snapshot = await registry.discover();
+    expect(snapshot.services).toHaveLength(1);
+    expect(snapshot.abilities).toMatchObject([{ id: 'example.sync', serviceId: 'example', exposure: 'private' }]);
+    await expect(registry.ability('example', 'example.sync')).resolves.toMatchObject({ rpc: { path: '/rpc/example.sync' } });
+    expect(registry.endpoint('example')?.id).toBe('example');
   });
 
-  it('can cache discovery documents through a callback cache', async () => {
+  it('caches discovery documents and revalidates stale cache entries with ETags', async () => {
     let now = Date.parse('2026-05-09T12:00:00.000Z');
-    let discoveryFetches = 0;
-    const app = new Hono().get('/ping', (context) => context.text('pong'));
-    mountDiscovery(
-      app,
-      defineService({
-        id: 'cached',
-        namespaces: [defineNamespace({ app, prefix: '/', visibility: 'public' })],
-        title: 'Cached',
-        version: '0.0.1',
-      }),
-    );
+    let fetches = 0;
     const registry = createServiceRegistry({
       cache: memoryRegistryCache(() => now),
       services: [
-        cloudflareServiceBinding({
-          binding: {
-            fetch: (request) => {
-              discoveryFetches += 1;
-              return app.fetch(request);
-            },
+        httpsService({
+          baseUrl: 'https://example.internal',
+          fetch: async (request) => {
+            fetches += 1;
+            if (request.headers.get('if-none-match') === 'v1') return new Response(null, { status: 304 });
+            return Response.json(document, { headers: { etag: 'v1' } });
           },
-          id: 'cached',
+          id: 'example',
         }),
       ],
     });
 
-    await registry.discover();
+    await expect(registry.discover()).resolves.toMatchObject({ services: [{ id: 'example' }] });
     await registry.discover();
     now += 31_000;
     await registry.discover();
-
-    expect(discoveryFetches).toBe(2);
+    expect(fetches).toBe(2);
   });
 
-  it('uses inline discovery documents without calling the service endpoint', async () => {
-    let discoveryFetches = 0;
-    const app = new Hono().get('/sync', (context) => context.text('ok'));
-    const service = defineService({
-      id: 'inline',
-      namespaces: [defineNamespace({ app, prefix: '/', visibility: 'internal' })],
-      title: 'Inline',
-      version: '0.0.1',
-    });
-    const registry = createServiceRegistry({
-      services: [
-        cloudflareServiceBinding({
-          binding: {
-            fetch: (request) => {
-              discoveryFetches += 1;
-              return app.fetch(request);
-            },
-          },
-          discovery: serviceDiscoveryDocument(service),
-          id: 'inline',
-        }),
-      ],
-    });
+  it('namespaces the default cache key by resolved service set', async () => {
+    const cache = memoryRegistryCache();
+    let exampleFetches = 0;
+    let otherFetches = 0;
+    const otherDocument: ServiceDiscoveryDocument = {
+      ...document,
+      capabilities: { scopes: [{ id: 'other.sync.run' }], serviceId: 'other' },
+      id: 'other',
+      title: 'Other',
+    };
 
-    await expect(registry.match('GET', '/sync')).resolves.toMatchObject({
-      path: '/sync',
-      serviceId: 'inline',
-      visibility: 'internal',
-    });
-    expect(discoveryFetches).toBe(0);
-  });
-
-  it('prefers the most restrictive matching route when route patterns overlap', async () => {
-    const app = new Hono().get('/admin', (context) => context.text('admin'));
-    const registry = createServiceRegistry({
+    const example = createServiceRegistry({
+      cache,
       services: [
-        cloudflareServiceBinding({
-          binding: { fetch: (request) => app.fetch(request) },
-          discovery: {
-            id: 'example',
-            routes: [
-              { method: 'GET', path: '/:slug', visibility: 'public' },
-              { method: 'GET', path: '/admin', visibility: 'internal' },
-            ],
-            title: 'Example',
-            version: '0.0.1',
+        httpsService({
+          baseUrl: 'https://example.internal',
+          fetch: async () => {
+            exampleFetches += 1;
+            return Response.json(document);
           },
           id: 'example',
         }),
       ],
     });
-
-    await expect(registry.match('GET', '/admin')).resolves.toMatchObject({
-      path: '/admin',
-      visibility: 'internal',
-    });
-  });
-
-  it('fails closed on discovery documents with invalid paths', async () => {
-    const app = new Hono().get('/safe', (context) => context.text('safe'));
-    const registry = createServiceRegistry({
+    const other = createServiceRegistry({
+      cache,
       services: [
-        cloudflareServiceBinding({
-          binding: { fetch: (request) => app.fetch(request) },
-          discovery: {
-            id: 'example',
-            routes: [
-              { method: 'GET', path: '__proto__', visibility: 'public' },
-              { method: 'GET', path: '/safe', visibility: 'public' },
-            ],
-            title: 'Example',
-            version: '0.0.1',
+        httpsService({
+          baseUrl: 'https://other.internal',
+          fetch: async () => {
+            otherFetches += 1;
+            return Response.json(otherDocument);
           },
-          id: 'example',
+          id: 'other',
         }),
       ],
     });
 
-    await expect(registry.match('GET', '/safe')).resolves.toBeUndefined();
-    await expect(registry.discover()).resolves.toMatchObject({
-      routes: [],
+    await expect(example.discover()).resolves.toMatchObject({ services: [{ id: 'example' }] });
+    await expect(other.discover()).resolves.toMatchObject({ services: [{ id: 'other' }] });
+    expect(exampleFetches).toBe(1);
+    expect(otherFetches).toBe(1);
+  });
+
+  it('uses inline discovery and omits malformed documents', async () => {
+    const registry = createServiceRegistry({
+      services: [
+        httpsService({
+          baseUrl: 'https://inline.internal',
+          discovery: document,
+          fetch: async () => {
+            throw new Error('should not fetch inline discovery');
+          },
+          id: 'example',
+        }),
+        httpsService({
+          baseUrl: 'https://bad.internal',
+          fetch: async () => Response.json({ not: 'a discovery document' }),
+          id: 'bad',
+        }),
+      ],
     });
+
+    const snapshot = await registry.discover();
+    expect(snapshot.services.map((service) => service.id)).toEqual(['example']);
+  });
+
+  it('builds discovery requests against the configured origin', () => {
+    const endpoint = httpsService({ baseUrl: 'https://example.internal', id: 'example' });
+    expect(serviceDiscoveryRequest(endpoint).url).toBe(`https://example.internal${SERVICE_DISCOVERY_PATH}`);
   });
 });

@@ -1,24 +1,57 @@
-export { mergeServiceOpenApi, type OpenApiDocument } from '../shared/openapi.js';
+export {
+  DEFAULT_HTTP_CACHE_MAX_AGE_SECONDS,
+  DEFAULT_HTTP_CACHE_STALE_WHILE_REVALIDATE_SECONDS,
+  type ServicePlaneHttpCacheOption,
+  type ServicePlaneHttpCacheOptions,
+  servicePlaneHttpCacheHeaders,
+} from '../shared/http-cache.js';
+export {
+  defaultServicePlaneLogSink,
+  type ServicePlaneBrokerLogEvent,
+  type ServicePlaneControlPlaneLogEvent,
+  type ServicePlaneLoggableEvent,
+  type ServicePlaneLogSink,
+} from '../shared/logging.js';
 export type {
+  AbilityAccess,
+  AbilityExposure,
+  AbilityTransport,
   CapabilityCatalog,
   CapabilityClaims,
   CapabilityJwks,
   CapabilityScopeDefinition,
-  DiscoveredServiceRoute,
+  DiscoveredServiceAbility,
   FetchLike,
   IssueCapabilityTokenInput,
   IssuedCapabilityToken,
+  McpDiscoveryDocument,
+  McpPromptDiscovery,
+  McpResourceDiscovery,
+  McpResourceTemplateDiscovery,
+  McpServicePlaneMeta,
+  McpToolDiscovery,
+  OpenApiDocument,
+  OpenApiDocumentCache,
+  OpenApiObject,
   RegistryCache,
+  ServiceAbilityDiscovery,
+  ServiceAbilityMcpProjection,
+  ServiceAbilityMcpPromptArgument,
+  ServiceAbilityMcpPromptProjection,
+  ServiceAbilityMcpResourceProjection,
+  ServiceAbilityMethodDiscovery,
+  ServiceAbilityRestProjection,
+  ServiceCallerAuthDiscovery,
   ServiceDiscoveryDocument,
   ServiceDiscoverySnapshot,
   ServiceEndpoint,
   ServiceEndpointGrant,
   ServiceGrant,
   ServiceGrantDefinition,
+  ServiceHttpMethod,
+  ServiceIngressDiscovery,
   ServiceRegistry,
   ServiceRegistrySnapshot,
-  ServiceRouteDiscovery,
-  ServiceRouteVisibility,
 } from '../shared/types.js';
 export {
   DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
@@ -28,20 +61,28 @@ export {
   SERVICE_PLANE_AUTHORIZATION_SCHEME,
   SERVICE_PLANE_CAPABILITY_JWKS_PATH,
   SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
+  SERVICE_PLANE_MCP_PATH,
+  SERVICE_PLANE_OPENAPI_PATH,
   SERVICE_PLANE_REQUEST_ID_HEADER,
+  SERVICE_PLANE_REQUEST_ID_QUERY_PARAM,
 } from '../shared/types.js';
 export {
-  generateServiceClientSecret,
+  type BrokerCaller,
+  type ControlPlaneRpcBroker,
+  type CreateControlPlaneRpcBrokerOptions,
+  createControlPlaneRpcBroker,
+} from './broker.js';
+export {
+  generateHmacClientSecret,
   type HmacServiceClient,
   type HmacServiceClientAuthLogEvent,
   type HmacServiceClientAuthOptions,
   type HmacServiceClientReplayCache,
-  hashServiceClientSecret,
   hmacServiceClientAuth,
-  type ServiceClientCredential,
-  type ServiceClientCredentialsAuthLogEvent,
-  type ServiceClientCredentialsAuthOptions,
-  serviceClientCredentialsAuth,
+  type JwkServiceClient,
+  type JwkServiceClientAuthLogEvent,
+  type JwkServiceClientAuthOptions,
+  jwkServiceClientAuth,
 } from './caller-auth.js';
 export {
   type CapabilityIssuer,
@@ -70,9 +111,20 @@ export {
   serviceDiscoveryRequest,
 } from './endpoints.js';
 export {
-  type ControlPlaneProxyOptions,
-  createControlPlaneProxy,
-} from './proxy.js';
+  type ControlPlaneMcpHandlerOptions,
+  type ControlPlaneMcpServerInfo,
+  DEFAULT_MCP_PATH,
+  generateMcpDiscovery,
+  handleControlPlaneMcpRequest,
+  MCP_PROTOCOL_VERSION,
+} from './mcp.js';
+export {
+  type ControlPlaneOpenApiOptions,
+  controlPlaneOpenApiCacheKey,
+  DEFAULT_OPENAPI_CACHE_TTL_SECONDS,
+  type GenerateControlPlaneOpenApiOptions,
+  generateControlPlaneOpenApi,
+} from './openapi.js';
 export {
   type CreateServiceRegistryOptions,
   createServiceRegistry,

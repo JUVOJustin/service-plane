@@ -202,6 +202,32 @@ describe('STS capability tokens', () => {
       }),
     ).rejects.toThrow('Service-Plane capability token TTL must be a positive integer');
   });
+
+  it('removes private JWK material when deriving public keys', async () => {
+    const keys = await testKeys();
+    const publicJwk = publicJwkFromPrivateJwk(
+      {
+        ...keys.privateJwk,
+        dp: 'private-dp',
+        dq: 'private-dq',
+        k: 'private-k',
+        oth: [{ d: 'private-other-prime' }],
+        p: 'private-p',
+        q: 'private-q',
+        qi: 'private-qi',
+      },
+      'test-key',
+    );
+
+    expect(publicJwk).not.toHaveProperty('d');
+    expect(publicJwk).not.toHaveProperty('dp');
+    expect(publicJwk).not.toHaveProperty('dq');
+    expect(publicJwk).not.toHaveProperty('k');
+    expect(publicJwk).not.toHaveProperty('oth');
+    expect(publicJwk).not.toHaveProperty('p');
+    expect(publicJwk).not.toHaveProperty('q');
+    expect(publicJwk).not.toHaveProperty('qi');
+  });
 });
 
 async function testKeys() {
