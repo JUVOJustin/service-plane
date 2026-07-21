@@ -1,0 +1,11 @@
+name: service-plane
+version: 0.2.0
+description: >-
+  Agent skill for the service-plane TypeScript library: ability-first service
+  APIs, control-plane capability tokens, and OpenAPI/MCP projections.
+author: JUVOJustin
+dependencies:
+  apm: []
+  mcp: []
+includes: auto
+scripts: {}
