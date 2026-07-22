@@ -34,6 +34,8 @@ export type OpenApiObject = Record<string, unknown>;
 
 export type ServiceAbilityRpcDiscovery = {
   path: string;
+  // Present when the ability declares streaming methods; they are served on this HTTP path.
+  streamPath?: string;
   transports: AbilityTransport[];
 };
 
@@ -82,6 +84,9 @@ export type ServiceAbilityMethodDiscovery = {
   outputSchema: OpenApiObject;
   rest?: ServiceAbilityRestProjection;
   scopes: string[];
+  // Streaming methods return many output items over the ability stream path; `outputSchema`
+  // then describes one streamed item, not the whole response.
+  stream?: true;
 };
 
 export type ServiceAbilityDiscovery = {
@@ -196,6 +201,8 @@ export type McpServicePlaneMeta = {
     method: string;
     scopes: string[];
     serviceId: string;
+    // The projected method streams; tools/call answers over SSE per MCP Streamable HTTP.
+    stream?: true;
   };
 };
 

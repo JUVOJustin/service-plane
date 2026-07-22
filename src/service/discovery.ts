@@ -2,6 +2,7 @@ import { RpcTarget } from 'capnweb';
 import type { Context, Env } from 'hono';
 import * as z from 'zod';
 import { AbilityValidationError, CapabilityAuthError } from '../shared/errors.js';
+import { abilityStreamPath } from '../shared/stream.js';
 import {
   type AbilityAccess,
   type AbilityExposure,
@@ -32,6 +33,9 @@ export type AbilityMethodDefinition<TInput extends AbilitySchema = AbilitySchema
   output: TOutput;
   rest?: ServiceAbilityRestProjection;
   scopes?: string[];
+  // Streaming methods yield many `output`-shaped items over the ability stream path instead of
+  // returning one value; `output` validates each item.
+  stream?: true;
 };
 
 export type AbilityMethodDefinitions = Record<string, AbilityMethodDefinition>;
@@ -42,17 +46,28 @@ export type ServiceAbilityHandlerFactoryInput<TEnv extends Env = Env> = {
   identity: CapabilityIdentity;
 };
 
+export type AbilityStreamSource<TItem> = AsyncIterable<TItem> | Iterable<TItem> | ReadableStream<TItem>;
+
+type AbilityMethodItem<TMethod extends AbilityMethodDefinition> = z.input<TMethod['output']> | z.output<TMethod['output']>;
+
 export type AbilityImplementation<TAbility extends ServiceAbilityDefinition> = {
-  [TMethod in keyof TAbility['methods']]: (
-    input: z.output<TAbility['methods'][TMethod]['input']>,
-  ) =>
-    | Promise<z.input<TAbility['methods'][TMethod]['output']> | z.output<TAbility['methods'][TMethod]['output']>>
-    | z.input<TAbility['methods'][TMethod]['output']>
-    | z.output<TAbility['methods'][TMethod]['output']>;
+  [TMethod in keyof TAbility['methods']]: TAbility['methods'][TMethod] extends { stream: true }
+    ? (
+        input: z.output<TAbility['methods'][TMethod]['input']>,
+      ) =>
+        | AbilityStreamSource<AbilityMethodItem<TAbility['methods'][TMethod]>>
+        | Promise<AbilityStreamSource<AbilityMethodItem<TAbility['methods'][TMethod]>>>
+    : (
+        input: z.output<TAbility['methods'][TMethod]['input']>,
+      ) =>
+        | Promise<z.input<TAbility['methods'][TMethod]['output']> | z.output<TAbility['methods'][TMethod]['output']>>
+        | z.input<TAbility['methods'][TMethod]['output']>
+        | z.output<TAbility['methods'][TMethod]['output']>;
 };
 
+// Streaming methods are not part of the Cap'n Web surface; call them with `abilityStream`.
 export type AbilityRpc<TAbility extends ServiceAbilityDefinition> = {
-  [TMethod in keyof TAbility['methods']]: (
+  [TMethod in keyof TAbility['methods'] as TAbility['methods'][TMethod] extends { stream: true } ? never : TMethod]: (
     input: z.input<TAbility['methods'][TMethod]['input']>,
   ) => Promise<z.output<TAbility['methods'][TMethod]['output']>>;
 };
@@ -96,6 +111,7 @@ export type NormalizedServiceAbility<TEnv extends Env = Env> = Omit<
   methods: Record<string, NormalizedAbilityMethodDefinition>;
   rpc: {
     path: string;
+    streamPath?: string;
     transports: AbilityTransport[];
   };
   scopes: string[];
@@ -178,6 +194,9 @@ export function createValidatingAbilityHandler<TEnv extends Env>(
     async invoke(methodName: string, args: unknown[]): Promise<unknown> {
       const method = ability.methods[methodName];
       if (!method) throw new AbilityValidationError(`Unknown Service-Plane ability method: ${methodName}`, 404);
+      if (method.stream) {
+        throw new AbilityValidationError(`Service-Plane streaming method requires the ability stream transport: ${methodName}`, 405);
+      }
       if (args.length !== 1) {
         throw new AbilityValidationError(`Service-Plane ability method expects a single input object: ${methodName}`, 422);
       }
@@ -203,6 +222,74 @@ export function createValidatingAbilityHandler<TEnv extends Env>(
   }
 
   return bindCapabilityIdentity(new ValidatingAbilityHandler(), identity);
+}
+
+// Streaming counterpart of createValidatingAbilityHandler: performs the same identity binding,
+// scope, and input checks up front (so failures map to HTTP statuses before the response body
+// starts), then validates each streamed item against the method output schema.
+export async function openStreamingAbilityMethod<TEnv extends Env>(
+  ability: NormalizedServiceAbility<TEnv>,
+  handler: RpcTarget & Record<string, unknown>,
+  identity: CapabilityIdentity,
+  methodName: string,
+  rawInput: unknown,
+): Promise<AsyncGenerator<unknown>> {
+  const method = ability.methods[methodName];
+  if (!method) throw new AbilityValidationError(`Unknown Service-Plane ability method: ${methodName}`, 404);
+  if (!method.stream) {
+    throw new AbilityValidationError(`Service-Plane ability method does not stream: ${methodName}`, 405);
+  }
+  if (capabilityIdentity(handler)) {
+    throw new CapabilityAuthError(`Service-Plane ability handler factory must return a new instance per call: ${ability.id}`, 500);
+  }
+  bindCapabilityIdentity(handler, identity);
+  requireScopes(handler, ...method.scopes);
+
+  const implementation = handler[methodName];
+  if (typeof implementation !== 'function') {
+    throw new AbilityValidationError(`Service-Plane ability handler does not implement method: ${methodName}`, 500);
+  }
+
+  const input = await method.input.parseAsync(rawInput);
+  const source = await implementation.call(handler, input);
+  return validateStreamItems(method, methodName, source);
+}
+
+async function* validateStreamItems(
+  method: NormalizedAbilityMethodDefinition,
+  methodName: string,
+  source: unknown,
+): AsyncGenerator<unknown> {
+  for await (const item of iterateAbilityStreamSource(source, methodName)) {
+    yield await method.output.parseAsync(item);
+  }
+}
+
+async function* iterateAbilityStreamSource(source: unknown, methodName: string): AsyncGenerator<unknown> {
+  if (source instanceof ReadableStream) {
+    const reader = (source as ReadableStream<unknown>).getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        yield value;
+      }
+    } finally {
+      void reader.cancel().catch(() => undefined);
+    }
+  }
+  if (source && typeof source === 'object' && Symbol.asyncIterator in source) {
+    yield* source as AsyncIterable<unknown>;
+    return;
+  }
+  if (source && typeof source === 'object' && Symbol.iterator in source) {
+    yield* source as Iterable<unknown>;
+    return;
+  }
+  throw new AbilityValidationError(
+    `Service-Plane streaming method must return an async iterable, iterable, or ReadableStream: ${methodName}`,
+    500,
+  );
 }
 
 export { SERVICE_DISCOVERY_PATH };
@@ -238,6 +325,12 @@ function normalizeAbilities<TEnv extends Env>(
     const path = normalizePath(ability.rpc?.path ?? defaultAbilityRpcPath(id), id);
     if (seenPaths.has(path)) throw new CapabilityAuthError(`Duplicate Service-Plane ability RPC path: ${path}`, 500);
     seenPaths.add(path);
+    // The stream path is derived from the RPC path, so it must be collision-checked like one.
+    const streamPath = Object.values(methods).some((method) => method.stream) ? abilityStreamPath(path) : undefined;
+    if (streamPath) {
+      if (seenPaths.has(streamPath)) throw new CapabilityAuthError(`Duplicate Service-Plane ability RPC path: ${streamPath}`, 500);
+      seenPaths.add(streamPath);
+    }
 
     return {
       ...ability,
@@ -247,6 +340,7 @@ function normalizeAbilities<TEnv extends Env>(
       methods,
       rpc: {
         path,
+        ...(streamPath ? { streamPath } : {}),
         transports: normalizeAbilityTransports(ability.rpc?.transports ?? ['http-batch']),
       },
       scopes,
@@ -283,6 +377,11 @@ function normalizeMethods(
       }
       validateKnownScopes(scopes, knownScopes, capabilities, `Service-Plane ability method requires unknown scope`);
       validateMethodScopesDeclaredByAbility(abilityId, name, scopes, abilityScopes);
+      if (method.stream && (method.mcpPrompt || method.mcpResource)) {
+        // MCP prompts and resources are single-response protocol surfaces; only tools can
+        // route through the streaming lane.
+        throw new CapabilityAuthError(`Service-Plane streaming method cannot project an MCP prompt or resource: ${abilityId}/${name}`, 500);
+      }
       const rest = method.rest ? normalizeRestProjection(abilityId, name, method.rest) : undefined;
       const mcp = method.mcp ? normalizeMcpProjection(abilityId, name, method.mcp) : undefined;
       const mcpPrompt = method.mcpPrompt ? normalizeMcpPromptProjection(abilityId, name, method.mcpPrompt) : undefined;
@@ -298,6 +397,7 @@ function normalizeMethods(
           outputSchema: zodToJsonSchema(method.output, 'output', `${abilityId}/${name}`),
           ...(rest ? { rest } : {}),
           scopes,
+          ...(method.stream ? { stream: true as const } : {}),
         },
       ];
     }),
@@ -337,6 +437,7 @@ function abilityDiscovery<TEnv extends Env>(ability: NormalizedServiceAbility<TE
           outputSchema: method.outputSchema,
           ...(method.rest ? { rest: method.rest } : {}),
           scopes: method.scopes,
+          ...(method.stream ? { stream: true as const } : {}),
         } satisfies ServiceAbilityMethodDiscovery,
       ]),
     ),

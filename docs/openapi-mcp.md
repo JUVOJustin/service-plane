@@ -46,6 +46,8 @@ OpenAPI includes methods when both are true:
 
 The request and response schemas come from the method's Zod input and output schemas through generated JSON Schema. The control plane only produces the document — it does not bundle a documentation UI.
 
+Streaming methods (`stream: true`) document their `200` response as `application/x-ndjson` with the item schema, and their `x-service-plane` extension carries `stream: true`.
+
 ## Docs UI
 
 `service-plane` produces the OpenAPI document but does not render it. The control plane exposes its Hono app as `plane.app`, so you mount whichever OpenAPI viewer you prefer against `/openapi.json`. Two ready-made Hono extensions cover the common choices — neither is a dependency of `service-plane`, so install the one you want.
@@ -106,13 +108,15 @@ The control plane exposes MCP tools, resources, and prompts from published metho
 POST /rpc/mcp
 ```
 
-The endpoint speaks the standard MCP streamable-HTTP transport (JSON-RPC 2.0), so stock MCP clients — Claude, Cursor, the MCP inspector — connect to it directly. It is stateless: each POST carries one JSON-RPC message and the response is plain JSON. No SSE stream or session id is issued, `GET` returns `405`, and notifications are acknowledged with `202`. Implemented methods: `initialize`, `ping`, `tools/list`, `tools/call`, `resources/list`, `resources/templates/list`, `resources/read`, `prompts/list`, and `prompts/get`. `initialize` declares the `tools`, `resources`, and `prompts` capabilities (no `listChanged`, no `subscribe` — the endpoint is stateless).
+The endpoint speaks the standard MCP streamable-HTTP transport (JSON-RPC 2.0), so stock MCP clients — Claude, Cursor, the MCP inspector — connect to it directly. It is stateless: each POST carries one JSON-RPC message and the response is plain JSON, except calls to streaming tools, which answer over SSE (see [Tools](#tools)). No session id is issued, `GET` returns `405`, and notifications are acknowledged with `202`. Implemented methods: `initialize`, `ping`, `tools/list`, `tools/call`, `resources/list`, `resources/templates/list`, `resources/read`, `prompts/list`, and `prompts/get`. `initialize` declares the `tools`, `resources`, and `prompts` capabilities (no `listChanged`, no `subscribe` — the endpoint is stateless).
 
 Every projected entry carries its Service Plane routing metadata (service, ability, method, scopes) under `_meta.servicePlane`, and every invocation — tool call, resource read, or prompt get — mints a scoped (or ingress-brokered) capability token and calls the backing ability through Service Plane.
 
 ### Tools
 
 `mcp: { name, description? }` projects a method as a tool. The tool's input and output schemas come from the method's Zod schemas. Results carry the method output as `structuredContent` plus a serialized `text` content block. Handler failures are reported in-band with `isError: true` per the MCP spec; unknown tools and authorization failures are JSON-RPC errors.
+
+Streaming methods (`stream: true`) can project tools too. Their `tools/call` responds over SSE per MCP streamable HTTP: while items arrive, the plane emits `notifications/progress` events (when the client sent `_meta.progressToken`), and the final response aggregates the items as `structuredContent: { items }` — MCP defines exactly one response per request, so the tool schema advertises the aggregated `{ items }` shape and `_meta.servicePlane.stream` marks the tool. Unbuffered transfer of very large streams belongs on the broker stream lane, not on MCP. Streaming methods cannot project resources or prompts (single-response surfaces); the service rejects such definitions at setup.
 
 ### Resources
 

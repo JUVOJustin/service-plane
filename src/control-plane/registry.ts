@@ -190,6 +190,7 @@ function isAbilityDiscovery(value: unknown): value is ServiceAbilityDiscovery {
     typeof ability.rpc === 'object' &&
     typeof ability.rpc.path === 'string' &&
     ability.rpc.path.startsWith('/') &&
+    (ability.rpc.streamPath === undefined || (typeof ability.rpc.streamPath === 'string' && ability.rpc.streamPath.startsWith('/'))) &&
     Array.isArray(ability.rpc.transports) &&
     ability.rpc.transports.every(isAbilityTransport) &&
     isRecord(ability.methods) &&
@@ -204,6 +205,7 @@ function isAbilityMethodDiscovery(value: unknown): value is ServiceAbilityMethod
     value.scopes.every((scope) => typeof scope === 'string') &&
     isRecord(value.inputSchema) &&
     isRecord(value.outputSchema) &&
+    (value.stream === undefined || value.stream === true) &&
     (value.rest === undefined ||
       (isRecord(value.rest) &&
         isHttpMethod(value.rest.method) &&

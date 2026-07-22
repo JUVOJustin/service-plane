@@ -104,6 +104,29 @@ export class AsanaTasksHandler extends RpcTarget {
 }
 ```
 
+### Streaming Methods
+
+Some operations produce many results over time — large file transfers, long exports. Declare them with `stream: true`; the `output` schema then validates each streamed item and the handler method returns an async generator (or any iterable / `ReadableStream`):
+
+```ts
+readFile: abilityMethod({
+  input: z.object({ path: z.string() }),
+  output: z.object({ chunk: z.string() }),
+  scopes: ['hub.files.read'],
+  stream: true,
+}),
+```
+
+```ts
+async *readFile(input: { path: string }) {
+  for await (const chunk of this.storage.read(input.path)) {
+    yield { chunk };
+  }
+}
+```
+
+Streaming methods are served on `POST {rpc.path}/stream` (NDJSON) instead of the Cap'n Web session, with the same token, ingress, scope, and input validation. Callers use `abilityStream(...)` rather than `abilitySession(...)`. See [reference](reference.md#streaming-methods) for the wire protocol.
+
 `context` is runtime access, such as Hono context, environment bindings, storage, and execution context.
 
 `identity` is the verified Service Plane caller and granted scopes. When the control plane brokers a call for an authenticated end user, `identity.subject` carries that user's id and org as an RFC 8693 delegated subject (see [auth](auth.md#subject-delegation)). Any other product-level connection context is application-owned; pass it in validated method input if the service needs it. Do not put provider OAuth tokens in identity. Store credentials in a service-owned store such as a Durable Object.

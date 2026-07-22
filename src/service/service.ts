@@ -3,8 +3,11 @@ import { type Context, type Env, Hono, type MiddlewareHandler } from 'hono';
 import { etag } from 'hono/etag';
 import { type RequestIdVariables, requestId } from 'hono/request-id';
 import type { UpgradeWebSocket } from 'hono/ws';
-import { CapabilityAuthError } from '../shared/errors.js';
+import * as z from 'zod';
+import { extractServicePlaneToken } from '../shared/capability-tokens.js';
+import { AbilityValidationError, CapabilityAuthError, ServicePlaneError } from '../shared/errors.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
+import { encodeAbilityStreamFrame, SERVICE_PLANE_STREAM_CONTENT_TYPE } from '../shared/stream.js';
 import {
   type CapabilityIdentity,
   type CapabilityJwksResolver,
@@ -21,6 +24,7 @@ import {
   type DefineServiceOptions,
   defineAbilityService,
   type NormalizedServiceAbility,
+  openStreamingAbilityMethod,
   type ServiceDefinition,
   serviceDiscoveryDocument,
 } from './discovery.js';
@@ -123,6 +127,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
   }
 
   private mountAbility(ability: NormalizedServiceAbility<TEnv>): void {
+    if (ability.rpc.streamPath) this.mountAbilityStream(ability, ability.rpc.streamPath);
     this.app.all(ability.rpc.path, async (context) => {
       const upgrade = context.req.header('upgrade')?.toLowerCase() === 'websocket';
       if (upgrade && !ability.rpc.transports.includes('websocket')) {
@@ -142,6 +147,31 @@ export class ServicePlaneService<TEnv extends Env = Env> {
       );
     });
   }
+
+  // Streaming methods bypass Cap'n Web: its transports are request/response shaped, so
+  // incremental results ride a sibling HTTP path. The auth pipeline is identical — token,
+  // ingress, scopes, and input validation all fail with real HTTP statuses before the
+  // response body commits; later failures surface as terminal error frames.
+  private mountAbilityStream(ability: NormalizedServiceAbility<TEnv>, path: string): void {
+    this.app.post(path, async (honoContext) => {
+      const context = honoContext as unknown as Context<TEnv>;
+      let items: AsyncGenerator<unknown>;
+      try {
+        const identity = await verifyAuthenticationToken(
+          extractServicePlaneToken(honoContext.req.raw),
+          await serviceVerifier(this.options.auth, this.definition.id, context),
+        );
+        await verifyServiceIngress(this.options.auth, this.options.ingress, identity, context);
+        const body = await abilityStreamRequestBody(honoContext.req.raw);
+        const handler = await ability.handler({ abilityId: ability.id, context, identity });
+        items = await openStreamingAbilityMethod(ability, handler, identity, body.method, body.input);
+      } catch (error) {
+        const failure = streamRequestFailure(error);
+        return Response.json({ error: failure.message }, { status: failure.status });
+      }
+      return abilityStreamResponse(items);
+    });
+  }
 }
 
 class AuthRoot<TEnv extends Env> extends RpcTarget {
@@ -156,8 +186,8 @@ class AuthRoot<TEnv extends Env> extends RpcTarget {
   }
 
   async authenticate(token: string) {
-    const identity = await verifyAuthenticationToken(token, await this.verifier());
-    await this.verifyIngress(identity);
+    const identity = await verifyAuthenticationToken(token, await serviceVerifier(this.auth, this.serviceId, this.context));
+    await verifyServiceIngress(this.auth, this.ingress, identity, this.context);
     const handler = await this.ability.handler({
       abilityId: this.ability.id,
       context: this.context,
@@ -165,23 +195,88 @@ class AuthRoot<TEnv extends Env> extends RpcTarget {
     });
     return createValidatingAbilityHandler(this.ability, handler, identity);
   }
+}
 
-  private async verifier(): Promise<CapabilityVerifierOptions> {
-    const jwks = await resolveServiceJwks(this.context, this.auth);
-    return {
-      expectedAudience: this.auth.expectedAudience ?? this.serviceId,
-      issuer: this.auth.issuer ?? 'control-plane',
-      jwks,
-      ...(this.auth.now ? { now: typeof this.auth.now === 'function' ? this.auth.now() : this.auth.now } : {}),
-    };
-  }
+async function serviceVerifier<TEnv extends Env>(
+  auth: ServicePlaneServiceAuthOptions<TEnv>,
+  serviceId: string,
+  context: Context<TEnv>,
+): Promise<CapabilityVerifierOptions> {
+  const jwks = await resolveServiceJwks(context, auth);
+  return {
+    expectedAudience: auth.expectedAudience ?? serviceId,
+    issuer: auth.issuer ?? 'control-plane',
+    jwks,
+    ...(auth.now ? { now: typeof auth.now === 'function' ? auth.now() : auth.now } : {}),
+  };
+}
 
-  private async verifyIngress(identity: CapabilityIdentity): Promise<void> {
-    if (!this.ingress) return;
-    const allowed = await resolveIngressBrokerServiceIds(this.context, this.auth, this.ingress);
-    if (identity.brokerServiceId && allowed.includes(identity.brokerServiceId)) return;
-    throw new CapabilityAuthError('Service-Plane brokered capability token is required', 403);
+async function verifyServiceIngress<TEnv extends Env>(
+  auth: ServicePlaneServiceAuthOptions<TEnv>,
+  ingress: false | ServicePlaneServiceIngressOptions<TEnv> | undefined,
+  identity: CapabilityIdentity,
+  context: Context<TEnv>,
+): Promise<void> {
+  if (!ingress) return;
+  const allowed = await resolveIngressBrokerServiceIds(context, auth, ingress);
+  if (identity.brokerServiceId && allowed.includes(identity.brokerServiceId)) return;
+  throw new CapabilityAuthError('Service-Plane brokered capability token is required', 403);
+}
+
+type AbilityStreamRequestBody = { input?: unknown; method: string };
+
+async function abilityStreamRequestBody(request: Request): Promise<AbilityStreamRequestBody> {
+  let value: unknown;
+  try {
+    value = await request.json();
+  } catch {
+    throw new AbilityValidationError('Service-Plane ability stream request requires a JSON body', 400);
   }
+  if (!value || typeof value !== 'object' || typeof (value as { method?: unknown }).method !== 'string') {
+    throw new AbilityValidationError('Service-Plane ability stream request requires a method', 400);
+  }
+  const body = value as { input?: unknown; method: string };
+  return { ...('input' in body ? { input: body.input } : {}), method: body.method };
+}
+
+function abilityStreamResponse(items: AsyncGenerator<unknown>): Response {
+  const encoder = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    async cancel() {
+      await items.return?.(undefined);
+    },
+    async pull(controller) {
+      try {
+        const next = await items.next();
+        if (!next.done) {
+          controller.enqueue(encoder.encode(encodeAbilityStreamFrame({ item: next.value })));
+          return;
+        }
+        controller.enqueue(encoder.encode(encodeAbilityStreamFrame({ done: true })));
+        controller.close();
+      } catch (error) {
+        controller.enqueue(encoder.encode(encodeAbilityStreamFrame({ error: streamFrameFailure(error) })));
+        controller.close();
+      }
+    },
+  });
+  return new Response(body, { headers: { 'content-type': SERVICE_PLANE_STREAM_CONTENT_TYPE }, status: 200 });
+}
+
+// Before the body commits Zod failures can only be input validation (422); after that they can
+// only be output items, which are service bugs (500).
+function streamRequestFailure(error: unknown): { message: string; status: number } {
+  if (error instanceof ServicePlaneError) return { message: error.message, status: error.status };
+  if (error instanceof z.ZodError) return { message: error.message, status: 422 };
+  return { message: error instanceof Error ? error.message : String(error), status: 500 };
+}
+
+function streamFrameFailure(error: unknown): { message: string; status: number } {
+  if (error instanceof ServicePlaneError) return { message: error.message, status: error.status };
+  if (error instanceof z.ZodError) {
+    return { message: `Service-Plane ability stream item failed output validation: ${error.message}`, status: 500 };
+  }
+  return { message: error instanceof Error ? error.message : String(error), status: 500 };
 }
 
 // Mirrors hono/request-id's header validation so a query-supplied id cannot smuggle

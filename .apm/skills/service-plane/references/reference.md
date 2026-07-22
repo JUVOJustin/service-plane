@@ -52,6 +52,50 @@ abilityMethod({
 
 Each method accepts one input object and returns one output value. The wrapper validates both with Zod.
 
+## Streaming Methods
+
+Cap'n Web transports are request/response shaped, so streaming returns ride a sibling HTTP lane instead.
+
+```ts
+abilityMethod({
+  input: z.object({ path: z.string() }),
+  output: z.object({ chunk: z.string() }), // validates each streamed item
+  scopes: ['hub.files.read'],
+  stream: true,
+});
+```
+
+With `stream: true` the handler method returns an async iterable (usually an async generator), a sync iterable, or a `ReadableStream`; `output` validates each item. The service mounts `POST {rpc.path}/stream` next to the ability, advertised in discovery as `rpc.streamPath`. The auth pipeline is identical to RPC — token, ingress, scope, and input validation fail with real HTTP statuses before the response body starts.
+
+Wire protocol (`application/x-ndjson`, one JSON frame per line):
+
+```txt
+{"item": <validated item>}   zero or more
+{"done": true}               terminal frame on success
+{"error": {"message": "...", "status": 500}}   terminal frame on mid-stream failure
+```
+
+A stream that ends without a terminal frame was truncated; `abilityStream` raises this as an error.
+
+Callers consume it with `abilityStream`, which accepts the same token options as `abilitySession` plus `method` and `input`, and yields the decoded items:
+
+```ts
+for await (const item of abilityStream<{ chunk: string }>({
+  abilityId: 'hub.files',
+  callerServiceId: 'workflow-runner',
+  targetServiceId: 'hub',
+  scopes: ['hub.files.read'],
+  requestToken,
+  transport, // http-batch or Cloudflare service-binding transports only
+  method: 'readFile',
+  input: { path: '/big.bin' },
+})) {
+  // ...
+}
+```
+
+The control plane brokers streams over `POST {brokerPath}/stream` (default `/rpc/broker/stream`) with the same fail-closed caller resolution as the broker: body `{ serviceId, abilityId, method, scopes, input }`, response piped through unbuffered. Calling a streaming method over Cap'n Web fails with status 405, and streaming methods cannot project MCP prompts or resources (tools are supported — see [OpenAPI and MCP](openapi-mcp.md)).
+
 ## Discovery Document
 
 ```ts
@@ -64,7 +108,7 @@ type ServiceDiscoveryDocument = {
 };
 ```
 
-Ability discovery includes exposure, access, scopes, RPC path, transports, method names, method scopes, JSON Schemas, optional REST metadata, and optional MCP metadata.
+Ability discovery includes exposure, access, scopes, RPC path, transports, method names, method scopes, JSON Schemas, optional REST metadata, and optional MCP metadata. Abilities with streaming methods also advertise `rpc.streamPath`, and each streaming method carries `stream: true` with its `outputSchema` describing one streamed item.
 
 ## Service
 
@@ -112,6 +156,7 @@ GET  /.well-known/service-plane/jwks.json
 GET  /openapi.json
 POST /rpc/mcp                                    (MCP streamable HTTP)
 ALL  /rpc/broker
+POST /rpc/broker/stream                          (brokered ability streams, NDJSON)
 ```
 
 The plane serves the OpenAPI document only. Mount a documentation UI yourself on `plane.app` (e.g. `@hono/swagger-ui` or `@scalar/hono-api-reference`) pointed at `/openapi.json`.

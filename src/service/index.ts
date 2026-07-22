@@ -1,3 +1,4 @@
+export { AbilityValidationError, CapabilityAuthError, ServicePlaneError } from '../shared/errors.js';
 export {
   DEFAULT_HTTP_CACHE_MAX_AGE_SECONDS,
   DEFAULT_HTTP_CACHE_STALE_WHILE_REVALIDATE_SECONDS,
@@ -10,6 +11,13 @@ export {
   type ServicePlaneLoggableEvent,
   type ServicePlaneLogSink,
 } from '../shared/logging.js';
+export {
+  type AbilityStreamFrame,
+  abilityStreamPath,
+  encodeAbilityStreamFrame,
+  readAbilityStreamFrames,
+  SERVICE_PLANE_STREAM_CONTENT_TYPE,
+} from '../shared/stream.js';
 export type {
   AbilityAccess,
   AbilityExposure,
@@ -85,7 +93,9 @@ export type {
   RpcTransport,
 } from './capabilities.js';
 export {
+  type AbilityStreamOptions,
   abilitySession,
+  abilityStream,
   bindCapabilityIdentity,
   capabilityIdentity,
   capabilityTokenCacheKey,
@@ -112,6 +122,7 @@ export type {
   AbilityMethodDefinitions,
   AbilityRpc,
   AbilitySchema,
+  AbilityStreamSource,
   AnyServiceAbilityDefinition,
   DefineServiceInput,
   DefineServiceOptions,
@@ -128,6 +139,7 @@ export {
   defaultAbilityRpcPath,
   defineAbility,
   defineAbilityService,
+  openStreamingAbilityMethod,
   serviceDiscoveryDocument,
 } from './discovery.js';
 export {

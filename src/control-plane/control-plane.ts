@@ -12,7 +12,7 @@ import {
   type ServiceEndpoint,
   type ServiceGrant,
 } from '../shared/types.js';
-import { type BrokerCaller, createControlPlaneRpcBroker } from './broker.js';
+import { type BrokerCaller, createControlPlaneRpcBroker, handleBrokerStreamRequest } from './broker.js';
 import { type CapabilityIssuer, type MountCapabilityEndpointsOptions, mountCapabilityEndpoints } from './capabilities.js';
 import { type ControlPlaneMcpServerInfo, DEFAULT_MCP_PATH, handleControlPlaneMcpRequest } from './mcp.js';
 import {
@@ -139,6 +139,29 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
         broker.rootCapability(caller),
         brokerOptions.upgradeWebSocket ? { upgradeWebSocket: brokerOptions.upgradeWebSocket } : undefined,
       );
+    });
+
+    // Streaming ability calls cannot ride the Cap'n Web session, so the broker exposes a
+    // sibling HTTP lane with the same fail-closed caller resolution.
+    this.app.post(`${path}/stream`, async (context) => {
+      const caller = await resolveBrokerCaller(context as Context<TEnv>, brokerOptions.caller);
+      if (caller instanceof Response) return caller;
+      const services = await this.options.services(context as Context<TEnv>);
+      const issuer = await this.issuerFor(context as Context<TEnv>, services);
+      const registry = createServiceRegistry({
+        ...(brokerOptions.cache ? { cache: brokerOptions.cache } : {}),
+        services,
+      });
+      const requestId = brokerRequestId(context);
+      const log = this.log;
+      return handleBrokerStreamRequest(context.req.raw, {
+        caller,
+        controlPlaneServiceId: this.options.controlPlaneServiceId ?? 'control-plane',
+        issuer,
+        ...(log ? { log: (event) => log(event, context) } : {}),
+        registry,
+        ...(requestId ? { requestId } : {}),
+      });
     });
   }
 

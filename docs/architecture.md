@@ -69,6 +69,8 @@ Hono middleware sees the HTTP or WebSocket request. Cap'n Web sees the logical m
 
 Services that must only process brokered traffic can enable service-plane ingress protection. In that mode, `/rpc/<abilityId>` rejects valid but non-brokered capability tokens before input validation or handler creation. The broker mints a signed broker claim with the same capability issuer and JWKS trust chain the service already uses.
 
+Cap'n Web transports are request/response shaped, so methods that return many results over time (`stream: true`) are served on a sibling HTTP lane instead: `POST /rpc/<abilityId>/stream` emits NDJSON frames after the same token, ingress, scope, and input checks, the broker pipes those streams through `POST /rpc/broker/stream`, and MCP tools backed by streaming methods answer over SSE. The security model is unchanged — only the response shape differs.
+
 ## Observability
 
 One request id follows a call across the whole plane. The control plane assigns or adopts `X-Request-Id` on every inbound request, and its broker and MCP surfaces forward that id on every outbound service call (header for HTTP transports, `request_id` query parameter for WebSocket upgrades, `requestId` field for native bindings). The service shell adopts the propagated id into its Hono `requestId` variable, echoes it on responses, and includes it in its log events, so plane and service logs correlate without extra plumbing.
