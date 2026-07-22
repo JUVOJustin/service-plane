@@ -69,7 +69,7 @@ Hono middleware sees the HTTP or WebSocket request. Cap'n Web sees the logical m
 
 Services that must only process brokered traffic can enable service-plane ingress protection. In that mode, `/rpc/<abilityId>` rejects valid but non-brokered capability tokens before input validation or handler creation. The broker mints a signed broker claim with the same capability issuer and JWKS trust chain the service already uses.
 
-Methods that return many results over time (`stream: true`) use Cap'n Web's native stream support: the validating wrapper returns a `ReadableStream` of per-item-validated results with built-in flow control. Streams ride the ongoing RPC session, so they work over WebSocket, native Workers RPC bindings, and custom bidirectional transports — but not over the one-round-trip HTTP-batch transport, where streaming calls fail with a clear 405. The broker proxies these streams transparently, and MCP tools backed by streaming methods answer over SSE. The security model is unchanged — only the return shape differs.
+Methods that return many results over time (`stream: true`) use Cap'n Web's native stream support: the validating wrapper returns a `ReadableStream` of per-item-validated results with built-in flow control. Streams ride the ongoing RPC session, so they work over WebSocket, native Workers RPC bindings, and custom bidirectional transports — but not over the one-round-trip HTTP-batch transport, where streaming calls fail with a clear 405. The broker proxies these streams transparently, and MCP tools backed by streaming methods answer over SSE. The security model is unchanged — only the return shape differs. See [Streaming](streaming.md).
 
 ## Observability
 

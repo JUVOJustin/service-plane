@@ -125,7 +125,7 @@ async *readFile(input: { path: string }) {
 }
 ```
 
-Callers receive a native Cap'n Web `ReadableStream` of validated items from the ordinary `abilitySession` call. Streams need an ongoing session, so the ability must enable a session transport (`websocket` or `cloudflare-binding-rpc`); HTTP-batch calls to streaming methods fail with 405. See [reference](reference.md#streaming-methods).
+Callers receive a native Cap'n Web `ReadableStream` of validated items from the ordinary `abilitySession` call. Streams need an ongoing session, so the ability must enable a session transport (`websocket` or `cloudflare-binding-rpc`); HTTP-batch calls to streaming methods fail with 405. See [Streaming](streaming.md).
 
 `context` is runtime access, such as Hono context, environment bindings, storage, and execution context.
 

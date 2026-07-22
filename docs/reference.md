@@ -77,7 +77,9 @@ for await (const item of stream) {
 
 Cap'n Web streams ride the ongoing session, so streaming methods require a **session transport**: WebSocket (`websocketRpc`), the Cloudflare native binding (`cloudflareNativeRpc`), or a custom bidirectional transport. The one-round-trip HTTP-batch transport cannot carry them — calling a streaming method over HTTP-batch fails with a 405, and an ability that declares streaming methods must enable `websocket` or `cloudflare-binding-rpc` in `rpc.transports` (checked at setup). Unary methods on the same ability keep working over HTTP-batch.
 
-Through the broker, streams proxy transparently: connect to `/rpc/broker` over WebSocket, and the plane reaches the service over its own session transport — preferring the endpoint's native ability RPC binding (`ServiceEndpoint.abilityRpc`, picked up automatically by `cloudflareServiceBinding` when the binding exposes `connectAbility`), then WebSocket. Streaming methods cannot project MCP prompts, resources, or REST operations (single-response surfaces); MCP tools are supported — see [OpenAPI and MCP](openapi-mcp.md).
+Through the broker, streams proxy transparently: connect to `/rpc/broker` over WebSocket, and the plane reaches the service over its own session transport — preferring the endpoint's native ability RPC binding (`ServiceEndpoint.abilityRpc`, picked up automatically by `cloudflareServiceBinding` when the binding exposes `connectAbility`), then WebSocket. Streaming methods cannot project MCP prompts, resources, or REST operations (single-response surfaces); MCP tools are supported.
+
+Full guide, including per-runtime WebSocket wiring: [Streaming](streaming.md).
 
 ## Discovery Document
 

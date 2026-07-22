@@ -135,7 +135,7 @@ Keep JWKS key rotation overlapping: publish a new key alongside the old one for 
 
 ## When To Use WebSockets
 
-Use WebSocket for long-lived or interactive sessions, such as MCP-style tool sessions or realtime updates.
+Use WebSocket for long-lived or interactive sessions, such as MCP-style tool sessions or realtime updates. Streaming ability methods also need a session transport — on Cloudflare prefer native binding RPC, which streams without a WebSocket (see [Streaming](streaming.md)).
 
 Do not use WebSocket as the default Worker-to-Worker transport. Bindings are simpler for request/response work and do not need connection lifecycle handling.
 
