@@ -132,21 +132,37 @@ Ingress-protected services work unchanged: the broker's token carries the signed
 
 Per-item cost is CPU, not waiting: validation runs on one item as it passes through (microseconds), and Cap'n Web serializes one message per item per hop. Cost therefore scales with **message rate × hops** — and serialization dominates, not validation (`npm run bench` streams 100,000 token-sized items per iteration against native baselines; disabling validation changes almost nothing, while batching items changes everything).
 
-For LLM-style token streams, coalesce deltas instead of sending one message per token. Declare it on the method — the handler keeps yielding plain items and the wrapper batches them automatically, flushing on whichever limit is hit first (byte size, item count, or wait time), so large items flush early instead of piling up in memory while slow producers still deliver with bounded latency:
+For LLM-style token streams, batch deltas instead of sending one message per token. This is deliberately a recipe, not an API: the batching policy is application-owned, and the batch belongs in the method contract — declare it as the item and flush on whichever limit is hit first, size or time. The size cap flushes chunky items early instead of piling them up in memory; the time cap bounds latency when the producer trickles:
 
 ```ts
 streamCompletion: abilityMethod({
-  coalesce: { maxBufferedBytes: 2048, maxWaitMs: 50 }, // 2 KiB or 50 ms, whichever first
   input: z.object({ prompt: z.string() }),
-  output: z.object({ delta: z.string() }), // still validates one item
+  output: z.array(z.object({ delta: z.string() })), // the batch is the item
   scopes: ['llm.call'],
   stream: true,
 }),
 ```
 
-The wire then carries `output[]` batches: callers receive `ReadableStream<Item[]>` (typed by `AbilityRpc`), discovery marks the method `coalesced: true`, and MCP tool results are flattened back to plain items. Callers see the batches by design — the saving has to exist on the wire, and unwrapping them invisibly would mean a hidden envelope protocol. For custom pipelines outside the wrapper, the standalone `coalesceAbilityStream(source, options)` helper does the same batching.
+```ts
+async *streamCompletion(input: { prompt: string }) {
+  let batch: Array<{ delta: string }> = [];
+  let batchBytes = 0;
+  let flushBy = 0;
+  for await (const delta of this.llm.tokens(input.prompt)) {
+    if (batch.length === 0) flushBy = Date.now() + 50; // latency bound for slow producers
+    batch.push(delta);
+    batchBytes += JSON.stringify(delta).length;
+    if (batchBytes >= 2048 || Date.now() >= flushBy) {
+      yield batch;
+      batch = [];
+      batchBytes = 0;
+    }
+  }
+  if (batch.length > 0) yield batch;
+}
+```
 
-In the benchmark (100,000 deltas per stream), coalescing turns ~100k messages into ~2,400 and cuts end-to-end stream cost ~4× (807 ms → 204 ms per stream), approaching the native-binding floor (121 ms).
+In the benchmark (100,000 deltas per stream) this cuts a stream from ~1.0 s to ~87 ms — ~2,400 wire messages instead of ~100k — and lands *below* the per-item native-binding cost, because validating one array per batch is also cheaper than validating items one by one.
 
 Two more levers for hot paths:
 

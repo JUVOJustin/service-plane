@@ -21,10 +21,6 @@ class HubApi extends RpcTarget {
     }
   }
 
-  async *readFileBatched(input: { parts: number }) {
-    yield* this.readFile(input);
-  }
-
   async stat(_input: Record<string, never>) {
     return { size: 3 };
   }
@@ -60,14 +56,6 @@ async function createFixture(options: FixtureOptions = {}) {
           readFile: abilityMethod({
             input: z.object({ parts: z.number() }),
             mcp: { description: 'Read a hub file', name: 'hub_read_file' },
-            output: z.object({ chunk: z.string() }),
-            scopes: ['hub.read'],
-            stream: true,
-          }),
-          readFileBatched: abilityMethod({
-            coalesce: { maxBufferedBytes: 1_000_000, maxItems: 2, maxWaitMs: 5_000 },
-            input: z.object({ parts: z.number() }),
-            mcp: { name: 'hub_read_file_batched' },
             output: z.object({ chunk: z.string() }),
             scopes: ['hub.read'],
             stream: true,
@@ -234,30 +222,6 @@ describe('control-plane MCP streaming tools', () => {
         result: {
           content: [{ text: JSON.stringify({ items: [{ chunk: 'part-0' }, { chunk: 'part-1' }] }), type: 'text' }],
           structuredContent: { items: [{ chunk: 'part-0' }, { chunk: 'part-1' }] },
-        },
-      },
-    ]);
-  });
-
-  it('flattens coalesced batches in the aggregated tool result', async () => {
-    const { mcpRequest } = await createFixture();
-    const response = await mcpRequest({
-      id: 12,
-      jsonrpc: '2.0',
-      method: 'tools/call',
-      params: { _meta: { progressToken: 'tok-2' }, arguments: { parts: 3 }, name: 'hub_read_file_batched' },
-    });
-    expect(response.headers.get('content-type')).toBe('text/event-stream');
-    const events = parseSse(await response.text());
-    expect(events).toEqual([
-      { jsonrpc: '2.0', method: 'notifications/progress', params: { progress: 2, progressToken: 'tok-2' } },
-      { jsonrpc: '2.0', method: 'notifications/progress', params: { progress: 3, progressToken: 'tok-2' } },
-      {
-        id: 12,
-        jsonrpc: '2.0',
-        result: {
-          content: [{ text: JSON.stringify({ items: [{ chunk: 'part-0' }, { chunk: 'part-1' }, { chunk: 'part-2' }] }), type: 'text' }],
-          structuredContent: { items: [{ chunk: 'part-0' }, { chunk: 'part-1' }, { chunk: 'part-2' }] },
         },
       },
     ]);

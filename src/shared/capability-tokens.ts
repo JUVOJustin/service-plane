@@ -1,4 +1,5 @@
 import { sign } from 'hono/jwt';
+import { verifying } from 'hono/utils/jwt/jws';
 import { CapabilityAuthError } from './errors.js';
 import {
   decodeServicePlaneJwkToken,
@@ -6,7 +7,6 @@ import {
   randomServicePlaneJwkId,
   SERVICE_PLANE_JWK_ALGORITHM,
   servicePlaneJwkSigningKey,
-  verifyServicePlaneJwkSignature,
 } from './jwk-auth.js';
 import {
   type CapabilityActorClaim,
@@ -86,7 +86,7 @@ export async function verifyCapabilityToken(token: string, options: VerifyCapabi
   const key = jwks.keys.find((candidate) => candidate.kid === header.kid);
   if (!key) throw new CapabilityAuthError('Unknown Service-Plane capability key id');
 
-  await verifyTokenSignature(token, jwks);
+  await verifyTokenSignature(token, key);
 
   // RFC 8693 delegation: with an act claim, sub is the end-user subject and act.sub is the acting
   // service; without one, sub is the calling service itself.
@@ -200,12 +200,45 @@ function isBoundedClaimString(value: string): boolean {
   return value.length > 0 && value.length <= MAX_CAPABILITY_CLAIM_STRING_LENGTH;
 }
 
-async function verifyTokenSignature(token: string, jwks: CapabilityJwks): Promise<void> {
+async function verifyTokenSignature(token: string, key: JsonWebKey & { kid?: string }): Promise<void> {
   try {
-    await verifyServicePlaneJwkSignature(token, jwks);
+    const [headerPart, payloadPart, signaturePart] = token.split('.');
+    if (!headerPart || !payloadPart || !signaturePart) throw new Error('malformed token');
+    const verified = await verifying(
+      await importedVerificationKey(key),
+      SERVICE_PLANE_JWK_ALGORITHM,
+      base64UrlToBytes(signaturePart),
+      new TextEncoder().encode(`${headerPart}.${payloadPart}`),
+    );
+    if (!verified) throw new Error('signature mismatch');
   } catch {
     throw new CapabilityAuthError('Invalid Service-Plane capability signature');
   }
+}
+
+// hono/jwt re-imports the CryptoKey from the JWK on every verification, which costs as much as
+// the verify itself. Tokens are verified per request on HTTP-batch transports, so imported keys
+// are cached by their public key material; a rotated key is a different entry by construction.
+const verificationKeyCache = new Map<string, Promise<CryptoKey>>();
+
+function importedVerificationKey(key: JsonWebKey & { kid?: string }): Promise<CryptoKey> {
+  const cacheKey = `${key.kid ?? ''}:${key.kty ?? ''}:${key.crv ?? ''}:${key.x ?? ''}:${key.y ?? ''}`;
+  const cached = verificationKeyCache.get(cacheKey);
+  if (cached) return cached;
+  if (verificationKeyCache.size >= 64) verificationKeyCache.clear();
+  const imported = crypto.subtle.importKey('jwk', key, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+  verificationKeyCache.set(cacheKey, imported);
+  imported.catch(() => verificationKeyCache.delete(cacheKey));
+  return imported;
+}
+
+function base64UrlToBytes(value: string): Uint8Array<ArrayBuffer> {
+  const normalized = value.replace(/-/gu, '+').replace(/_/gu, '/');
+  const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+  const binary = atob(padded);
+  const bytes = new Uint8Array(new ArrayBuffer(binary.length));
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
 }
 
 function normalizeTtlSeconds(ttlSeconds: number): number {

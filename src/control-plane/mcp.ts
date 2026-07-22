@@ -262,8 +262,7 @@ async function streamToolCall(
       isError: true,
     });
   }
-  const coalesced = match.ability.methods[match.method]?.coalesced === true;
-  return sseResponse(streamToolEvents(id, name, match, options, stream, progressTokenOf(params), startedAt, coalesced));
+  return sseResponse(streamToolEvents(id, name, match, options, stream, progressTokenOf(params), startedAt));
 }
 
 async function* streamToolEvents(
@@ -274,7 +273,6 @@ async function* streamToolEvents(
   stream: ReadableStream<unknown>,
   progressToken: string | number | undefined,
   startedAt: number,
-  coalesced: boolean,
 ): AsyncGenerator<string> {
   const items: unknown[] = [];
   const reader = stream.getReader();
@@ -282,9 +280,7 @@ async function* streamToolEvents(
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      // Coalesced methods put batches on the wire; the aggregated tool result stays flat.
-      if (coalesced && Array.isArray(value)) items.push(...value);
-      else items.push(value);
+      items.push(value);
       if (progressToken !== undefined) {
         yield sseEvent({ jsonrpc: '2.0', method: 'notifications/progress', params: { progress: items.length, progressToken } });
       }

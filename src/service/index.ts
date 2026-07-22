@@ -126,9 +126,7 @@ export type {
 } from './discovery.js';
 export {
   abilityMethod,
-  type CoalesceAbilityStreamOptions,
   type CreateValidatingAbilityHandlerOptions,
-  coalesceAbilityStream,
   createValidatingAbilityHandler,
   defaultAbilityRpcPath,
   defineAbility,

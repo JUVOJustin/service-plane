@@ -79,7 +79,7 @@ Cap'n Web streams ride the ongoing session, so streaming methods require a **ses
 
 Through the broker, streams proxy transparently: connect to `/rpc/broker` over WebSocket, and the plane reaches the service over its own session transport — preferring the endpoint's native ability RPC binding (`ServiceEndpoint.abilityRpc`, picked up automatically by `cloudflareServiceBinding` when the binding exposes `connectAbility`), then WebSocket. Streaming methods cannot project MCP prompts, resources, or REST operations (single-response surfaces); MCP tools are supported.
 
-For high-frequency streams (LLM token deltas), declare `coalesce: { maxBufferedBytes?, maxItems?, maxWaitMs? }` on the streaming method: the wrapper batches validated items into `output[]` wire items automatically, flushing on whichever limit is hit first, and discovery marks the method `coalesced: true`. The standalone `coalesceAbilityStream(source, options)` helper applies the same batching in custom pipelines.
+For high-frequency streams (LLM token deltas), batch deltas in the handler and declare the batch as the item (`output: z.array(...)`) — see the coalescing recipe in [Streaming](streaming.md#high-frequency-streams).
 
 Full guide, including per-runtime WebSocket wiring and performance guidance: [Streaming](streaming.md).
 
