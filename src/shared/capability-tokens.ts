@@ -200,6 +200,13 @@ function isBoundedClaimString(value: string): boolean {
   return value.length > 0 && value.length <= MAX_CAPABILITY_CLAIM_STRING_LENGTH;
 }
 
+// Deviation from the ready-made hono helper, on purpose: hono/jwt's verifyWithJwks re-imports
+// the CryptoKey from the JWK on EVERY call, which measured 206us/op vs 100us/op with a cached
+// key on Node — capability tokens are verified per request on HTTP-batch transports, so that
+// doubling matters. The JWS signature check itself still uses hono's own low-level `verifying`
+// primitive (hono/utils/jwt/jws); only kid-matching and key caching are ours. Everything here
+// is web-standard (crypto.subtle, atob, TextEncoder), so it behaves identically on Node 20+,
+// Bun, workerd, and Deno — the same matrix hono itself targets.
 async function verifyTokenSignature(token: string, key: JsonWebKey & { kid?: string }): Promise<void> {
   try {
     const [headerPart, payloadPart, signaturePart] = token.split('.');
@@ -216,9 +223,9 @@ async function verifyTokenSignature(token: string, key: JsonWebKey & { kid?: str
   }
 }
 
-// hono/jwt re-imports the CryptoKey from the JWK on every verification, which costs as much as
-// the verify itself. Tokens are verified per request on HTTP-batch transports, so imported keys
-// are cached by their public key material; a rotated key is a different entry by construction.
+// Imported keys are cached by their public key material, so a rotated key is a different cache
+// entry by construction and a poisoned/failed import never sticks (the catch below evicts it).
+// The bound exists only to keep a pathological JWKS from growing the map without limit.
 const verificationKeyCache = new Map<string, Promise<CryptoKey>>();
 
 function importedVerificationKey(key: JsonWebKey & { kid?: string }): Promise<CryptoKey> {
@@ -232,6 +239,9 @@ function importedVerificationKey(key: JsonWebKey & { kid?: string }): Promise<Cr
   return imported;
 }
 
+// atob + manual byte copy instead of a library helper: hono does not export its base64url
+// decoder, and atob is a web-standard global on every target runtime (Node 16+, Bun, workerd,
+// Deno). Signatures are ~64 bytes, so the char loop is irrelevant to performance.
 function base64UrlToBytes(value: string): Uint8Array<ArrayBuffer> {
   const normalized = value.replace(/-/gu, '+').replace(/_/gu, '/');
   const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);

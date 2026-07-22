@@ -584,9 +584,17 @@ function missingAbilityId(): never {
   throw new CapabilityAuthError('Service-Plane abilityId is required for Cloudflare native RPC transport', 500);
 }
 
-// The batch flushes on the next macrotask so same-tick pipelined calls share one request.
-// Node clamps setTimeout(0) to ~1ms — more than the ES256 token verification itself — so
-// setImmediate is preferred where it exists; workerd's setTimeout(0) is not clamped.
+// Deviation from capnweb's stock newHttpBatchRpcSession client, on purpose: batches must
+// flush on the next macrotask so same-tick pipelined calls share one request, and the stock
+// client schedules that flush with setTimeout(0) — which Node clamps to ~1ms, costing more per
+// call than the ES256 token verification itself (measured 1,185us vs 100us). This helper
+// prefers setImmediate where it exists and is feature-detected via globalThis so no runtime
+// types are required:
+//   - Node, Bun: setImmediate exists — flush in ~1us.
+//   - workerd, Deno: no setImmediate — setTimeout(0) fallback, which neither runtime clamps
+//     the way Node does.
+// A microtask flush would be wrong here: pull messages can be registered a microtask after the
+// call messages, and flushing between them would truncate the batch.
 function nextMacrotask(): Promise<void> {
   const immediate = (globalThis as { setImmediate?: (callback: () => void) => void }).setImmediate;
   return new Promise((resolve) => {
@@ -595,6 +603,10 @@ function nextMacrotask(): Promise<void> {
   });
 }
 
+// Speaks the exact newline-delimited wire protocol of capnweb's HTTP-batch client, built on
+// web-standard Request/fetch only (portable to Node 20+, Bun, workerd, Deno). It exists instead
+// of the stock client for two reasons: the unclamped flush above, and Request-template support —
+// a template Request's headers (gateway auth, tenant routing) survive into every batch.
 function createFetchBatchTransport(fetcher: FetchLike, url: Request | string, headers?: Record<string, string>): RpcTransport {
   let batchToSend: string[] | null = [];
   let batchToReceive: string[] | undefined;
