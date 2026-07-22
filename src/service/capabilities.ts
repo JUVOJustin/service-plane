@@ -1,4 +1,5 @@
 import {
+  newHttpBatchRpcSession,
   newWebSocketRpcSession,
   type RpcCompatible,
   RpcSession,
@@ -516,14 +517,10 @@ function openSession<Scoped>(options: {
   const { abilityId, requestId, rpcSessionOptions, transport } = options;
   const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
   if (transport.kind === 'http-batch') {
-    // Same wire protocol as capnweb's newHttpBatchRpcSession, but flushed without Node's
-    // setTimeout clamp (see nextMacrotask) and with Request-template headers preserved.
-    const batchTransport = createFetchBatchTransport(
-      { fetch: (request) => fetch(request) },
+    return newHttpBatchRpcSession<UntypedAuthenticatedRoot>(
       withRequestIdHeader(httpBatchUrl(transport, abilityId), requestId, requestIdHeaderName),
-    );
-    const session = new RpcSession<UntypedAuthenticatedRoot>(batchTransport, undefined, rpcSessionOptions);
-    return session.getRemoteMain() as unknown as AuthenticatedRoot<Scoped>;
+      rpcSessionOptions,
+    ) as unknown as AuthenticatedRoot<Scoped>;
   }
   if (transport.kind === 'websocket') {
     return newWebSocketRpcSession<UntypedAuthenticatedRoot>(
@@ -584,35 +581,16 @@ function missingAbilityId(): never {
   throw new CapabilityAuthError('Service-Plane abilityId is required for Cloudflare native RPC transport', 500);
 }
 
-// Deviation from capnweb's stock newHttpBatchRpcSession client, on purpose: batches must
-// flush on the next macrotask so same-tick pipelined calls share one request, and the stock
-// client schedules that flush with setTimeout(0) — which Node clamps to ~1ms, costing more per
-// call than the ES256 token verification itself (measured 1,185us vs 100us). This helper
-// prefers setImmediate where it exists and is feature-detected via globalThis so no runtime
-// types are required:
-//   - Node, Bun: setImmediate exists — flush in ~1us.
-//   - workerd, Deno: no setImmediate — setTimeout(0) fallback, which neither runtime clamps
-//     the way Node does.
-// A microtask flush would be wrong here: pull messages can be registered a microtask after the
-// call messages, and flushing between them would truncate the batch.
-function nextMacrotask(): Promise<void> {
-  const immediate = (globalThis as { setImmediate?: (callback: () => void) => void }).setImmediate;
-  return new Promise((resolve) => {
-    if (immediate) immediate(resolve);
-    else setTimeout(resolve, 0);
-  });
-}
-
-// Speaks the exact newline-delimited wire protocol of capnweb's HTTP-batch client, built on
-// web-standard Request/fetch only (portable to Node 20+, Bun, workerd, Deno). It exists instead
-// of the stock client for two reasons: the unclamped flush above, and Request-template support —
-// a template Request's headers (gateway auth, tenant routing) survive into every batch.
-function createFetchBatchTransport(fetcher: FetchLike, url: Request | string, headers?: Record<string, string>): RpcTransport {
+function createFetchBatchTransport(fetcher: FetchLike, url: string, headers?: Record<string, string>): RpcTransport {
   let batchToSend: string[] | null = [];
   let batchToReceive: string[] | undefined;
   let aborted: unknown;
   const scheduled = (async () => {
-    await nextMacrotask();
+    // Waits for the caller's microtask cascade to drain before flushing, mirroring capnweb's
+    // stock batch client. Node clamps setTimeout(0) to ~1ms; accepted deliberately — see
+    // issue #12 and cloudflare/capnweb#219 before re-introducing a local workaround
+    // (reference implementation: commit 9278842).
+    await new Promise((resolve) => setTimeout(resolve, 0));
     if (aborted !== undefined) throw aborted;
     const batch = batchToSend ?? [];
     batchToSend = null;
