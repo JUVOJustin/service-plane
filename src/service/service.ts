@@ -70,6 +70,19 @@ export class ServicePlaneService<TEnv extends Env = Env> {
     this.definition = defineAbilityService(options, { requireAbilityScopes: options.requireAbilityScopes ?? true });
     this.discoveryPath = options.discoveryPath ?? SERVICE_DISCOVERY_PATH;
 
+    // @hono/capnweb answers upgrades with 400 unless an upgradeWebSocket helper is wired in,
+    // so a websocket declaration without one is dead configuration that discovery would still
+    // advertise as usable; fail at construction instead of at the first upgrade.
+    if (!options.rpc?.upgradeWebSocket) {
+      const broken = this.definition.abilities.find((ability) => ability.rpc.transports.includes('websocket'));
+      if (broken) {
+        throw new CapabilityAuthError(
+          `Service-Plane ability declares the websocket transport but rpc.upgradeWebSocket is not configured: ${broken.id}`,
+          500,
+        );
+      }
+    }
+
     // Request-id assignment is not optional: correlation with the control plane depends on it,
     // and the middleware is free when the id is already present. Use `requestId` to customize.
     this.app.use(

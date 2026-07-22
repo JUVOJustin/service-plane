@@ -49,7 +49,10 @@ export type ServiceAbilityHandlerFactoryInput<TEnv extends Env = Env> = {
 // back from a streaming method is almost certainly a bug, and the runtime rejects it.
 export type AbilityStreamSource<TItem> = AsyncIterable<TItem> | (Iterable<TItem> & object) | ReadableStream<TItem>;
 
-type AbilityMethodItem<TMethod extends AbilityMethodDefinition> = z.input<TMethod['output']> | z.output<TMethod['output']>;
+// Streamed items are re-validated by `output.parseAsync`, so handlers must yield the schema's
+// INPUT shape: for transforming schemas (pipes, coercions) the transformed output would fail
+// re-parsing, so unlike unary methods the output side is not accepted here.
+type AbilityMethodItem<TMethod extends AbilityMethodDefinition> = z.input<TMethod['output']>;
 
 export type AbilityImplementation<TAbility extends ServiceAbilityDefinition> = {
   [TMethod in keyof TAbility['methods']]: TAbility['methods'][TMethod] extends { stream: true }
@@ -260,7 +263,15 @@ function validatedAbilityItemStream(
         controller.close();
         return;
       }
-      controller.enqueue(await method.output.parseAsync(next.value));
+      try {
+        controller.enqueue(await method.output.parseAsync(next.value));
+      } catch (error) {
+        // An invalid item errors the stream, and an errored stream can no longer be cancelled
+        // by the consumer — release the handler's source here so generator finally blocks and
+        // reader locks are not stranded.
+        puller.cancel(error);
+        throw error;
+      }
     },
   });
 }

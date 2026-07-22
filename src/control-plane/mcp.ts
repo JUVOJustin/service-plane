@@ -32,7 +32,13 @@ export type ControlPlaneMcpHandlerOptions = {
   registry: ServiceRegistry;
   requestId?: string;
   serverInfo?: Partial<ControlPlaneMcpServerInfo>;
+  // Streaming tools must aggregate into one MCP result, so unbounded sources would grow
+  // control-plane memory without limit; calls exceeding these caps fail in-band.
+  streamLimits?: { maxBytes?: number; maxItems?: number };
 };
+
+const DEFAULT_MCP_STREAM_MAX_ITEMS = 10_000;
+const DEFAULT_MCP_STREAM_MAX_BYTES = 1_048_576;
 
 export const DEFAULT_MCP_PATH = SERVICE_PLANE_MCP_PATH;
 
@@ -262,7 +268,12 @@ async function streamToolCall(
       isError: true,
     });
   }
-  return sseResponse(streamToolEvents(id, name, match, options, stream, progressTokenOf(params), startedAt));
+  const reader = stream.getReader();
+  return sseResponse(streamToolEvents(id, name, match, options, reader, progressTokenOf(params), startedAt), (reason) => {
+    // Cancel the upstream reader directly on client disconnect: the generator's queued
+    // return() would wait behind an in-flight read() while the consumer is already gone.
+    void reader.cancel(reason).catch(() => undefined);
+  });
 }
 
 async function* streamToolEvents(
@@ -270,17 +281,28 @@ async function* streamToolEvents(
   name: string,
   match: McpMethodMatch,
   options: ControlPlaneMcpHandlerOptions,
-  stream: ReadableStream<unknown>,
+  reader: ReadableStreamDefaultReader<unknown>,
   progressToken: string | number | undefined,
   startedAt: number,
 ): AsyncGenerator<string> {
+  const maxItems = options.streamLimits?.maxItems ?? DEFAULT_MCP_STREAM_MAX_ITEMS;
+  const maxBytes = options.streamLimits?.maxBytes ?? DEFAULT_MCP_STREAM_MAX_BYTES;
   const items: unknown[] = [];
-  const reader = stream.getReader();
+  let aggregatedBytes = 0;
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       items.push(value);
+      aggregatedBytes += JSON.stringify(value)?.length ?? 4;
+      if (items.length > maxItems || aggregatedBytes > maxBytes) {
+        // MCP defines exactly one response per request, so the full stream must be held in
+        // memory here; unbounded or caller-inflated streams are cut off in-band instead.
+        const message = `Service-Plane MCP tool stream exceeded aggregation limits (${maxItems} items / ${maxBytes} bytes); use a session transport for large streams`;
+        logMcpFailed(options, 'service_plane.mcp.tool.failed', { tool: name }, new CapabilityAuthError(message, 413), startedAt);
+        yield sseEvent({ id, jsonrpc: '2.0', result: { content: [{ text: message, type: 'text' }], isError: true } });
+        return;
+      }
       if (progressToken !== undefined) {
         yield sseEvent({ jsonrpc: '2.0', method: 'notifications/progress', params: { progress: items.length, progressToken } });
       }
@@ -313,22 +335,54 @@ function progressTokenOf(params: unknown): string | number | undefined {
 }
 
 function streamToolOutputSchema(itemSchema: OpenApiObject): OpenApiObject {
+  // Root-relative $refs ("#...") would re-anchor to the aggregate wrapper once the item schema
+  // is nested; hoist such schemas into $defs and rewrite their refs so recursive item schemas
+  // stay valid. Plain schemas are embedded directly to keep tools/list output simple.
+  if (!containsRootRef(itemSchema)) {
+    return {
+      properties: { items: { items: itemSchema, type: 'array' } },
+      required: ['items'],
+      type: 'object',
+    };
+  }
   return {
-    properties: { items: { items: itemSchema, type: 'array' } },
+    $defs: { item: rewriteRootRefs(itemSchema) as OpenApiObject },
+    properties: { items: { items: { $ref: '#/$defs/item' }, type: 'array' } },
     required: ['items'],
     type: 'object',
   };
+}
+
+function containsRootRef(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(containsRootRef);
+  if (!isRecord(value)) return false;
+  if (typeof value.$ref === 'string' && value.$ref.startsWith('#')) return true;
+  return Object.values(value).some(containsRootRef);
+}
+
+function rewriteRootRefs(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(rewriteRootRefs);
+  if (!isRecord(value)) return value;
+  const result: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    result[key] =
+      key === '$ref' && typeof entry === 'string' && entry.startsWith('#') ? `#/$defs/item${entry.slice(1)}` : rewriteRootRefs(entry);
+  }
+  return result;
 }
 
 function sseEvent(message: unknown): string {
   return `data: ${JSON.stringify(message)}\n\n`;
 }
 
-function sseResponse(events: AsyncGenerator<string>): Response {
+function sseResponse(events: AsyncGenerator<string>, onCancel?: (reason: unknown) => void): Response {
   const encoder = new TextEncoder();
   const body = new ReadableStream<Uint8Array>({
-    async cancel() {
-      await events.return?.(undefined);
+    cancel(reason) {
+      onCancel?.(reason);
+      // Fire-and-forget: awaiting the generator's return() would queue behind an in-flight
+      // read while the client is already gone.
+      void events.return?.(undefined);
     },
     async pull(controller) {
       const next = await events.next();

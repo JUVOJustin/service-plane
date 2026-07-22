@@ -3,11 +3,12 @@ import { describe, expect, it } from 'vitest';
 import * as z from 'zod';
 import { abilityMethod, defineAbility, defineCapabilities, RpcTarget, requireScopes, ServicePlaneService } from '../service/index.js';
 import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
+import type { ServiceEndpoint, ServiceRegistrySnapshot } from '../shared/types.js';
 import { memoryRpcTransportPair } from '../testing/index.js';
 import { createControlPlaneRpcBroker } from './broker.js';
 import { createCapabilityIssuer, defineServiceGrants } from './capabilities.js';
 import { cloudflareServiceBinding } from './endpoints.js';
-import { handleControlPlaneMcpRequest } from './mcp.js';
+import { generateMcpDiscovery, handleControlPlaneMcpRequest } from './mcp.js';
 import { createServiceRegistry } from './registry.js';
 
 const ISSUED_AT = new Date('2026-07-22T12:00:00.000Z');
@@ -28,6 +29,7 @@ class HubApi extends RpcTarget {
 
 type FixtureOptions = {
   ingress?: boolean;
+  streamLimits?: { maxBytes?: number; maxItems?: number };
   // Drop connectAbility from the endpoint so only HTTP-batch remains reachable.
   withoutNativeRpc?: boolean;
 };
@@ -108,6 +110,7 @@ async function createFixture(options: FixtureOptions = {}) {
         controlPlaneServiceId: 'control-plane',
         issuer,
         registry,
+        ...(options.streamLimits ? { streamLimits: options.streamLimits } : {}),
       },
     );
 
@@ -239,6 +242,101 @@ describe('control-plane MCP streaming tools', () => {
     const events = parseSse(await response.text());
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ id: 8, result: { structuredContent: { items: [{ chunk: 'part-0' }] } } });
+  });
+
+  it('caps stream aggregation and fails the tool call in-band', async () => {
+    const { mcpRequest } = await createFixture({ streamLimits: { maxItems: 2 } });
+    const response = await mcpRequest({
+      id: 20,
+      jsonrpc: '2.0',
+      method: 'tools/call',
+      params: { arguments: { parts: 5 }, name: 'hub_read_file' },
+    });
+    const events = parseSse(await response.text());
+    const final = events.at(-1) as { result: { content: Array<{ text: string }>; isError?: boolean } };
+    expect(final.result.isError).toBe(true);
+    expect(final.result.content[0]?.text).toContain('aggregation limits');
+  });
+
+  it('hoists root-relative $refs when wrapping a streaming tool output schema', () => {
+    const endpoint: ServiceEndpoint = { fetch: async () => new Response(null, { status: 404 }), id: 'x', origin: 'https://x.internal' };
+    const snapshot: ServiceRegistrySnapshot = {
+      abilities: [
+        {
+          access: 'plane',
+          exposure: 'published',
+          id: 'x.tree',
+          methods: {
+            walk: {
+              inputSchema: { type: 'object' },
+              mcp: { name: 'x_walk' },
+              outputSchema: {
+                properties: { children: { items: { $ref: '#' }, type: 'array' }, name: { type: 'string' } },
+                type: 'object',
+              },
+              scopes: ['s'],
+              stream: true,
+            },
+          },
+          rpc: { path: '/rpc/x.tree', transports: ['cloudflare-binding-rpc'] },
+          scopes: ['s'],
+          service: endpoint,
+          serviceId: 'x',
+          serviceTitle: 'X',
+          serviceVersion: '1',
+        },
+      ],
+      discoveredAt: new Date(0).toISOString(),
+      services: [],
+    };
+    expect(generateMcpDiscovery(snapshot).tools[0]?.outputSchema).toEqual({
+      $defs: {
+        item: {
+          properties: { children: { items: { $ref: '#/$defs/item' }, type: 'array' }, name: { type: 'string' } },
+          type: 'object',
+        },
+      },
+      properties: { items: { items: { $ref: '#/$defs/item' }, type: 'array' } },
+      required: ['items'],
+      type: 'object',
+    });
+  });
+
+  it('drops discovered documents whose streaming methods claim single-response projections', async () => {
+    const registry = createServiceRegistry({
+      services: [
+        {
+          discovery: {
+            abilities: [
+              {
+                access: 'plane' as const,
+                exposure: 'published' as const,
+                id: 'bad.a',
+                methods: {
+                  m: {
+                    inputSchema: { type: 'object' },
+                    outputSchema: { type: 'object' },
+                    rest: { method: 'post' as const, path: '/x' },
+                    scopes: ['s'],
+                    stream: true as const,
+                  },
+                },
+                rpc: { path: '/rpc/bad.a', transports: ['websocket' as const] },
+                scopes: ['s'],
+              },
+            ],
+            id: 'bad',
+            title: 'Bad',
+            version: '1',
+          },
+          fetch: async () => new Response(null, { status: 404 }),
+          id: 'bad',
+          origin: 'https://bad.internal',
+        },
+      ],
+    });
+    const snapshot = await registry.discover();
+    expect(snapshot.services).toHaveLength(0);
   });
 
   it('reports invalid input as an in-band tool error before any stream starts', async () => {

@@ -31,6 +31,8 @@ type StreamItem = { caller: string; index: number };
 // The real consumer projection: proves `stream: true` survives abilityMethod/defineAbility.
 type StreamAbilityRpc = AbilityRpc<ReturnType<typeof streamAbility>>;
 
+let badItemSourceClosed = false;
+
 class StreamApi extends RpcTarget {
   async *listChunks(input: { count: number }) {
     const caller = requireScopes(this, 'example.read');
@@ -45,7 +47,12 @@ class StreamApi extends RpcTarget {
   }
 
   async *badItem(_input: Record<string, never>) {
-    yield { caller: 42, index: 'nope' };
+    try {
+      yield { caller: 42, index: 'nope' };
+      yield { caller: 'never-reached', index: 1 };
+    } finally {
+      badItemSourceClosed = true;
+    }
   }
 
   async *hang(_input: Record<string, never>) {
@@ -349,6 +356,48 @@ describe('streaming ability methods', () => {
       new Promise<string>((resolve) => setTimeout(() => resolve('timed out'), 500)),
     ]);
     expect(outcome).toBe('cancelled');
+  });
+
+  it('releases the handler source when an item fails output validation', async () => {
+    badItemSourceClosed = false;
+    const fixture = await createFixture();
+    const api = await abilitySession<StreamAbilityRpc>({
+      abilityId: 'example.stream',
+      callerServiceId: 'worker-a',
+      requestToken: async () => fixture.issued,
+      scopes: ['example.read'],
+      targetServiceId: 'example',
+      transport: cloudflareNativeRpc(fixture.service),
+    });
+    await expect(drainStream(await api.badItem({}))).rejects.toThrow();
+    // The generator's finally block runs once the wrapper cancels the source.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(badItemSourceClosed).toBe(true);
+  });
+
+  it('rejects a websocket transport declaration without an upgrade helper at construction', async () => {
+    const keys = await testKeys();
+    expect(
+      () =>
+        new ServicePlaneService({
+          abilities: [
+            defineAbility({
+              id: 'example.ws',
+              methods: {
+                ping: abilityMethod({ input: z.object({}), output: z.object({}), scopes: ['example.read'] }),
+              },
+              rpc: { transports: ['websocket'] },
+              scopes: ['example.read'],
+              handler: () => new StreamApi() as StreamApi & Record<string, unknown>,
+            }),
+          ],
+          auth: { issuer: 'control-plane', jwks: { keys: [keys.publicJwk] } },
+          capabilities: defineCapabilities({ scopes: [{ id: 'example.read' }], serviceId: 'example' }),
+          id: 'example',
+          title: 'Example',
+          version: '0.1.0',
+        }),
+    ).toThrow('rpc.upgradeWebSocket is not configured');
   });
 
   it('rejects streaming connections without a brokered token when ingress protection is enabled', async () => {

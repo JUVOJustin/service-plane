@@ -59,6 +59,7 @@ export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
         caller?: BrokerCallerResolver<TEnv>;
         path?: string;
         serverInfo?: Partial<ControlPlaneMcpServerInfo>;
+        streamLimits?: { maxBytes?: number; maxItems?: number };
       };
   openapi?: false | ControlPlaneOpenApiOptions;
   requestId?: ServicePlaneRequestIdOptions;
@@ -163,6 +164,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
         registry,
         ...(requestId ? { requestId } : {}),
         ...(mcpOptions.serverInfo ? { serverInfo: mcpOptions.serverInfo } : {}),
+        ...(mcpOptions.streamLimits ? { streamLimits: mcpOptions.streamLimits } : {}),
       });
     });
   }

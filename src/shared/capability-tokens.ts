@@ -229,7 +229,10 @@ async function verifyTokenSignature(token: string, key: JsonWebKey & { kid?: str
 const verificationKeyCache = new Map<string, Promise<CryptoKey>>();
 
 function importedVerificationKey(key: JsonWebKey & { kid?: string }): Promise<CryptoKey> {
-  const cacheKey = `${key.kid ?? ''}:${key.kty ?? ''}:${key.crv ?? ''}:${key.x ?? ''}:${key.y ?? ''}`;
+  // Policy metadata (alg/use/key_ops/ext) is part of the cache identity: a JWK re-served with
+  // the same point but stricter policy must go through a fresh WebCrypto import, not reuse a
+  // previously blessed key.
+  const cacheKey = `${key.kid ?? ''}:${key.kty ?? ''}:${key.crv ?? ''}:${key.x ?? ''}:${key.y ?? ''}:${key.alg ?? ''}:${key.use ?? ''}:${(key.key_ops ?? []).join('|')}:${String(key.ext ?? '')}`;
   const cached = verificationKeyCache.get(cacheKey);
   if (cached) return cached;
   if (verificationKeyCache.size >= 64) verificationKeyCache.clear();

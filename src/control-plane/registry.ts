@@ -205,6 +205,9 @@ function isAbilityMethodDiscovery(value: unknown): value is ServiceAbilityMethod
     isRecord(value.inputSchema) &&
     isRecord(value.outputSchema) &&
     (value.stream === undefined || value.stream === true) &&
+    // Mirrors defineAbilityService: streaming methods cannot claim single-response projections,
+    // and foreign discovery documents do not get to bypass that.
+    (value.stream !== true || (value.mcpPrompt === undefined && value.mcpResource === undefined && value.rest === undefined)) &&
     (value.rest === undefined ||
       (isRecord(value.rest) &&
         isHttpMethod(value.rest.method) &&
