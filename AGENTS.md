@@ -89,6 +89,7 @@ Docs follow the existing Diataxis-style split:
 - `docs/plane-creation.md`: how to create a control plane.
 - `docs/auth.md`: authentication and token behavior.
 - `docs/streaming.md`: streaming ability methods and session transports.
+- `docs/transports.md`: choosing a transport per environment, with performance and cost guidance.
 - `docs/cloudflare.md` and `docs/nodejs.md`: deployment-specific usage.
 - `docs/reference.md`: API and route reference.
 

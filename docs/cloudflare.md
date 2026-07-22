@@ -137,6 +137,6 @@ Keep JWKS key rotation overlapping: publish a new key alongside the old one for 
 
 Use WebSocket for long-lived or interactive sessions, such as MCP-style tool sessions or realtime updates. Streaming ability methods also need a session transport — on Cloudflare prefer native binding RPC, which streams without a WebSocket (see [Streaming](streaming.md)).
 
-Do not use WebSocket as the default Worker-to-Worker transport. Bindings are simpler for request/response work and do not need connection lifecycle handling.
+Do not use WebSocket as the default Worker-to-Worker transport. Bindings are simpler for request/response work and do not need connection lifecycle handling. Note that Durable Objects holding Cap'n Web sessions bill duration for the whole connection — Cap'n Web cannot use the WebSocket Hibernation API yet (capnweb#36). Full decision guide: [Choosing A Transport](transports.md).
 
 Next: [architecture](architecture.md), [auth](auth.md), and [Node.js](nodejs.md).

@@ -172,6 +172,8 @@ Transports:
 
 `cloudflareNativeRpc(...)` can call ingress-protected services only with brokered capability tokens. Normal direct caller tokens are rejected.
 
+Which transport fits which pair of services — by environment, performance, and cost — is covered in [Choosing A Transport](transports.md).
+
 Token requesters:
 
 - `controlPlaneRpcTokenRequester(...)`

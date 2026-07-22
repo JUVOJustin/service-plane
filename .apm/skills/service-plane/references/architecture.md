@@ -105,4 +105,4 @@ Only `exposure: 'published'` methods with REST metadata enter OpenAPI. Only publ
 - Private: ability excluded from OpenAPI and MCP.
 - Published: ability eligible for OpenAPI, MCP, or user-facing transports.
 
-Next: [create a service](service-creation.md), then [create a control plane](plane-creation.md).
+Next: [create a service](service-creation.md), [create a control plane](plane-creation.md), and [choosing a transport](transports.md).

@@ -135,6 +135,8 @@ those within `references/` as needed.
   LOAD references/auth.md
 - Streaming ability methods, session transports, broker/MCP streaming:
   LOAD references/streaming.md
+- Which transport to use between services (environment, performance, cost):
+  LOAD references/transports.md
 - API lookup: option shapes, routes, transports, logging events, errors:
   LOAD references/reference.md
 - OpenAPI, Swagger UI/Scalar, MCP tools and their fail-closed callers:

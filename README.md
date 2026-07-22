@@ -212,6 +212,7 @@ references are synced copies of [`docs/`](docs/).
 - [Create A Service](docs/service-creation.md)
 - [Create A Control Plane](docs/plane-creation.md)
 - [Streaming](docs/streaming.md)
+- [Choosing A Transport](docs/transports.md)
 - [Auth](docs/auth.md)
 - [Cloudflare](docs/cloudflare.md)
 - [Node.js And Self-Hosted Services](docs/nodejs.md)

@@ -51,7 +51,7 @@ Cap'n Web streams ride the ongoing RPC session, so streaming methods need a **se
 | `customRpcTransport(transport)` | yes | any bidirectional transport |
 | `cloudflareServiceBindingRpc(binding)` / `httpBatchRpc(url)` | no | one round trip; streaming calls fail with 405 |
 
-An ability that declares streaming methods must enable `websocket` or `cloudflare-binding-rpc` in `rpc.transports` (checked at setup). Unary methods on the same ability keep working over HTTP-batch — batch stays the right default for request/response calls.
+An ability that declares streaming methods must enable `websocket` or `cloudflare-binding-rpc` in `rpc.transports` (checked at setup). Unary methods on the same ability keep working over HTTP-batch — batch stays the right default for request/response calls. For the full environment/cost decision guide, see [Choosing A Transport](transports.md).
 
 ## Serve WebSocket Sessions
 

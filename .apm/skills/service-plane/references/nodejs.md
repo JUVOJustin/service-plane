@@ -95,6 +95,6 @@ Use WebSocket only when the session is long-lived, interactive, or chatty.
 transport: websocketRpc('wss://asana.example.com/rpc/asana.tasks')
 ```
 
-For normal request/response calls, prefer HTTP-batch. It is easier to deploy, cache, observe, and retry. Streaming ability methods require a session transport; wire `upgradeWebSocket` from `@hono/node-ws` into the service shell as shown in [Streaming](streaming.md#serve-websocket-sessions).
+For normal request/response calls, prefer HTTP-batch. It is easier to deploy, cache, observe, and retry. Streaming ability methods require a session transport; wire `upgradeWebSocket` from `@hono/node-ws` into the service shell as shown in [Streaming](streaming.md#serve-websocket-sessions). On long-running Node processes WebSockets are essentially free, so chatty service pairs should hold a session — the full decision guide is [Choosing A Transport](transports.md).
 
 Next: [auth](auth.md), [OpenAPI and MCP](openapi-mcp.md), and [reference](reference.md).
