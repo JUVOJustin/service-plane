@@ -1,5 +1,4 @@
 import {
-  newHttpBatchRpcSession,
   newWebSocketRpcSession,
   type RpcCompatible,
   RpcSession,
@@ -517,10 +516,14 @@ function openSession<Scoped>(options: {
   const { abilityId, requestId, rpcSessionOptions, transport } = options;
   const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
   if (transport.kind === 'http-batch') {
-    return newHttpBatchRpcSession<UntypedAuthenticatedRoot>(
+    // Same wire protocol as capnweb's newHttpBatchRpcSession, but flushed without Node's
+    // setTimeout clamp (see nextMacrotask) and with Request-template headers preserved.
+    const batchTransport = createFetchBatchTransport(
+      { fetch: (request) => fetch(request) },
       withRequestIdHeader(httpBatchUrl(transport, abilityId), requestId, requestIdHeaderName),
-      rpcSessionOptions,
-    ) as unknown as AuthenticatedRoot<Scoped>;
+    );
+    const session = new RpcSession<UntypedAuthenticatedRoot>(batchTransport, undefined, rpcSessionOptions);
+    return session.getRemoteMain() as unknown as AuthenticatedRoot<Scoped>;
   }
   if (transport.kind === 'websocket') {
     return newWebSocketRpcSession<UntypedAuthenticatedRoot>(
@@ -581,12 +584,23 @@ function missingAbilityId(): never {
   throw new CapabilityAuthError('Service-Plane abilityId is required for Cloudflare native RPC transport', 500);
 }
 
-function createFetchBatchTransport(fetcher: FetchLike, url: string, headers?: Record<string, string>): RpcTransport {
+// The batch flushes on the next macrotask so same-tick pipelined calls share one request.
+// Node clamps setTimeout(0) to ~1ms — more than the ES256 token verification itself — so
+// setImmediate is preferred where it exists; workerd's setTimeout(0) is not clamped.
+function nextMacrotask(): Promise<void> {
+  const immediate = (globalThis as { setImmediate?: (callback: () => void) => void }).setImmediate;
+  return new Promise((resolve) => {
+    if (immediate) immediate(resolve);
+    else setTimeout(resolve, 0);
+  });
+}
+
+function createFetchBatchTransport(fetcher: FetchLike, url: Request | string, headers?: Record<string, string>): RpcTransport {
   let batchToSend: string[] | null = [];
   let batchToReceive: string[] | undefined;
   let aborted: unknown;
   const scheduled = (async () => {
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await nextMacrotask();
     if (aborted !== undefined) throw aborted;
     const batch = batchToSend ?? [];
     batchToSend = null;
