@@ -11,13 +11,6 @@ export {
   type ServicePlaneLoggableEvent,
   type ServicePlaneLogSink,
 } from '../shared/logging.js';
-export {
-  type AbilityStreamFrame,
-  abilityStreamPath,
-  encodeAbilityStreamFrame,
-  readAbilityStreamFrames,
-  SERVICE_PLANE_STREAM_CONTENT_TYPE,
-} from '../shared/stream.js';
 export type {
   AbilityAccess,
   AbilityExposure,
@@ -93,9 +86,7 @@ export type {
   RpcTransport,
 } from './capabilities.js';
 export {
-  type AbilityStreamOptions,
   abilitySession,
-  abilityStream,
   bindCapabilityIdentity,
   capabilityIdentity,
   capabilityTokenCacheKey,
@@ -135,11 +126,11 @@ export type {
 } from './discovery.js';
 export {
   abilityMethod,
+  type CreateValidatingAbilityHandlerOptions,
   createValidatingAbilityHandler,
   defaultAbilityRpcPath,
   defineAbility,
   defineAbilityService,
-  openStreamingAbilityMethod,
   serviceDiscoveryDocument,
 } from './discovery.js';
 export {

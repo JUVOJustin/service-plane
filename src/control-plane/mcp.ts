@@ -1,7 +1,6 @@
-import { abilitySession, cloudflareServiceBindingRpc, websocketRpc } from '../service/index.js';
+import { abilitySession, cloudflareNativeRpc, cloudflareServiceBindingRpc, websocketRpc } from '../service/index.js';
 import { CapabilityAuthError } from '../shared/errors.js';
 import type { ServicePlaneBrokerLogEvent } from '../shared/logging.js';
-import { readAbilityStreamFrames } from '../shared/stream.js';
 import {
   type DiscoveredServiceAbility,
   type McpDiscoveryDocument,
@@ -17,7 +16,7 @@ import {
   type ServiceRegistry,
   type ServiceRegistrySnapshot,
 } from '../shared/types.js';
-import { type BrokerCaller, brokerCallerLogFields, brokerCallerSubject, openBrokeredAbilityStream } from './broker.js';
+import { type BrokerCaller, brokerCallerLogFields, brokerCallerSubject } from './broker.js';
 import type { CapabilityIssuer } from './capabilities.js';
 
 export type ControlPlaneMcpServerInfo = {
@@ -234,10 +233,10 @@ async function callTool(id: JsonRpcId, params: unknown, options: ControlPlaneMcp
   }
 }
 
-// Streaming tools answer over MCP Streamable HTTP (SSE). Items are announced as progress
-// notifications while they arrive (when the client sent a progressToken); the final tools/call
-// result aggregates them, because MCP defines exactly one response per request. Unbuffered
-// transfer of very large streams belongs on the broker stream lane, not on MCP.
+// Streaming tools answer over MCP Streamable HTTP (SSE). The plane opens the backing ability
+// over a session transport and forwards items as progress notifications while they arrive
+// (when the client sent a progressToken); the final tools/call result aggregates the items,
+// because MCP defines exactly one response per request.
 async function streamToolCall(
   id: JsonRpcId,
   name: string,
@@ -247,27 +246,23 @@ async function streamToolCall(
   params: unknown,
 ): Promise<Response> {
   const startedAt = Date.now();
-  authorizePublishedAbility(match.ability, options.caller);
-  const { response } = await openBrokeredAbilityStream({
-    ability: match.ability,
-    brokerServiceId: options.controlPlaneServiceId,
-    caller: options.caller,
-    callerServiceId: options.caller?.kind === 'service' ? options.caller.id : options.controlPlaneServiceId,
-    ...(input === undefined ? {} : { input }),
-    issuer: options.issuer,
-    method: match.method,
-    ...(options.requestId ? { requestId: options.requestId } : {}),
-    scopes: match.scopes,
-  });
-
-  // Pre-stream service failures (auth, validation) are tool-execution failures per the MCP spec.
-  if (!response.ok || !response.body) {
-    const message = await upstreamStreamError(response);
-    logMcpFailed(options, 'service_plane.mcp.tool.failed', { tool: name }, new CapabilityAuthError(message, response.status), startedAt);
-    return jsonRpcResult(id, { content: [{ text: message, type: 'text' }], isError: true });
+  let stream: ReadableStream<unknown>;
+  try {
+    const result = await invokeMethod(match, input, options);
+    if (!(result instanceof ReadableStream)) {
+      throw new Error(`Service-Plane streaming tool did not return a stream: ${name}`);
+    }
+    stream = result;
+  } catch (error) {
+    if (error instanceof CapabilityAuthError) throw error;
+    // Tool execution failures are reported in-band per the MCP spec, not as protocol errors.
+    logMcpFailed(options, 'service_plane.mcp.tool.failed', { tool: name }, error, startedAt);
+    return jsonRpcResult(id, {
+      content: [{ text: error instanceof Error ? error.message : String(error), type: 'text' }],
+      isError: true,
+    });
   }
-
-  return sseResponse(streamToolEvents(id, name, match, options, response.body, progressTokenOf(params), startedAt));
+  return sseResponse(streamToolEvents(id, name, match, options, stream, progressTokenOf(params), startedAt));
 }
 
 async function* streamToolEvents(
@@ -275,43 +270,30 @@ async function* streamToolEvents(
   name: string,
   match: McpMethodMatch,
   options: ControlPlaneMcpHandlerOptions,
-  body: ReadableStream<Uint8Array>,
+  stream: ReadableStream<unknown>,
   progressToken: string | number | undefined,
   startedAt: number,
 ): AsyncGenerator<string> {
   const items: unknown[] = [];
+  const reader = stream.getReader();
   try {
-    for await (const frame of readAbilityStreamFrames(body)) {
-      if ('item' in frame) {
-        items.push(frame.item);
-        if (progressToken !== undefined) {
-          yield sseEvent({ jsonrpc: '2.0', method: 'notifications/progress', params: { progress: items.length, progressToken } });
-        }
-        continue;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      items.push(value);
+      if (progressToken !== undefined) {
+        yield sseEvent({ jsonrpc: '2.0', method: 'notifications/progress', params: { progress: items.length, progressToken } });
       }
-      if ('done' in frame) {
-        logMcpCompleted(options, 'service_plane.mcp.tool.completed', { tool: name }, match, startedAt);
-        yield sseEvent({
-          id,
-          jsonrpc: '2.0',
-          result: {
-            content: [{ text: JSON.stringify({ items }), type: 'text' }],
-            structuredContent: { items },
-          },
-        });
-        return;
-      }
-      logMcpFailed(
-        options,
-        'service_plane.mcp.tool.failed',
-        { tool: name },
-        new CapabilityAuthError(frame.error.message, frame.error.status),
-        startedAt,
-      );
-      yield sseEvent({ id, jsonrpc: '2.0', result: { content: [{ text: frame.error.message, type: 'text' }], isError: true } });
-      return;
     }
-    throw new Error('Service-Plane ability stream ended without a terminal frame');
+    logMcpCompleted(options, 'service_plane.mcp.tool.completed', { tool: name }, match, startedAt);
+    yield sseEvent({
+      id,
+      jsonrpc: '2.0',
+      result: {
+        content: [{ text: JSON.stringify({ items }), type: 'text' }],
+        structuredContent: { items },
+      },
+    });
   } catch (error) {
     logMcpFailed(options, 'service_plane.mcp.tool.failed', { tool: name }, error, startedAt);
     yield sseEvent({
@@ -319,17 +301,9 @@ async function* streamToolEvents(
       jsonrpc: '2.0',
       result: { content: [{ text: error instanceof Error ? error.message : String(error), type: 'text' }], isError: true },
     });
+  } finally {
+    void reader.cancel().catch(() => undefined);
   }
-}
-
-async function upstreamStreamError(response: Response): Promise<string> {
-  try {
-    const parsed: unknown = await response.json();
-    if (isRecord(parsed) && typeof parsed.error === 'string') return parsed.error;
-  } catch {
-    // fall through to the generic message
-  }
-  return `Service-Plane ability stream request failed: ${response.status}`;
 }
 
 function progressTokenOf(params: unknown): string | number | undefined {
@@ -576,6 +550,17 @@ function authorizePublishedAbility(ability: DiscoveredServiceAbility, caller: Br
 }
 
 function transportForAbility(ability: DiscoveredServiceAbility) {
+  // Streaming methods need a session transport: prefer the endpoint's native ability RPC
+  // binding, then WebSocket. Falling through to HTTP-batch keeps unary methods working; the
+  // service rejects streaming calls there with a clear 405.
+  if (Object.values(ability.methods).some((method) => method.stream)) {
+    if (ability.service.abilityRpc && ability.rpc.transports.includes('cloudflare-binding-rpc')) {
+      return cloudflareNativeRpc(ability.service.abilityRpc);
+    }
+    if (ability.rpc.transports.includes('websocket')) {
+      return websocketRpc(new URL(ability.rpc.path, ability.service.origin.replace(/^http/u, 'ws')).toString());
+    }
+  }
   if (ability.rpc.transports.includes('http-batch')) {
     return cloudflareServiceBindingRpc(ability.service, ability.rpc.path, ability.service.origin);
   }

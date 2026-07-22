@@ -2,7 +2,6 @@ import { RpcTarget } from 'capnweb';
 import type { Context, Env } from 'hono';
 import * as z from 'zod';
 import { AbilityValidationError, CapabilityAuthError } from '../shared/errors.js';
-import { abilityStreamPath } from '../shared/stream.js';
 import {
   type AbilityAccess,
   type AbilityExposure,
@@ -33,8 +32,8 @@ export type AbilityMethodDefinition<TInput extends AbilitySchema = AbilitySchema
   output: TOutput;
   rest?: ServiceAbilityRestProjection;
   scopes?: string[];
-  // Streaming methods yield many `output`-shaped items over the ability stream path instead of
-  // returning one value; `output` validates each item.
+  // Streaming methods return a ReadableStream of `output`-shaped items over the ordinary
+  // Cap'n Web session instead of one value; `output` validates each item.
   stream?: true;
 };
 
@@ -65,11 +64,12 @@ export type AbilityImplementation<TAbility extends ServiceAbilityDefinition> = {
         | z.output<TAbility['methods'][TMethod]['output']>;
 };
 
-// Streaming methods are not part of the Cap'n Web surface; call them with `abilityStream`.
+// Streaming methods resolve to a native Cap'n Web ReadableStream of validated items; they
+// require a session transport (WebSocket, native binding, custom bidirectional).
 export type AbilityRpc<TAbility extends ServiceAbilityDefinition> = {
-  [TMethod in keyof TAbility['methods'] as TAbility['methods'][TMethod] extends { stream: true } ? never : TMethod]: (
-    input: z.input<TAbility['methods'][TMethod]['input']>,
-  ) => Promise<z.output<TAbility['methods'][TMethod]['output']>>;
+  [TMethod in keyof TAbility['methods']]: TAbility['methods'][TMethod] extends { stream: true }
+    ? (input: z.input<TAbility['methods'][TMethod]['input']>) => Promise<ReadableStream<z.output<TAbility['methods'][TMethod]['output']>>>
+    : (input: z.input<TAbility['methods'][TMethod]['input']>) => Promise<z.output<TAbility['methods'][TMethod]['output']>>;
 };
 
 export type ServiceAbilityHandlerFactory<TEnv extends Env = Env> = (
@@ -111,7 +111,6 @@ export type NormalizedServiceAbility<TEnv extends Env = Env> = Omit<
   methods: Record<string, NormalizedAbilityMethodDefinition>;
   rpc: {
     path: string;
-    streamPath?: string;
     transports: AbilityTransport[];
   };
   scopes: string[];
@@ -178,11 +177,19 @@ export function defaultAbilityRpcPath(abilityId: string): string {
   return `/rpc/${abilityId}`;
 }
 
+export type CreateValidatingAbilityHandlerOptions = {
+  // Cap'n Web streams need an ongoing session. HTTP-batch shells must pass false so streaming
+  // methods fail with a clear 405 instead of a dangling stream stub after the batch ends.
+  allowStreaming?: boolean;
+};
+
 export function createValidatingAbilityHandler<TEnv extends Env>(
   ability: NormalizedServiceAbility<TEnv>,
   handler: RpcTarget & Record<string, unknown>,
   identity: CapabilityIdentity,
+  options: CreateValidatingAbilityHandlerOptions = {},
 ): RpcTarget {
+  const allowStreaming = options.allowStreaming ?? true;
   // A handler instance carries one caller's identity; a factory that returns a shared
   // instance would let concurrent sessions overwrite each other's identity and scopes.
   if (capabilityIdentity(handler)) {
@@ -194,8 +201,11 @@ export function createValidatingAbilityHandler<TEnv extends Env>(
     async invoke(methodName: string, args: unknown[]): Promise<unknown> {
       const method = ability.methods[methodName];
       if (!method) throw new AbilityValidationError(`Unknown Service-Plane ability method: ${methodName}`, 404);
-      if (method.stream) {
-        throw new AbilityValidationError(`Service-Plane streaming method requires the ability stream transport: ${methodName}`, 405);
+      if (method.stream && !allowStreaming) {
+        throw new AbilityValidationError(
+          `Service-Plane streaming method requires a session transport (WebSocket, native binding, or custom bidirectional): ${methodName}`,
+          405,
+        );
       }
       if (args.length !== 1) {
         throw new AbilityValidationError(`Service-Plane ability method expects a single input object: ${methodName}`, 422);
@@ -209,6 +219,9 @@ export function createValidatingAbilityHandler<TEnv extends Env>(
 
       const input = await method.input.parseAsync(args[0]);
       const output = await implementation.call(handler, input);
+      // Streaming methods return their items as a native Cap'n Web ReadableStream, validated
+      // one item at a time as the consumer pulls.
+      if (method.stream) return validatedAbilityItemStream(method, methodName, output);
       return method.output.parseAsync(output);
     }
   }
@@ -224,35 +237,27 @@ export function createValidatingAbilityHandler<TEnv extends Env>(
   return bindCapabilityIdentity(new ValidatingAbilityHandler(), identity);
 }
 
-// Streaming counterpart of createValidatingAbilityHandler: performs the same identity binding,
-// scope, and input checks up front (so failures map to HTTP statuses before the response body
-// starts), then validates each streamed item against the method output schema.
-export async function openStreamingAbilityMethod<TEnv extends Env>(
-  ability: NormalizedServiceAbility<TEnv>,
-  handler: RpcTarget & Record<string, unknown>,
-  identity: CapabilityIdentity,
+// Wraps a handler's stream source into a ReadableStream that validates each item lazily, so
+// backpressure from the consumer reaches the handler's generator untouched.
+function validatedAbilityItemStream(
+  method: NormalizedAbilityMethodDefinition,
   methodName: string,
-  rawInput: unknown,
-): Promise<AsyncGenerator<unknown>> {
-  const method = ability.methods[methodName];
-  if (!method) throw new AbilityValidationError(`Unknown Service-Plane ability method: ${methodName}`, 404);
-  if (!method.stream) {
-    throw new AbilityValidationError(`Service-Plane ability method does not stream: ${methodName}`, 405);
-  }
-  if (capabilityIdentity(handler)) {
-    throw new CapabilityAuthError(`Service-Plane ability handler factory must return a new instance per call: ${ability.id}`, 500);
-  }
-  bindCapabilityIdentity(handler, identity);
-  requireScopes(handler, ...method.scopes);
-
-  const implementation = handler[methodName];
-  if (typeof implementation !== 'function') {
-    throw new AbilityValidationError(`Service-Plane ability handler does not implement method: ${methodName}`, 500);
-  }
-
-  const input = await method.input.parseAsync(rawInput);
-  const source = await implementation.call(handler, input);
-  return validateStreamItems(method, methodName, source);
+  source: unknown,
+): ReadableStream<unknown> {
+  const items = validateStreamItems(method, methodName, source);
+  return new ReadableStream<unknown>({
+    async cancel() {
+      await items.return?.(undefined);
+    },
+    async pull(controller) {
+      const next = await items.next();
+      if (next.done) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(next.value);
+    },
+  });
 }
 
 async function* validateStreamItems(
@@ -325,11 +330,18 @@ function normalizeAbilities<TEnv extends Env>(
     const path = normalizePath(ability.rpc?.path ?? defaultAbilityRpcPath(id), id);
     if (seenPaths.has(path)) throw new CapabilityAuthError(`Duplicate Service-Plane ability RPC path: ${path}`, 500);
     seenPaths.add(path);
-    // The stream path is derived from the RPC path, so it must be collision-checked like one.
-    const streamPath = Object.values(methods).some((method) => method.stream) ? abilityStreamPath(path) : undefined;
-    if (streamPath) {
-      if (seenPaths.has(streamPath)) throw new CapabilityAuthError(`Duplicate Service-Plane ability RPC path: ${streamPath}`, 500);
-      seenPaths.add(streamPath);
+    const transports = normalizeAbilityTransports(ability.rpc?.transports ?? ['http-batch']);
+    // Cap'n Web streams need an ongoing session; the one-round-trip HTTP-batch transport
+    // cannot carry them, so fail at setup instead of at the first streamed call.
+    if (
+      Object.values(methods).some((method) => method.stream) &&
+      !transports.includes('websocket') &&
+      !transports.includes('cloudflare-binding-rpc')
+    ) {
+      throw new CapabilityAuthError(
+        `Service-Plane ability with streaming methods must enable a session transport (websocket or cloudflare-binding-rpc): ${id}`,
+        500,
+      );
     }
 
     return {
@@ -340,8 +352,7 @@ function normalizeAbilities<TEnv extends Env>(
       methods,
       rpc: {
         path,
-        ...(streamPath ? { streamPath } : {}),
-        transports: normalizeAbilityTransports(ability.rpc?.transports ?? ['http-batch']),
+        transports,
       },
       scopes,
     };
@@ -379,8 +390,13 @@ function normalizeMethods(
       validateMethodScopesDeclaredByAbility(abilityId, name, scopes, abilityScopes);
       if (method.stream && (method.mcpPrompt || method.mcpResource)) {
         // MCP prompts and resources are single-response protocol surfaces; only tools can
-        // route through the streaming lane.
+        // be backed by streaming methods.
         throw new CapabilityAuthError(`Service-Plane streaming method cannot project an MCP prompt or resource: ${abilityId}/${name}`, 500);
+      }
+      if (method.stream && method.rest) {
+        // The generated OpenAPI documents request/response operations; a streamed return has
+        // no REST serving semantics here.
+        throw new CapabilityAuthError(`Service-Plane streaming method cannot project a REST operation: ${abilityId}/${name}`, 500);
       }
       const rest = method.rest ? normalizeRestProjection(abilityId, name, method.rest) : undefined;
       const mcp = method.mcp ? normalizeMcpProjection(abilityId, name, method.mcp) : undefined;

@@ -8,13 +8,8 @@ import {
   RpcTarget,
   type RpcTransport,
 } from 'capnweb';
-import {
-  decodeCapabilityTokenPayload,
-  normalizeCapabilitySubject,
-  servicePlaneAuthorization,
-  verifyCapabilityToken,
-} from '../shared/capability-tokens.js';
-import { CapabilityAuthError, ServicePlaneError } from '../shared/errors.js';
+import { decodeCapabilityTokenPayload, normalizeCapabilitySubject, verifyCapabilityToken } from '../shared/capability-tokens.js';
+import { CapabilityAuthError } from '../shared/errors.js';
 import { SERVICE_PLANE_HMAC_CLIENT_HEADER, SERVICE_PLANE_HMAC_TIMESTAMP_HEADER, signServicePlaneHmacRequest } from '../shared/hmac-auth.js';
 import {
   SERVICE_PLANE_JWK_ASSERTION_AUDIENCE,
@@ -22,7 +17,6 @@ import {
   SERVICE_PLANE_JWK_KEY_ID_HEADER,
   signServicePlaneJwkRequest,
 } from '../shared/jwk-auth.js';
-import { abilityStreamPath, readAbilityStreamFrames } from '../shared/stream.js';
 import {
   type CapabilityCatalog,
   type CapabilityIdentity,
@@ -359,85 +353,6 @@ export async function capabilityRpcSession<Scoped extends RpcCompatible<Scoped>>
 
 export function abilitySession<Scoped extends RpcCompatible<Scoped>>(options: AbilitySessionOptions<Scoped>): Promise<RpcStub<Scoped>> {
   return capabilityRpcSession(options);
-}
-
-export type AbilityStreamOptions = (
-  | (CreateCapabilityTokenProviderOptions & { tokenProvider?: undefined })
-  | ({ tokenProvider: CapabilityTokenProvider } & Pick<
-      CreateCapabilityTokenProviderOptions,
-      'callerServiceId' | 'scopes' | 'targetServiceId'
-    >)
-) & {
-  abilityId?: string;
-  input?: unknown;
-  method: string;
-  requestId?: string;
-  requestIdHeaderName?: string;
-  signal?: AbortSignal;
-  transport: CapabilityRpcTransport;
-};
-
-// Calls one streaming ability method over the ability's HTTP stream path and yields each
-// item as the service emits it. Items are already output-validated by the service; a stream
-// that ends without a terminal frame is surfaced as an error, not silently truncated.
-export async function* abilityStream<TItem = unknown>(options: AbilityStreamOptions): AsyncGenerator<TItem, void, undefined> {
-  const tokenProvider = options.tokenProvider ?? createCapabilityTokenProvider(options as CreateCapabilityTokenProviderOptions);
-  const target = abilityStreamTarget(options.transport, options.abilityId);
-  const headers = new Headers({
-    authorization: servicePlaneAuthorization(await tokenProvider.token()),
-    'content-type': 'application/json',
-  });
-  if (options.requestId) headers.set(options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER, options.requestId);
-
-  const response = await target.fetcher(
-    new Request(target.url, {
-      body: JSON.stringify({ ...(options.input === undefined ? {} : { input: options.input }), method: options.method }),
-      headers,
-      method: 'POST',
-      ...(options.signal ? { signal: options.signal } : {}),
-    }),
-  );
-  if (!response.ok) {
-    void response.body?.cancel().catch(() => undefined);
-    throw new CapabilityAuthError(`Service-Plane ability stream request failed: ${response.status}`, response.status);
-  }
-  if (!response.body) throw new ServicePlaneError('Service-Plane ability stream response has no body', 502);
-
-  for await (const frame of readAbilityStreamFrames(response.body)) {
-    if ('item' in frame) {
-      yield frame.item as TItem;
-      continue;
-    }
-    if ('done' in frame) return;
-    throw new ServicePlaneError(frame.error.message, frame.error.status);
-  }
-  throw new ServicePlaneError('Service-Plane ability stream ended without a terminal frame', 502);
-}
-
-function abilityStreamTarget(
-  transport: CapabilityRpcTransport,
-  abilityId: string | undefined,
-): { fetcher: (request: Request) => Promise<Response>; url: string } {
-  if (transport.kind === 'fetch') {
-    return {
-      fetcher: (request) => transport.fetcher.fetch(request),
-      url: appendStreamSegment(fetchTransportUrl(transport, abilityId)),
-    };
-  }
-  if (transport.kind === 'http-batch') {
-    const base = httpBatchUrl(transport, abilityId);
-    return {
-      fetcher: (request) => fetch(request),
-      url: appendStreamSegment(base instanceof Request ? base.url : base),
-    };
-  }
-  throw new CapabilityAuthError('Service-Plane ability streaming requires an HTTP transport', 500);
-}
-
-function appendStreamSegment(url: string): string {
-  const parsed = new URL(url);
-  parsed.pathname = abilityStreamPath(parsed.pathname);
-  return parsed.toString();
 }
 
 export function httpBatchRpc(url: Request | string | URL, path?: string): CapabilityRpcTransport {

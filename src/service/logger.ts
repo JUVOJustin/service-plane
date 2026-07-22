@@ -53,9 +53,7 @@ export function servicePlaneLogger(service: ServiceDefinition, options: ServiceP
   return createMiddleware(async (context, next) => {
     const startedAt = Date.now();
     const url = new URL(context.req.url);
-    const ability = discovery.abilities.find(
-      (candidate) => candidate.rpc.path === url.pathname || candidate.rpc.streamPath === url.pathname,
-    );
+    const ability = discovery.abilities.find((candidate) => candidate.rpc.path === url.pathname);
     const requestId = resolveRequestId(context, options);
 
     try {

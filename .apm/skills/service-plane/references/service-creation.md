@@ -125,7 +125,7 @@ async *readFile(input: { path: string }) {
 }
 ```
 
-Streaming methods are served on `POST {rpc.path}/stream` (NDJSON) instead of the Cap'n Web session, with the same token, ingress, scope, and input validation. Callers use `abilityStream(...)` rather than `abilitySession(...)`. See [reference](reference.md#streaming-methods) for the wire protocol.
+Callers receive a native Cap'n Web `ReadableStream` of validated items from the ordinary `abilitySession` call. Streams need an ongoing session, so the ability must enable a session transport (`websocket` or `cloudflare-binding-rpc`); HTTP-batch calls to streaming methods fail with 405. See [reference](reference.md#streaming-methods).
 
 `context` is runtime access, such as Hono context, environment bindings, storage, and execution context.
 

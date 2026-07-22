@@ -1,22 +1,32 @@
+import { RpcSession } from 'capnweb';
 import { describe, expect, it } from 'vitest';
 import * as z from 'zod';
 import { createCapabilityIssuer, defineServiceGrants } from '../control-plane/capabilities.js';
-import { publicJwkFromPrivateJwk, servicePlaneAuthorization } from '../shared/capability-tokens.js';
-import { ServicePlaneError } from '../shared/errors.js';
-import { SERVICE_PLANE_STREAM_CONTENT_TYPE } from '../shared/stream.js';
+import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
+import { memoryRpcTransportPair } from '../testing/memory-transport.js';
 import {
   abilitySession,
-  abilityStream,
+  cloudflareNativeRpc,
   cloudflareServiceBindingRpc,
+  customRpcTransport,
   defineCapabilities,
   RpcTarget,
   requireScopes,
 } from './capabilities.js';
-import { type AbilityRpc, abilityMethod, defineAbility, defineAbilityService } from './discovery.js';
+import { abilityMethod, defineAbility, defineAbilityService } from './discovery.js';
 import { ServicePlaneService } from './service.js';
 
 const ISSUED_AT = new Date('2026-07-22T12:00:00.000Z');
 const VERIFIED_AT = new Date('2026-07-22T12:00:01.000Z');
+
+type StreamItem = { caller: string; index: number };
+
+type StreamAbilityRpc = {
+  badItem(input: Record<string, never>): Promise<ReadableStream<StreamItem>>;
+  failMid(input: Record<string, never>): Promise<ReadableStream<StreamItem>>;
+  listChunks(input: { count: number }): Promise<ReadableStream<StreamItem>>;
+  single(input: Record<string, never>): Promise<{ ok: boolean }>;
+};
 
 class StreamApi extends RpcTarget {
   async *listChunks(input: { count: number }) {
@@ -68,6 +78,7 @@ function streamAbility() {
         scopes: ['example.read'],
       }),
     },
+    rpc: { transports: ['http-batch', 'cloudflare-binding-rpc'] },
     scopes: ['example.read'],
     handler: () => new StreamApi() as StreamApi & Record<string, unknown>,
   });
@@ -104,31 +115,21 @@ async function createFixture(options: { ingress?: boolean } = {}) {
     scopes: ['example.read'],
     targetServiceId: 'example',
   });
-  const binding = { fetch: (request: Request) => service.fetch(request) };
-  return { binding, issued, issuer, service };
+  return { issued, issuer, service };
 }
 
-function streamOptions(fixture: Awaited<ReturnType<typeof createFixture>>, method: string, input?: unknown) {
-  return {
-    abilityId: 'example.stream',
-    callerServiceId: 'worker-a',
-    ...(input === undefined ? {} : { input }),
-    method,
-    requestToken: async () => fixture.issued,
-    scopes: ['example.read'],
-    targetServiceId: 'example',
-    transport: cloudflareServiceBindingRpc(fixture.binding, undefined, 'https://example.internal'),
-  };
-}
-
-async function collect<T>(iterable: AsyncGenerator<T>): Promise<T[]> {
+async function drainStream<T>(stream: ReadableStream<T>): Promise<T[]> {
+  const reader = stream.getReader();
   const items: T[] = [];
-  for await (const item of iterable) items.push(item);
-  return items;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) return items;
+    items.push(value as T);
+  }
 }
 
 describe('streaming ability methods', () => {
-  it('advertises the stream contract in discovery', () => {
+  it('advertises streaming methods in discovery', () => {
     const definition = defineAbilityService({
       abilities: [streamAbility()],
       capabilities: defineCapabilities({ scopes: [{ id: 'example.read' }], serviceId: 'example' }),
@@ -137,13 +138,12 @@ describe('streaming ability methods', () => {
       version: '0.1.0',
     });
     const ability = definition.abilities[0];
-    expect(ability?.rpc.streamPath).toBe('/rpc/example.stream/stream');
     expect(ability?.methods.listChunks?.stream).toBe(true);
     expect(ability?.methods.single?.stream).toBeUndefined();
   });
 
-  it('rejects streaming methods that project MCP prompts or resources', () => {
-    expect(() =>
+  it('rejects streaming methods that project MCP prompts, resources, or REST', () => {
+    const define = (extra: Record<string, unknown>) => () =>
       defineAbilityService({
         abilities: [
           defineAbility({
@@ -151,12 +151,44 @@ describe('streaming ability methods', () => {
             methods: {
               stream: abilityMethod({
                 input: z.object({}),
-                mcpResource: { name: 'nope', uri: 'example://nope' },
+                output: z.object({}),
+                scopes: ['example.read'],
+                stream: true,
+                ...extra,
+              }),
+            },
+            rpc: { transports: ['websocket'] },
+            scopes: ['example.read'],
+            handler: () => new StreamApi() as StreamApi & Record<string, unknown>,
+          }),
+        ],
+        capabilities: defineCapabilities({ scopes: [{ id: 'example.read' }], serviceId: 'example' }),
+        id: 'example',
+        title: 'Example',
+        version: '0.1.0',
+      });
+    expect(define({ mcpResource: { name: 'nope', uri: 'example://nope' } })).toThrow(
+      'Service-Plane streaming method cannot project an MCP prompt or resource',
+    );
+    expect(define({ mcpPrompt: { name: 'nope' } })).toThrow('Service-Plane streaming method cannot project an MCP prompt or resource');
+    expect(define({ rest: { method: 'post', path: '/nope' } })).toThrow('Service-Plane streaming method cannot project a REST operation');
+  });
+
+  it('requires a session transport for abilities with streaming methods', () => {
+    expect(() =>
+      defineAbilityService({
+        abilities: [
+          defineAbility({
+            id: 'example.batch-only',
+            methods: {
+              stream: abilityMethod({
+                input: z.object({}),
                 output: z.object({}),
                 scopes: ['example.read'],
                 stream: true,
               }),
             },
+            rpc: { transports: ['http-batch'] },
             scopes: ['example.read'],
             handler: () => new StreamApi() as StreamApi & Record<string, unknown>,
           }),
@@ -166,105 +198,98 @@ describe('streaming ability methods', () => {
         title: 'Example',
         version: '0.1.0',
       }),
-    ).toThrow('Service-Plane streaming method cannot project an MCP prompt or resource');
+    ).toThrow('Service-Plane ability with streaming methods must enable a session transport');
   });
 
-  it('streams validated items and a terminal done frame end to end', async () => {
+  it('streams validated items natively over the binding RPC session', async () => {
     const fixture = await createFixture();
-    const items = await collect(abilityStream(streamOptions(fixture, 'listChunks', { count: 3 })));
-    expect(items).toEqual([
+    const api = await abilitySession<StreamAbilityRpc>({
+      abilityId: 'example.stream',
+      callerServiceId: 'worker-a',
+      requestToken: async () => fixture.issued,
+      scopes: ['example.read'],
+      targetServiceId: 'example',
+      transport: cloudflareNativeRpc(fixture.service),
+    });
+
+    const stream = await api.listChunks({ count: 3 });
+    expect(stream).toBeInstanceOf(ReadableStream);
+    await expect(drainStream(stream)).resolves.toEqual([
       { caller: 'worker-a', index: 0 },
       { caller: 'worker-a', index: 1 },
       { caller: 'worker-a', index: 2 },
     ]);
   });
 
-  it('rejects streaming methods over the Cap’n Web transport', async () => {
+  it('streams validated items over a real Cap’n Web session transport', async () => {
     const fixture = await createFixture();
-    const api = await abilitySession<
-      AbilityRpc<ReturnType<typeof streamAbility>> & { listChunks(input: { count: number }): Promise<unknown> }
-    >({
+
+    class SessionRoot extends RpcTarget {
+      authenticate(token: string) {
+        return fixture.service.connectAbility({ abilityId: 'example.stream', token });
+      }
+    }
+    const { left, right } = memoryRpcTransportPair();
+    new RpcSession(right, new SessionRoot());
+
+    const api = await abilitySession<StreamAbilityRpc>({
       abilityId: 'example.stream',
       callerServiceId: 'worker-a',
       requestToken: async () => fixture.issued,
       scopes: ['example.read'],
       targetServiceId: 'example',
-      transport: cloudflareServiceBindingRpc(fixture.binding, undefined, 'https://example.internal'),
+      transport: customRpcTransport(left),
     });
+
     await expect(api.single({})).resolves.toEqual({ ok: true });
-    await expect(api.listChunks({ count: 1 })).rejects.toThrow('Service-Plane streaming method requires the ability stream transport');
+    const stream = await api.listChunks({ count: 2 });
+    await expect(drainStream(stream)).resolves.toEqual([
+      { caller: 'worker-a', index: 0 },
+      { caller: 'worker-a', index: 1 },
+    ]);
   });
 
-  it('fails before the stream starts with real HTTP statuses', async () => {
+  it('rejects streaming methods over the one-round-trip HTTP-batch transport', async () => {
     const fixture = await createFixture();
-    const post = (body: unknown, token = fixture.issued.token) =>
-      fixture.service.fetch(
-        new Request('https://example.internal/rpc/example.stream/stream', {
-          body: JSON.stringify(body),
-          headers: { authorization: servicePlaneAuthorization(token), 'content-type': 'application/json' },
-          method: 'POST',
-        }),
-      );
+    const binding = { fetch: (request: Request) => fixture.service.fetch(request) };
+    const api = await abilitySession<StreamAbilityRpc>({
+      abilityId: 'example.stream',
+      callerServiceId: 'worker-a',
+      requestToken: async () => fixture.issued,
+      scopes: ['example.read'],
+      targetServiceId: 'example',
+      transport: cloudflareServiceBindingRpc(binding, undefined, 'https://example.internal'),
+    });
 
-    const unauthorized = await fixture.service.fetch(
-      new Request('https://example.internal/rpc/example.stream/stream', {
-        body: JSON.stringify({ input: { count: 1 }, method: 'listChunks' }),
-        method: 'POST',
-      }),
-    );
-    expect(unauthorized.status).toBe(401);
-
-    expect((await post({ input: {}, method: 'unknown' })).status).toBe(404);
-    expect((await post({ input: {}, method: 'single' })).status).toBe(405);
-    expect((await post({ input: { count: 'NaN' }, method: 'listChunks' })).status).toBe(422);
-    expect((await post({ input: {} })).status).toBe(400);
+    await expect(api.single({})).resolves.toEqual({ ok: true });
+    await expect(api.listChunks({ count: 1 })).rejects.toThrow('Service-Plane streaming method requires a session transport');
   });
 
-  it('reports mid-stream handler failures as terminal error frames', async () => {
+  it('propagates mid-stream handler failures and output validation errors through the stream', async () => {
     const fixture = await createFixture();
-    const iterator = abilityStream(streamOptions(fixture, 'failMid', {}));
-    const first = await iterator.next();
-    expect(first.value).toEqual({ caller: 'example', index: 0 });
-    await expect(iterator.next()).rejects.toThrow('stream exploded');
+    const api = await abilitySession<StreamAbilityRpc>({
+      abilityId: 'example.stream',
+      callerServiceId: 'worker-a',
+      requestToken: async () => fixture.issued,
+      scopes: ['example.read'],
+      targetServiceId: 'example',
+      transport: cloudflareNativeRpc(fixture.service),
+    });
+
+    const failing = await api.failMid({});
+    const failingReader = failing.getReader();
+    await expect(failingReader.read()).resolves.toEqual({ done: false, value: { caller: 'example', index: 0 } });
+    await expect(failingReader.read()).rejects.toThrow('stream exploded');
+
+    const invalid = await api.badItem({});
+    await expect(drainStream(invalid)).rejects.toThrow();
   });
 
-  it('reports invalid output items as terminal error frames with status 500', async () => {
-    const fixture = await createFixture();
-    const iterator = abilityStream(streamOptions(fixture, 'badItem', {}));
-    const error = await iterator.next().catch((caught: unknown) => caught);
-    expect(error).toBeInstanceOf(ServicePlaneError);
-    expect((error as ServicePlaneError).status).toBe(500);
-    expect((error as ServicePlaneError).message).toContain('output validation');
-  });
-
-  it('rejects direct stream calls when ingress protection is enabled', async () => {
+  it('rejects streaming connections without a brokered token when ingress protection is enabled', async () => {
     const fixture = await createFixture({ ingress: true });
-    const response = await fixture.service.fetch(
-      new Request('https://example.internal/rpc/example.stream/stream', {
-        body: JSON.stringify({ input: { count: 1 }, method: 'listChunks' }),
-        headers: { authorization: servicePlaneAuthorization(fixture.issued.token), 'content-type': 'application/json' },
-        method: 'POST',
-      }),
+    await expect(fixture.service.connectAbility({ abilityId: 'example.stream', token: fixture.issued.token })).rejects.toThrow(
+      'Service-Plane brokered capability token is required',
     );
-    expect(response.status).toBe(403);
-  });
-
-  it('serves the stream with the NDJSON content type', async () => {
-    const fixture = await createFixture();
-    const response = await fixture.service.fetch(
-      new Request('https://example.internal/rpc/example.stream/stream', {
-        body: JSON.stringify({ input: { count: 1 }, method: 'listChunks' }),
-        headers: { authorization: servicePlaneAuthorization(fixture.issued.token), 'content-type': 'application/json' },
-        method: 'POST',
-      }),
-    );
-    expect(response.status).toBe(200);
-    expect(response.headers.get('content-type')).toBe(SERVICE_PLANE_STREAM_CONTENT_TYPE);
-    const body = await response.text();
-    const lines = body.trim().split('\n');
-    expect(lines).toHaveLength(2);
-    expect(JSON.parse(lines[0] ?? '')).toEqual({ item: { caller: 'worker-a', index: 0 } });
-    expect(JSON.parse(lines[1] ?? '')).toEqual({ done: true });
   });
 });
 

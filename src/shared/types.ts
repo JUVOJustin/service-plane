@@ -34,8 +34,6 @@ export type OpenApiObject = Record<string, unknown>;
 
 export type ServiceAbilityRpcDiscovery = {
   path: string;
-  // Present when the ability declares streaming methods; they are served on this HTTP path.
-  streamPath?: string;
   transports: AbilityTransport[];
 };
 
@@ -84,8 +82,8 @@ export type ServiceAbilityMethodDiscovery = {
   outputSchema: OpenApiObject;
   rest?: ServiceAbilityRestProjection;
   scopes: string[];
-  // Streaming methods return many output items over the ability stream path; `outputSchema`
-  // then describes one streamed item, not the whole response.
+  // Streaming methods return a ReadableStream of output items over a Cap'n Web session
+  // transport; `outputSchema` then describes one streamed item, not the whole response.
   stream?: true;
 };
 
@@ -132,7 +130,19 @@ export type ServiceGrantDefinition = {
   grants: ServiceGrant[];
 };
 
+// Native ability RPC surface a service can expose next to `fetch` (e.g. a Cloudflare
+// WorkerEntrypoint forwarding to ServicePlaneService.connectAbility). Session-shaped, so
+// streaming method returns flow through it natively.
+export type ServiceAbilityNativeRpcBinding = {
+  connectAbility(input: {
+    abilityId: string;
+    requestId?: string;
+    token: string;
+  }): Promise<Record<string, unknown>> | Record<string, unknown>;
+};
+
 export type ServiceEndpoint = {
+  abilityRpc?: ServiceAbilityNativeRpcBinding;
   discovery?: ServiceDiscoveryDocument | (() => Promise<ServiceDiscoveryDocument> | ServiceDiscoveryDocument);
   fetch(request: Request): Promise<Response>;
   grants?: ServiceEndpointGrant[];

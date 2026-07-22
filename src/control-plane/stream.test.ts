@@ -1,11 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import * as z from 'zod';
 import { abilityMethod, defineAbility, defineCapabilities, RpcTarget, requireScopes, ServicePlaneService } from '../service/index.js';
-import { type CapabilityJwks, SERVICE_PLANE_CAPABILITY_JWKS_PATH, SERVICE_PLANE_MCP_PATH } from '../shared/types.js';
-import type { BrokerCaller } from './broker.js';
-import { ServicePlaneControlPlane } from './control-plane.js';
+import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
+import { createControlPlaneRpcBroker } from './broker.js';
+import { createCapabilityIssuer, defineServiceGrants } from './capabilities.js';
 import { cloudflareServiceBinding } from './endpoints.js';
-import { generateCapabilitySigningSecret } from './signing-secret.js';
+import { handleControlPlaneMcpRequest } from './mcp.js';
+import { createServiceRegistry } from './registry.js';
+
+const ISSUED_AT = new Date('2026-07-22T12:00:00.000Z');
+const VERIFIED_AT = new Date('2026-07-22T12:00:01.000Z');
 
 class HubApi extends RpcTarget {
   async *readFile(input: { parts: number }) {
@@ -21,14 +25,25 @@ class HubApi extends RpcTarget {
 }
 
 type FixtureOptions = {
-  caller?: BrokerCaller | undefined;
   ingress?: boolean;
-  omitCallerResolver?: boolean;
+  // Drop connectAbility from the endpoint so only HTTP-batch remains reachable.
+  withoutNativeRpc?: boolean;
 };
 
 async function createFixture(options: FixtureOptions = {}) {
+  const keys = await testKeys();
   const capabilities = defineCapabilities({ scopes: [{ id: 'hub.read' }], serviceId: 'hub' });
-  let plane: ServicePlaneControlPlane | undefined;
+  const issuer = createCapabilityIssuer({
+    capabilities: [capabilities],
+    grants: defineServiceGrants({
+      grants: [{ caller: 'control-plane', scopes: ['hub.read'], target: 'hub' }],
+    }),
+    issuer: 'control-plane',
+    keyId: 'test-key',
+    now: () => ISSUED_AT,
+    privateJwk: keys.privateJwk,
+  });
+
   const service = new ServicePlaneService({
     abilities: [
       defineAbility({
@@ -50,17 +65,15 @@ async function createFixture(options: FixtureOptions = {}) {
             scopes: ['hub.read'],
           }),
         },
+        rpc: { transports: ['http-batch', 'cloudflare-binding-rpc'] },
         scopes: ['hub.read'],
         handler: () => new HubApi() as HubApi & Record<string, unknown>,
       }),
     ],
     auth: {
-      issuer: 'https://issuer.example',
-      jwks: async () => {
-        if (!plane) throw new Error('Control plane is not initialized');
-        const response = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_CAPABILITY_JWKS_PATH}`));
-        return response.json() as Promise<CapabilityJwks>;
-      },
+      issuer: 'control-plane',
+      jwks: { keys: [keys.publicJwk] },
+      now: () => VERIFIED_AT,
     },
     capabilities,
     id: 'hub',
@@ -69,48 +82,44 @@ async function createFixture(options: FixtureOptions = {}) {
     version: '0.1.0',
   });
 
-  const signingSecret = await generateCapabilitySigningSecret();
-  plane = new ServicePlaneControlPlane({
-    broker: options.omitCallerResolver ? {} : { caller: () => options.caller ?? { id: 'user-1', kind: 'user' } },
-    issuer: 'https://issuer.example',
-    log: false,
-    mcp: { caller: () => options.caller ?? { id: 'user-1', kind: 'user' } },
-    services: () => [
-      cloudflareServiceBinding({
-        binding: { fetch: (request) => service.fetch(request) },
-        grants: [{ caller: 'control-plane', scopes: ['hub.read'] }],
-        id: 'hub',
-        origin: 'https://hub.internal',
-      }),
-    ],
-    signingSecret: () => signingSecret,
+  const endpoint = cloudflareServiceBinding({
+    binding: options.withoutNativeRpc
+      ? { fetch: (request: Request) => service.fetch(request) }
+      : {
+          connectAbility: (input: { abilityId: string; requestId?: string; token: string }) => service.connectAbility(input),
+          fetch: (request: Request) => service.fetch(request),
+        },
+    id: 'hub',
+    origin: 'https://hub.internal',
   });
+  const registry = createServiceRegistry({ services: [endpoint] });
 
-  const boundPlane = plane;
-  const streamRequest = (body: unknown) =>
-    boundPlane.fetch(
-      new Request('https://plane.internal/rpc/broker/stream', {
-        body: JSON.stringify(body),
-        headers: { 'content-type': 'application/json' },
-        method: 'POST',
-      }),
-    );
   const mcpRequest = (body: unknown) =>
-    boundPlane.fetch(
-      new Request(`https://plane.internal${SERVICE_PLANE_MCP_PATH}`, {
+    handleControlPlaneMcpRequest(
+      new Request('https://plane.internal/rpc/mcp', {
         body: JSON.stringify(body),
         headers: { 'content-type': 'application/json' },
         method: 'POST',
       }),
+      {
+        caller: { id: 'user-1', kind: 'user' },
+        controlPlaneServiceId: 'control-plane',
+        issuer,
+        registry,
+      },
     );
-  return { mcpRequest, plane: boundPlane, streamRequest };
+
+  return { issuer, mcpRequest, registry, service };
 }
 
-function parseNdjson(body: string): unknown[] {
-  return body
-    .trim()
-    .split('\n')
-    .map((line) => JSON.parse(line));
+async function drainStream<T>(stream: ReadableStream<T>): Promise<T[]> {
+  const reader = stream.getReader();
+  const items: T[] = [];
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) return items;
+    items.push(value as T);
+  }
 }
 
 function parseSse(body: string): unknown[] {
@@ -120,70 +129,24 @@ function parseSse(body: string): unknown[] {
     .map((block) => JSON.parse(block.slice('data: '.length)));
 }
 
-describe('control-plane broker stream lane', () => {
-  it('pipes a brokered NDJSON stream through the control plane', async () => {
-    const { streamRequest } = await createFixture({ ingress: true });
-    const response = await streamRequest({
-      abilityId: 'hub.files',
-      input: { parts: 2 },
-      method: 'readFile',
-      scopes: ['hub.read'],
-      serviceId: 'hub',
+describe('brokered streaming abilities', () => {
+  it('proxies a native ReadableStream through the broker for an ingress-protected service', async () => {
+    const fixture = await createFixture({ ingress: true });
+    const broker = createControlPlaneRpcBroker({
+      controlPlaneServiceId: 'control-plane',
+      issuer: fixture.issuer,
+      registry: fixture.registry,
     });
-    expect(response.status).toBe(200);
-    expect(response.headers.get('content-type')).toBe('application/x-ndjson');
-    expect(parseNdjson(await response.text())).toEqual([{ item: { chunk: 'part-0' } }, { item: { chunk: 'part-1' } }, { done: true }]);
-  });
 
-  it('fails closed without a caller resolver and rejects anonymous callers', async () => {
-    const unconfigured = await createFixture({ omitCallerResolver: true });
-    const noResolver = await unconfigured.streamRequest({
-      abilityId: 'hub.files',
-      method: 'readFile',
-      scopes: ['hub.read'],
-      serviceId: 'hub',
-    });
-    expect(noResolver.status).toBe(500);
-
-    const anonymous = await createFixture({ caller: undefined });
-    // The fixture defaults to a user caller when options.caller is undefined, so build one that
-    // explicitly returns no caller.
-    const rejecting = new ServicePlaneControlPlane({
-      broker: { caller: () => undefined },
-      services: () => [],
-      signingSecret: async () => generateCapabilitySigningSecret(),
-    });
-    const response = await rejecting.fetch(
-      new Request('https://plane.internal/rpc/broker/stream', {
-        body: JSON.stringify({ abilityId: 'hub.files', method: 'readFile', scopes: ['hub.read'], serviceId: 'hub' }),
-        headers: { 'content-type': 'application/json' },
-        method: 'POST',
-      }),
-    );
-    expect(response.status).toBe(401);
-    expect(anonymous.plane).toBeDefined();
-  });
-
-  it('rejects undeclared scopes and non-streaming methods', async () => {
-    const { streamRequest } = await createFixture();
-    const badScope = await streamRequest({
-      abilityId: 'hub.files',
-      method: 'readFile',
-      scopes: ['hub.write'],
-      serviceId: 'hub',
-    });
-    expect(badScope.status).toBe(403);
-
-    const notStreaming = await streamRequest({
-      abilityId: 'hub.files',
-      method: 'stat',
-      scopes: ['hub.read'],
-      serviceId: 'hub',
-    });
-    expect(notStreaming.status).toBe(405);
-
-    const invalid = await streamRequest({ abilityId: 'hub.files', serviceId: 'hub' });
-    expect(invalid.status).toBe(400);
+    type Brokered = {
+      connect(scopes: string[]): Promise<{ readFile(input: { parts: number }): Promise<ReadableStream<{ chunk: string }>> }>;
+    };
+    const root = broker.rootCapability({ id: 'user-1', kind: 'user' }) as unknown as {
+      ability(serviceId: string, abilityId: string): Promise<Brokered>;
+    };
+    const api = await (await root.ability('hub', 'hub.files')).connect(['hub.read']);
+    const stream = await api.readFile({ parts: 2 });
+    await expect(drainStream(stream)).resolves.toEqual([{ chunk: 'part-0' }, { chunk: 'part-1' }]);
   });
 });
 
@@ -243,7 +206,7 @@ describe('control-plane MCP streaming tools', () => {
     expect(events[0]).toMatchObject({ id: 8, result: { structuredContent: { items: [{ chunk: 'part-0' }] } } });
   });
 
-  it('reports upstream stream failures as in-band tool errors', async () => {
+  it('reports invalid input as an in-band tool error before any stream starts', async () => {
     const { mcpRequest } = await createFixture();
     const response = await mcpRequest({
       id: 9,
@@ -251,7 +214,40 @@ describe('control-plane MCP streaming tools', () => {
       method: 'tools/call',
       params: { arguments: { parts: 'NaN' }, name: 'hub_read_file' },
     });
+    expect(response.headers.get('content-type')).toContain('application/json');
     const parsed = (await response.json()) as { result: { isError?: boolean } };
     expect(parsed.result.isError).toBe(true);
   });
+
+  it('degrades to an in-band error when the endpoint has no session transport', async () => {
+    const { mcpRequest } = await createFixture({ withoutNativeRpc: true });
+    const response = await mcpRequest({
+      id: 10,
+      jsonrpc: '2.0',
+      method: 'tools/call',
+      params: { arguments: { parts: 1 }, name: 'hub_read_file' },
+    });
+    const parsed = (await response.json()) as { result: { content: Array<{ text: string }>; isError?: boolean } };
+    expect(parsed.result.isError).toBe(true);
+    expect(parsed.result.content[0]?.text).toContain('session transport');
+
+    // Unary tools on the same ability keep working over HTTP-batch.
+    const unary = await mcpRequest({
+      id: 11,
+      jsonrpc: '2.0',
+      method: 'tools/call',
+      params: { arguments: {}, name: 'hub_stat' },
+    });
+    const unaryParsed = (await unary.json()) as { result: { structuredContent?: unknown } };
+    expect(unaryParsed.result.structuredContent).toEqual({ size: 3 });
+  });
 });
+
+async function testKeys() {
+  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+  const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
+  return {
+    privateJwk,
+    publicJwk: publicJwkFromPrivateJwk(privateJwk, 'test-key'),
+  };
+}

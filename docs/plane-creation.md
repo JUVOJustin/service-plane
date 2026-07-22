@@ -147,6 +147,6 @@ broker.ability('asana', 'asana.tasks').connect(['asana.tasks.write']);
 
 When service-plane ingress protection is enabled, callers must use the broker or another approved service-plane component that can mint brokered capability tokens.
 
-Streaming ability methods cannot ride the Cap'n Web broker session, so the broker also mounts `POST {path}/stream` (default `/rpc/broker/stream`) with the same fail-closed caller resolution. The request body is `{ serviceId, abilityId, method, scopes, input }`; the plane authorizes the caller, mints the (brokered) token, and pipes the service's NDJSON stream through without buffering. See [reference](reference.md#streaming-methods) for the frame protocol.
+Streaming ability methods proxy through the broker as native Cap'n Web `ReadableStream`s: connect to the broker over WebSocket (`upgradeWebSocket`), and the plane reaches the service over its own session transport — the endpoint's native ability RPC binding when available (a binding exposing `connectAbility` is picked up automatically by `cloudflareServiceBinding`), otherwise WebSocket. See [reference](reference.md#streaming-methods).
 
 Next: [auth](auth.md), [OpenAPI and MCP](openapi-mcp.md), and [Cloudflare](cloudflare.md).

@@ -46,7 +46,7 @@ OpenAPI includes methods when both are true:
 
 The request and response schemas come from the method's Zod input and output schemas through generated JSON Schema. The control plane only produces the document — it does not bundle a documentation UI.
 
-Streaming methods (`stream: true`) document their `200` response as `application/x-ndjson` with the item schema, and their `x-service-plane` extension carries `stream: true`.
+Streaming methods (`stream: true`) cannot declare `rest` metadata — the generated OpenAPI documents request/response operations only.
 
 ## Docs UI
 
@@ -116,7 +116,7 @@ Every projected entry carries its Service Plane routing metadata (service, abili
 
 `mcp: { name, description? }` projects a method as a tool. The tool's input and output schemas come from the method's Zod schemas. Results carry the method output as `structuredContent` plus a serialized `text` content block. Handler failures are reported in-band with `isError: true` per the MCP spec; unknown tools and authorization failures are JSON-RPC errors.
 
-Streaming methods (`stream: true`) can project tools too. Their `tools/call` responds over SSE per MCP streamable HTTP: while items arrive, the plane emits `notifications/progress` events (when the client sent `_meta.progressToken`), and the final response aggregates the items as `structuredContent: { items }` — MCP defines exactly one response per request, so the tool schema advertises the aggregated `{ items }` shape and `_meta.servicePlane.stream` marks the tool. Unbuffered transfer of very large streams belongs on the broker stream lane, not on MCP. Streaming methods cannot project resources or prompts (single-response surfaces); the service rejects such definitions at setup.
+Streaming methods (`stream: true`) can project tools too. The plane opens the backing ability over a session transport (the endpoint's native ability RPC binding, then WebSocket) and answers `tools/call` over SSE per MCP streamable HTTP: while items arrive, it emits `notifications/progress` events (when the client sent `_meta.progressToken`), and the final response aggregates the items as `structuredContent: { items }` — MCP defines exactly one response per request, so the tool schema advertises the aggregated `{ items }` shape and `_meta.servicePlane.stream` marks the tool. Unbuffered transfer of very large streams belongs on a direct or brokered Cap'n Web session, not on MCP. Streaming methods cannot project resources or prompts (single-response surfaces); the service rejects such definitions at setup.
 
 ### Resources
 

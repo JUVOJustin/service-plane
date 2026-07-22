@@ -13,13 +13,6 @@ export {
   type ServicePlaneLoggableEvent,
   type ServicePlaneLogSink,
 } from '../shared/logging.js';
-export {
-  type AbilityStreamFrame,
-  abilityStreamPath,
-  encodeAbilityStreamFrame,
-  readAbilityStreamFrames,
-  SERVICE_PLANE_STREAM_CONTENT_TYPE,
-} from '../shared/stream.js';
 export type {
   AbilityAccess,
   AbilityExposure,
@@ -78,14 +71,10 @@ export {
 } from '../shared/types.js';
 export {
   type BrokerCaller,
-  type BrokerStreamHandlerOptions,
   brokerCallerSubject,
   type ControlPlaneRpcBroker,
   type CreateControlPlaneRpcBrokerOptions,
   createControlPlaneRpcBroker,
-  handleBrokerStreamRequest,
-  type OpenBrokeredAbilityStreamInput,
-  openBrokeredAbilityStream,
 } from './broker.js';
 export {
   generateHmacClientSecret,
