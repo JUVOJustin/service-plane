@@ -9,7 +9,6 @@ import {
   abilitySession,
   cloudflareNativeRpc,
   cloudflareServiceBindingRpc,
-  coalesceAbilityStream,
   customRpcTransport,
   defineAbility,
   defineCapabilities,
@@ -24,7 +23,11 @@ import { memoryRpcTransportPair } from './testing/index.js';
 // isolate CPU cost per call/item (token crypto, Cap'n Web serialization, Zod validation).
 // Run with `npm run bench`.
 
-const STREAM_ITEMS = 1000;
+// 100k token deltas by default (BENCH_STREAM_ITEMS overrides); unary benches sample for
+// several seconds to wash out one-time effects (JIT, key import, first-fetch caches).
+const STREAM_ITEMS = Number(process.env.BENCH_STREAM_ITEMS ?? 100_000);
+const UNARY_BENCH = { time: 2_000, warmupTime: 250 };
+const STREAM_BENCH = { time: 5_000, warmupIterations: 1 };
 const PROMPT = { prompt: 'Explain how streaming works in one paragraph.' };
 const DELTAS = Array.from({ length: STREAM_ITEMS }, (_, index) => ({ delta: `token-${index} lorem ipsum `, index }));
 const COMPLETION = DELTAS.map((item) => item.delta).join('');
@@ -94,8 +97,9 @@ const llmAbility = defineAbility({
       scopes: ['llm.call'],
     }),
     streamCoalesced: abilityMethod({
+      coalesce: { maxBufferedBytes: 2048, maxWaitMs: 50 },
       input: z.object({}),
-      output: z.array(z.object({ delta: z.string(), index: z.number() })),
+      output: z.object({ delta: z.string(), index: z.number() }),
       scopes: ['llm.call'],
       stream: true,
     }),
@@ -123,9 +127,9 @@ class LlmHandler extends RpcTarget {
   }
 
   streamCoalesced(_input: Record<string, never>) {
-    // Time-or-size flush: 2 KiB or 50 ms, whichever comes first. With an instant producer the
-    // byte cap triggers, turning ~1000 messages into a few dozen.
-    return coalesceAbilityStream(rawDeltaStream(), { maxBufferedBytes: 2048, maxWaitMs: 50 });
+    // Declarative coalescing (see the method definition): the handler yields plain items and
+    // the wrapper batches them — 2 KiB or 50 ms, whichever comes first.
+    return rawDeltaStream();
   }
 
   streamLoose(_input: Record<string, never>) {
@@ -251,56 +255,102 @@ type BrokerPipeline = {
 };
 
 describe(`unary completion: website -> worker (HTTP)`, () => {
-  bench('native hono fetch (baseline)', async () => {
-    const response = await nativeApp.fetch(new Request('https://hub.internal/complete', { body: JSON.stringify(PROMPT), method: 'POST' }));
-    await response.json();
-  });
+  bench(
+    'native hono fetch (baseline)',
+    async () => {
+      const response = await nativeApp.fetch(
+        new Request('https://hub.internal/complete', { body: JSON.stringify(PROMPT), method: 'POST' }),
+      );
+      await response.json();
+    },
+    UNARY_BENCH,
+  );
 
-  bench('service-plane direct (HTTP-batch, token verify per call)', async () => {
-    await directHttpApi.complete(PROMPT);
-  });
+  bench(
+    'service-plane direct (HTTP-batch, token verify per call)',
+    async () => {
+      await directHttpApi.complete(PROMPT);
+    },
+    UNARY_BENCH,
+  );
 
-  bench('service-plane via control-plane broker (HTTP-batch, pipelined)', async () => {
-    const root = newHttpBatchRpcSession<Record<string, never>>('https://plane.internal/rpc/broker') as unknown as BrokerPipeline;
-    await root.ability('hub', 'hub.llm').connect(['llm.call']).complete(PROMPT);
-  });
+  bench(
+    'service-plane via control-plane broker (HTTP-batch, pipelined)',
+    async () => {
+      const root = newHttpBatchRpcSession<Record<string, never>>('https://plane.internal/rpc/broker') as unknown as BrokerPipeline;
+      await root.ability('hub', 'hub.llm').connect(['llm.call']).complete(PROMPT);
+    },
+    UNARY_BENCH,
+  );
 });
 
 describe(`unary completion: persistent session (≈WebSocket, in-memory)`, () => {
-  bench('raw capnweb session (baseline)', async () => {
-    await rawApi.complete(PROMPT);
-  });
+  bench(
+    'raw capnweb session (baseline)',
+    async () => {
+      await rawApi.complete(PROMPT);
+    },
+    UNARY_BENCH,
+  );
 
-  bench('service-plane session (validated)', async () => {
-    await sessionApi.complete(PROMPT);
-  });
+  bench(
+    'service-plane session (validated)',
+    async () => {
+      await sessionApi.complete(PROMPT);
+    },
+    UNARY_BENCH,
+  );
 });
 
 describe(`stream ${STREAM_ITEMS} LLM token deltas`, () => {
-  bench('native hono ReadableStream over fetch (baseline)', async () => {
-    const response = await nativeApp.fetch(new Request('https://hub.internal/stream', { method: 'POST' }));
-    if (!response.body) throw new Error('no body');
-    await drain(response.body);
-  });
+  bench(
+    'native hono ReadableStream over fetch (baseline)',
+    async () => {
+      const response = await nativeApp.fetch(new Request('https://hub.internal/stream', { method: 'POST' }));
+      if (!response.body) throw new Error('no body');
+      await drain(response.body);
+    },
+    STREAM_BENCH,
+  );
 
-  bench('raw capnweb stream over session (baseline)', async () => {
-    // Cast: raw capnweb's own types cannot express typed item streams (see PR notes).
-    await drain((await rawApi.streamTokens()) as unknown as ReadableStream<unknown>);
-  });
+  bench(
+    'raw capnweb stream over session (baseline)',
+    async () => {
+      // Cast: raw capnweb's own types cannot express typed item streams (see PR notes).
+      await drain((await rawApi.streamTokens()) as unknown as ReadableStream<unknown>);
+    },
+    STREAM_BENCH,
+  );
 
-  bench('service-plane session (validated per item)', async () => {
-    await drain(await sessionApi.streamTokens({}));
-  });
+  bench(
+    'service-plane session (validated per item)',
+    async () => {
+      await drain(await sessionApi.streamTokens({}));
+    },
+    STREAM_BENCH,
+  );
 
-  bench('service-plane session (schema z.unknown)', async () => {
-    await drain(await sessionApi.streamLoose({}));
-  });
+  bench(
+    'service-plane session (schema z.unknown)',
+    async () => {
+      await drain(await sessionApi.streamLoose({}));
+    },
+    STREAM_BENCH,
+  );
 
-  bench('service-plane session (coalesced 2 KiB / 50 ms batches)', async () => {
-    await drain(await sessionApi.streamCoalesced({}));
-  });
+  bench(
+    'service-plane session (coalesced 2 KiB / 50 ms batches)',
+    async () => {
+      await drain(await sessionApi.streamCoalesced({}));
+    },
+    STREAM_BENCH,
+  );
 
-  bench('service-plane native binding (validated, in-process)', async () => {
-    await drain(await nativeRpcApi.streamTokens({}));
-  });
+  bench(
+    'service-plane native binding (validated, in-process)',
+    async () => {
+      await drain(await nativeRpcApi.streamTokens({}));
+    },
+    STREAM_BENCH,
+  );
 });

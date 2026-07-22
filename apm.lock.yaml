@@ -82,7 +82,7 @@ deployments:
   owners:
   - .
   active_owner: .
-  content_hash: sha256:c4491804c3acac55899a59459406d8d087b9e51dc6a102a307f73e5a3a501a93
+  content_hash: sha256:3b1f6a92987a157a95982a461444fd063c19702d0ce3802d318d1ec04b454bf8
 - kind: project-relative
   target: agents
   value: .agents/skills/service-plane/references/service-creation.md
@@ -100,7 +100,7 @@ deployments:
   owners:
   - .
   active_owner: .
-  content_hash: sha256:93c8122cda2e9b0cd2ce6a306183fdc5d01b3cfd2561e69a3d698b236c2a4736
+  content_hash: sha256:4400e1a2a3a03c56430a24d157f87a0263e7a0b499d5c50b4bcfab9722fc39b5
 - kind: project-relative
   target: claude
   value: .claude/skills/service-plane
@@ -181,7 +181,7 @@ deployments:
   owners:
   - .
   active_owner: .
-  content_hash: sha256:c4491804c3acac55899a59459406d8d087b9e51dc6a102a307f73e5a3a501a93
+  content_hash: sha256:3b1f6a92987a157a95982a461444fd063c19702d0ce3802d318d1ec04b454bf8
 - kind: project-relative
   target: claude
   value: .claude/skills/service-plane/references/service-creation.md
@@ -199,7 +199,7 @@ deployments:
   owners:
   - .
   active_owner: .
-  content_hash: sha256:93c8122cda2e9b0cd2ce6a306183fdc5d01b3cfd2561e69a3d698b236c2a4736
+  content_hash: sha256:4400e1a2a3a03c56430a24d157f87a0263e7a0b499d5c50b4bcfab9722fc39b5
 local_deployed_files:
 - .agents/skills/service-plane
 - .agents/skills/service-plane/SKILL.md
@@ -231,9 +231,9 @@ local_deployed_file_hashes:
   .agents/skills/service-plane/references/nodejs.md: sha256:3f1544e419bfdb7040ac8eb616309e19d9ec8d6958b1681c27b0a1be30bb485d
   .agents/skills/service-plane/references/openapi-mcp.md: sha256:eb2f91e55d34e0d058b3c60833446ad4c2d6991c847bc9172a59246d20a01331
   .agents/skills/service-plane/references/plane-creation.md: sha256:babc016cd2dbbf120f59c2f622f1a9e756965da6fc8869ffb3d571f7d91c43b2
-  .agents/skills/service-plane/references/reference.md: sha256:c4491804c3acac55899a59459406d8d087b9e51dc6a102a307f73e5a3a501a93
+  .agents/skills/service-plane/references/reference.md: sha256:3b1f6a92987a157a95982a461444fd063c19702d0ce3802d318d1ec04b454bf8
   .agents/skills/service-plane/references/service-creation.md: sha256:75a56a94a0aeecd5460e393797f8796bfcb54bac1385c3dc659554336cf428eb
-  .agents/skills/service-plane/references/streaming.md: sha256:93c8122cda2e9b0cd2ce6a306183fdc5d01b3cfd2561e69a3d698b236c2a4736
+  .agents/skills/service-plane/references/streaming.md: sha256:4400e1a2a3a03c56430a24d157f87a0263e7a0b499d5c50b4bcfab9722fc39b5
   .claude/skills/service-plane/SKILL.md: sha256:afc831a6bf201beecc2f6a9c7a26458c29db99f15dac2ae1e198c5edcfa06aef
   .claude/skills/service-plane/references/architecture.md: sha256:4fe781c1ee9cd2ff29d5fa5f8f44e4927296d01b6ea4167203c3192dec73775e
   .claude/skills/service-plane/references/auth.md: sha256:52496dfafd4acf18d3e1dcc12e11e8960d767374d8ac6035a6643127ca701830
@@ -241,6 +241,6 @@ local_deployed_file_hashes:
   .claude/skills/service-plane/references/nodejs.md: sha256:3f1544e419bfdb7040ac8eb616309e19d9ec8d6958b1681c27b0a1be30bb485d
   .claude/skills/service-plane/references/openapi-mcp.md: sha256:eb2f91e55d34e0d058b3c60833446ad4c2d6991c847bc9172a59246d20a01331
   .claude/skills/service-plane/references/plane-creation.md: sha256:babc016cd2dbbf120f59c2f622f1a9e756965da6fc8869ffb3d571f7d91c43b2
-  .claude/skills/service-plane/references/reference.md: sha256:c4491804c3acac55899a59459406d8d087b9e51dc6a102a307f73e5a3a501a93
+  .claude/skills/service-plane/references/reference.md: sha256:3b1f6a92987a157a95982a461444fd063c19702d0ce3802d318d1ec04b454bf8
   .claude/skills/service-plane/references/service-creation.md: sha256:75a56a94a0aeecd5460e393797f8796bfcb54bac1385c3dc659554336cf428eb
-  .claude/skills/service-plane/references/streaming.md: sha256:93c8122cda2e9b0cd2ce6a306183fdc5d01b3cfd2561e69a3d698b236c2a4736
+  .claude/skills/service-plane/references/streaming.md: sha256:4400e1a2a3a03c56430a24d157f87a0263e7a0b499d5c50b4bcfab9722fc39b5

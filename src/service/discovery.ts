@@ -25,6 +25,10 @@ import { bindCapabilityIdentity, capabilityIdentity, requireScopes } from './cap
 export type AbilitySchema = z.ZodType;
 
 export type AbilityMethodDefinition<TInput extends AbilitySchema = AbilitySchema, TOutput extends AbilitySchema = AbilitySchema> = {
+  // Streaming only: the wrapper batches validated items into arrays automatically, flushing
+  // on whichever limit is hit first (byte size, item count, wait time). The wire then carries
+  // `output[]` items — callers see the batches, since the saving must exist on the wire.
+  coalesce?: CoalesceAbilityStreamOptions<z.output<TOutput>>;
   input: TInput;
   mcp?: ServiceAbilityMcpProjection;
   mcpPrompt?: ServiceAbilityMcpPromptProjection;
@@ -70,9 +74,16 @@ export type AbilityImplementation<TAbility extends ServiceAbilityDefinition> = {
 // require a session transport (WebSocket, native binding, custom bidirectional).
 export type AbilityRpc<TAbility extends ServiceAbilityDefinition> = {
   [TMethod in keyof TAbility['methods']]: TAbility['methods'][TMethod] extends { stream: true }
-    ? (input: z.input<TAbility['methods'][TMethod]['input']>) => Promise<ReadableStream<z.output<TAbility['methods'][TMethod]['output']>>>
+    ? (
+        input: z.input<TAbility['methods'][TMethod]['input']>,
+      ) => Promise<ReadableStream<AbilityStreamWireItem<TAbility['methods'][TMethod]>>>
     : (input: z.input<TAbility['methods'][TMethod]['input']>) => Promise<z.output<TAbility['methods'][TMethod]['output']>>;
 };
+
+// Coalesced streaming methods put `output[]` batches on the wire; plain ones put single items.
+type AbilityStreamWireItem<TMethod extends AbilityMethodDefinition> = TMethod extends { coalesce: object }
+  ? z.output<TMethod['output']>[]
+  : z.output<TMethod['output']>;
 
 export type ServiceAbilityHandlerFactory<TEnv extends Env = Env> = (
   input: ServiceAbilityHandlerFactoryInput<TEnv>,
@@ -240,13 +251,20 @@ export function createValidatingAbilityHandler<TEnv extends Env>(
 }
 
 // Wraps a handler's stream source into a ReadableStream that validates each item lazily, so
-// backpressure from the consumer reaches the handler's generator untouched.
+// backpressure from the consumer reaches the handler's generator untouched. When the method
+// declares `coalesce`, validated items are batched into arrays before hitting the wire.
 function validatedAbilityItemStream(
   method: NormalizedAbilityMethodDefinition,
   methodName: string,
   source: unknown,
 ): ReadableStream<unknown> {
   const puller = abilityStreamPuller(source, methodName);
+  const validated = async (): Promise<IteratorResult<unknown>> => {
+    const next = await puller.next();
+    if (next.done) return next;
+    return { done: false, value: await method.output.parseAsync(next.value) };
+  };
+  const items = method.coalesce ? coalesceResults(validated, method.coalesce as CoalesceAbilityStreamOptions<unknown>) : undefined;
   return new ReadableStream<unknown>({
     cancel(reason) {
       // Cancel the underlying source directly and without awaiting: an async generator's
@@ -255,12 +273,12 @@ function validatedAbilityItemStream(
       puller.cancel(reason);
     },
     async pull(controller) {
-      const next = await puller.next();
+      const next = items ? await items.next() : await validated();
       if (next.done) {
         controller.close();
         return;
       }
-      controller.enqueue(await method.output.parseAsync(next.value));
+      controller.enqueue(next.value);
     },
   });
 }
@@ -284,11 +302,22 @@ export async function* coalesceAbilityStream<TItem>(
   source: AbilityStreamSource<TItem>,
   options: CoalesceAbilityStreamOptions<TItem> = {},
 ): AsyncGenerator<TItem[], void, undefined> {
+  const puller = abilityStreamPuller(source, 'coalesceAbilityStream');
+  try {
+    yield* coalesceResults(() => puller.next(), options);
+  } finally {
+    puller.cancel();
+  }
+}
+
+async function* coalesceResults<TItem>(
+  next: () => Promise<IteratorResult<unknown>>,
+  options: CoalesceAbilityStreamOptions<TItem>,
+): AsyncGenerator<TItem[], void, undefined> {
   const maxBufferedBytes = options.maxBufferedBytes ?? 2048;
   const maxItems = options.maxItems ?? Number.POSITIVE_INFINITY;
   const maxWaitMs = options.maxWaitMs ?? 50;
   const sizeOf = options.sizeOf ?? ((item: TItem) => JSON.stringify(item).length);
-  const puller = abilityStreamPuller(source, 'coalesceAbilityStream');
 
   let batch: TItem[] = [];
   let batchBytes = 0;
@@ -302,34 +331,30 @@ export async function* coalesceAbilityStream<TItem>(
     return flushed;
   };
 
-  try {
-    while (true) {
-      pending ??= puller.next();
-      let result: IteratorResult<unknown>;
-      if (batch.length === 0) {
-        result = await pending;
-      } else {
-        const waited = await raceWithDeadline(pending, deadline);
-        if (waited === FLUSH_DEADLINE) {
-          yield flush();
-          continue;
-        }
-        result = waited;
+  while (true) {
+    pending ??= next();
+    let result: IteratorResult<unknown>;
+    if (batch.length === 0) {
+      result = await pending;
+    } else {
+      const waited = await raceWithDeadline(pending, deadline);
+      if (waited === FLUSH_DEADLINE) {
+        yield flush();
+        continue;
       }
-      pending = undefined;
-
-      if (result.done) {
-        if (batch.length > 0) yield flush();
-        return;
-      }
-      const item = result.value as TItem;
-      if (batch.length === 0) deadline = Date.now() + maxWaitMs;
-      batch.push(item);
-      batchBytes += sizeOf(item);
-      if (batchBytes >= maxBufferedBytes || batch.length >= maxItems) yield flush();
+      result = waited;
     }
-  } finally {
-    puller.cancel();
+    pending = undefined;
+
+    if (result.done) {
+      if (batch.length > 0) yield flush();
+      return;
+    }
+    const item = result.value as TItem;
+    if (batch.length === 0) deadline = Date.now() + maxWaitMs;
+    batch.push(item);
+    batchBytes += sizeOf(item);
+    if (batchBytes >= maxBufferedBytes || batch.length >= maxItems) yield flush();
   }
 }
 
@@ -498,6 +523,9 @@ function normalizeMethods(
         // be backed by streaming methods.
         throw new CapabilityAuthError(`Service-Plane streaming method cannot project an MCP prompt or resource: ${abilityId}/${name}`, 500);
       }
+      if (method.coalesce && !method.stream) {
+        throw new CapabilityAuthError(`Service-Plane ability method coalesce requires stream: true: ${abilityId}/${name}`, 500);
+      }
       if (method.stream && method.rest) {
         // The generated OpenAPI documents request/response operations; a streamed return has
         // no REST serving semantics here.
@@ -555,6 +583,7 @@ function abilityDiscovery<TEnv extends Env>(ability: NormalizedServiceAbility<TE
           ...(method.mcp ? { mcp: method.mcp } : {}),
           ...(method.mcpPrompt ? { mcpPrompt: method.mcpPrompt } : {}),
           ...(method.mcpResource ? { mcpResource: method.mcpResource } : {}),
+          ...(method.coalesce ? { coalesced: true as const } : {}),
           outputSchema: method.outputSchema,
           ...(method.rest ? { rest: method.rest } : {}),
           scopes: method.scopes,

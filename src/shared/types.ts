@@ -75,6 +75,8 @@ export type ServiceAbilityMcpPromptProjection = {
 };
 
 export type ServiceAbilityMethodDiscovery = {
+  // Streaming only: wire items are `outputSchema[]` batches produced by declarative coalescing.
+  coalesced?: true;
   inputSchema: OpenApiObject;
   mcp?: ServiceAbilityMcpProjection;
   mcpPrompt?: ServiceAbilityMcpPromptProjection;

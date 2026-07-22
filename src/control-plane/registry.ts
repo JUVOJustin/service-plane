@@ -205,6 +205,7 @@ function isAbilityMethodDiscovery(value: unknown): value is ServiceAbilityMethod
     isRecord(value.inputSchema) &&
     isRecord(value.outputSchema) &&
     (value.stream === undefined || value.stream === true) &&
+    (value.coalesced === undefined || value.coalesced === true) &&
     (value.rest === undefined ||
       (isRecord(value.rest) &&
         isHttpMethod(value.rest.method) &&

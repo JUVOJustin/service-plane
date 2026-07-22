@@ -130,29 +130,23 @@ Ingress-protected services work unchanged: the broker's token carries the signed
 
 ## High-Frequency Streams
 
-Per-item cost is CPU, not waiting: validation runs on one item as it passes through (microseconds), and Cap'n Web serializes one message per item per hop. Cost therefore scales with **message rate × hops** — and serialization dominates, not validation (`npm run bench` compares native baselines against every library path; with 1000 token-sized items per stream, disabling validation changes almost nothing, while batching items changes everything).
+Per-item cost is CPU, not waiting: validation runs on one item as it passes through (microseconds), and Cap'n Web serializes one message per item per hop. Cost therefore scales with **message rate × hops** — and serialization dominates, not validation (`npm run bench` streams 100,000 token-sized items per iteration against native baselines; disabling validation changes almost nothing, while batching items changes everything).
 
-For LLM-style token streams, coalesce deltas instead of sending one message per token. `coalesceAbilityStream` batches a source into arrays and flushes on whichever limit is hit first — byte size, item count, or wait time — so large items flush early instead of piling up in memory, and slow producers still deliver with bounded latency:
+For LLM-style token streams, coalesce deltas instead of sending one message per token. Declare it on the method — the handler keeps yielding plain items and the wrapper batches them automatically, flushing on whichever limit is hit first (byte size, item count, or wait time), so large items flush early instead of piling up in memory while slow producers still deliver with bounded latency:
 
 ```ts
 streamCompletion: abilityMethod({
+  coalesce: { maxBufferedBytes: 2048, maxWaitMs: 50 }, // 2 KiB or 50 ms, whichever first
   input: z.object({ prompt: z.string() }),
-  output: z.array(z.object({ delta: z.string() })), // the batch is the item
+  output: z.object({ delta: z.string() }), // still validates one item
   scopes: ['llm.call'],
   stream: true,
 }),
 ```
 
-```ts
-streamCompletion(input: { prompt: string }) {
-  return coalesceAbilityStream(this.llm.tokens(input.prompt), {
-    maxBufferedBytes: 2048, // flush when the pending batch reaches 2 KiB…
-    maxWaitMs: 50,          // …or 50 ms after its first item, whichever comes first
-  });
-}
-```
+The wire then carries `output[]` batches: callers receive `ReadableStream<Item[]>` (typed by `AbilityRpc`), discovery marks the method `coalesced: true`, and MCP tool results are flattened back to plain items. Callers see the batches by design — the saving has to exist on the wire, and unwrapping them invisibly would mean a hidden envelope protocol. For custom pipelines outside the wrapper, the standalone `coalesceAbilityStream(source, options)` helper does the same batching.
 
-In the benchmark this turns a 1000-message stream into ~24 messages and cuts end-to-end stream cost by ~4.7×, close to the native-binding floor.
+In the benchmark (100,000 deltas per stream), coalescing turns ~100k messages into ~2,400 and cuts end-to-end stream cost ~4× (807 ms → 204 ms per stream), approaching the native-binding floor (121 ms).
 
 Two more levers for hot paths:
 

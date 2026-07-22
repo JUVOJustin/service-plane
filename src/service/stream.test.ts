@@ -360,6 +360,101 @@ describe('streaming ability methods', () => {
   });
 });
 
+describe('declarative coalescing', () => {
+  class BatchApi extends RpcTarget {
+    async *chunks(input: { count: number }) {
+      for (let index = 0; index < input.count; index += 1) {
+        yield { index };
+      }
+    }
+  }
+
+  function batchAbility() {
+    return defineAbility({
+      id: 'example.batch',
+      methods: {
+        chunks: abilityMethod({
+          coalesce: { maxBufferedBytes: 1_000_000, maxItems: 2, maxWaitMs: 5_000 },
+          input: z.object({ count: z.number() }),
+          output: z.object({ index: z.number() }),
+          scopes: ['example.read'],
+          stream: true,
+        }),
+      },
+      rpc: { transports: ['cloudflare-binding-rpc'] },
+      scopes: ['example.read'],
+      handler: () => new BatchApi() as BatchApi & Record<string, unknown>,
+    });
+  }
+
+  it('batches validated items automatically and marks discovery', async () => {
+    const keys = await testKeys();
+    const capabilities = defineCapabilities({ scopes: [{ id: 'example.read' }], serviceId: 'example' });
+    const issuer = createCapabilityIssuer({
+      capabilities: [capabilities],
+      grants: defineServiceGrants({ grants: [{ caller: 'worker-a', scopes: ['example.read'], target: 'example' }] }),
+      issuer: 'control-plane',
+      keyId: 'test-key',
+      now: () => ISSUED_AT,
+      privateJwk: keys.privateJwk,
+    });
+    const service = new ServicePlaneService({
+      abilities: [batchAbility()],
+      auth: { issuer: 'control-plane', jwks: { keys: [keys.publicJwk] }, now: () => VERIFIED_AT },
+      capabilities,
+      id: 'example',
+      title: 'Example',
+      version: '0.1.0',
+    });
+    const issued = await issuer.issueCapabilityToken({
+      callerServiceId: 'worker-a',
+      scopes: ['example.read'],
+      targetServiceId: 'example',
+    });
+
+    const discovery = await (await service.fetch(new Request('https://example.internal/.well-known/service-plane/service.json'))).json();
+    expect(discovery).toMatchObject({ abilities: [{ methods: { chunks: { coalesced: true, stream: true } } }] });
+
+    const api = await abilitySession<AbilityRpc<ReturnType<typeof batchAbility>>>({
+      abilityId: 'example.batch',
+      callerServiceId: 'worker-a',
+      requestToken: async () => issued,
+      scopes: ['example.read'],
+      targetServiceId: 'example',
+      transport: cloudflareNativeRpc(service),
+    });
+    const stream = await api.chunks({ count: 5 });
+    expectTypeOf(stream).toEqualTypeOf<ReadableStream<{ index: number }[]>>();
+    await expect(drainStream(stream)).resolves.toEqual([[{ index: 0 }, { index: 1 }], [{ index: 2 }, { index: 3 }], [{ index: 4 }]]);
+  });
+
+  it('rejects coalesce on non-streaming methods', () => {
+    expect(() =>
+      defineAbilityService({
+        abilities: [
+          defineAbility({
+            id: 'example.bad',
+            methods: {
+              single: abilityMethod({
+                coalesce: { maxItems: 2 },
+                input: z.object({}),
+                output: z.object({}),
+                scopes: ['example.read'],
+              }),
+            },
+            scopes: ['example.read'],
+            handler: () => new BatchApi() as BatchApi & Record<string, unknown>,
+          }),
+        ],
+        capabilities: defineCapabilities({ scopes: [{ id: 'example.read' }], serviceId: 'example' }),
+        id: 'example',
+        title: 'Example',
+        version: '0.1.0',
+      }),
+    ).toThrow('Service-Plane ability method coalesce requires stream: true');
+  });
+});
+
 describe('coalesceAbilityStream', () => {
   it('flushes on the byte cap before the wait window when items pile up', async () => {
     async function* fast() {
