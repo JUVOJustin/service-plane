@@ -45,6 +45,7 @@
     "format": "biome format --write .",
     "lint": "biome lint .",
     "sync:skill-docs": "cp docs/*.md .apm/skills/service-plane/references/",
+    "bench": "vitest bench --run",
     "test": "vitest run",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
     "prepare": "npm run build",

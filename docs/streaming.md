@@ -128,6 +128,37 @@ const stream = await api.readFile({ path: '/big.bin' });
 
 Ingress-protected services work unchanged: the broker's token carries the signed broker claim, and the stream flows service → plane → caller with flow control on each hop.
 
+## High-Frequency Streams
+
+Per-item cost is CPU, not waiting: validation runs on one item as it passes through (microseconds), and Cap'n Web serializes one message per item per hop. Cost therefore scales with **message rate × hops** — and serialization dominates, not validation (`npm run bench` compares native baselines against every library path; with 1000 token-sized items per stream, disabling validation changes almost nothing, while batching items changes everything).
+
+For LLM-style token streams, coalesce deltas instead of sending one message per token. `coalesceAbilityStream` batches a source into arrays and flushes on whichever limit is hit first — byte size, item count, or wait time — so large items flush early instead of piling up in memory, and slow producers still deliver with bounded latency:
+
+```ts
+streamCompletion: abilityMethod({
+  input: z.object({ prompt: z.string() }),
+  output: z.array(z.object({ delta: z.string() })), // the batch is the item
+  scopes: ['llm.call'],
+  stream: true,
+}),
+```
+
+```ts
+streamCompletion(input: { prompt: string }) {
+  return coalesceAbilityStream(this.llm.tokens(input.prompt), {
+    maxBufferedBytes: 2048, // flush when the pending batch reaches 2 KiB…
+    maxWaitMs: 50,          // …or 50 ms after its first item, whichever comes first
+  });
+}
+```
+
+In the benchmark this turns a 1000-message stream into ~24 messages and cuts end-to-end stream cost by ~4.7×, close to the native-binding floor.
+
+Two more levers for hot paths:
+
+- **Keep the plane out of the data path.** The plane is a control plane: it mints the token, and the caller opens a direct session to the service (`websocketRpc`, `cloudflareNativeRpc`). Route through the broker only when you need it — ingress-protected services, or callers that must never hold tokens. Direct-vs-brokered is an explicit choice, not a hidden mode.
+- **Prefer persistent sessions over HTTP-batch for chatty callers.** A batch call verifies the capability token per request; a session verifies once at `authenticate` and then costs microseconds per call.
+
 ## MCP Streaming Tools
 
 Published streaming methods with `mcp` metadata become tools whose `tools/call` answers over SSE per MCP streamable HTTP: progress notifications while items arrive, then one final result aggregating `structuredContent: { items }`. See [OpenAPI and MCP](openapi-mcp.md#tools).

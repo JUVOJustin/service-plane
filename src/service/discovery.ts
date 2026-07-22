@@ -265,6 +265,95 @@ function validatedAbilityItemStream(
   });
 }
 
+export type CoalesceAbilityStreamOptions<TItem> = {
+  // Flush when the buffered batch reaches this many serialized bytes, even if the wait window
+  // has not elapsed — large items must not pile up in memory behind the timer.
+  maxBufferedBytes?: number;
+  maxItems?: number;
+  // Flush at the latest this long after the first buffered item, so slow producers still
+  // deliver with bounded latency.
+  maxWaitMs?: number;
+  sizeOf?: (item: TItem) => number;
+};
+
+// Batches a high-frequency item source (e.g. LLM token deltas) into arrays, flushing on
+// whichever limit is hit first: byte size, item count, or wait time. Wire cost per item —
+// serialization, framing, validation — scales with message count, so coalescing shrinks all
+// of it proportionally. Declare the method's output schema as the batch shape (an array).
+export async function* coalesceAbilityStream<TItem>(
+  source: AbilityStreamSource<TItem>,
+  options: CoalesceAbilityStreamOptions<TItem> = {},
+): AsyncGenerator<TItem[], void, undefined> {
+  const maxBufferedBytes = options.maxBufferedBytes ?? 2048;
+  const maxItems = options.maxItems ?? Number.POSITIVE_INFINITY;
+  const maxWaitMs = options.maxWaitMs ?? 50;
+  const sizeOf = options.sizeOf ?? ((item: TItem) => JSON.stringify(item).length);
+  const puller = abilityStreamPuller(source, 'coalesceAbilityStream');
+
+  let batch: TItem[] = [];
+  let batchBytes = 0;
+  let deadline = 0;
+  let pending: Promise<IteratorResult<unknown>> | undefined;
+
+  const flush = (): TItem[] => {
+    const flushed = batch;
+    batch = [];
+    batchBytes = 0;
+    return flushed;
+  };
+
+  try {
+    while (true) {
+      pending ??= puller.next();
+      let result: IteratorResult<unknown>;
+      if (batch.length === 0) {
+        result = await pending;
+      } else {
+        const waited = await raceWithDeadline(pending, deadline);
+        if (waited === FLUSH_DEADLINE) {
+          yield flush();
+          continue;
+        }
+        result = waited;
+      }
+      pending = undefined;
+
+      if (result.done) {
+        if (batch.length > 0) yield flush();
+        return;
+      }
+      const item = result.value as TItem;
+      if (batch.length === 0) deadline = Date.now() + maxWaitMs;
+      batch.push(item);
+      batchBytes += sizeOf(item);
+      if (batchBytes >= maxBufferedBytes || batch.length >= maxItems) yield flush();
+    }
+  } finally {
+    puller.cancel();
+  }
+}
+
+const FLUSH_DEADLINE = Symbol('service-plane.flush-deadline');
+
+async function raceWithDeadline(
+  pending: Promise<IteratorResult<unknown>>,
+  deadline: number,
+): Promise<IteratorResult<unknown> | typeof FLUSH_DEADLINE> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return FLUSH_DEADLINE;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      pending,
+      new Promise<typeof FLUSH_DEADLINE>((resolve) => {
+        timer = setTimeout(() => resolve(FLUSH_DEADLINE), remaining);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 type AbilityStreamPuller = {
   cancel(reason?: unknown): void;
   next(): Promise<IteratorResult<unknown>>;

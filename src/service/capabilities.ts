@@ -314,7 +314,10 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
   const authenticate = options.authenticate ?? defaultAuthenticate<Scoped>;
   let persistent: Scoped | undefined;
   let nativeBinding: Promise<object> | object | undefined;
-  return new Proxy(Object.create(null), {
+  // The proxy target is RpcTarget-branded so the session object survives being returned over
+  // another Cap'n Web session by reference (e.g. the broker handing a connected ability to a
+  // remote caller) instead of being serialized into an empty plain object.
+  return new Proxy(new SessionProxyTarget(), {
     get(_target, property) {
       if (property === 'then') return undefined;
       if (typeof property !== 'string') return undefined;
@@ -493,6 +496,8 @@ export function tokenExpiresAt(token: string): Date {
 
 export type { RpcCompatible, RpcSessionOptions, RpcStub, RpcTransport };
 export { RpcTarget };
+
+class SessionProxyTarget extends RpcTarget {}
 
 function defaultAuthenticate<Scoped>(root: AuthenticatedRoot<Scoped>, token: string): Scoped {
   return root.authenticate(token);

@@ -18,6 +18,7 @@ import {
   type AbilityRpc,
   type AbilityStreamSource,
   abilityMethod,
+  coalesceAbilityStream,
   defineAbility,
   defineAbilityService,
 } from './discovery.js';
@@ -358,6 +359,49 @@ describe('streaming ability methods', () => {
     );
   });
 });
+
+describe('coalesceAbilityStream', () => {
+  it('flushes on the byte cap before the wait window when items pile up', async () => {
+    async function* fast() {
+      for (let index = 0; index < 10; index += 1) yield { delta: 'x'.repeat(20), index };
+    }
+    const batches = await collectBatches(coalesceAbilityStream(fast(), { maxBufferedBytes: 100, maxWaitMs: 5_000 }));
+    expect(batches.length).toBeGreaterThan(2);
+    expect(batches.flat()).toHaveLength(10);
+    for (const batch of batches.slice(0, -1)) {
+      expect(batch.length).toBeLessThanOrEqual(4);
+    }
+  });
+
+  it('flushes on the wait window when the producer is slow', async () => {
+    async function* slow() {
+      yield { index: 0 };
+      yield { index: 1 };
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      yield { index: 2 };
+      yield { index: 3 };
+    }
+    const batches = await collectBatches(coalesceAbilityStream(slow(), { maxBufferedBytes: 1_000_000, maxWaitMs: 20 }));
+    expect(batches).toEqual([
+      [{ index: 0 }, { index: 1 }],
+      [{ index: 2 }, { index: 3 }],
+    ]);
+  });
+
+  it('flushes the trailing partial batch and honors maxItems', async () => {
+    async function* five() {
+      for (let index = 0; index < 5; index += 1) yield { index };
+    }
+    const batches = await collectBatches(coalesceAbilityStream(five(), { maxBufferedBytes: 1_000_000, maxItems: 2, maxWaitMs: 5_000 }));
+    expect(batches).toEqual([[{ index: 0 }, { index: 1 }], [{ index: 2 }, { index: 3 }], [{ index: 4 }]]);
+  });
+});
+
+async function collectBatches<T>(source: AsyncGenerator<T[], void, undefined>): Promise<T[][]> {
+  const batches: T[][] = [];
+  for await (const batch of source) batches.push(batch);
+  return batches;
+}
 
 async function testKeys() {
   const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);

@@ -1,7 +1,9 @@
+import { RpcSession } from 'capnweb';
 import { describe, expect, it } from 'vitest';
 import * as z from 'zod';
 import { abilityMethod, defineAbility, defineCapabilities, RpcTarget, requireScopes, ServicePlaneService } from '../service/index.js';
 import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
+import { memoryRpcTransportPair } from '../testing/index.js';
 import { createControlPlaneRpcBroker } from './broker.js';
 import { createCapabilityIssuer, defineServiceGrants } from './capabilities.js';
 import { cloudflareServiceBinding } from './endpoints.js';
@@ -147,6 +149,39 @@ describe('brokered streaming abilities', () => {
     const api = await (await root.ability('hub', 'hub.files')).connect(['hub.read']);
     const stream = await api.readFile({ parts: 2 });
     await expect(drainStream(stream)).resolves.toEqual([{ chunk: 'part-0' }, { chunk: 'part-1' }]);
+  });
+});
+
+describe('remote broker sessions', () => {
+  it('serves unary calls and streams to a caller connected over a Cap’n Web session', async () => {
+    const fixture = await createFixture({ ingress: true });
+    const broker = createControlPlaneRpcBroker({
+      controlPlaneServiceId: 'control-plane',
+      issuer: fixture.issuer,
+      registry: fixture.registry,
+    });
+
+    // The caller talks to the broker over an actual wire: every message is serialized, so this
+    // catches session objects that would not survive being returned by reference.
+    const { left, right } = memoryRpcTransportPair();
+    new RpcSession(right, broker.rootCapability({ id: 'user-1', kind: 'user' }));
+    const root = new RpcSession<{
+      ability(
+        serviceId: string,
+        abilityId: string,
+      ): Promise<{
+        connect(scopes: string[]): Promise<{
+          readFile(input: { parts: number }): Promise<ReadableStream<{ chunk: string }>>;
+          stat(input: Record<string, never>): Promise<{ size: number }>;
+        }>;
+      }>;
+    }>(left).getRemoteMain();
+
+    const api = await (await root.ability('hub', 'hub.files')).connect(['hub.read']);
+    await expect(api.stat({})).resolves.toEqual({ size: 3 });
+    // Cast: raw capnweb stub types cannot express typed item streams (see PR notes).
+    const stream = (await api.readFile({ parts: 3 })) as unknown as ReadableStream<{ chunk: string }>;
+    await expect(drainStream(stream)).resolves.toEqual([{ chunk: 'part-0' }, { chunk: 'part-1' }, { chunk: 'part-2' }]);
   });
 });
 

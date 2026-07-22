@@ -79,7 +79,9 @@ Cap'n Web streams ride the ongoing session, so streaming methods require a **ses
 
 Through the broker, streams proxy transparently: connect to `/rpc/broker` over WebSocket, and the plane reaches the service over its own session transport — preferring the endpoint's native ability RPC binding (`ServiceEndpoint.abilityRpc`, picked up automatically by `cloudflareServiceBinding` when the binding exposes `connectAbility`), then WebSocket. Streaming methods cannot project MCP prompts, resources, or REST operations (single-response surfaces); MCP tools are supported.
 
-Full guide, including per-runtime WebSocket wiring: [Streaming](streaming.md).
+For high-frequency streams (LLM token deltas), `coalesceAbilityStream(source, { maxBufferedBytes, maxWaitMs, maxItems })` batches items into arrays, flushing on whichever limit is hit first.
+
+Full guide, including per-runtime WebSocket wiring and performance guidance: [Streaming](streaming.md).
 
 ## Discovery Document
 
