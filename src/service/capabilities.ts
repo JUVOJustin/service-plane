@@ -43,6 +43,14 @@ const identityByTarget = new WeakMap<object, CapabilityIdentity>();
 const serviceBindingJwksResolvers = new WeakMap<object, Map<string, CapabilityJwksResolver>>();
 const urlJwksResolvers = new Map<string, CapabilityJwksResolver>();
 
+// The well-known disposal symbols, read as values so the code does not require the
+// ESNext.Disposable lib in tsconfig. They exist at runtime on every target (Node 20+, Bun,
+// workerd, Deno) and on Cap'n Web's Disposable stubs.
+const { dispose: DISPOSE_SYMBOL, asyncDispose: ASYNC_DISPOSE_SYMBOL } = Symbol as unknown as {
+  asyncDispose: symbol;
+  dispose: symbol;
+};
+
 export type RemoteJwksFetch = typeof fetch | FetchLike;
 
 export type JwksFromUrlOptions = {
@@ -142,6 +150,10 @@ export type CapabilityRpcSessionOptions<Scoped> = (
 ) & {
   abilityId?: string;
   authenticate?: (root: AuthenticatedRoot<Scoped>, token: string) => Scoped;
+  // Method names whose streamed results cannot travel back over the caller's own transport
+  // (e.g. a brokered ability handed to a caller whose leg to the broker is HTTP-batch). Calls
+  // to them are rejected with a clear 405 instead of returning a stream that fails to serialize.
+  rejectStreamMethods?: string[];
   requestId?: string;
   requestIdHeaderName?: string;
   rpcSessionOptions?: RpcSessionOptions;
@@ -312,6 +324,10 @@ export function capabilityTokenCacheKey(input: {
 export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSessionOptions<Scoped>): Promise<Scoped> {
   const tokenProvider = options.tokenProvider ?? createCapabilityTokenProvider(options as CreateCapabilityTokenProviderOptions);
   const authenticate = options.authenticate ?? defaultAuthenticate<Scoped>;
+  const rejectStreamMethods = options.rejectStreamMethods ? new Set(options.rejectStreamMethods) : undefined;
+  // The persistent session's Cap'n Web root stub is Disposable; keep it so the underlying
+  // transport (socket) can be released — the scoped stub alone does not close the session.
+  let persistentRoot: AuthenticatedRoot<Scoped> | undefined;
   let persistent: Scoped | undefined;
   let nativeBinding: Promise<object> | object | undefined;
   // The proxy target is RpcTarget-branded so the session object survives being returned over
@@ -319,9 +335,22 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
   // remote caller) instead of being serialized into an empty plain object.
   return new Proxy(new SessionProxyTarget(), {
     get(_target, property) {
+      // Closing the session releases the socket; per-call http-batch/fetch legs and native
+      // bindings hold no persistent root, so this is a no-op for them. Cap'n Web also routes a
+      // remote caller's disposal of the returned stub through here.
+      if (property === DISPOSE_SYMBOL || property === ASYNC_DISPOSE_SYMBOL) {
+        return () => {
+          disposeSessionRoot(persistentRoot);
+          persistentRoot = undefined;
+          persistent = undefined;
+        };
+      }
       if (property === 'then') return undefined;
       if (typeof property !== 'string') return undefined;
       return async (...args: unknown[]) => {
+        if (rejectStreamMethods?.has(property)) {
+          throw new CapabilityAuthError(`Service-Plane streaming method requires a session transport to the caller: ${property}`, 405);
+        }
         if (options.transport.kind === 'cloudflare-binding-rpc') {
           nativeBinding ??= options.transport.binding.connectAbility({
             abilityId: options.abilityId ?? missingAbilityId(),
@@ -342,7 +371,8 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
         } else {
           if (!persistent) {
             const token = await tokenProvider.token();
-            persistent = authenticate(openSession<Scoped>(options), token);
+            persistentRoot = openSession<Scoped>(options);
+            persistent = authenticate(persistentRoot, token);
           }
           scoped = persistent;
         }
@@ -350,6 +380,23 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
       };
     },
   }) as Scoped;
+}
+
+// Closes a persistent Cap'n Web session opened by `abilitySession`/`capabilityRpcSession`,
+// releasing its transport socket. Safe (and a no-op) for per-call HTTP-batch and native-binding
+// sessions, which hold nothing to close.
+export async function disposeAbilitySession(session: unknown): Promise<void> {
+  const disposable = session as Record<symbol, (() => unknown) | undefined>;
+  await disposable?.[ASYNC_DISPOSE_SYMBOL]?.();
+}
+
+function disposeSessionRoot(root: unknown): void {
+  const disposable = root as Record<symbol, (() => void) | undefined> | undefined;
+  try {
+    disposable?.[DISPOSE_SYMBOL]?.();
+  } catch {
+    // Best effort: a transport already closed by the peer must not turn cleanup into a throw.
+  }
 }
 
 export function abilitySession<Scoped>(options: AbilitySessionOptions<Scoped>): Promise<Scoped> {

@@ -75,6 +75,7 @@ export {
   type ControlPlaneRpcBroker,
   type CreateControlPlaneRpcBrokerOptions,
   createControlPlaneRpcBroker,
+  type RootCapabilityOptions,
 } from './broker.js';
 export {
   generateHmacClientSecret,

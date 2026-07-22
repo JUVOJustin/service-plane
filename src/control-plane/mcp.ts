@@ -1,4 +1,4 @@
-import { abilitySession, cloudflareNativeRpc, cloudflareServiceBindingRpc, websocketRpc } from '../service/index.js';
+import { abilitySession, disposeAbilitySession } from '../service/index.js';
 import { CapabilityAuthError } from '../shared/errors.js';
 import type { ServicePlaneBrokerLogEvent } from '../shared/logging.js';
 import {
@@ -16,7 +16,7 @@ import {
   type ServiceRegistry,
   type ServiceRegistrySnapshot,
 } from '../shared/types.js';
-import { type BrokerCaller, brokerCallerLogFields, brokerCallerSubject } from './broker.js';
+import { type BrokerCaller, brokerCallerLogFields, brokerCallerSubject, transportForAbility } from './broker.js';
 import type { CapabilityIssuer } from './capabilities.js';
 
 export type ControlPlaneMcpServerInfo = {
@@ -252,14 +252,20 @@ async function streamToolCall(
   params: unknown,
 ): Promise<Response> {
   const startedAt = Date.now();
+  const { api, dispose } = await openMethodSession(match, options);
   let stream: ReadableStream<unknown>;
   try {
-    const result = await invokeMethod(match, input, options);
+    const method = api[match.method];
+    if (!method) throw new CapabilityAuthError(`Service-Plane MCP method not found: ${match.method}`, 500);
+    const result = await method(input);
     if (!(result instanceof ReadableStream)) {
       throw new Error(`Service-Plane streaming tool did not return a stream: ${name}`);
     }
     stream = result;
   } catch (error) {
+    // The session must be closed on every early-exit path; only the happy path hands ownership
+    // to streamToolEvents (which disposes after the stream drains).
+    await dispose();
     if (error instanceof CapabilityAuthError) throw error;
     // Tool execution failures are reported in-band per the MCP spec, not as protocol errors.
     logMcpFailed(options, 'service_plane.mcp.tool.failed', { tool: name }, error, startedAt);
@@ -269,9 +275,12 @@ async function streamToolCall(
     });
   }
   const reader = stream.getReader();
-  return sseResponse(streamToolEvents(id, name, match, options, reader, progressTokenOf(params), startedAt), (reason) => {
+  const state = { cancelled: false };
+  return sseResponse(streamToolEvents(id, name, match, options, reader, dispose, state, progressTokenOf(params), startedAt), (reason) => {
     // Cancel the upstream reader directly on client disconnect: the generator's queued
-    // return() would wait behind an in-flight read() while the consumer is already gone.
+    // return() would wait behind an in-flight read() while the consumer is already gone. The
+    // flag lets the generator distinguish this abort from a natural end-of-stream.
+    state.cancelled = true;
     void reader.cancel(reason).catch(() => undefined);
   });
 }
@@ -282,19 +291,36 @@ async function* streamToolEvents(
   match: McpMethodMatch,
   options: ControlPlaneMcpHandlerOptions,
   reader: ReadableStreamDefaultReader<unknown>,
+  dispose: () => Promise<void>,
+  state: { cancelled: boolean },
   progressToken: string | number | undefined,
   startedAt: number,
 ): AsyncGenerator<string> {
   const maxItems = options.streamLimits?.maxItems ?? DEFAULT_MCP_STREAM_MAX_ITEMS;
   const maxBytes = options.streamLimits?.maxBytes ?? DEFAULT_MCP_STREAM_MAX_BYTES;
+  const encoder = new TextEncoder();
   const items: unknown[] = [];
   let aggregatedBytes = 0;
   try {
     while (true) {
       const { done, value } = await reader.read();
+      // A client disconnect resolves the pending read as done via reader.cancel; treat it as an
+      // abort, not a successful completion, and skip the pointless full aggregation.
+      if (state.cancelled) {
+        logMcpFailed(
+          options,
+          'service_plane.mcp.tool.failed',
+          { tool: name },
+          new CapabilityAuthError('client disconnected', 499),
+          startedAt,
+        );
+        return;
+      }
       if (done) break;
       items.push(value);
-      aggregatedBytes += JSON.stringify(value)?.length ?? 4;
+      // Measure UTF-8 bytes (not UTF-16 code units) so multibyte items count against the cap
+      // at their true wire cost.
+      aggregatedBytes += encoder.encode(JSON.stringify(value) ?? 'null').length;
       if (items.length > maxItems || aggregatedBytes > maxBytes) {
         // MCP defines exactly one response per request, so the full stream must be held in
         // memory here; unbounded or caller-inflated streams are cut off in-band instead.
@@ -307,12 +333,13 @@ async function* streamToolEvents(
         yield sseEvent({ jsonrpc: '2.0', method: 'notifications/progress', params: { progress: items.length, progressToken } });
       }
     }
+    const serialized = JSON.stringify({ items });
     logMcpCompleted(options, 'service_plane.mcp.tool.completed', { tool: name }, match, startedAt);
     yield sseEvent({
       id,
       jsonrpc: '2.0',
       result: {
-        content: [{ text: JSON.stringify({ items }), type: 'text' }],
+        content: [{ text: serialized, type: 'text' }],
         structuredContent: { items },
       },
     });
@@ -325,6 +352,7 @@ async function* streamToolEvents(
     });
   } finally {
     void reader.cancel().catch(() => undefined);
+    await dispose();
   }
 }
 
@@ -436,9 +464,13 @@ async function getPrompt(id: JsonRpcId, params: unknown, options: ControlPlaneMc
   }
 }
 
-// One shared brokered-invocation path for tools, resources, and prompts: authorize the caller for the
-// ability, mint the scoped (or brokered) token, and invoke the method over the service's RPC transport.
-async function invokeMethod(match: McpMethodMatch, input: unknown, options: ControlPlaneMcpHandlerOptions): Promise<unknown> {
+// One shared brokered-invocation path for tools, resources, and prompts: authorize the caller for
+// the ability, mint the scoped (or brokered) token, and open the session over the service's RPC
+// transport. The caller MUST dispose the session so its transport socket is released.
+async function openMethodSession(
+  match: McpMethodMatch,
+  options: ControlPlaneMcpHandlerOptions,
+): Promise<{ api: Record<string, (methodInput: unknown) => Promise<unknown>>; dispose: () => Promise<void> }> {
   authorizePublishedAbility(match.ability, options.caller);
   const subject = brokerCallerSubject(options.caller);
   const api = await abilitySession<Record<string, (methodInput: unknown) => Promise<unknown>>>({
@@ -454,9 +486,19 @@ async function invokeMethod(match: McpMethodMatch, input: unknown, options: Cont
     targetServiceId: match.ability.serviceId,
     transport: transportForAbility(match.ability),
   });
-  const method = api[match.method];
-  if (!method) throw new CapabilityAuthError(`Service-Plane MCP method not found: ${match.method}`, 500);
-  return method(input);
+  return { api, dispose: () => disposeAbilitySession(api) };
+}
+
+// Unary invocation: the session is closed as soon as the single result resolves.
+async function invokeMethod(match: McpMethodMatch, input: unknown, options: ControlPlaneMcpHandlerOptions): Promise<unknown> {
+  const { api, dispose } = await openMethodSession(match, options);
+  try {
+    const method = api[match.method];
+    if (!method) throw new CapabilityAuthError(`Service-Plane MCP method not found: ${match.method}`, 500);
+    return await method(input);
+  } finally {
+    await dispose();
+  }
 }
 
 function findMcpMethod(
@@ -601,27 +643,6 @@ function authorizePublishedAbility(ability: DiscoveredServiceAbility, caller: Br
   if (ability.access === 'plane') return;
   if (ability.access === 'service' && caller?.kind === 'service') return;
   throw new CapabilityAuthError('Service-Plane MCP call requires service access', 403);
-}
-
-function transportForAbility(ability: DiscoveredServiceAbility) {
-  // Streaming methods need a session transport: prefer the endpoint's native ability RPC
-  // binding, then WebSocket. Falling through to HTTP-batch keeps unary methods working; the
-  // service rejects streaming calls there with a clear 405.
-  if (Object.values(ability.methods).some((method) => method.stream)) {
-    if (ability.service.abilityRpc && ability.rpc.transports.includes('cloudflare-binding-rpc')) {
-      return cloudflareNativeRpc(ability.service.abilityRpc);
-    }
-    if (ability.rpc.transports.includes('websocket')) {
-      return websocketRpc(new URL(ability.rpc.path, ability.service.origin.replace(/^http/u, 'ws')).toString());
-    }
-  }
-  if (ability.rpc.transports.includes('http-batch')) {
-    return cloudflareServiceBindingRpc(ability.service, ability.rpc.path, ability.service.origin);
-  }
-  if (ability.rpc.transports.includes('websocket')) {
-    return websocketRpc(new URL(ability.rpc.path, ability.service.origin.replace(/^http/u, 'ws')).toString());
-  }
-  throw new CapabilityAuthError(`Service-Plane ability has no supported RPC transport: ${ability.serviceId}/${ability.id}`, 500);
 }
 
 function jsonRpcIdOf(message: Record<string, unknown>): JsonRpcId | undefined {

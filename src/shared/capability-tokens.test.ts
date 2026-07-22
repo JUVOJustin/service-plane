@@ -366,6 +366,28 @@ describe('STS capability tokens', () => {
     expect(publicJwk).not.toHaveProperty('q');
     expect(publicJwk).not.toHaveProperty('qi');
   });
+
+  it('rejects a token when the matched JWK advertises a non-ES256 algorithm', async () => {
+    const keys = await testKeys();
+    const issued = await signCapabilityToken({
+      claims: { aud: 'fizzy', iss: 'control-plane', scp: ['fizzy.users.lookup'], sub: 'moco' },
+      keyId: 'test-key',
+      now: NOW,
+      privateJwk: keys.privateJwk,
+    });
+    // Same EC P-256 point, but the operator marked the key for a different algorithm — WebCrypto
+    // import ignores `alg`, so Service-Plane must honour it (matching hono's verifyWithJwks).
+    const mismatchedJwks = { keys: [{ ...keys.jwks.keys[0], alg: 'ES384' }] };
+
+    await expect(
+      verifyCapabilityToken(issued.token, {
+        expectedAudience: 'fizzy',
+        issuer: 'control-plane',
+        jwks: mismatchedJwks,
+        now: new Date('2026-05-09T12:01:00.000Z'),
+      }),
+    ).rejects.toThrow('Invalid Service-Plane capability signature');
+  });
 });
 
 async function testKeys() {

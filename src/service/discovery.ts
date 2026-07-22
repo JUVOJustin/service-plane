@@ -183,8 +183,9 @@ export function defaultAbilityRpcPath(abilityId: string): string {
 }
 
 export type CreateValidatingAbilityHandlerOptions = {
-  // Cap'n Web streams need an ongoing session. HTTP-batch shells must pass false so streaming
-  // methods fail with a clear 405 instead of a dangling stream stub after the batch ends.
+  // Cap'n Web streams need an ongoing session. Defaults to false (fail-closed): a caller must
+  // opt in only for a session transport (WebSocket upgrade, native binding). Over HTTP-batch,
+  // streaming methods then fail with a clear 405 instead of a dangling stub after the batch ends.
   allowStreaming?: boolean;
 };
 
@@ -194,7 +195,7 @@ export function createValidatingAbilityHandler<TEnv extends Env>(
   identity: CapabilityIdentity,
   options: CreateValidatingAbilityHandlerOptions = {},
 ): RpcTarget {
-  const allowStreaming = options.allowStreaming ?? true;
+  const allowStreaming = options.allowStreaming ?? false;
   // A handler instance carries one caller's identity; a factory that returns a shared
   // instance would let concurrent sessions overwrite each other's identity and scopes.
   if (capabilityIdentity(handler)) {

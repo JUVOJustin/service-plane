@@ -135,9 +135,12 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
         registry,
         ...(requestId ? { requestId } : {}),
       });
+      // Only a WebSocket-upgraded caller leg can carry a returned stream back; over HTTP-batch
+      // the broker rejects streaming methods with a clear 405 instead of a dangling stub.
+      const allowStreaming = context.req.header('upgrade')?.toLowerCase() === 'websocket';
       return newRpcResponse(
         context,
-        broker.rootCapability(caller),
+        broker.rootCapability(caller, { allowStreaming }),
         brokerOptions.upgradeWebSocket ? { upgradeWebSocket: brokerOptions.upgradeWebSocket } : undefined,
       );
     });

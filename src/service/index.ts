@@ -98,6 +98,7 @@ export {
   createCapabilityTokenProvider,
   customRpcTransport,
   defineCapabilities,
+  disposeAbilitySession,
   httpBatchRpc,
   jwksFromServiceBinding,
   jwksFromUrl,

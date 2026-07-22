@@ -153,6 +153,30 @@ describe('brokered streaming abilities', () => {
     const stream = await api.readFile({ parts: 2 });
     await expect(drainStream(stream)).resolves.toEqual([{ chunk: 'part-0' }, { chunk: 'part-1' }]);
   });
+
+  it('rejects streaming methods with 405 when the caller leg cannot carry a stream', async () => {
+    const fixture = await createFixture({ ingress: true });
+    const broker = createControlPlaneRpcBroker({
+      controlPlaneServiceId: 'control-plane',
+      issuer: fixture.issuer,
+      registry: fixture.registry,
+    });
+
+    type Brokered = {
+      connect(scopes: string[]): Promise<{
+        readFile(input: { parts: number }): Promise<ReadableStream<{ chunk: string }>>;
+        stat(input: Record<string, never>): Promise<{ size: number }>;
+      }>;
+    };
+    // allowStreaming:false models an HTTP-batch caller leg to the broker.
+    const root = broker.rootCapability({ id: 'user-1', kind: 'user' }, { allowStreaming: false }) as unknown as {
+      ability(serviceId: string, abilityId: string): Promise<Brokered>;
+    };
+    const api = await (await root.ability('hub', 'hub.files')).connect(['hub.read']);
+    // Unary methods still work; only streaming methods are rejected.
+    await expect(api.stat({})).resolves.toEqual({ size: 3 });
+    await expect(api.readFile({ parts: 2 })).rejects.toThrow('requires a session transport');
+  });
 });
 
 describe('remote broker sessions', () => {

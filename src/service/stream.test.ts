@@ -10,6 +10,7 @@ import {
   cloudflareServiceBindingRpc,
   customRpcTransport,
   defineCapabilities,
+  disposeAbilitySession,
   RpcTarget,
   requireScopes,
 } from './capabilities.js';
@@ -18,6 +19,7 @@ import {
   type AbilityRpc,
   type AbilityStreamSource,
   abilityMethod,
+  createValidatingAbilityHandler,
   defineAbility,
   defineAbilityService,
 } from './discovery.js';
@@ -398,6 +400,58 @@ describe('streaming ability methods', () => {
           version: '0.1.0',
         }),
     ).toThrow('rpc.upgradeWebSocket is not configured');
+  });
+
+  it('fails closed: createValidatingAbilityHandler rejects streaming methods unless allowStreaming is set', () => {
+    const definition = defineAbilityService({
+      abilities: [streamAbility()],
+      capabilities: defineCapabilities({ scopes: [{ id: 'example.read' }], serviceId: 'example' }),
+      id: 'example',
+      title: 'Example',
+      version: '0.1.0',
+    });
+    const ability = definition.abilities[0];
+    if (!ability) throw new Error('missing ability');
+    const identity = {
+      audience: 'example',
+      expiresAt: new Date(VERIFIED_AT.getTime() + 60_000),
+      issuer: 'control-plane',
+      scopes: ['example.read'],
+      serviceId: 'worker-a',
+      tokenId: 't',
+    };
+    // No options → allowStreaming defaults to false (fail-closed for custom shells).
+    const handler = createValidatingAbilityHandler(
+      ability,
+      new StreamApi() as StreamApi & Record<string, unknown>,
+      identity,
+    ) as unknown as Record<string, ((input: unknown) => Promise<unknown>) | undefined>;
+    return expect(handler.listChunks?.({ count: 1 })).rejects.toThrow('requires a session transport');
+  });
+
+  it('exposes a working disposer that closes the underlying session', async () => {
+    const fixture = await createFixture();
+
+    class SessionRoot extends RpcTarget {
+      authenticate(token: string) {
+        return fixture.service.connectAbility({ abilityId: 'example.stream', token });
+      }
+    }
+    const { left, right } = memoryRpcTransportPair();
+    new RpcSession(right, new SessionRoot());
+    const api = await abilitySession<StreamAbilityRpc>({
+      abilityId: 'example.stream',
+      callerServiceId: 'worker-a',
+      requestToken: async () => fixture.issued,
+      scopes: ['example.read'],
+      targetServiceId: 'example',
+      transport: customRpcTransport(left),
+    });
+
+    await expect(api.single({})).resolves.toEqual({ ok: true });
+    // Disposal is wired (previously the proxy returned undefined for symbol keys) and idempotent.
+    await expect(disposeAbilitySession(api)).resolves.toBeUndefined();
+    await expect(disposeAbilitySession(api)).resolves.toBeUndefined();
   });
 
   it('rejects streaming connections without a brokered token when ingress protection is enabled', async () => {

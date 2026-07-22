@@ -1,4 +1,5 @@
 import { sign } from 'hono/jwt';
+import { decodeBase64Url } from 'hono/utils/encode';
 import { verifying } from 'hono/utils/jwt/jws';
 import { CapabilityAuthError } from './errors.js';
 import {
@@ -207,15 +208,24 @@ function isBoundedClaimString(value: string): boolean {
 // primitive (hono/utils/jwt/jws); only kid-matching and key caching are ours. Everything here
 // is web-standard (crypto.subtle, atob, TextEncoder), so it behaves identically on Node 20+,
 // Bun, workerd, and Deno — the same matrix hono itself targets.
+const utf8Encoder = new TextEncoder();
+
 async function verifyTokenSignature(token: string, key: JsonWebKey & { kid?: string }): Promise<void> {
+  // WebCrypto's ECDSA JWK import ignores the key's advisory `alg` member (though it does enforce
+  // `use`/`key_ops`), so honour a mismatching key algorithm here — matching hono's verifyWithJwks,
+  // which the low-level `verifying` primitive below does not. The token header alg is already
+  // pinned to ES256 by the caller.
+  if (typeof key.alg === 'string' && key.alg !== SERVICE_PLANE_JWK_ALGORITHM) {
+    throw new CapabilityAuthError('Invalid Service-Plane capability signature');
+  }
   try {
     const [headerPart, payloadPart, signaturePart] = token.split('.');
     if (!headerPart || !payloadPart || !signaturePart) throw new Error('malformed token');
     const verified = await verifying(
       await importedVerificationKey(key),
       SERVICE_PLANE_JWK_ALGORITHM,
-      base64UrlToBytes(signaturePart),
-      new TextEncoder().encode(`${headerPart}.${payloadPart}`),
+      decodeBase64Url(signaturePart),
+      utf8Encoder.encode(`${headerPart}.${payloadPart}`),
     );
     if (!verified) throw new Error('signature mismatch');
   } catch {
@@ -240,18 +250,6 @@ function importedVerificationKey(key: JsonWebKey & { kid?: string }): Promise<Cr
   verificationKeyCache.set(cacheKey, imported);
   imported.catch(() => verificationKeyCache.delete(cacheKey));
   return imported;
-}
-
-// atob + manual byte copy instead of a library helper: hono does not export its base64url
-// decoder, and atob is a web-standard global on every target runtime (Node 16+, Bun, workerd,
-// Deno). Signatures are ~64 bytes, so the char loop is irrelevant to performance.
-function base64UrlToBytes(value: string): Uint8Array<ArrayBuffer> {
-  const normalized = value.replace(/-/gu, '+').replace(/_/gu, '/');
-  const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
-  const binary = atob(padded);
-  const bytes = new Uint8Array(new ArrayBuffer(binary.length));
-  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
-  return bytes;
 }
 
 function normalizeTtlSeconds(ttlSeconds: number): number {

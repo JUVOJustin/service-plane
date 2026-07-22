@@ -42,16 +42,23 @@ export type CreateControlPlaneRpcBrokerOptions = {
   services?: ServiceEndpoint[];
 };
 
+export type RootCapabilityOptions = {
+  // False when the caller's own leg to the broker is HTTP-batch and cannot carry a returned
+  // stream; streaming methods are then rejected with a clear 405 instead of a dangling stub.
+  allowStreaming?: boolean;
+};
+
 export type ControlPlaneRpcBroker = {
-  rootCapability(caller?: BrokerCaller): RpcTarget;
+  rootCapability(caller?: BrokerCaller, options?: RootCapabilityOptions): RpcTarget;
 };
 
 export function createControlPlaneRpcBroker(options: CreateControlPlaneRpcBrokerOptions): ControlPlaneRpcBroker {
   const registry = options.registry ?? createServiceRegistry({ services: options.services ?? [] });
   return {
-    rootCapability(caller) {
+    rootCapability(caller, rootOptions) {
       return new BrokerRoot(
         {
+          allowStreaming: rootOptions?.allowStreaming ?? true,
           controlPlaneServiceId: options.controlPlaneServiceId,
           issuer: options.issuer,
           ...(options.log ? { log: options.log } : {}),
@@ -67,6 +74,7 @@ export function createControlPlaneRpcBroker(options: CreateControlPlaneRpcBroker
 class BrokerRoot extends RpcTarget {
   constructor(
     private readonly options: {
+      allowStreaming: boolean;
       controlPlaneServiceId: string;
       issuer: CapabilityIssuer;
       log?: (event: ServicePlaneBrokerLogEvent) => void;
@@ -86,6 +94,7 @@ class BrokerRoot extends RpcTarget {
       }
       authorizeAbility(ability, this.caller);
       return new BrokeredAbility({
+        allowStreaming: this.options.allowStreaming,
         brokerServiceId: this.options.controlPlaneServiceId,
         caller: this.caller,
         callerServiceId: this.caller?.kind === 'service' ? this.caller.id : this.options.controlPlaneServiceId,
@@ -105,6 +114,7 @@ class BrokeredAbility extends RpcTarget {
   constructor(
     private readonly input: {
       ability: DiscoveredServiceAbility;
+      allowStreaming: boolean;
       brokerServiceId: string;
       caller: BrokerCaller | undefined;
       callerServiceId: string;
@@ -134,10 +144,19 @@ class BrokeredAbility extends RpcTarget {
 
       const brokered = Boolean(this.input.ability.serviceIngress?.required);
       const subject = brokerCallerSubject(this.input.caller);
+      // If the caller's own leg to the broker cannot carry a stream (HTTP-batch), reject the
+      // ability's streaming methods with a clear 405 rather than returning a stream that fails
+      // to serialize back to the caller and leaks the plane→service session.
+      const rejectStreamMethods = this.input.allowStreaming
+        ? undefined
+        : Object.entries(this.input.ability.methods)
+            .filter(([, method]) => method.stream)
+            .map(([name]) => name);
       const session = (await abilitySession<unknown>({
         abilityId: this.input.ability.id,
         callerServiceId: this.input.callerServiceId,
         ...(subject ? { subject } : {}),
+        ...(rejectStreamMethods && rejectStreamMethods.length > 0 ? { rejectStreamMethods } : {}),
         ...(this.input.requestId ? { requestId: this.input.requestId } : {}),
         requestToken: (input) =>
           brokered
@@ -187,7 +206,10 @@ function authorizeAbility(ability: DiscoveredServiceAbility, caller: BrokerCalle
   throw new CapabilityAuthError('Service-Plane broker ability requires service access', 403);
 }
 
-function transportForAbility(ability: DiscoveredServiceAbility) {
+// Shared transport selection for broker and MCP so the two cannot drift. Streaming
+// methods need a session transport: prefer the endpoint's native ability RPC binding, then
+// WebSocket. Unary-only abilities fall through to HTTP-batch.
+export function transportForAbility(ability: DiscoveredServiceAbility) {
   // Streaming methods need a session transport: prefer the endpoint's native ability RPC
   // binding, then WebSocket. Falling through to HTTP-batch keeps unary methods working; the
   // service rejects streaming calls there with a clear 405.
