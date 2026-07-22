@@ -287,7 +287,7 @@ async function createFixture(options: FixtureOptions = {}) {
     },
     services: () => [
       cloudflareServiceBinding({
-        binding: { fetch: (request) => service.fetch(request) },
+        binding: { fetch: async (request) => service.fetch(request) },
         grants: [
           { caller: 'control-plane', scopes: ['example.read'] },
           { caller: 'gateway-svc', scopes: ['example.read'] },
@@ -887,7 +887,7 @@ describe('handleControlPlaneMcpRequest protocol plumbing', () => {
       signingSecret: await generateCapabilitySigningSecret(),
     });
     const registry = createServiceRegistry({
-      services: [{ fetch: (request: Request) => service.fetch(request), id: 'example', origin: 'https://example.internal' }],
+      services: [{ fetch: async (request: Request) => service.fetch(request), id: 'example', origin: 'https://example.internal' }],
     });
     const events: ServicePlaneBrokerLogEvent[] = [];
 

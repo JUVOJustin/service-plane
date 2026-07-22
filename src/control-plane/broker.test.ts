@@ -69,7 +69,7 @@ describe('control-plane RPC broker', () => {
       issuer,
       services: [
         cloudflareServiceBinding({
-          binding: { fetch: (request) => service.fetch(request) },
+          binding: { fetch: async (request) => service.fetch(request) },
           id: 'example',
           origin: 'https://example.internal',
         }),
@@ -143,7 +143,7 @@ describe('control-plane RPC broker', () => {
       services: [
         cloudflareServiceBinding({
           binding: {
-            fetch: (request) => {
+            fetch: async (request) => {
               seenRequests.push(request);
               return service.fetch(request);
             },
@@ -235,7 +235,7 @@ describe('control-plane RPC broker', () => {
       log: (event) => brokerEvents.push(event),
       services: [
         cloudflareServiceBinding({
-          binding: { fetch: (request) => service.fetch(request) },
+          binding: { fetch: async (request) => service.fetch(request) },
           id: 'example',
           origin: 'https://example.internal',
         }),

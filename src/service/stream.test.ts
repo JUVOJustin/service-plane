@@ -1,5 +1,5 @@
 import { RpcSession } from 'capnweb';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 import * as z from 'zod';
 import { createCapabilityIssuer, defineServiceGrants } from '../control-plane/capabilities.js';
 import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
@@ -13,7 +13,14 @@ import {
   RpcTarget,
   requireScopes,
 } from './capabilities.js';
-import { abilityMethod, defineAbility, defineAbilityService } from './discovery.js';
+import {
+  type AbilityImplementation,
+  type AbilityRpc,
+  type AbilityStreamSource,
+  abilityMethod,
+  defineAbility,
+  defineAbilityService,
+} from './discovery.js';
 import { ServicePlaneService } from './service.js';
 
 const ISSUED_AT = new Date('2026-07-22T12:00:00.000Z');
@@ -21,12 +28,8 @@ const VERIFIED_AT = new Date('2026-07-22T12:00:01.000Z');
 
 type StreamItem = { caller: string; index: number };
 
-type StreamAbilityRpc = {
-  badItem(input: Record<string, never>): Promise<ReadableStream<StreamItem>>;
-  failMid(input: Record<string, never>): Promise<ReadableStream<StreamItem>>;
-  listChunks(input: { count: number }): Promise<ReadableStream<StreamItem>>;
-  single(input: Record<string, never>): Promise<{ ok: boolean }>;
-};
+// The real consumer projection: proves `stream: true` survives abilityMethod/defineAbility.
+type StreamAbilityRpc = AbilityRpc<ReturnType<typeof streamAbility>>;
 
 class StreamApi extends RpcTarget {
   async *listChunks(input: { count: number }) {
@@ -45,6 +48,11 @@ class StreamApi extends RpcTarget {
     yield { caller: 42, index: 'nope' };
   }
 
+  async *hang(_input: Record<string, never>) {
+    yield { caller: 'example', index: 0 };
+    await new Promise(() => undefined); // never settles; only cancellation ends this stream
+  }
+
   async single(_input: Record<string, never>) {
     return { ok: true };
   }
@@ -61,6 +69,12 @@ function streamAbility() {
         stream: true,
       }),
       failMid: abilityMethod({
+        input: z.object({}),
+        output: z.object({ caller: z.string(), index: z.number() }),
+        scopes: ['example.read'],
+        stream: true,
+      }),
+      hang: abilityMethod({
         input: z.object({}),
         output: z.object({ caller: z.string(), index: z.number() }),
         scopes: ['example.read'],
@@ -251,7 +265,7 @@ describe('streaming ability methods', () => {
 
   it('rejects streaming methods over the one-round-trip HTTP-batch transport', async () => {
     const fixture = await createFixture();
-    const binding = { fetch: (request: Request) => fixture.service.fetch(request) };
+    const binding = { fetch: async (request: Request) => fixture.service.fetch(request) };
     const api = await abilitySession<StreamAbilityRpc>({
       abilityId: 'example.stream',
       callerServiceId: 'worker-a',
@@ -283,6 +297,58 @@ describe('streaming ability methods', () => {
 
     const invalid = await api.badItem({});
     await expect(drainStream(invalid)).rejects.toThrow();
+  });
+
+  it('preserves the stream discriminator through abilityMethod for consumers', () => {
+    type Ability = ReturnType<typeof streamAbility>;
+    expectTypeOf<Awaited<ReturnType<StreamAbilityRpc['listChunks']>>>().toEqualTypeOf<ReadableStream<StreamItem>>();
+    expectTypeOf<Awaited<ReturnType<StreamAbilityRpc['single']>>>().toEqualTypeOf<{ ok: boolean }>();
+
+    // Generator-based handlers satisfy the implementation contract for streaming methods.
+    const implementation: AbilityImplementation<Ability> = {
+      async *badItem() {
+        yield { caller: 'x', index: 1 };
+      },
+      async *failMid() {
+        yield { caller: 'x', index: 1 };
+      },
+      async *hang() {
+        yield { caller: 'x', index: 0 };
+      },
+      async *listChunks(input) {
+        yield { caller: 'x', index: input.count };
+      },
+      async single() {
+        return { ok: true };
+      },
+    };
+    expect(implementation).toBeDefined();
+
+    // A bare string is not a stream source, even though strings are Iterable<string>.
+    expectTypeOf<string>().not.toExtend<AbilityStreamSource<string>>();
+  });
+
+  it('cancels promptly even while the handler is awaiting its next chunk', async () => {
+    const fixture = await createFixture();
+    const api = await abilitySession<StreamAbilityRpc>({
+      abilityId: 'example.stream',
+      callerServiceId: 'worker-a',
+      requestToken: async () => fixture.issued,
+      scopes: ['example.read'],
+      targetServiceId: 'example',
+      transport: cloudflareNativeRpc(fixture.service),
+    });
+
+    const stream = await api.hang({});
+    const reader = stream.getReader();
+    await expect(reader.read()).resolves.toEqual({ done: false, value: { caller: 'example', index: 0 } });
+
+    // The handler is now parked on a never-settling await; cancellation must not wait for it.
+    const outcome = await Promise.race([
+      reader.cancel('client went away').then(() => 'cancelled'),
+      new Promise<string>((resolve) => setTimeout(() => resolve('timed out'), 500)),
+    ]);
+    expect(outcome).toBe('cancelled');
   });
 
   it('rejects streaming connections without a brokered token when ingress protection is enabled', async () => {

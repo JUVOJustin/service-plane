@@ -45,7 +45,9 @@ export type ServiceAbilityHandlerFactoryInput<TEnv extends Env = Env> = {
   identity: CapabilityIdentity;
 };
 
-export type AbilityStreamSource<TItem> = AsyncIterable<TItem> | Iterable<TItem> | ReadableStream<TItem>;
+// `Iterable & object` keeps plain strings out: a string is Iterable<string>, but handing one
+// back from a streaming method is almost certainly a bug, and the runtime rejects it.
+export type AbilityStreamSource<TItem> = AsyncIterable<TItem> | (Iterable<TItem> & object) | ReadableStream<TItem>;
 
 type AbilityMethodItem<TMethod extends AbilityMethodDefinition> = z.input<TMethod['output']> | z.output<TMethod['output']>;
 
@@ -133,9 +135,9 @@ export type DefineServiceOptions = {
   requireAbilityScopes?: boolean;
 };
 
-export function abilityMethod<TInput extends AbilitySchema, TOutput extends AbilitySchema>(
-  definition: AbilityMethodDefinition<TInput, TOutput>,
-): AbilityMethodDefinition<TInput, TOutput> {
+// Returns the definition's own type (not the widened AbilityMethodDefinition) so the
+// `stream: true` discriminator survives into AbilityRpc and AbilityImplementation.
+export function abilityMethod<TDefinition extends AbilityMethodDefinition>(definition: TDefinition): TDefinition {
   return definition;
 }
 
@@ -244,52 +246,66 @@ function validatedAbilityItemStream(
   methodName: string,
   source: unknown,
 ): ReadableStream<unknown> {
-  const items = validateStreamItems(method, methodName, source);
+  const puller = abilityStreamPuller(source, methodName);
   return new ReadableStream<unknown>({
-    async cancel() {
-      await items.return?.(undefined);
+    cancel(reason) {
+      // Cancel the underlying source directly and without awaiting: an async generator's
+      // return() queues behind an in-flight next(), and a disconnected consumer must not
+      // keep the handler pinned while it waits for the next chunk that may never come.
+      puller.cancel(reason);
     },
     async pull(controller) {
-      const next = await items.next();
+      const next = await puller.next();
       if (next.done) {
         controller.close();
         return;
       }
-      controller.enqueue(next.value);
+      controller.enqueue(await method.output.parseAsync(next.value));
     },
   });
 }
 
-async function* validateStreamItems(
-  method: NormalizedAbilityMethodDefinition,
-  methodName: string,
-  source: unknown,
-): AsyncGenerator<unknown> {
-  for await (const item of iterateAbilityStreamSource(source, methodName)) {
-    yield await method.output.parseAsync(item);
-  }
-}
+type AbilityStreamPuller = {
+  cancel(reason?: unknown): void;
+  next(): Promise<IteratorResult<unknown>>;
+};
 
-async function* iterateAbilityStreamSource(source: unknown, methodName: string): AsyncGenerator<unknown> {
+function abilityStreamPuller(source: unknown, methodName: string): AbilityStreamPuller {
   if (source instanceof ReadableStream) {
     const reader = (source as ReadableStream<unknown>).getReader();
-    try {
-      while (true) {
+    return {
+      cancel(reason) {
+        void reader.cancel(reason).catch(() => undefined);
+      },
+      async next() {
         const { done, value } = await reader.read();
-        if (done) return;
-        yield value;
-      }
-    } finally {
-      void reader.cancel().catch(() => undefined);
-    }
+        return done ? { done: true, value: undefined } : { done: false, value };
+      },
+    };
   }
   if (source && typeof source === 'object' && Symbol.asyncIterator in source) {
-    yield* source as AsyncIterable<unknown>;
-    return;
+    const iterator = (source as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+    return {
+      cancel() {
+        void Promise.resolve()
+          .then(() => iterator.return?.(undefined))
+          .catch(() => undefined);
+      },
+      next: () => iterator.next(),
+    };
   }
   if (source && typeof source === 'object' && Symbol.iterator in source) {
-    yield* source as Iterable<unknown>;
-    return;
+    const iterator = (source as Iterable<unknown>)[Symbol.iterator]();
+    return {
+      cancel() {
+        try {
+          iterator.return?.(undefined);
+        } catch {
+          // best effort: sync iterator cleanup must not fail cancellation
+        }
+      },
+      next: async () => iterator.next(),
+    };
   }
   throw new AbilityValidationError(
     `Service-Plane streaming method must return an async iterable, iterable, or ReadableStream: ${methodName}`,

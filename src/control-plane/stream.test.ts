@@ -84,10 +84,10 @@ async function createFixture(options: FixtureOptions = {}) {
 
   const endpoint = cloudflareServiceBinding({
     binding: options.withoutNativeRpc
-      ? { fetch: (request: Request) => service.fetch(request) }
+      ? { fetch: async (request: Request) => service.fetch(request) }
       : {
           connectAbility: (input: { abilityId: string; requestId?: string; token: string }) => service.connectAbility(input),
-          fetch: (request: Request) => service.fetch(request),
+          fetch: async (request: Request) => service.fetch(request),
         },
     id: 'hub',
     origin: 'https://hub.internal',

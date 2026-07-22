@@ -58,8 +58,9 @@ describe('service registry', () => {
       services: [
         httpsService({
           baseUrl: 'https://example.internal',
-          fetch: async (request) => {
+          fetch: async (input) => {
             fetches += 1;
+            const request = new Request(input);
             if (request.headers.get('if-none-match') === 'v1') return new Response(null, { status: 304 });
             return Response.json(document, { headers: { etag: 'v1' } });
           },

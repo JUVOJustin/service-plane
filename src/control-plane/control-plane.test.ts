@@ -100,7 +100,7 @@ describe('ServicePlaneControlPlane', () => {
       clientId: 'worker-a',
       clientSecret: 'a'.repeat(43),
       controlPlaneUrl: 'https://plane.internal',
-      fetch: (request) => plane.fetch(request),
+      fetch: async (request: RequestInfo | URL, init?: RequestInit) => plane.fetch(new Request(request, init)),
       now: () => new Date('2026-05-09T12:00:00.000Z'),
       requestId: 'req-1',
     });
@@ -343,7 +343,7 @@ describe('ServicePlaneControlPlane', () => {
       mcp: { caller: () => ({ id: 'gateway', kind: 'user' }) },
       services: () => [
         cloudflareServiceBinding({
-          binding: { fetch: (request) => service.fetch(request) },
+          binding: { fetch: async (request) => service.fetch(request) },
           grants: [{ caller: 'control-plane', scopes: ['example.search'] }],
           id: 'example',
           origin: 'https://example.internal',
@@ -415,7 +415,7 @@ describe('ServicePlaneControlPlane', () => {
       services: () => [
         cloudflareServiceBinding({
           binding: {
-            fetch: (request) => {
+            fetch: async (request) => {
               seenRequests.push(request);
               return service.fetch(request);
             },
@@ -476,7 +476,7 @@ function memoryOpenApiDocumentCache(): OpenApiDocumentCache {
   };
 }
 
-function mcpRequest(plane: ServicePlaneControlPlane, body: unknown, headers?: Record<string, string>): Promise<Response> {
+async function mcpRequest(plane: ServicePlaneControlPlane, body: unknown, headers?: Record<string, string>): Promise<Response> {
   return plane.fetch(
     new Request(`https://plane.internal${SERVICE_PLANE_MCP_PATH}`, {
       body: JSON.stringify(body),

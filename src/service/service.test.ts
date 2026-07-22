@@ -75,7 +75,7 @@ describe('ServicePlaneService', () => {
       scopes: ['example.sync.run'],
       targetServiceId: 'example',
     });
-    const binding = { fetch: (request: Request) => service.fetch(request) };
+    const binding = { fetch: async (request: Request) => service.fetch(request) };
 
     const api = await abilitySession<AbilityRpc<typeof syncAbility>>({
       abilityId: 'example.sync',
@@ -160,7 +160,7 @@ describe('ServicePlaneService', () => {
       scopes: ['example.sync.run'],
       targetServiceId: 'example',
     });
-    const directBinding = { fetch: (request: Request) => service.fetch(request) };
+    const directBinding = { fetch: async (request: Request) => service.fetch(request) };
     const directApi = await abilitySession<AbilityRpc<typeof syncAbility>>({
       abilityId: 'example.sync',
       callerServiceId: 'worker-a',

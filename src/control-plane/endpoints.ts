@@ -9,7 +9,7 @@ import {
 
 export function cloudflareServiceBinding(input: {
   abilityRpc?: ServiceAbilityNativeRpcBinding;
-  binding: FetchLike;
+  binding: FetchLike & Partial<ServiceAbilityNativeRpcBinding>;
   discovery?: ServiceDiscoveryDocument | (() => Promise<ServiceDiscoveryDocument> | ServiceDiscoveryDocument);
   grants?: ServiceEndpointGrant[];
   id: string;
@@ -20,9 +20,7 @@ export function cloudflareServiceBinding(input: {
   // session-shaped ability connections — the transport streaming methods need.
   const abilityRpc =
     input.abilityRpc ??
-    (typeof (input.binding as Partial<ServiceAbilityNativeRpcBinding>).connectAbility === 'function'
-      ? (input.binding as FetchLike & ServiceAbilityNativeRpcBinding)
-      : undefined);
+    (typeof input.binding.connectAbility === 'function' ? (input.binding as FetchLike & ServiceAbilityNativeRpcBinding) : undefined);
   return {
     ...(abilityRpc ? { abilityRpc } : {}),
     ...(input.discovery ? { discovery: input.discovery } : {}),

@@ -119,11 +119,7 @@ export type ControlPlaneRpcTokenRequesterOptions = {
 };
 
 export type CloudflareAbilityRpcBinding = {
-  connectAbility(input: {
-    abilityId: string;
-    requestId?: string;
-    token: string;
-  }): Promise<Record<string, unknown>> | Record<string, unknown>;
+  connectAbility(input: { abilityId: string; requestId?: string; token: string }): Promise<object> | object;
 };
 
 export interface AuthenticatedRoot<Scoped> {
@@ -145,7 +141,7 @@ export type CapabilityRpcSessionOptions<Scoped> = (
     >)
 ) & {
   abilityId?: string;
-  authenticate?: (root: RpcStub<AuthenticatedRoot<Scoped>>, token: string) => RpcStub<Scoped>;
+  authenticate?: (root: AuthenticatedRoot<Scoped>, token: string) => Scoped;
   requestId?: string;
   requestIdHeaderName?: string;
   rpcSessionOptions?: RpcSessionOptions;
@@ -309,13 +305,15 @@ export function capabilityTokenCacheKey(input: {
   return `service-plane:capability-token:${encodeURIComponent(JSON.stringify(parts))}`;
 }
 
-export async function capabilityRpcSession<Scoped extends RpcCompatible<Scoped>>(
-  options: CapabilityRpcSessionOptions<Scoped>,
-): Promise<RpcStub<Scoped>> {
+// The session proxy is deliberately NOT typed as a capnweb RpcStub: it is our own
+// promise-returning proxy at runtime, and capnweb's RpcCompatible machinery cannot represent
+// typed item streams (its types only bless ReadableStream<Uint8Array>), which would send the
+// compiler into unbounded recursion for abilities with streaming methods.
+export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSessionOptions<Scoped>): Promise<Scoped> {
   const tokenProvider = options.tokenProvider ?? createCapabilityTokenProvider(options as CreateCapabilityTokenProviderOptions);
   const authenticate = options.authenticate ?? defaultAuthenticate<Scoped>;
-  let persistent: RpcStub<Scoped> | undefined;
-  let nativeBinding: Promise<Record<string, unknown>> | Record<string, unknown> | undefined;
+  let persistent: Scoped | undefined;
+  let nativeBinding: Promise<object> | object | undefined;
   return new Proxy(Object.create(null), {
     get(_target, property) {
       if (property === 'then') return undefined;
@@ -327,14 +325,14 @@ export async function capabilityRpcSession<Scoped extends RpcCompatible<Scoped>>
             ...(options.requestId ? { requestId: options.requestId } : {}),
             token: await tokenProvider.token(),
           });
-          const target = await nativeBinding;
+          const target = (await nativeBinding) as Record<string, unknown>;
           const method = target[property];
           if (typeof method !== 'function')
             throw new CapabilityAuthError(`Service-Plane ability method is not available: ${property}`, 500);
           return method.apply(target, args);
         }
 
-        let scoped: RpcStub<Scoped>;
+        let scoped: Scoped;
         if (options.transport.kind === 'http-batch' || options.transport.kind === 'fetch') {
           const token = await tokenProvider.token();
           scoped = authenticate(openSession<Scoped>(options), token);
@@ -348,10 +346,10 @@ export async function capabilityRpcSession<Scoped extends RpcCompatible<Scoped>>
         return (scoped as Record<string, (...methodArgs: unknown[]) => unknown>)[property]?.(...args);
       };
     },
-  }) as RpcStub<Scoped>;
+  }) as Scoped;
 }
 
-export function abilitySession<Scoped extends RpcCompatible<Scoped>>(options: AbilitySessionOptions<Scoped>): Promise<RpcStub<Scoped>> {
+export function abilitySession<Scoped>(options: AbilitySessionOptions<Scoped>): Promise<Scoped> {
   return capabilityRpcSession(options);
 }
 
@@ -496,31 +494,35 @@ export function tokenExpiresAt(token: string): Date {
 export type { RpcCompatible, RpcSessionOptions, RpcStub, RpcTransport };
 export { RpcTarget };
 
-function defaultAuthenticate<Scoped>(root: RpcStub<AuthenticatedRoot<Scoped>>, token: string): RpcStub<Scoped> {
-  return root.authenticate(token) as unknown as RpcStub<Scoped>;
+function defaultAuthenticate<Scoped>(root: AuthenticatedRoot<Scoped>, token: string): Scoped {
+  return root.authenticate(token);
 }
 
-function openSession<Scoped extends RpcCompatible<Scoped>>(options: {
+// capnweb's generics are instantiated with an untyped root so RpcCompatible never sees the
+// caller's Scoped shape; the runtime stub is identical either way.
+type UntypedAuthenticatedRoot = AuthenticatedRoot<Record<string, unknown>>;
+
+function openSession<Scoped>(options: {
   abilityId?: string;
   requestId?: string;
   requestIdHeaderName?: string;
   rpcSessionOptions?: RpcSessionOptions;
   transport: CapabilityRpcTransport;
-}): RpcStub<AuthenticatedRoot<Scoped>> {
+}): AuthenticatedRoot<Scoped> {
   const { abilityId, requestId, rpcSessionOptions, transport } = options;
   const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
   if (transport.kind === 'http-batch') {
-    return newHttpBatchRpcSession<AuthenticatedRoot<Scoped>>(
+    return newHttpBatchRpcSession<UntypedAuthenticatedRoot>(
       withRequestIdHeader(httpBatchUrl(transport, abilityId), requestId, requestIdHeaderName),
       rpcSessionOptions,
-    );
+    ) as unknown as AuthenticatedRoot<Scoped>;
   }
   if (transport.kind === 'websocket') {
-    return newWebSocketRpcSession<AuthenticatedRoot<Scoped>>(
+    return newWebSocketRpcSession<UntypedAuthenticatedRoot>(
       withRequestIdQueryParam(transport.url, requestId),
       undefined,
       rpcSessionOptions,
-    );
+    ) as unknown as AuthenticatedRoot<Scoped>;
   }
   if (transport.kind === 'cloudflare-binding-rpc') {
     throw new CapabilityAuthError('Cloudflare native RPC transport does not open a Cap’n Web session', 500);
@@ -533,8 +535,8 @@ function openSession<Scoped extends RpcCompatible<Scoped>>(options: {
           requestId ? { [requestIdHeaderName]: requestId } : undefined,
         )
       : transport.transport;
-  const session = new RpcSession<AuthenticatedRoot<Scoped>>(rpcTransport, undefined, rpcSessionOptions);
-  return session.getRemoteMain();
+  const session = new RpcSession<UntypedAuthenticatedRoot>(rpcTransport, undefined, rpcSessionOptions);
+  return session.getRemoteMain() as unknown as AuthenticatedRoot<Scoped>;
 }
 
 // Cap'n Web sends the batch as `fetch(urlOrRequest, { method, body })`, so a bodyless template

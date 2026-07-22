@@ -134,11 +134,7 @@ export type ServiceGrantDefinition = {
 // WorkerEntrypoint forwarding to ServicePlaneService.connectAbility). Session-shaped, so
 // streaming method returns flow through it natively.
 export type ServiceAbilityNativeRpcBinding = {
-  connectAbility(input: {
-    abilityId: string;
-    requestId?: string;
-    token: string;
-  }): Promise<Record<string, unknown>> | Record<string, unknown>;
+  connectAbility(input: { abilityId: string; requestId?: string; token: string }): Promise<object> | object;
 };
 
 export type ServiceEndpoint = {
