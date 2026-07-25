@@ -44,14 +44,21 @@ To serve a documentation UI, mount a Hono renderer on `plane.app` against `/open
 
 ```mermaid
 flowchart TD
+  Secret["signingSecret"] --> Authority["Signing authority: issuer, key id, public JWKS"]
+  Authority --> JWKS["Serve /jwks.json"]
   Services["Configured services"] --> Discovery["Fetch service discovery"]
   Discovery --> Catalog["Build ability + scope catalog"]
   Catalog --> STS["Issue scoped capability tokens"]
+  Authority --> STS
   Catalog --> OpenAPI["Build /openapi.json"]
   Catalog --> MCP["Build /rpc/mcp tool list"]
 ```
 
 The plane does not implement Asana, ClickUp, or Moco logic. It only knows how to discover those services, validate grants, issue tokens, and project published metadata.
+
+JWKS hangs off the signing authority alone: it needs no discovery, so services can keep refreshing
+their verification keys while a target service is down. Everything on the catalog path fails closed
+when discovery cannot be completed. See [auth.md](auth.md#signing-authority-and-authorization-catalog).
 
 Every inbound request gets an `X-Request-Id` (adopted from the caller or generated), and the broker and MCP surfaces forward it to services on every brokered call. Broker connects, MCP tool calls, and configuration errors are logged as structured JSON events; pass `log` to redirect them to your own sink or `log: false` to silence them. See the logging section in [the reference](reference.md).
 

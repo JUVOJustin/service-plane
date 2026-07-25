@@ -16,7 +16,12 @@ import {
   type ServiceRegistry,
 } from '../shared/types.js';
 import { type BrokerCaller, createControlPlaneRpcBroker } from './broker.js';
-import { type CapabilityIssuer, type MountCapabilityEndpointsOptions, mountCapabilityEndpoints } from './capabilities.js';
+import {
+  type CapabilityIssuer,
+  type CapabilitySigningAuthority,
+  type MountCapabilityEndpointsOptions,
+  mountCapabilityEndpoints,
+} from './capabilities.js';
 import {
   type ControlPlaneMcpServerInfo,
   DEFAULT_MCP_PATH,
@@ -31,7 +36,7 @@ import {
 } from './openapi.js';
 import { createServiceRegistry } from './registry.js';
 import { type IssueCapabilityTokenForCallerInput, issueCapabilityTokenForCaller, type RpcIssuedCapabilityToken } from './rpc.js';
-import { createCapabilityIssuerFromSigningSecret } from './signing-secret.js';
+import { createCapabilityIssuerFromSigningSecret, createCapabilitySigningAuthorityFromSigningSecret } from './signing-secret.js';
 
 type ServicePlaneControlPlaneEnv<TEnv extends Env> = TEnv & {
   Variables: RequestIdVariables;
@@ -99,6 +104,9 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   readonly app: Hono<ServicePlaneControlPlaneEnv<TEnv>>;
   private readonly issuers = new Map<string, Promise<CapabilityIssuer>>();
   private readonly log: ServicePlaneLogSink | undefined;
+  // Single slot rather than a map: JWKS is a hot route, and the only reason the derived key changes
+  // is a secret or key-id rotation, which should replace the memo instead of growing it.
+  private signingAuthority: { authority: CapabilitySigningAuthority; cacheKey: string } | undefined;
 
   constructor(private readonly options: ServicePlaneControlPlaneOptions<TEnv>) {
     this.app = (options.app ?? new Hono<ServicePlaneControlPlaneEnv<TEnv>>()) as Hono<ServicePlaneControlPlaneEnv<TEnv>>;
@@ -115,6 +123,9 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     mountCapabilityEndpoints(this.app, (context) => this.issuerFor(context as Context<TEnv>), {
       authenticateCaller: options.authenticateCaller ?? ((context) => missingAuthenticateCaller(context, this.log)),
       ...(options.httpCache === undefined ? {} : { httpCache: options.httpCache }),
+      // JWKS answers from the signing authority only. Verifiers must be able to refresh keys while
+      // target services are unreachable, and the public key does not depend on the catalog.
+      jwks: (context) => this.signingAuthorityFor(context as Context<TEnv>),
     });
 
     if (options.openapi !== false) {
@@ -240,6 +251,21 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     };
   }
 
+  // Signing authority: key material only. Deliberately does not resolve `services`.
+  private async signingAuthorityFor(context: Context<TEnv>): Promise<CapabilitySigningAuthority> {
+    const signingSecret = await this.options.signingSecret(context.env, context);
+    const issuer = this.options.issuer ?? 'control-plane';
+    const keyId = this.options.keyId ?? 'default';
+    const cacheKey = JSON.stringify({ issuer, keyId, signingSecret });
+    if (this.signingAuthority?.cacheKey === cacheKey) return this.signingAuthority.authority;
+
+    const authority = createCapabilitySigningAuthorityFromSigningSecret({ issuer, keyId, signingSecret });
+    this.signingAuthority = { authority, cacheKey };
+    return authority;
+  }
+
+  // Authorization catalog plus signing authority: needs discovered capabilities and grants, so it
+  // can fail while a target service is down. Only token issuance and brokering depend on it.
   private async issuerFor(context: Context<TEnv>, services?: ServiceEndpoint[]): Promise<CapabilityIssuer> {
     const signingSecret = await this.options.signingSecret(context.env, context);
     const resolvedServices = services ?? (await this.options.services(context));
@@ -267,6 +293,11 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       ...(this.options.ttlSeconds ? { ttlSeconds: this.options.ttlSeconds } : {}),
     });
     this.issuers.set(cacheKey, issuer);
+    // A rejected issuer (an unreachable grant target, say) must not be memoized as a permanent
+    // failure; the next request re-resolves the catalog once discovery recovers.
+    issuer.catch(() => {
+      if (this.issuers.get(cacheKey) === issuer) this.issuers.delete(cacheKey);
+    });
     return issuer;
   }
 }

@@ -2,8 +2,10 @@ import { CapabilityAuthError } from '../shared/errors.js';
 import { type CapabilityCatalog, DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS, type ServiceGrantDefinition } from '../shared/types.js';
 import {
   type CapabilityIssuer,
+  type CapabilitySigningAuthority,
   type CreateCapabilityIssuerFromPrivateJwkOptions,
   createCapabilityIssuerFromPrivateJwk,
+  createCapabilitySigningAuthority,
 } from './capabilities.js';
 
 const DEFAULT_CAPABILITY_ISSUER = 'control-plane';
@@ -27,6 +29,12 @@ export type CreateCapabilityIssuerFromSigningSecretOptions = {
   signingSecret: string;
   ttlSeconds?: number;
   validateKeyPair?: boolean;
+};
+
+export type CreateCapabilitySigningAuthorityFromSigningSecretOptions = {
+  issuer?: string;
+  keyId?: string;
+  signingSecret: string;
 };
 
 // Generates the only value that needs to be stored as the control-plane secret.
@@ -59,6 +67,19 @@ export function privateJwkFromCapabilitySigningSecret(
     x: bigIntToBase64Url(publicPoint.x),
     y: bigIntToBase64Url(publicPoint.y),
   };
+}
+
+// Builds only the signing authority from the stored scalar. Publishing JWKS needs nothing else, so
+// this path never touches the service catalog.
+export function createCapabilitySigningAuthorityFromSigningSecret(
+  options: CreateCapabilitySigningAuthorityFromSigningSecretOptions,
+): CapabilitySigningAuthority {
+  const keyId = options.keyId ?? DEFAULT_CAPABILITY_KEY_ID;
+  return createCapabilitySigningAuthority({
+    issuer: options.issuer ?? DEFAULT_CAPABILITY_ISSUER,
+    keyId,
+    privateJwk: privateJwkFromCapabilitySigningSecret(options.signingSecret, keyId),
+  });
 }
 
 // Builds a full issuer from a single stored scalar plus strong Service-Plane defaults.

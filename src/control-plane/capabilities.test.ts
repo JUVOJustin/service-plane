@@ -3,11 +3,14 @@ import { describe, expect, it } from 'vitest';
 import { defineCapabilities } from '../service/capabilities.js';
 import { publicJwkFromPrivateJwk, verifyCapabilityToken } from '../shared/capability-tokens.js';
 import {
+  type CapabilityIssuer,
   createCapabilityIssuer,
   createCapabilityIssuerFromPrivateJwk,
+  createCapabilitySigningAuthority,
   defineServiceGrants,
   generateCapabilitySigningJwk,
   mountCapabilityEndpoints,
+  mountCapabilityJwksEndpoint,
   mountCapabilityTokenEndpoint,
 } from './capabilities.js';
 
@@ -439,6 +442,66 @@ describe('capability issuer', () => {
         privateJwk: { crv: 'P-256', kty: 'EC' },
       }),
     ).rejects.toThrow('Service-Plane public JWK does not match private signing key');
+  });
+
+  it('publishes the same JWKS from a signing authority as from the full issuer', async () => {
+    const keys = await testKeys();
+    const authority = createCapabilitySigningAuthority({
+      issuer: 'control-plane',
+      keyId: 'test-key',
+      privateJwk: keys.privateJwk,
+    });
+    const issuer = createCapabilityIssuer({
+      capabilities: [fizzyCapabilities],
+      grants: defineServiceGrants({
+        grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
+      }),
+      issuer: 'control-plane',
+      keyId: 'test-key',
+      privateJwk: keys.privateJwk,
+    });
+
+    await expect(authority.jwks()).resolves.toEqual({ keys: [keys.publicJwk] });
+    await expect(issuer.jwks()).resolves.toEqual(await authority.jwks());
+  });
+
+  it('mounts the JWKS route on a signing authority that cannot issue tokens', async () => {
+    const keys = await testKeys();
+    const app = new Hono();
+    mountCapabilityJwksEndpoint(
+      app,
+      createCapabilitySigningAuthority({ issuer: 'control-plane', keyId: 'test-key', privateJwk: keys.privateJwk }),
+    );
+
+    const response = await app.request('/.well-known/service-plane/jwks.json');
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ keys: [keys.publicJwk] });
+  });
+
+  it('serves JWKS from the signing authority while the issuer resolver is failing', async () => {
+    const keys = await testKeys();
+    const app = new Hono();
+    mountCapabilityEndpoints(
+      app,
+      (): CapabilityIssuer => {
+        throw new Error('service discovery unavailable');
+      },
+      {
+        authenticateCaller: () => 'moco',
+        jwks: createCapabilitySigningAuthority({ issuer: 'control-plane', keyId: 'test-key', privateJwk: keys.privateJwk }),
+      },
+    );
+
+    const jwks = await app.request('/.well-known/service-plane/jwks.json');
+    expect(jwks.status).toBe(200);
+    await expect(jwks.json()).resolves.toEqual({ keys: [keys.publicJwk] });
+
+    const token = await app.request('/.well-known/service-plane/capability-token', {
+      body: JSON.stringify({ scopes: ['fizzy.users.lookup'], targetServiceId: 'fizzy' }),
+      headers: { 'content-type': 'application/json' },
+      method: 'POST',
+    });
+    expect(token.status).toBe(500);
   });
 });
 
