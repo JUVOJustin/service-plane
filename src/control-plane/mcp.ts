@@ -497,10 +497,18 @@ function streamToolOutputSchema(itemSchema: OpenApiObject): OpenApiObject {
   };
 }
 
+// Only the empty fragment ('#', the document root) and JSON Pointer fragments ('#/...') move when
+// the item schema is nested. A plain-name fragment ('#node') resolves against an `$anchor`, which
+// travels inside the hoisted schema and keeps resolving because `$defs/item` declares no `$id` and
+// so starts no new schema resource — rewriting it would point at nothing.
+function isRootRelativeRef(value: unknown): value is string {
+  return typeof value === 'string' && (value === '#' || value.startsWith('#/'));
+}
+
 function containsRootRef(value: unknown): boolean {
   if (Array.isArray(value)) return value.some(containsRootRef);
   if (!isRecord(value)) return false;
-  if (typeof value.$ref === 'string' && value.$ref.startsWith('#')) return true;
+  if (isRootRelativeRef(value.$ref)) return true;
   return Object.values(value).some(containsRootRef);
 }
 
@@ -509,8 +517,7 @@ function rewriteRootRefs(value: unknown): unknown {
   if (!isRecord(value)) return value;
   const result: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value)) {
-    result[key] =
-      key === '$ref' && typeof entry === 'string' && entry.startsWith('#') ? `#/$defs/item${entry.slice(1)}` : rewriteRootRefs(entry);
+    result[key] = key === '$ref' && isRootRelativeRef(entry) ? `#/$defs/item${entry.slice(1)}` : rewriteRootRefs(entry);
   }
   return result;
 }

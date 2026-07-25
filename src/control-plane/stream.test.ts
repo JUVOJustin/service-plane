@@ -179,6 +179,39 @@ async function drainStream<T>(stream: ReadableStream<T>): Promise<T[]> {
   }
 }
 
+// Drives an item schema through the real projection so these assertions cover the discovery path
+// a foreign service document takes, not a hand-called helper.
+function streamToolOutputSchema(outputSchema: Record<string, unknown>): unknown {
+  const endpoint: ServiceEndpoint = { fetch: async () => new Response(null, { status: 404 }), id: 'x', origin: 'https://x.internal' };
+  const snapshot: ServiceRegistrySnapshot = {
+    abilities: [
+      {
+        access: 'plane',
+        exposure: 'published',
+        id: 'x.tree',
+        methods: {
+          walk: {
+            inputSchema: { type: 'object' },
+            mcp: { name: 'x_walk' },
+            outputSchema,
+            scopes: ['s'],
+            stream: true,
+          },
+        },
+        rpc: { path: '/rpc/x.tree', transports: ['cloudflare-binding-rpc'] },
+        scopes: ['s'],
+        service: endpoint,
+        serviceId: 'x',
+        serviceTitle: 'X',
+        serviceVersion: '1',
+      },
+    ],
+    discoveredAt: new Date(0).toISOString(),
+    services: [],
+  } as unknown as ServiceRegistrySnapshot;
+  return generateMcpDiscovery(snapshot).tools[0]?.outputSchema;
+}
+
 function parseSse(body: string): unknown[] {
   return body
     .split('\n\n')
@@ -459,37 +492,12 @@ describe('control-plane MCP streaming tools', () => {
   });
 
   it('hoists root-relative $refs when wrapping a streaming tool output schema', () => {
-    const endpoint: ServiceEndpoint = { fetch: async () => new Response(null, { status: 404 }), id: 'x', origin: 'https://x.internal' };
-    const snapshot: ServiceRegistrySnapshot = {
-      abilities: [
-        {
-          access: 'plane',
-          exposure: 'published',
-          id: 'x.tree',
-          methods: {
-            walk: {
-              inputSchema: { type: 'object' },
-              mcp: { name: 'x_walk' },
-              outputSchema: {
-                properties: { children: { items: { $ref: '#' }, type: 'array' }, name: { type: 'string' } },
-                type: 'object',
-              },
-              scopes: ['s'],
-              stream: true,
-            },
-          },
-          rpc: { path: '/rpc/x.tree', transports: ['cloudflare-binding-rpc'] },
-          scopes: ['s'],
-          service: endpoint,
-          serviceId: 'x',
-          serviceTitle: 'X',
-          serviceVersion: '1',
-        },
-      ],
-      discoveredAt: new Date(0).toISOString(),
-      services: [],
-    };
-    expect(generateMcpDiscovery(snapshot).tools[0]?.outputSchema).toEqual({
+    expect(
+      streamToolOutputSchema({
+        properties: { children: { items: { $ref: '#' }, type: 'array' }, name: { type: 'string' } },
+        type: 'object',
+      }),
+    ).toEqual({
       $defs: {
         item: {
           properties: { children: { items: { $ref: '#/$defs/item' }, type: 'array' }, name: { type: 'string' } },
@@ -499,6 +507,47 @@ describe('control-plane MCP streaming tools', () => {
       properties: { items: { items: { $ref: '#/$defs/item' }, type: 'array' } },
       required: ['items'],
       type: 'object',
+    });
+  });
+
+  it('leaves $anchor references untouched when wrapping a streaming tool output schema', () => {
+    // '#node' resolves against an $anchor, which travels inside the hoisted schema; only '#' and
+    // '#/...' change meaning when nested. Rewriting a plain-name fragment would point at nothing.
+    expect(
+      streamToolOutputSchema({
+        $anchor: 'node',
+        properties: { children: { items: { $ref: '#node' }, type: 'array' }, name: { type: 'string' } },
+        type: 'object',
+      }),
+    ).toEqual({
+      properties: {
+        items: {
+          items: {
+            $anchor: 'node',
+            properties: { children: { items: { $ref: '#node' }, type: 'array' }, name: { type: 'string' } },
+            type: 'object',
+          },
+          type: 'array',
+        },
+      },
+      required: ['items'],
+      type: 'object',
+    });
+  });
+
+  it('rewrites JSON Pointer fragments relative to the hoisted item schema', () => {
+    expect(
+      streamToolOutputSchema({
+        $defs: { leaf: { type: 'string' } },
+        properties: { name: { $ref: '#/$defs/leaf' }, self: { $ref: '#' } },
+        type: 'object',
+      }),
+    ).toMatchObject({
+      $defs: {
+        item: {
+          properties: { name: { $ref: '#/$defs/item/$defs/leaf' }, self: { $ref: '#/$defs/item' } },
+        },
+      },
     });
   });
 
