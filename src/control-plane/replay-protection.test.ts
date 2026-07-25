@@ -1,4 +1,3 @@
-import type { Context } from 'hono';
 import { describe, expect, it } from 'vitest';
 import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
 import { signServicePlaneHmacRequest } from '../shared/hmac-auth.js';
@@ -11,6 +10,7 @@ import {
   jwkServiceClientAuth,
   type ServicePlaneReplayCache,
 } from './caller-auth.js';
+import type { CallerAuthenticator } from './capabilities.js';
 import { ServicePlaneControlPlane } from './control-plane.js';
 import { cloudflareServiceBinding } from './endpoints.js';
 import { generateCapabilitySigningSecret } from './signing-secret.js';
@@ -256,10 +256,7 @@ function hmacPlane(
   );
 }
 
-function controlPlane(
-  signingSecret: string,
-  authenticateCaller: (context: Context) => Promise<Response | string>,
-): ServicePlaneControlPlane {
+function controlPlane(signingSecret: string, authenticateCaller: CallerAuthenticator): ServicePlaneControlPlane {
   return new ServicePlaneControlPlane({
     authenticateCaller,
     services: () => [

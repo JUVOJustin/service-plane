@@ -250,9 +250,76 @@ Cloudflare same-account `controlPlaneRpcTokenRequester` calls are not part of th
 caller identity is pinned by the private service-binding entrypoint and no HMAC or JWK HTTP assertion
 is sent, so there is nothing to capture and replay.
 
-Issued capability tokens are separate too. They are bearer credentials and may be reused on purpose
-until they expire; replay protection is about re-using a caller-authentication request to mint
-another token.
+Issued capability tokens are a separate problem, and a larger one — replay protection is about
+re-using a caller-authentication *request*, and does nothing about a stolen token. That is what
+sender-constrained tokens are for.
+
+## Sender-Constrained Tokens
+
+A capability token is a bearer credential by default: whoever holds the bytes can use it. So the
+attacker in the replay risk assessment who captured the *response* rather than the request wins
+outright, no replay needed — and so does anyone who reads the plane's logs, a token cache, or the plane
+itself.
+
+Binding fixes that. RFC 7800 defines the `cnf` (confirmation) claim: the issuer names a key the
+presenter must prove it holds. Service Plane uses the `jkt` confirmation method — the RFC 7638 SHA-256
+thumbprint of the caller's public JWK, as registered by RFC 9449 (DPoP).
+
+**JWK callers get this automatically, with no configuration and no new secrets.** The plane already
+holds the caller's public key and already verifies a signature on every token request, so it stamps the
+thumbprint of the key that actually authenticated:
+
+```json
+{ "iss": "control-plane", "sub": "workflow-runner", "aud": "asana", "cnf": { "jkt": "NzbLsXh8..." } }
+```
+
+The caller then signs a short-lived proof when it opens a session:
+
+```ts
+const api = await abilitySession<AbilityRpc<typeof asanaTasks>>({
+  abilityId: 'asana.tasks',
+  callerServiceId: 'workflow-runner',
+  targetServiceId: 'asana',
+  scopes: ['asana.tasks.write'],
+  requestToken,
+  // Same private key the token requester authenticates with.
+  proveTokenPossession: jwkCapabilityProofSigner({ privateJwk }),
+  transport: websocketRpc('wss://asana.example.com/rpc/asana.tasks'),
+});
+```
+
+Each proof is bound to the token (by hash), the target service, and the ability, and carries the public
+key so the service needs no key distribution. The service thumbprints that key, compares it to
+`cnf.jkt`, *then* checks the signature — so substituting a different key fails the comparison, and
+substituting the bound key without re-signing fails the signature.
+
+**Services enforce this with no configuration.** A token carrying `cnf` is rejected unless a matching
+proof arrives, because the requirement travels in the token rather than in local config. A caller
+cannot downgrade a sender-constrained token to a bearer token by omitting the proof, and a service
+cannot forget to check.
+
+What this buys beyond replay protection: a token minted for one caller is useless to everyone else,
+**including to a compromised control plane**. The plane can still mint tokens, but it cannot present
+one.
+
+### Where It Applies
+
+| Path | Binding |
+| --- | --- |
+| JWK caller → token endpoint → service | Automatic. This is where a token leaves the plane. |
+| HMAC caller | None. A shared secret has no key to confirm; use JWK caller auth if you want binding. |
+| Brokered calls (`/rpc/broker`) | Not applicable. The broker mints the token and uses it on its own leg to the service — the caller never receives it. Ingress plus the signed `spb` claim already restricts those tokens to brokered use. |
+| Cloudflare service bindings | Unnecessary. Identity is pinned by the binding entrypoint and no token crosses a network. |
+
+### Limits
+
+The proof is **session-scoped**, not per-call: Cap'n Web sessions are long-lived, so one proof is signed
+when the session opens. The guarantee is "the caller held the key when this session opened", not "on
+every method call".
+
+Proofs have their own 60-second freshness window (plus skew) for the same reason token requests do —
+a proof is itself a signed artifact. It is bound to one token, one service, and one ability, so a
+captured proof cannot be pointed anywhere else, but binding narrows exposure rather than eliminating it.
 
 ## Context And Identity
 

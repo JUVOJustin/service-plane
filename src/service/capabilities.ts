@@ -24,6 +24,7 @@ import {
   SERVICE_PLANE_JWK_KEY_ID_HEADER,
   signServicePlaneJwkRequest,
 } from '../shared/jwk-auth.js';
+import { signCapabilityProof } from '../shared/proof-of-possession.js';
 import {
   type CapabilityCatalog,
   type CapabilityIdentity,
@@ -133,7 +134,13 @@ export type ControlPlaneRpcTokenRequesterOptions = {
 };
 
 export type CloudflareAbilityRpcBinding = {
-  connectAbility(input: { abilityId: string; connInfo?: ConnInfo; requestId?: string; token: string }): Promise<object> | object;
+  connectAbility(input: {
+    abilityId: string;
+    connInfo?: ConnInfo;
+    proof?: string;
+    requestId?: string;
+    token: string;
+  }): Promise<object> | object;
 };
 
 export type WebSocketRpcOptions = {
@@ -143,8 +150,12 @@ export type WebSocketRpcOptions = {
 };
 
 export interface AuthenticatedRoot<Scoped> {
-  authenticate(token: string): Scoped;
+  authenticate(token: string, proof?: string): Scoped;
 }
+
+// Signs a proof of possession for a sender-constrained token. Supplied by the caller because only the
+// caller holds the private key its tokens are bound to.
+export type CapabilityProofSigner = (input: { abilityId: string; targetServiceId: string; token: string }) => Promise<string> | string;
 
 export type CapabilityRpcTransport =
   | { binding: CloudflareAbilityRpcBinding; kind: 'cloudflare-binding-rpc' }
@@ -161,10 +172,13 @@ export type CapabilityRpcSessionOptions<Scoped> = (
     >)
 ) & {
   abilityId?: string;
-  authenticate?: (root: AuthenticatedRoot<Scoped>, token: string) => Scoped;
+  authenticate?: (root: AuthenticatedRoot<Scoped>, token: string, proof?: string) => Scoped;
   // Advisory connection info about the original client, forwarded to the service alongside the
   // request id. Only a brokered call into an ingress-protected service surfaces it to handlers.
   connInfo?: ConnInfo;
+  // Required when the plane sender-constrains this caller's tokens (`cnf`), because such a token is
+  // rejected by the service without a matching proof.
+  proveTokenPossession?: CapabilityProofSigner;
   // Method names whose streamed results cannot travel back over the caller's own transport
   // (e.g. a brokered ability handed to a caller whose leg to the broker is HTTP-batch). Calls
   // to them are rejected with a clear 405 instead of returning a stream that fails to serialize.
@@ -354,6 +368,14 @@ export function capabilityTokenCacheKey(input: {
 export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSessionOptions<Scoped>): Promise<AbilitySession<Scoped>> {
   const tokenProvider = options.tokenProvider ?? createCapabilityTokenProvider(options as CreateCapabilityTokenProviderOptions);
   const authenticate = options.authenticate ?? defaultAuthenticate<Scoped>;
+  // One proof per session, freshly signed each time a session opens: it is bound to the token and
+  // ability, so it cannot be reused for another session on another service.
+  const proveToken = async (token: string): Promise<string | undefined> =>
+    options.proveTokenPossession?.({
+      abilityId: options.abilityId ?? missingAbilityId(),
+      targetServiceId: options.targetServiceId,
+      token,
+    });
   const rejectStreamMethods = options.rejectStreamMethods ? new Set(options.rejectStreamMethods) : undefined;
   // The persistent session's Cap'n Web root stub is Disposable; keep it so the underlying
   // transport (socket) can be released — the scoped stub alone does not close the session.
@@ -399,9 +421,11 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
       throw new CapabilityAuthError('Cloudflare native RPC transport is required', 500);
     }
     const connInfo = normalizeConnInfo(options.connInfo);
+    const proof = await proveToken(token);
     const target = await options.transport.binding.connectAbility({
       abilityId: options.abilityId ?? missingAbilityId(),
       ...(connInfo ? { connInfo } : {}),
+      ...(proof ? { proof } : {}),
       ...(options.requestId ? { requestId: options.requestId } : {}),
       token,
     });
@@ -414,11 +438,12 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
   };
   const openPersistentSession = async (): Promise<void> => {
     const token = await tokenProvider.token();
+    const proof = await proveToken(token);
     assertActive();
     const root = openSession<Scoped>(options);
     persistentRoot = root;
     try {
-      const scoped = authenticate(root, token);
+      const scoped = authenticate(root, token, proof);
       persistent = scoped;
     } catch (error) {
       if (persistentRoot === root) persistentRoot = undefined;
@@ -468,8 +493,9 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
         let scoped: Scoped;
         if (options.transport.kind === 'http-batch' || options.transport.kind === 'fetch') {
           const token = await tokenProvider.token();
+          const proof = await proveToken(token);
           assertActive();
-          scoped = authenticate(openSession<Scoped>(options), token);
+          scoped = authenticate(openSession<Scoped>(options), token, proof);
         } else {
           if (persistent === undefined) {
             persistentOpening ??= openPersistentSession();
@@ -591,6 +617,26 @@ export function controlPlaneHmacTokenRequester(
   };
 }
 
+export type JwkCapabilityProofSignerOptions = {
+  now?: () => Date;
+  privateJwk: JsonWebKey | (() => Promise<JsonWebKey> | JsonWebKey);
+  ttlSeconds?: number;
+};
+
+// Signs proofs with the same private key the caller authenticates to the control plane with, so a
+// sender-constrained token can be used without registering or distributing anything further.
+export function jwkCapabilityProofSigner(options: JwkCapabilityProofSignerOptions): CapabilityProofSigner {
+  return async (input) =>
+    signCapabilityProof({
+      abilityId: input.abilityId,
+      ...(options.now ? { now: options.now() } : {}),
+      privateJwk: await resolvePrivateJwk(options.privateJwk),
+      targetServiceId: input.targetServiceId,
+      token: input.token,
+      ...(options.ttlSeconds === undefined ? {} : { ttlSeconds: options.ttlSeconds }),
+    });
+}
+
 export function controlPlaneJwkTokenRequester(
   options: ControlPlaneJwkTokenRequesterOptions,
 ): CreateCapabilityTokenProviderOptions['requestToken'] {
@@ -672,8 +718,8 @@ export { RpcTarget };
 
 class SessionProxyTarget extends RpcTarget {}
 
-function defaultAuthenticate<Scoped>(root: AuthenticatedRoot<Scoped>, token: string): Scoped {
-  return root.authenticate(token);
+function defaultAuthenticate<Scoped>(root: AuthenticatedRoot<Scoped>, token: string, proof?: string): Scoped {
+  return proof === undefined ? root.authenticate(token) : root.authenticate(token, proof);
 }
 
 // capnweb's generics are instantiated with an untyped root so RpcCompatible never sees the

@@ -18,9 +18,12 @@ import {
   SERVICE_PLANE_JWK_CLIENT_HEADER,
   SERVICE_PLANE_JWK_KEY_ID_HEADER,
   servicePlaneJwkRequestParts,
+  servicePlaneJwkSigner,
+  servicePlaneJwkThumbprint,
   verifyServicePlaneJwkSignature,
 } from '../shared/jwk-auth.js';
 import { type CapabilityJwks, type RegistryCache, SERVICE_PLANE_REQUEST_ID_HEADER, type ServiceEndpoint } from '../shared/types.js';
+import type { CallerAuthResult } from './capabilities.js';
 import { createServiceRegistry } from './registry.js';
 
 const HMAC_CLIENT_SECRET_BYTES = 32;
@@ -227,7 +230,7 @@ export function jwkServiceClientAuth(options: JwkServiceClientAuthOptions) {
   );
   const log = options.log ?? defaultJwkCallerAuthLog;
 
-  return async (context: Context): Promise<Response | string> => {
+  return async (context: Context): Promise<Response | CallerAuthResult> => {
     const clientId = context.req.header(clientIdHeader)?.trim();
     if (!clientId) {
       log(jwkUnauthorizedEvent(context, 'missing_client', 'Missing Service-Plane JWK client id'));
@@ -299,7 +302,13 @@ export function jwkServiceClientAuth(options: JwkServiceClientAuthOptions) {
         }
       }
 
-      return client.serviceId ?? client.clientId;
+      // Report the key that actually authenticated, so issuance can sender-constrain the token to it.
+      // `verifyWithJwks` pins the signer by `kid`, so selecting on the validated key id names the
+      // signer rather than a key the caller merely claimed to use.
+      return {
+        confirmation: { jkt: await servicePlaneJwkThumbprint(servicePlaneJwkSigner(jwks, headerKeyId)) },
+        serviceId: client.serviceId ?? client.clientId,
+      };
     } catch (error) {
       if (error instanceof CapabilityAuthError) {
         log(jwkUnauthorizedEvent(context, 'invalid_claims', error.message));

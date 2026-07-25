@@ -21,6 +21,7 @@ export type {
   CapabilityActorClaim,
   CapabilityCatalog,
   CapabilityClaims,
+  CapabilityConfirmation,
   CapabilityJwks,
   CapabilityScopeDefinition,
   CapabilitySubject,
@@ -91,6 +92,8 @@ export {
   type ServicePlaneReplayCache,
 } from './caller-auth.js';
 export {
+  type CallerAuthenticator,
+  type CallerAuthResult,
   type CapabilityIssuer,
   type CapabilityIssuerResolver,
   type CapabilityJwksProvider,

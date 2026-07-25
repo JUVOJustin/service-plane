@@ -42,7 +42,7 @@ describe('control-plane caller authentication', () => {
     const app = new Hono();
     app.post('/', async (context) => {
       const result = await authenticate(context);
-      return result instanceof Response ? result : context.text(result);
+      return result instanceof Response ? result : context.text(result.serviceId);
     });
 
     const response = await app.request('/', { method: 'POST' });

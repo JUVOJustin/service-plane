@@ -258,10 +258,11 @@ Delegated (user-brokered) token:
 | `aud` | target service id → `identity.audience` | same |
 | `scp` | granted scopes → `identity.scopes` | same |
 | `spb` | broker service id on brokered (ingress) tokens → `identity.brokerServiceId` | same |
+| `cnf` | `{ jkt }` on tokens bound to a caller key → `identity.confirmation`, only after a matching proof verified | same |
 | `jti` | token id → `identity.tokenId` | same |
 | `exp` | expiry → `identity.expiresAt`; `iat`/`nbf` are also enforced | same |
 
-Only the `act` delegation relationship comes from RFC 8693. `scp`, `spo`, and `spb` are Service Plane-specific claims, and `/.well-known/service-plane/capability-token` is the package's JSON capability endpoint, not an RFC 8693 token-exchange endpoint.
+The `act` delegation relationship comes from RFC 8693 and `cnf` from RFC 7800 (with the `jkt` confirmation method registered by RFC 9449). `scp`, `spo`, and `spb` are Service Plane-specific claims, and `/.well-known/service-plane/capability-token` is the package's JSON capability endpoint, not an RFC 8693 token-exchange endpoint.
 
 Delegated subjects are minted only by control-plane code — the broker/MCP caller resolver (a `BrokerCaller` with `kind: 'user'` and optional `orgId`) or a direct `issueCapabilityToken({ subject, ... })` call. The capability-token endpoint and `issueCapabilityTokenForCaller` reject caller-supplied subjects with 403, and the shipped token requesters fail fast locally instead of transmitting one. Direct issue mints a non-brokered token, so ingress-required targets must be reached through the broker, which selects `issueBrokeredCapabilityToken` automatically. See [auth](auth.md#subject-delegation).
 

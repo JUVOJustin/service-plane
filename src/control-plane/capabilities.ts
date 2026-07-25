@@ -12,6 +12,7 @@ import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHt
 import { generateServicePlaneJwkSigningKey } from '../shared/jwk-auth.js';
 import {
   type CapabilityCatalog,
+  type CapabilityConfirmation,
   type CapabilityJwks,
   DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
   type IssueCapabilityTokenInput,
@@ -73,8 +74,20 @@ export type GenerateCapabilitySigningJwkOptions = {
   keyId?: string;
 };
 
+// A caller-auth result. The bare string form says "authenticated, no key to bind" — which is all HMAC
+// and service-binding callers can offer. The object form reports the key that actually authenticated,
+// so issuance can sender-constrain the token to it.
+export type CallerAuthResult = {
+  confirmation?: CapabilityConfirmation;
+  serviceId: string;
+};
+
+export type CallerAuthenticator = (
+  context: Context,
+) => Promise<Response | CallerAuthResult | string> | Response | CallerAuthResult | string;
+
 export type MountCapabilityTokenEndpointOptions = {
-  authenticateCaller(context: Context): Promise<Response | string> | Response | string;
+  authenticateCaller: CallerAuthenticator;
   path?: string;
 };
 
@@ -86,7 +99,7 @@ export type MountCapabilityJwksEndpointOptions = {
 };
 
 export type MountCapabilityEndpointsOptions = {
-  authenticateCaller(context: Context): Promise<Response | string> | Response | string;
+  authenticateCaller: CallerAuthenticator;
   httpCache?: ServicePlaneHttpCacheOption;
   // Required, and separate from the issuer on purpose: passing the issuer here couples key
   // publication to the authorization catalog, so a service-discovery outage takes JWKS down with it.
@@ -180,10 +193,13 @@ function issueCapabilityToken(options: {
   const subject = options.input.subject === undefined ? undefined : normalizeCapabilitySubject(options.input.subject);
 
   // RFC 8693 delegation: with a subject, sub carries the end user and act names the acting service.
+  // RFC 7800 `cnf`: present only when the caller authenticated with a key, sender-constraining the
+  // token to it so the bytes alone are not enough to use it.
   return signCapabilityToken({
     claims: {
       ...(subject ? { act: { sub: options.input.callerServiceId } } : {}),
       aud: options.input.targetServiceId,
+      ...(options.input.confirmation ? { cnf: normalizeConfirmation(options.input.confirmation) } : {}),
       iss: options.issuer,
       scp: requestedScopes,
       ...(options.brokerServiceId ? { spb: options.brokerServiceId } : {}),
@@ -225,19 +241,23 @@ export function mountCapabilityTokenEndpoint(
       // Token responses carry bearer credentials; keep them out of shared caches (RFC 6749 §5.1).
       context.header('cache-control', 'no-store');
       context.header('pragma', 'no-cache');
-      const caller = await options.authenticateCaller(context);
-      if (caller instanceof Response) return caller;
+      const authenticated = await options.authenticateCaller(context);
+      if (authenticated instanceof Response) return authenticated;
+      const caller = typeof authenticated === 'string' ? { serviceId: authenticated } : authenticated;
 
       try {
         // Resolved inside the guard so an unavailable authorization catalog fails closed with the
         // issuer's own error instead of an opaque unhandled rejection.
         const resolvedIssuer = typeof issuer === 'function' ? await issuer(context) : issuer;
         const body = await readTokenRequest(context.req.raw);
-        if (body.callerServiceId && body.callerServiceId !== caller) {
+        if (body.callerServiceId && body.callerServiceId !== caller.serviceId) {
           return context.json({ error: 'Caller service mismatch' }, 403);
         }
         const issued = await resolvedIssuer.issueCapabilityToken({
-          callerServiceId: caller,
+          callerServiceId: caller.serviceId,
+          // Comes from the authenticator, never from the request body: a caller-supplied confirmation
+          // would let it bind a key of its choosing and defeat the point.
+          ...(caller.confirmation ? { confirmation: caller.confirmation } : {}),
           scopes: body.scopes,
           targetServiceId: body.targetServiceId,
           ...(body.ttlSeconds === undefined ? {} : { ttlSeconds: body.ttlSeconds }),
@@ -285,6 +305,12 @@ export function mountCapabilityJwksEndpoint(
       return context.json(await provider.jwks());
     }),
   );
+}
+
+function normalizeConfirmation(confirmation: CapabilityConfirmation): CapabilityConfirmation {
+  const jkt = confirmation.jkt.trim();
+  if (!jkt) throw new CapabilityAuthError('Service-Plane capability confirmation thumbprint cannot be empty', 500);
+  return { jkt };
 }
 
 function normalizeGrant(grant: ServiceGrant): ServiceGrant {

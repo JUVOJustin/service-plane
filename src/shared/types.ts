@@ -271,9 +271,18 @@ export type CapabilityActorClaim = {
   sub: string;
 };
 
+// RFC 7800 `cnf` (confirmation) claim: the issuer states which key the presenter must prove it holds.
+// RFC 7800 itself defines jwk/jwe/jku/kid; `jkt` is the JWK SHA-256 thumbprint (RFC 7638) registered
+// as a confirmation method by RFC 9449 (DPoP). Only `jkt` is supported here — it is 32 bytes and the
+// proof carries the public key, so a service needs no key distribution to verify one.
+export type CapabilityConfirmation = {
+  jkt: string;
+};
+
 export type CapabilityClaims = {
   act?: CapabilityActorClaim;
   aud: string;
+  cnf?: CapabilityConfirmation;
   exp: number;
   iat: number;
   iss: string;
@@ -288,6 +297,9 @@ export type CapabilityClaims = {
 export type CapabilityIdentity = {
   audience: string;
   brokerServiceId?: string;
+  // Present when the token is sender-constrained. A verified identity only ever carries this after a
+  // matching proof of possession was checked, so handlers can treat it as proof the caller was present.
+  confirmation?: CapabilityConfirmation;
   expiresAt: Date;
   issuer: string;
   scopes: string[];
@@ -313,10 +325,14 @@ export type CapabilityJwksCache = {
 };
 
 export type VerifyCapabilityTokenOptions = {
+  // Required to check a proof of possession, because a proof is bound to the ability whose session it
+  // opens. A sender-constrained token presented without both of these is rejected.
+  abilityId?: string;
   expectedAudience: string;
   issuer?: string;
   jwks: CapabilityJwksResolver;
   now?: Date;
+  proof?: string;
   requiredScopes?: string[];
 };
 
@@ -324,6 +340,9 @@ export type CapabilityVerifierOptions = Omit<VerifyCapabilityTokenOptions, 'requ
 
 export type IssueCapabilityTokenInput = {
   callerServiceId: string;
+  // Binds the issued token to a caller key. Set by the plane from the key that actually authenticated
+  // the request, never by the caller — a caller-chosen confirmation would bind a key of its choosing.
+  confirmation?: CapabilityConfirmation;
   scopes: string[];
   subject?: CapabilitySubject;
   targetServiceId: string;
