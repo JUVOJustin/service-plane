@@ -141,6 +141,8 @@ export function hmacServiceClientAuth(options: HmacServiceClientAuthOptions) {
   const log = options.log ?? defaultHmacCallerAuthLog;
 
   return async (context: Context): Promise<Response | string> => {
+    // One clock per request, so the skew check and the reservation TTL cannot disagree.
+    const now = options.now?.() ?? new Date();
     try {
       const clientId = context.req.header(clientIdHeader)?.trim();
       if (!clientId) {
@@ -154,7 +156,7 @@ export function hmacServiceClientAuth(options: HmacServiceClientAuthOptions) {
         return callerAuthUnauthorized(context, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME);
       }
 
-      const timestampError = validateHmacTimestamp(timestamp, options.now?.() ?? new Date(), maxSkewSeconds);
+      const { error: timestampError, signedAt } = validateHmacTimestamp(timestamp, now, maxSkewSeconds);
       if (timestampError) {
         log(hmacUnauthorizedEvent(context, timestampError, hmacTimestampMessage(timestampError)));
         return callerAuthUnauthorized(context, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME);
@@ -192,7 +194,7 @@ export function hmacServiceClientAuth(options: HmacServiceClientAuthOptions) {
         const reservation = await reserveReplayKey(
           options.replayCache,
           `service-plane:hmac:${clientId}:${context.req.header(requestIdHeader)?.trim() || signature}`,
-          maxSkewSeconds,
+          replayTtlSeconds(hmacAcceptableUntilSeconds(signedAt, maxSkewSeconds), now),
         );
         if (reservation.decision === 'replayed') {
           log(hmacUnauthorizedEvent(context, 'replayed_signature', 'Replayed Service-Plane HMAC signature'));
@@ -290,7 +292,7 @@ export function jwkServiceClientAuth(options: JwkServiceClientAuthOptions) {
         const reservation = await reserveReplayKey(
           options.replayCache,
           `service-plane:jwk:${clientId}:${claims.requestId ?? claims.jti}`,
-          jwkReplayTtlSeconds(claims, now, maxSkewSeconds),
+          replayTtlSeconds(claims.exp + maxSkewSeconds, now),
         );
         if (reservation.decision === 'replayed') {
           log(jwkUnauthorizedEvent(context, 'replayed_assertion', 'Replayed Service-Plane JWK assertion'));
@@ -365,12 +367,16 @@ function defaultJwkCallerAuthLog(event: JwkServiceClientAuthLogEvent): void {
   console.warn(JSON.stringify(event));
 }
 
-function validateHmacTimestamp(timestamp: string, now: Date, maxSkewSeconds: number): 'invalid_timestamp' | 'timestamp_skew' | undefined {
+type HmacTimestampCheck = { error: 'invalid_timestamp' | 'timestamp_skew'; signedAt?: undefined } | { error?: undefined; signedAt: Date };
+
+// Returns the parsed timestamp on success: the replay reservation is sized from it, not from the
+// moment the request arrived.
+function validateHmacTimestamp(timestamp: string, now: Date, maxSkewSeconds: number): HmacTimestampCheck {
   const parsed = new Date(timestamp);
-  if (Number.isNaN(parsed.getTime())) return 'invalid_timestamp';
+  if (Number.isNaN(parsed.getTime())) return { error: 'invalid_timestamp' };
   const skewMs = Math.abs(now.getTime() - parsed.getTime());
-  if (skewMs > maxSkewSeconds * 1000) return 'timestamp_skew';
-  return undefined;
+  if (skewMs > maxSkewSeconds * 1000) return { error: 'timestamp_skew' };
+  return { signedAt: parsed };
 }
 
 function normalizePositiveAuthLimit(value: number, name: string): number {
@@ -517,9 +523,19 @@ async function validateJwkAssertionClaims(
   }
 }
 
-function jwkReplayTtlSeconds(claims: Pick<ParsedJwkAssertionClaims, 'exp'>, now: Date, maxSkewSeconds: number): number {
-  const nowSeconds = Math.floor(now.getTime() / 1000);
-  return Math.max(1, claims.exp + maxSkewSeconds - nowSeconds);
+// A reservation must outlive the credential it guards. Sizing it from the moment the request arrived
+// instead of from when the credential stops being acceptable leaves a window in which the reservation
+// has lapsed but the same bytes still pass their freshness check — replayable despite a shared store.
+// Both caller-auth paths derive their TTL here so they cannot drift apart again.
+function replayTtlSeconds(acceptableUntilSeconds: number, now: Date): number {
+  return Math.max(1, acceptableUntilSeconds - Math.floor(now.getTime() / 1000));
+}
+
+// An HMAC request stays acceptable until its signed timestamp plus the skew allowance — which is later
+// than arrival whenever the timestamp is in the future. Rounded up so sub-second precision can only
+// lengthen the reservation.
+function hmacAcceptableUntilSeconds(signedAt: Date, maxSkewSeconds: number): number {
+  return Math.ceil(signedAt.getTime() / 1000) + maxSkewSeconds;
 }
 
 function validateJwkAssertionTimestamps(

@@ -168,6 +168,38 @@ describe('caller-auth replay protection across control-plane replicas', () => {
     expect(events.map((event) => event.reason)).toEqual(['replayed_signature']);
   });
 
+  it('holds an HMAC reservation until a future-dated request stops being acceptable', async () => {
+    const signingSecret = await generateCapabilitySigningSecret();
+    const events: HmacServiceClientAuthLogEvent[] = [];
+    let clock = NOW.getTime();
+    const replayCache = sharedReplayStore(() => clock);
+    const plane = controlPlane(
+      signingSecret,
+      hmacServiceClientAuth({
+        clients: [{ clientId: 'worker-a', secret: CLIENT_SECRET }],
+        log: (event) => events.push(event),
+        now: () => new Date(clock),
+        replayCache,
+      }),
+    );
+    // The skew check is symmetric, so a timestamp this far ahead is accepted and stays acceptable
+    // until 60s *after* it — later than the moment the reservation was taken.
+    const captured = await captureHmacRequest(new Date(NOW.getTime() + 60_000));
+
+    expect((await plane.fetch(replay(captured))).status).toBe(200);
+
+    // Sizing the reservation from arrival rather than from the signed timestamp would have let it
+    // lapse here, handing the identical bytes a second token.
+    clock += 61_000;
+    expect((await plane.fetch(replay(captured))).status).toBe(401);
+    expect(events.map((event) => event.reason)).toEqual(['replayed_signature']);
+
+    // Once the request itself is stale it is refused on freshness, so the reservation is free to go.
+    clock += 60_000;
+    expect((await plane.fetch(replay(captured))).status).toBe(401);
+    expect(events.map((event) => event.reason)).toEqual(['replayed_signature', 'timestamp_skew']);
+  });
+
   it('refuses the request with 503 when a configured replay store errors', async () => {
     const signingSecret = await generateCapabilitySigningSecret();
     const events: HmacServiceClientAuthLogEvent[] = [];

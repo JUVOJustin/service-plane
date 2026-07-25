@@ -332,7 +332,7 @@ type ServicePlaneReplayCache = {
 
 - **be atomic** — one create-if-absent operation. Return `true` if this call created the key, `false` if it already existed. Concurrent calls for one key must produce exactly one `true`.
 - **be routed consistently** — every copy of a given key must reach the same authoritative store or object. Consistent hashing on the key, or `idFromName(key)` for a Durable Object, satisfies this; per-replica memory does not.
-- **expire on its own** — honor `ttlSeconds` as a floor. Service Plane passes the HMAC skew window, or the JWK assertion `exp` plus the skew window, so a reservation always outlives the credential it guards. Never expire a key early; expiring late only costs storage.
+- **expire on its own** — honor `ttlSeconds` as a floor. Service Plane sizes it from the point the credential stops being acceptable, not from when the request arrived: the HMAC signed timestamp plus the skew window, or the JWK assertion `exp` plus the skew window, minus now. A future-dated credential therefore reserves for longer than the skew window, because it stays usable for longer. Never expire a key early — that reopens the replay it was taken to prevent; expiring late only costs storage.
 - **read its own writes** — eventually consistent stores (Cloudflare KV) cannot provide this and are unsuitable.
 
 Keys are already namespaced by Service Plane as `service-plane:hmac:<clientId>:<requestId|signature>` and `service-plane:jwk:<clientId>:<requestId|jti>`. Add your own prefix if the store is shared with other workloads.
