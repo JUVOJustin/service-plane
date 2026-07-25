@@ -51,8 +51,6 @@ export type HmacServiceClientAuthLogEvent = {
     | 'missing_client'
     | 'missing_signature'
     | 'missing_timestamp'
-    | 'replay_cache_unavailable'
-    | 'replayed_signature'
     | 'timestamp_skew';
   requestId?: string;
 };
@@ -64,21 +62,8 @@ export type HmacServiceClientAuthOptions = {
   maxBodyBytes?: number;
   maxSkewSeconds?: number;
   now?: () => Date;
-  replayCache?: ServicePlaneReplayCache;
   requestIdHeader?: string;
   timestampHeader?: string;
-};
-
-// Optional. Without it, replay is bounded by the request binding plus the skew window, which is the
-// documented baseline and scales horizontally on its own.
-//
-// Configuring one is opting into a guarantee, so it is enforced without further settings: one atomic
-// create-if-absent per key, backed by a store every replica reaches. Exactly one copy of a replayed
-// request can win, and a store that cannot answer refuses the request rather than serving unprotected.
-// Separate read-then-write is deliberately not accepted — two replicas can both observe "absent"
-// before either writes, which loses the guarantee with no visible symptom.
-export type ServicePlaneReplayCache = {
-  reserve(key: string, ttlSeconds: number): Promise<boolean> | boolean;
 };
 
 export type JwkServiceClient = {
@@ -100,8 +85,6 @@ export type JwkServiceClientAuthLogEvent = {
     | 'missing_client'
     | 'missing_key'
     | 'missing_signature'
-    | 'replay_cache_unavailable'
-    | 'replayed_assertion'
     | 'timestamp_skew';
   requestId?: string;
 };
@@ -119,8 +102,11 @@ export type JwkServiceClientAuthOptions = {
   registryCache?: RegistryCache;
   registryCacheKey?: string;
   registryCacheTtlSeconds?: number;
-  replayCache?: ServicePlaneReplayCache;
   requestIdHeader?: string;
+  // Binds issued tokens to the key that authenticated (RFC 7800 `cnf`), so the token cannot be used
+  // by anyone else. Opt-in: a bound token is refused without a matching proof, so callers must also
+  // pass `proveTokenPossession` when opening sessions. Turning it on without that breaks them.
+  senderConstrained?: boolean;
   services?: ServiceEndpoint[] | ((context: Context) => Promise<ServiceEndpoint[]> | ServiceEndpoint[]);
 };
 
@@ -141,7 +127,6 @@ export function hmacServiceClientAuth(options: HmacServiceClientAuthOptions) {
   const log = options.log ?? defaultHmacCallerAuthLog;
 
   return async (context: Context): Promise<Response | string> => {
-    // One clock per request, so the skew check and the reservation TTL cannot disagree.
     const now = options.now?.() ?? new Date();
     try {
       const clientId = context.req.header(clientIdHeader)?.trim();
@@ -156,7 +141,7 @@ export function hmacServiceClientAuth(options: HmacServiceClientAuthOptions) {
         return callerAuthUnauthorized(context, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME);
       }
 
-      const { error: timestampError, signedAt } = validateHmacTimestamp(timestamp, now, maxSkewSeconds);
+      const timestampError = validateHmacTimestamp(timestamp, now, maxSkewSeconds);
       if (timestampError) {
         log(hmacUnauthorizedEvent(context, timestampError, hmacTimestampMessage(timestampError)));
         return callerAuthUnauthorized(context, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME);
@@ -188,24 +173,6 @@ export function hmacServiceClientAuth(options: HmacServiceClientAuthOptions) {
         log(hmacUnauthorizedEvent(context, 'invalid_signature', 'Invalid Service-Plane HMAC signature'));
         return callerAuthUnauthorized(context, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME);
       }
-      if (options.replayCache) {
-        // The signature is the fallback replay key: it already binds method, path, body, timestamp,
-        // and client, so a captured request replays under the same key even without a request id.
-        const reservation = await reserveReplayKey(
-          options.replayCache,
-          `service-plane:hmac:${clientId}:${context.req.header(requestIdHeader)?.trim() || signature}`,
-          replayTtlSeconds(hmacAcceptableUntilSeconds(signedAt, maxSkewSeconds), now),
-        );
-        if (reservation.decision === 'replayed') {
-          log(hmacUnauthorizedEvent(context, 'replayed_signature', 'Replayed Service-Plane HMAC signature'));
-          return callerAuthUnauthorized(context, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME);
-        }
-        if (reservation.decision === 'unavailable') {
-          log(hmacUnauthorizedEvent(context, 'replay_cache_unavailable', replayCacheUnavailableMessage(reservation.error)));
-          return replayVerificationUnavailable(context);
-        }
-      }
-
       return client.serviceId ?? client.clientId;
     } catch (error) {
       if (error instanceof CapabilityAuthError) {
@@ -286,30 +253,15 @@ export function jwkServiceClientAuth(options: JwkServiceClientAuthOptions) {
         now,
         requestIdHeader,
       });
-      if (options.replayCache) {
-        // TTL outlives the assertion plus the accepted skew, so a reservation can never expire while
-        // the assertion it guards would still verify.
-        const reservation = await reserveReplayKey(
-          options.replayCache,
-          `service-plane:jwk:${clientId}:${claims.requestId ?? claims.jti}`,
-          replayTtlSeconds(claims.exp + maxSkewSeconds, now),
-        );
-        if (reservation.decision === 'replayed') {
-          log(jwkUnauthorizedEvent(context, 'replayed_assertion', 'Replayed Service-Plane JWK assertion'));
-          return callerAuthUnauthorized(context, SERVICE_PLANE_JWK_AUTHORIZATION_SCHEME);
-        }
-        if (reservation.decision === 'unavailable') {
-          log(jwkUnauthorizedEvent(context, 'replay_cache_unavailable', replayCacheUnavailableMessage(reservation.error)));
-          return replayVerificationUnavailable(context);
-        }
-      }
+      const serviceId = client.serviceId ?? client.clientId;
+      if (!options.senderConstrained) return { serviceId };
 
       // Report the key that actually authenticated, so issuance can sender-constrain the token to it.
       // `verifyWithJwks` pins the signer by `kid`, so selecting on the validated key id names the
       // signer rather than a key the caller merely claimed to use.
       return {
         confirmation: { jkt: await servicePlaneJwkThumbprint(servicePlaneJwkSigner(jwks, headerKeyId)) },
-        serviceId: client.serviceId ?? client.clientId,
+        serviceId,
       };
     } catch (error) {
       if (error instanceof CapabilityAuthError) {
@@ -367,16 +319,12 @@ function defaultJwkCallerAuthLog(event: JwkServiceClientAuthLogEvent): void {
   console.warn(JSON.stringify(event));
 }
 
-type HmacTimestampCheck = { error: 'invalid_timestamp' | 'timestamp_skew'; signedAt?: undefined } | { error?: undefined; signedAt: Date };
-
-// Returns the parsed timestamp on success: the replay reservation is sized from it, not from the
-// moment the request arrived.
-function validateHmacTimestamp(timestamp: string, now: Date, maxSkewSeconds: number): HmacTimestampCheck {
+function validateHmacTimestamp(timestamp: string, now: Date, maxSkewSeconds: number): 'invalid_timestamp' | 'timestamp_skew' | undefined {
   const parsed = new Date(timestamp);
-  if (Number.isNaN(parsed.getTime())) return { error: 'invalid_timestamp' };
+  if (Number.isNaN(parsed.getTime())) return 'invalid_timestamp';
   const skewMs = Math.abs(now.getTime() - parsed.getTime());
-  if (skewMs > maxSkewSeconds * 1000) return { error: 'timestamp_skew' };
-  return { signedAt: parsed };
+  if (skewMs > maxSkewSeconds * 1000) return 'timestamp_skew';
+  return undefined;
 }
 
 function normalizePositiveAuthLimit(value: number, name: string): number {
@@ -523,21 +471,6 @@ async function validateJwkAssertionClaims(
   }
 }
 
-// A reservation must outlive the credential it guards. Sizing it from the moment the request arrived
-// instead of from when the credential stops being acceptable leaves a window in which the reservation
-// has lapsed but the same bytes still pass their freshness check — replayable despite a shared store.
-// Both caller-auth paths derive their TTL here so they cannot drift apart again.
-function replayTtlSeconds(acceptableUntilSeconds: number, now: Date): number {
-  return Math.max(1, acceptableUntilSeconds - Math.floor(now.getTime() / 1000));
-}
-
-// An HMAC request stays acceptable until its signed timestamp plus the skew allowance — which is later
-// than arrival whenever the timestamp is in the future. Rounded up so sub-second precision can only
-// lengthen the reservation.
-function hmacAcceptableUntilSeconds(signedAt: Date, maxSkewSeconds: number): number {
-  return Math.ceil(signedAt.getTime() / 1000) + maxSkewSeconds;
-}
-
 function validateJwkAssertionTimestamps(
   claims: Pick<ParsedJwkAssertionClaims, 'exp' | 'iat' | 'nbf'>,
   now: Date,
@@ -556,31 +489,6 @@ function validateJwkAssertionTimestamps(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
-}
-
-type ReplayReservation = {
-  decision: 'accepted' | 'replayed' | 'unavailable';
-  error?: string;
-};
-
-// One reservation attempt per authenticated request. A store error is reported rather than thrown so
-// the caller-auth path decides between refusing the request and accepting it without protection.
-async function reserveReplayKey(replayCache: ServicePlaneReplayCache, key: string, ttlSeconds: number): Promise<ReplayReservation> {
-  try {
-    return { decision: (await replayCache.reserve(key, ttlSeconds)) ? 'accepted' : 'replayed' };
-  } catch (error) {
-    return { decision: 'unavailable', error: error instanceof Error ? error.message : String(error) };
-  }
-}
-
-function replayCacheUnavailableMessage(error: string | undefined): string {
-  return `Service-Plane replay cache is unavailable${error ? `: ${error}` : ''}`;
-}
-
-// Not a credential problem, so no 401 and no challenge: the caller signed correctly and the plane
-// cannot currently prove the request is fresh.
-function replayVerificationUnavailable(context: Context): Response {
-  return context.json({ error: 'Service-Plane replay verification unavailable' }, 503);
 }
 
 function requestIdFromContext(context: Context): string | undefined {

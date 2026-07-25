@@ -89,7 +89,6 @@ export {
   type JwkServiceClientAuthLogEvent,
   type JwkServiceClientAuthOptions,
   jwkServiceClientAuth,
-  type ServicePlaneReplayCache,
 } from './caller-auth.js';
 export {
   type CallerAuthenticator,

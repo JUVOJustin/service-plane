@@ -8,7 +8,12 @@ import {
   RpcTarget,
   type RpcTransport,
 } from 'capnweb';
-import { decodeCapabilityTokenPayload, normalizeCapabilitySubject, verifyCapabilityToken } from '../shared/capability-tokens.js';
+import {
+  decodeCapabilityTokenPayload,
+  normalizeCapabilitySubject,
+  publicJwkFromPrivateJwk,
+  verifyCapabilityToken,
+} from '../shared/capability-tokens.js';
 import {
   type ConnInfo,
   normalizeConnInfo,
@@ -22,6 +27,7 @@ import {
   SERVICE_PLANE_JWK_ASSERTION_AUDIENCE,
   SERVICE_PLANE_JWK_CLIENT_HEADER,
   SERVICE_PLANE_JWK_KEY_ID_HEADER,
+  servicePlaneJwkThumbprint,
   signServicePlaneJwkRequest,
 } from '../shared/jwk-auth.js';
 import { signCapabilityProof } from '../shared/proof-of-possession.js';
@@ -626,15 +632,33 @@ export type JwkCapabilityProofSignerOptions = {
 // Signs proofs with the same private key the caller authenticates to the control plane with, so a
 // sender-constrained token can be used without registering or distributing anything further.
 export function jwkCapabilityProofSigner(options: JwkCapabilityProofSignerOptions): CapabilityProofSigner {
-  return async (input) =>
-    signCapabilityProof({
+  return async (input) => {
+    const privateJwk = await resolvePrivateJwk(options.privateJwk);
+    // A rotating key resolver can outrun the token cache: the provider may still hold a token bound to
+    // the previous key, and signing that with the new one produces a proof the service rejects. Catch
+    // it here, where the cause is visible, instead of shipping a proof that fails remotely as a 401.
+    await assertProofKeyMatchesToken(privateJwk, input.token);
+    return signCapabilityProof({
       abilityId: input.abilityId,
       ...(options.now ? { now: options.now() } : {}),
-      privateJwk: await resolvePrivateJwk(options.privateJwk),
+      privateJwk,
       targetServiceId: input.targetServiceId,
       token: input.token,
       ...(options.ttlSeconds === undefined ? {} : { ttlSeconds: options.ttlSeconds }),
     });
+  };
+}
+
+async function assertProofKeyMatchesToken(privateJwk: JsonWebKey, token: string): Promise<void> {
+  const bound = decodeCapabilityTokenPayload(token).cnf?.jkt;
+  if (!bound) return;
+  const thumbprint = await servicePlaneJwkThumbprint(publicJwkFromPrivateJwk(privateJwk, 'service-plane-pop'));
+  if (thumbprint !== bound) {
+    throw new CapabilityAuthError(
+      'Service-Plane proof of possession key does not match the capability token it accompanies; the token was issued for a different key (a rotated signing key outrunning a cached token is the usual cause)',
+      401,
+    );
+  }
 }
 
 export function controlPlaneJwkTokenRequester(

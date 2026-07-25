@@ -89,12 +89,6 @@ controlPlaneHmacTokenRequester({
 
 JWK is preferable for distributed services because the private key stays with the caller and the public key can be discovered or configured by the plane.
 
-Replay protection is optional and off by default; without it a captured token request stays usable
-until its timestamp leaves the skew window, which is fine across any number of replicas. If you do
-want it, it must be a store every process, container, and region reaches atomically (Redis
-`SET … NX EX`) — process memory cannot decide this — and it then becomes a hard dependency of token
-issuance. See [auth.md](auth.md#two-node-replicas).
-
 ## WebSocket Sessions
 
 Use WebSocket only when the session is long-lived, interactive, or chatty.

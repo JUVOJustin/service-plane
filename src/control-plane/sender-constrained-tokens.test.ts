@@ -13,6 +13,7 @@ import {
 } from '../service/index.js';
 import { decodeCapabilityTokenPayload, publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
 import { servicePlaneJwkThumbprint } from '../shared/jwk-auth.js';
+import { signCapabilityProof } from '../shared/proof-of-possession.js';
 import { type CapabilityJwks, SERVICE_PLANE_CAPABILITY_JWKS_PATH } from '../shared/types.js';
 import { jwkServiceClientAuth } from './caller-auth.js';
 import { ServicePlaneControlPlane } from './control-plane.js';
@@ -72,9 +73,11 @@ describe('sender-constrained capability tokens', () => {
     const { requestToken, service } = await deployment(caller);
     const issued = await requestToken({ callerServiceId: CALLER, scopes: ['example.sync.run'], targetServiceId: 'example' });
 
-    // The attacker holds the token and a key of its own, which is the realistic theft scenario.
+    // Signed directly rather than through jwkCapabilityProofSigner: that helper refuses a mismatched
+    // key client-side, and an attacker would simply not use it. The service must reject on its own.
     const forged = await session(service, {
-      proveTokenPossession: jwkCapabilityProofSigner({ privateJwk: attacker.privateJwk }),
+      proveTokenPossession: ({ abilityId, targetServiceId, token }) =>
+        signCapabilityProof({ abilityId, privateJwk: attacker.privateJwk, targetServiceId, token }),
       token: issued.token,
     });
 
@@ -98,6 +101,33 @@ describe('sender-constrained capability tokens', () => {
     await expect(mismatched.runSync({})).rejects.toThrow(/bound to a different token/u);
   });
 
+  it('leaves JWK callers unbound until the plane opts in, so upgrading cannot break them', async () => {
+    const caller = await callerKeys();
+    const { requestToken } = await deployment(caller, { senderConstrained: false });
+
+    // Binding a caller's tokens requires it to send proofs. Turning that on silently would break every
+    // existing session, so the plane must ask for it.
+    const issued = await requestToken({ callerServiceId: CALLER, scopes: ['example.sync.run'], targetServiceId: 'example' });
+    expect((decodeCapabilityTokenPayload(issued.token) as unknown as { cnf?: unknown }).cnf).toBeUndefined();
+  });
+
+  it('fails locally when the proof key no longer matches the token it accompanies', async () => {
+    const caller = await callerKeys();
+    const rotated = await callerKeys();
+    const { requestToken } = await deployment(caller);
+    const issued = await requestToken({ callerServiceId: CALLER, scopes: ['example.sync.run'], targetServiceId: 'example' });
+
+    // A rotated key resolver outrunning a cached token would otherwise ship a proof that fails
+    // remotely as an opaque 401.
+    await expect(
+      jwkCapabilityProofSigner({ privateJwk: rotated.privateJwk })({
+        abilityId: 'example.sync',
+        targetServiceId: 'example',
+        token: issued.token,
+      }),
+    ).rejects.toThrow(/does not match the capability token it accompanies/u);
+  });
+
   it('leaves HMAC callers unbound, since a shared secret has no key to confirm', async () => {
     const caller = await callerKeys();
     const { plane } = await deployment(caller);
@@ -117,7 +147,7 @@ async function callerKeys() {
   return { privateJwk, publicJwk, thumbprint: await servicePlaneJwkThumbprint(publicJwk) };
 }
 
-async function deployment(caller: Awaited<ReturnType<typeof callerKeys>>) {
+async function deployment(caller: Awaited<ReturnType<typeof callerKeys>>, options: { senderConstrained?: boolean } = {}) {
   const signingSecret = await generateCapabilitySigningSecret();
   // Declared up front because the two shells reference each other lazily: the service fetches JWKS
   // from the plane, and the plane discovers the service.
@@ -156,6 +186,7 @@ async function deployment(caller: Awaited<ReturnType<typeof callerKeys>>) {
     authenticateCaller: jwkServiceClientAuth({
       clients: [{ clientId: CALLER, jwks: { keys: [caller.publicJwk] } }],
       log: () => undefined,
+      senderConstrained: options.senderConstrained ?? true,
     }),
     log: false,
     services: () => [

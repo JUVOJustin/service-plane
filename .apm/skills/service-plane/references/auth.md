@@ -128,20 +128,16 @@ The cheapest way to shrink the window further needs no infrastructure at all: lo
 (to the tightest value your clock discipline tolerates) and `maxAssertionTtlSeconds`. Do that before
 reaching for a store.
 
-Cases where a store does earn its cost: request headers are retained in logs or an APM while
-responses are not; a component can replay a request it could not observe the response to; one-time-use
-assertions are a compliance requirement; or duplicate token issuance is itself an audit finding.
-
 ### Precedent
 
-This baseline — bind the request, bound the window, treat replay reservation as optional hardening —
-is where the specifications and the large deployments land. Cited as precedent for the shape of the
-control, not as a compliance claim:
+This baseline — bind the request, bound the window, and do not track used requests — is where the
+specifications and the large deployments land. Cited as precedent for the shape of the control, not as
+a compliance claim:
 
 - **RFC 7523 §3** (JWT profile for OAuth 2.0 client authentication) makes it explicitly optional: an
   authorization server "MAY ensure that JWTs are not replayed by maintaining the set of used `jti`
-  values for the length of time for which the JWT would be considered valid". A MAY, and bounded to
-  the assertion's own validity window — which is exactly the TTL Service Plane passes to `reserve()`.
+  values for the length of time for which the JWT would be considered valid". A MAY, not a MUST, and
+  bounded to the assertion's own validity window.
 - **RFC 9449 §11.1** (DPoP) treats proof replay the same way: a server *can* store each proof's `jti`
   for the window in which that proof would still be accepted. Where DPoP wants a stronger guarantee it
   does not reach for a bigger cache, it adds a server-issued nonce.
@@ -153,96 +149,14 @@ control, not as a compliance claim:
   duplicate suppression to the consumer as idempotent event handling rather than guaranteeing
   exactly-once delivery themselves.
 
-`replayCache` is therefore **optional and off by default**. There is one supported configuration on
-each side of that choice:
+No replay store ships with this package, and none is accepted as configuration. Narrowing a ~60
+second window is not worth a shared, atomically-reserving store on the critical path of every token
+request — that store becomes a hard dependency of token issuance, so its outage is a total token
+outage. If you want the window smaller, lower `maxSkewSeconds` and `maxAssertionTtlSeconds`; the cost
+is zero infrastructure.
 
-| Configuration | Guarantee |
-| --- | --- |
-| No `replayCache` (default) | A captured request is reusable until its skew window or assertion lifetime expires. Horizontal scaling is unaffected. |
-| A shared store | Exactly one copy of a request wins, regardless of which replica or isolate receives it. |
-
-There is no third option on purpose. A process- or isolate-local cache is not offered, because it
-would look like protection while only the replica that saw the first copy rejects the second, with
-nothing reporting the gap. Nor is a store with a separate read and write: two replicas can both
-observe "absent" before either writes, and that failure is invisible too. `replayCache` accepts one
-operation, `reserve(key, ttlSeconds)`, and it must be atomic and reachable by every replica.
-
-Configuring a store is opting into the guarantee, so it is enforced without further settings:
-
-```ts
-hmacServiceClientAuth({
-  clients,
-  replayCache: redisReplayCache(env.REDIS_URL),
-});
-```
-
-### Two Node Replicas
-
-Both replicas run the same image behind a load balancer and share one Redis. `SET key value NX EX ttl`
-is the atomic reservation: it succeeds only if the key does not exist.
-
-```ts
-function redisReplayCache(redis: { set(...args: string[]): Promise<string | null> }): ServicePlaneReplayCache {
-  return {
-    // NX makes the write conditional; EX bounds it. One command, so no read/write gap to race.
-    async reserve(key, ttlSeconds) {
-      return (await redis.set(key, '1', 'NX', 'EX', String(ttlSeconds))) === 'OK';
-    },
-  };
-}
-
-const authenticateCaller = jwkServiceClientAuth({
-  clients,
-  replayCache: redisReplayCache(redis),
-});
-```
-
-Replica A accepts the request and reserves the key. Replica B receives the replay, finds the key
-present, and answers `401`. Only the replay cache is shared: signing configuration is identical on
-both replicas, but each keeps its own issuer, registry, and OpenAPI caches.
-
-### Two Cloudflare Isolates
-
-Several isolates may serve one Worker deployment, in different locations, created and evicted at any
-time. An isolate-local `Map` cannot see a sibling's reservations. Route every replay key to one
-Durable Object instead — `idFromName(key)` gives consistent routing, and the object's single-threaded
-storage gives atomicity:
-
-```ts
-function durableObjectReplayCache(namespace: DurableObjectNamespace): ServicePlaneReplayCache {
-  return {
-    async reserve(key, ttlSeconds) {
-      const stub = namespace.get(namespace.idFromName(key));
-      const response = await stub.fetch('https://replay.internal/reserve', {
-        body: JSON.stringify({ key, ttlSeconds }),
-        method: 'POST',
-      });
-      return (await response.json<{ reserved: boolean }>()).reserved;
-    },
-  };
-}
-```
-
-Cloudflare KV is not suitable here: its reads are eventually consistent, so two isolates can both
-read "absent" for a key one of them has already written. Use KV for discovery snapshots and OpenAPI
-documents, not for replay reservations.
-
-### When The Store Is Unavailable
-
-Redis restarts. Durable Objects have bad minutes. If `reserve()` throws, the request is refused with
-`503` and `{ "error": "Service-Plane replay verification unavailable" }`, and a
-`replay_cache_unavailable` event is logged. There is no `401` and no `WWW-Authenticate` challenge:
-the caller's credentials were valid and re-signing would not help.
-
-This is not configurable, and the trade-off is worth being explicit about. Wiring a store is a
-statement that replay must not happen, so serving unprotected would quietly break that statement —
-and a switch to permit it is a switch that gets flipped once during an incident and never flipped
-back. The cost is real: **the replay store becomes a hard dependency of token issuance**, so a store
-outage is a token outage, and every brokered call fails with it. Give it the same uptime budget,
-health checks, and alerting as the plane itself.
-
-If that dependency is not one you want, do not configure a store. The default is a documented
-baseline, not a broken state.
+What does close the gap this leaves — a token captured in flight or at rest — is binding the token to
+the caller's key rather than tracking used requests. See [Sender-Constrained Tokens](#sender-constrained-tokens).
 
 ### Out Of Scope
 
@@ -265,9 +179,16 @@ Binding fixes that. RFC 7800 defines the `cnf` (confirmation) claim: the issuer 
 presenter must prove it holds. Service Plane uses the `jkt` confirmation method — the RFC 7638 SHA-256
 thumbprint of the caller's public JWK, as registered by RFC 9449 (DPoP).
 
-**JWK callers get this automatically, with no configuration and no new secrets.** The plane already
-holds the caller's public key and already verifies a signature on every token request, so it stamps the
-thumbprint of the key that actually authenticated:
+**Opt in on the plane with `senderConstrained: true`.** It is off by default on purpose: a bound token
+is refused without a proof, so switching it on before callers send proofs would break every existing
+session. Turn it on together with rolling `proveTokenPossession` out to callers.
+
+```ts
+jwkServiceClientAuth({ clients, senderConstrained: true });
+```
+
+No new secrets are involved — the plane already holds the caller's public key and already verifies a
+signature on every token request, so it stamps the thumbprint of the key that actually authenticated:
 
 ```json
 { "iss": "control-plane", "sub": "workflow-runner", "aud": "asana", "cnf": { "jkt": "NzbLsXh8..." } }
@@ -298,15 +219,18 @@ proof arrives, because the requirement travels in the token rather than in local
 cannot downgrade a sender-constrained token to a bearer token by omitting the proof, and a service
 cannot forget to check.
 
-What this buys beyond replay protection: a token minted for one caller is useless to everyone else,
-**including to a compromised control plane**. The plane can still mint tokens, but it cannot present
-one.
+What this buys: a token that leaks — from a captured response, a proxy log, an APM trace, or a token
+cache — is useless to whoever finds it, because using it requires the caller's private key.
+
+It does **not** bound a compromised control plane. The plane holds the signing key, so it can mint a
+fresh token with no `cnf` claim at all and present that as a bearer credential. Binding protects
+tokens against theft; it does not make the issuer untrusted.
 
 ### Where It Applies
 
 | Path | Binding |
 | --- | --- |
-| JWK caller → token endpoint → service | Automatic. This is where a token leaves the plane. |
+| JWK caller → token endpoint → service | Opt in with `senderConstrained`. This is where a token leaves the plane. |
 | HMAC caller | None. A shared secret has no key to confirm; use JWK caller auth if you want binding. |
 | Brokered calls (`/rpc/broker`) | Not applicable. The broker mints the token and uses it on its own leg to the service — the caller never receives it. Ingress plus the signed `spb` claim already restricts those tokens to brokered use. |
 | Cloudflare service bindings | Unnecessary. Identity is pinned by the binding entrypoint and no token crosses a network. |
@@ -316,6 +240,10 @@ one.
 The proof is **session-scoped**, not per-call: Cap'n Web sessions are long-lived, so one proof is signed
 when the session opens. The guarantee is "the caller held the key when this session opened", not "on
 every method call".
+
+Rotating a caller key needs both keys registered on the plane until cached tokens expire: a token
+bound to the old key cannot be proved with the new one. `jwkCapabilityProofSigner` detects that
+locally and raises a clear error rather than emitting a proof the service will reject.
 
 Proofs have their own 60-second freshness window (plus skew) for the same reason token requests do —
 a proof is itself a signed artifact. It is bound to one token, one service, and one ability, so a

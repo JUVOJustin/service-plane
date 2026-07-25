@@ -164,8 +164,16 @@ function parseProofClaims(payload: unknown): ParsedProofClaims {
   ) {
     throw new CapabilityAuthError('Invalid Service-Plane proof of possession claims', 401);
   }
-  // A private half here would mean the caller leaked its own signing key. Refuse rather than use it.
-  if (typeof cnk.d === 'string') {
+  // Fully validated here rather than left to the thumbprint helper: the embedded key is
+  // attacker-controlled, so a malformed one must be an authentication failure, not a 500.
+  // A private half would also mean the caller leaked its own signing key — refuse rather than use it.
+  if (
+    typeof cnk.d === 'string' ||
+    cnk.kty !== 'EC' ||
+    typeof cnk.crv !== 'string' ||
+    typeof cnk.x !== 'string' ||
+    typeof cnk.y !== 'string'
+  ) {
     throw new CapabilityAuthError('Invalid Service-Plane proof of possession key', 401);
   }
   return { abl, ath, aud, cnk: cnk as JsonWebKey, exp, iat, jti };
