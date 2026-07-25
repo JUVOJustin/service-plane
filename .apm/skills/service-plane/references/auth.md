@@ -43,6 +43,22 @@ node --input-type=module -e "import { generateCapabilitySigningSecret } from 'se
 
 Store the output as `STS_SIGNING_SECRET` on the control plane only. Services and callers must not receive this secret.
 
+## Signing Authority And Authorization Catalog
+
+The control plane keeps two responsibilities apart:
+
+- The **signing authority** owns the signing key, the issuer, the key id, and the public JWKS. It is derived from `signingSecret` alone.
+- The **authorization catalog** owns the discovered services, capability scopes, and grants. Building it fetches every configured service's discovery document.
+
+`GET /.well-known/service-plane/jwks.json` answers from the signing authority only. It resolves neither
+`services` nor any discovery document, so services can refresh their cached verification keys while a
+target service is unavailable. Token issuance and brokering still need both halves and keep failing
+closed: an unknown service, scope, or grant is rejected, and an unreachable grant target is a `500`
+rather than a token.
+
+`createCapabilitySigningAuthorityFromSigningSecret({ signingSecret, issuer, keyId })` builds that half
+directly, and `mountCapabilityJwksEndpoint` accepts it, if you publish JWKS from your own Hono app.
+
 ## Caller Authentication Options
 
 Use the simplest option that matches the deployment boundary.

@@ -33,6 +33,28 @@ export type CapabilityIssuer = {
   jwks(): Promise<CapabilityJwks>;
 };
 
+// The signing authority owns key material only: issuer, key id, and public JWKS. It is deliberately
+// separate from the authorization catalog (services, scopes, grants) so publishing JWKS never
+// depends on downstream service discovery — verifiers must be able to refresh keys during an outage.
+export type CapabilitySigningAuthority = {
+  issuer: string;
+  jwks(): Promise<CapabilityJwks>;
+  keyId: string;
+};
+
+// Anything that can publish JWKS. A full CapabilityIssuer satisfies it, so JWKS mounts accept either.
+export type CapabilityJwksProvider = Pick<CapabilityIssuer, 'jwks'>;
+
+export type CapabilityJwksProviderResolver =
+  | CapabilityJwksProvider
+  | ((context: Context) => Promise<CapabilityJwksProvider> | CapabilityJwksProvider);
+
+export type CreateCapabilitySigningAuthorityOptions = {
+  issuer: string;
+  keyId?: string;
+  privateJwk: JsonWebKey;
+};
+
 export type CreateCapabilityIssuerOptions = {
   capabilities: CapabilityCatalog[];
   grants: ServiceGrantDefinition;
@@ -66,6 +88,9 @@ export type MountCapabilityJwksEndpointOptions = {
 export type MountCapabilityEndpointsOptions = {
   authenticateCaller(context: Context): Promise<Response | string> | Response | string;
   httpCache?: ServicePlaneHttpCacheOption;
+  // Serves JWKS from a signing authority instead of the token issuer, so key publication stays up
+  // while the authorization catalog is unavailable. Defaults to the issuer.
+  jwks?: CapabilityJwksProviderResolver;
   jwksPath?: string;
   tokenPath?: string;
 };
@@ -82,9 +107,25 @@ export function defineServiceGrants(definition: ServiceGrantDefinition): Service
   };
 }
 
-export function createCapabilityIssuer(options: CreateCapabilityIssuerOptions): CapabilityIssuer {
+// Derives the public JWKS from private key material alone. No catalog, no discovery, no I/O.
+export function createCapabilitySigningAuthority(options: CreateCapabilitySigningAuthorityOptions): CapabilitySigningAuthority {
   const keyId = options.keyId ?? DEFAULT_CAPABILITY_KEY_ID;
   const publicJwk = publicJwkFromPrivateJwk(options.privateJwk, keyId);
+
+  return {
+    issuer: options.issuer,
+    async jwks() {
+      return {
+        keys: [publicJwk],
+      };
+    },
+    keyId,
+  };
+}
+
+export function createCapabilityIssuer(options: CreateCapabilityIssuerOptions): CapabilityIssuer {
+  const keyId = options.keyId ?? DEFAULT_CAPABILITY_KEY_ID;
+  const signingAuthority = createCapabilitySigningAuthority({ ...options, keyId });
   const capabilitiesByService = capabilityScopesByService(options.capabilities);
   const grants = options.grants.grants.map((grant) => validateGrant(grant, capabilitiesByService));
   const maxTtlSeconds = normalizeTtlSeconds(options.ttlSeconds ?? DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS, 500);
@@ -113,11 +154,7 @@ export function createCapabilityIssuer(options: CreateCapabilityIssuerOptions): 
         privateJwk: options.privateJwk,
       });
     },
-    async jwks() {
-      return {
-        keys: [publicJwk],
-      };
-    },
+    jwks: signingAuthority.jwks,
   };
 }
 
@@ -189,9 +226,11 @@ export function mountCapabilityTokenEndpoint(
       context.header('pragma', 'no-cache');
       const caller = await options.authenticateCaller(context);
       if (caller instanceof Response) return caller;
-      const resolvedIssuer = typeof issuer === 'function' ? await issuer(context) : issuer;
 
       try {
+        // Resolved inside the guard so an unavailable authorization catalog fails closed with the
+        // issuer's own error instead of an opaque unhandled rejection.
+        const resolvedIssuer = typeof issuer === 'function' ? await issuer(context) : issuer;
         const body = await readTokenRequest(context.req.raw);
         if (body.callerServiceId && body.callerServiceId !== caller) {
           return context.json({ error: 'Caller service mismatch' }, 403);
@@ -220,7 +259,7 @@ export function mountCapabilityEndpoints(
     authenticateCaller: options.authenticateCaller,
     ...(options.tokenPath ? { path: options.tokenPath } : {}),
   });
-  mountCapabilityJwksEndpoint(app, issuer, {
+  mountCapabilityJwksEndpoint(app, options.jwks ?? issuer, {
     ...(options.httpCache === undefined ? {} : { httpCache: options.httpCache }),
     ...(options.jwksPath ? { path: options.jwksPath } : {}),
   });
@@ -231,7 +270,7 @@ export function mountCapabilityJwksEndpoint(
     get(path: string, ...handlers: Handler[]): unknown;
     use(path: string, ...handlers: Handler[]): unknown;
   },
-  issuer: CapabilityIssuerResolver,
+  jwks: CapabilityJwksProviderResolver,
   options: MountCapabilityJwksEndpointOptions = {},
 ): void {
   const path = options.path ?? SERVICE_PLANE_CAPABILITY_JWKS_PATH;
@@ -241,8 +280,8 @@ export function mountCapabilityJwksEndpoint(
     path,
     ...endpointFactory.createHandlers(async (context) => {
       applyHttpCacheHeaders(cacheHeaders, (name, value) => context.header(name, value));
-      const resolvedIssuer = typeof issuer === 'function' ? await issuer(context) : issuer;
-      return context.json(await resolvedIssuer.jwks());
+      const provider = typeof jwks === 'function' ? await jwks(context) : jwks;
+      return context.json(await provider.jwks());
     }),
   );
 }

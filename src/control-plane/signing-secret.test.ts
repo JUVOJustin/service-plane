@@ -4,6 +4,7 @@ import { verifyCapabilityToken } from '../shared/capability-tokens.js';
 import { defineServiceGrants } from './capabilities.js';
 import {
   createCapabilityIssuerFromSigningSecret,
+  createCapabilitySigningAuthorityFromSigningSecret,
   generateCapabilitySigningSecret,
   privateJwkFromCapabilitySigningSecret,
 } from './signing-secret.js';
@@ -52,5 +53,57 @@ describe('control-plane signing secrets', () => {
         requiredScopes: ['fizzy.users.lookup'],
       }),
     ).resolves.toMatchObject({ serviceId: 'moco' });
+  });
+
+  it('builds a signing authority that publishes the issuer key without a capability catalog', async () => {
+    const signingSecret = await generateCapabilitySigningSecret();
+    const authority = createCapabilitySigningAuthorityFromSigningSecret({
+      issuer: 'https://issuer.example',
+      keyId: 'test-key',
+      signingSecret,
+    });
+
+    expect(authority.issuer).toBe('https://issuer.example');
+    expect(authority.keyId).toBe('test-key');
+    const jwks = await authority.jwks();
+    expect(jwks.keys[0]).toMatchObject({ crv: 'P-256', kid: 'test-key', kty: 'EC' });
+    expect(jwks.keys[0]).not.toHaveProperty('d');
+
+    // The same secret must verify tokens signed by the full issuer, otherwise splitting the
+    // signing authority out of the catalog would publish a key that verifies nothing.
+    const issuer = await createCapabilityIssuerFromSigningSecret({
+      capabilities: [defineCapabilities({ scopes: [{ id: 'fizzy.users.lookup' }], serviceId: 'fizzy' })],
+      grants: defineServiceGrants({
+        grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
+      }),
+      issuer: 'https://issuer.example',
+      keyId: 'test-key',
+      signingSecret,
+    });
+    const issued = await issuer.issueCapabilityToken({
+      callerServiceId: 'moco',
+      scopes: ['fizzy.users.lookup'],
+      targetServiceId: 'fizzy',
+    });
+
+    await expect(
+      verifyCapabilityToken(issued.token, {
+        expectedAudience: 'fizzy',
+        issuer: authority.issuer,
+        jwks,
+        requiredScopes: ['fizzy.users.lookup'],
+      }),
+    ).resolves.toMatchObject({ serviceId: 'moco' });
+    await expect(issuer.jwks()).resolves.toEqual(jwks);
+  });
+
+  it('defaults the signing-authority issuer and key id to the control-plane defaults', async () => {
+    const authority = createCapabilitySigningAuthorityFromSigningSecret({
+      signingSecret: await generateCapabilitySigningSecret(),
+    });
+
+    expect(authority.issuer).toBe('control-plane');
+    expect(authority.keyId).toBe('default');
+    await expect(authority.jwks()).resolves.toMatchObject({ keys: [{ kid: 'default' }] });
   });
 });

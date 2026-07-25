@@ -147,6 +147,12 @@ ALL  /rpc/broker
 
 The plane serves the OpenAPI document only. Mount a documentation UI yourself on `plane.app` (e.g. `@hono/swagger-ui` or `@scalar/hono-api-reference`) pointed at `/openapi.json`.
 
+The JWKS route is served from the signing authority (`signingSecret`, `issuer`, `keyId`) and never
+resolves `services` or fetches discovery documents, so key publication survives a service-discovery
+outage. The capability-token, broker, and MCP routes additionally need the authorization catalog
+(discovered capabilities and grants) and fail closed when it cannot be built. See
+[auth.md](auth.md#signing-authority-and-authorization-catalog).
+
 `httpCache` is optional and mirrors the service option: when set, the OpenAPI and JWKS routes emit `Cache-Control` and `Cache-Tag` headers. The capability-token endpoint always responds with `Cache-Control: no-store` and `Pragma: no-cache`. Broker and MCP RPC responses are never cache-eligible.
 
 `broker.cache` and `mcp.cache` cache the discovery snapshots used by those surfaces. `openapi.cache` caches the generated document; set its TTL with `openapi.cacheTtlSeconds`. Keep discovery and OpenAPI caches separate.

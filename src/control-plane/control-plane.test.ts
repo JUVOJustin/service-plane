@@ -164,6 +164,72 @@ describe('ServicePlaneControlPlane', () => {
     ).resolves.toMatchObject({ token: expect.any(String) });
   });
 
+  it('serves JWKS during a service-discovery outage without discovering services', async () => {
+    const signingSecret = await generateCapabilitySigningSecret();
+    let discoveryFetches = 0;
+    let serviceResolutions = 0;
+    let unavailable = true;
+    const plane = new ServicePlaneControlPlane({
+      authenticateCaller: () => 'worker-a',
+      services: () => {
+        serviceResolutions += 1;
+        return [
+          cloudflareServiceBinding({
+            binding: {
+              fetch: async () => {
+                discoveryFetches += 1;
+                return unavailable ? new Response('Service Unavailable', { status: 503 }) : Response.json(discovery);
+              },
+            },
+            grants: [{ caller: 'worker-a', scopes: ['example.sync.run'] }],
+            id: 'example',
+          }),
+        ];
+      },
+      signingSecret: () => signingSecret,
+    });
+    const jwksRequest = () => new Request(`https://plane.internal${SERVICE_PLANE_CAPABILITY_JWKS_PATH}`);
+    const tokenRequest = (scopes: string[]) =>
+      new Request(`https://plane.internal${SERVICE_PLANE_CAPABILITY_TOKEN_PATH}`, {
+        body: JSON.stringify({ scopes, targetServiceId: 'example' }),
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
+      });
+
+    const outageJwks = await plane.fetch(jwksRequest());
+    expect(outageJwks.status).toBe(200);
+    const published = (await outageJwks.json()) as CapabilityJwks;
+    expect(published.keys[0]).toMatchObject({ crv: 'P-256', kid: 'default', kty: 'EC' });
+    expect(published.keys[0]).not.toHaveProperty('d');
+    // JWKS depends on the signing secret only: no endpoint set is resolved and nothing is fetched.
+    expect(serviceResolutions).toBe(0);
+    expect(discoveryFetches).toBe(0);
+
+    // Issuance still needs the authorization catalog, so it fails closed while the target is down.
+    const duringOutage = await plane.fetch(tokenRequest(['example.sync.run']));
+    expect(duringOutage.status).toBe(500);
+    await expect(duringOutage.json()).resolves.toEqual({ error: 'Unknown Service-Plane capability target: example' });
+    expect(discoveryFetches).toBe(1);
+
+    unavailable = false;
+    const recovered = await plane.fetch(tokenRequest(['example.sync.run']));
+    expect(recovered.status).toBe(200);
+    await expect(recovered.json()).resolves.toMatchObject({ token: expect.any(String) });
+
+    // Ungranted scopes stay denied once discovery recovers, and the published key never changed.
+    const ungranted = await plane.fetch(tokenRequest(['example.search']));
+    expect(ungranted.status).toBe(403);
+    const unknownScope = await plane.fetch(
+      new Request(`https://plane.internal${SERVICE_PLANE_CAPABILITY_TOKEN_PATH}`, {
+        body: JSON.stringify({ scopes: ['example.sync.run'], targetServiceId: 'unknown' }),
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
+      }),
+    );
+    expect(unknownScope.status).toBe(403);
+    await expect((await plane.fetch(jwksRequest())).json()).resolves.toEqual(published);
+  });
+
   it('authenticates the shipped request-bound JWK token requester', async () => {
     const callerKeys = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
     const privateJwk = await crypto.subtle.exportKey('jwk', callerKeys.privateKey);
