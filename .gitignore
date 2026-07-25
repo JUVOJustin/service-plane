@@ -11,3 +11,4 @@ apm_modules/
 # APM deployed output (rebuilt via `apm install --target claude,agent-skills`)
 .claude/skills/
 .agents/
+tick.mjs

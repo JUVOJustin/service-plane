@@ -1,3 +1,4 @@
+import { isOriginRelativePath } from '../shared/paths.js';
 import {
   type AbilityAccess,
   type AbilityExposure,
@@ -189,7 +190,7 @@ function isAbilityDiscovery(value: unknown): value is ServiceAbilityDiscovery {
     !!ability.rpc &&
     typeof ability.rpc === 'object' &&
     typeof ability.rpc.path === 'string' &&
-    ability.rpc.path.startsWith('/') &&
+    isOriginRelativePath(ability.rpc.path) &&
     Array.isArray(ability.rpc.transports) &&
     ability.rpc.transports.every(isAbilityTransport) &&
     isRecord(ability.methods) &&
@@ -204,11 +205,15 @@ function isAbilityMethodDiscovery(value: unknown): value is ServiceAbilityMethod
     value.scopes.every((scope) => typeof scope === 'string') &&
     isRecord(value.inputSchema) &&
     isRecord(value.outputSchema) &&
+    (value.stream === undefined || value.stream === true) &&
+    // Mirrors defineAbilityService: streaming methods cannot claim single-response projections,
+    // and foreign discovery documents do not get to bypass that.
+    (value.stream !== true || (value.mcpPrompt === undefined && value.mcpResource === undefined && value.rest === undefined)) &&
     (value.rest === undefined ||
       (isRecord(value.rest) &&
         isHttpMethod(value.rest.method) &&
         typeof value.rest.path === 'string' &&
-        value.rest.path.startsWith('/') &&
+        isOriginRelativePath(value.rest.path) &&
         (value.rest.operationId === undefined || typeof value.rest.operationId === 'string'))) &&
     (value.mcp === undefined || (isRecord(value.mcp) && typeof value.mcp.name === 'string'))
   );

@@ -92,7 +92,6 @@ export default new ServicePlaneService<{ Bindings: Env }>({
   },
   capabilities,
   abilities: [asanaTasks],
-  ingress: {},
 });
 ```
 
@@ -139,26 +138,34 @@ POST /rpc/mcp                                    (MCP streamable HTTP)
 
 The plane serves the OpenAPI document; to render it, mount a Hono UI extension (e.g. `@hono/swagger-ui` or `@scalar/hono-api-reference`) on `plane.app` pointed at `/openapi.json`.
 
-When `ingress` is configured on a service, ability RPC requests must use a capability token brokered by the control plane. Direct calls to a service `/rpc/<abilityId>` route are rejected with `403` before any ability handler is created, even if the caller has a valid non-brokered capability token.
+For this compact local-development walkthrough, the service above leaves `ingress` disabled so the caller below can connect directly. Do not use this direct topology as the production boundary. Production services should enable `ingress: {}` and route ability calls through the control-plane broker; direct non-brokered tokens are then rejected with `403` before handler creation. See [Service-Plane Ingress](docs/plane-creation.md#service-plane-ingress).
 
-## Minimal Caller
+## Minimal Local Caller
 
 ```ts
 import {
   abilitySession,
   cloudflareServiceBindingRpc,
-  controlPlaneRpcTokenRequester,
+  controlPlaneHmacTokenRequester,
   type AbilityRpc,
 } from 'service-plane/service';
+
+declare const env: {
+  ASANA: Fetcher;
+  CONTROL_PLANE: Fetcher;
+  WORKFLOW_RUNNER_SECRET: string;
+};
 
 const asana = await abilitySession<AbilityRpc<typeof asanaTasks>>({
   abilityId: 'asana.tasks',
   callerServiceId: 'workflow-runner',
   targetServiceId: 'asana',
   scopes: ['asana.tasks.write'],
-  requestToken: controlPlaneRpcTokenRequester({
-    binding: env.CONTROL_PLANE,
-    callerServiceId: 'workflow-runner',
+  requestToken: controlPlaneHmacTokenRequester({
+    clientId: 'workflow-runner',
+    clientSecret: env.WORKFLOW_RUNNER_SECRET,
+    controlPlaneUrl: 'https://control-plane.internal',
+    fetch: env.CONTROL_PLANE,
   }),
   transport: cloudflareServiceBindingRpc(env.ASANA),
 });
@@ -211,6 +218,8 @@ references are synced copies of [`docs/`](docs/).
 - [Architecture](docs/architecture.md)
 - [Create A Service](docs/service-creation.md)
 - [Create A Control Plane](docs/plane-creation.md)
+- [Streaming](docs/streaming.md)
+- [Choosing A Transport](docs/transports.md)
 - [Auth](docs/auth.md)
 - [Cloudflare](docs/cloudflare.md)
 - [Node.js And Self-Hosted Services](docs/nodejs.md)

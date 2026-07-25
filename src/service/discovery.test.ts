@@ -195,6 +195,37 @@ describe('ability service discovery', () => {
     );
   });
 
+  it('rejects RPC and REST paths that can resolve outside the service origin', () => {
+    const defineWithPaths =
+      (rpcPath: string, restPath = '/examples/search') =>
+      () =>
+        defineAbilityService({
+          abilities: [
+            defineAbility({
+              id: 'example.search',
+              methods: {
+                search: abilityMethod({
+                  input: z.object({}),
+                  output: z.object({}),
+                  rest: { method: 'post', path: restPath },
+                  scopes: ['example.search'],
+                }),
+              },
+              rpc: { path: rpcPath },
+              scopes: ['example.search'],
+              handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
+            }),
+          ],
+          capabilities,
+          id: 'example',
+          title: 'Example',
+          version: '0.1.0',
+        });
+
+    expect(defineWithPaths('//other.example/rpc')).toThrow('path must be origin-relative');
+    expect(defineWithPaths('/rpc/example.search', '/\\other.example/rest')).toThrow('path must be origin-relative');
+  });
+
   it('rejects duplicate ability ids, unknown scopes, and unscoped abilities', () => {
     expect(() =>
       defineAbilityService({
@@ -387,14 +418,14 @@ describe('ability handler safety', () => {
       version: '0.1.0',
     });
 
-  it('rejects ability methods with reserved names', () => {
+  it.each(['invoke', 'then', 'map', 'catch'])('rejects the reserved ability method name %s', (methodName) => {
     expect(() =>
       defineAbilityService({
         abilities: [
           defineAbility({
             id: 'example.bad',
             methods: {
-              invoke: abilityMethod({
+              [methodName]: abilityMethod({
                 input: z.object({}),
                 output: z.object({}),
                 scopes: ['example.search'],
@@ -409,7 +440,7 @@ describe('ability handler safety', () => {
         title: 'Example',
         version: '0.1.0',
       }),
-    ).toThrow('Service-Plane ability method name is reserved: example.bad/invoke');
+    ).toThrow(`Service-Plane ability method name is reserved: example.bad/${methodName}`);
   });
 
   it('rejects handler factories that return a shared instance across sessions', () => {
@@ -421,5 +452,73 @@ describe('ability handler safety', () => {
     expect(() => createValidatingAbilityHandler(ability, shared, identity('cap_2'))).toThrow(
       'Service-Plane ability handler factory must return a new instance per call: example.search',
     );
+  });
+
+  it('reuses the generated validating wrapper prototype for one normalized ability', async () => {
+    const ability = searchService().abilities[0];
+    if (!ability) throw new Error('missing ability');
+
+    class SearchHandler extends RpcTarget {
+      search(input: { query: string }) {
+        return { results: [input.query] };
+      }
+    }
+
+    type SearchTarget = RpcTarget & {
+      search(input: { query: string }): Promise<{ results: string[] }>;
+    };
+    const first = createValidatingAbilityHandler(
+      ability,
+      new SearchHandler() as SearchHandler & Record<string, unknown>,
+      identity('cap_1'),
+    ) as SearchTarget;
+    const second = createValidatingAbilityHandler(
+      ability,
+      new SearchHandler() as SearchHandler & Record<string, unknown>,
+      identity('cap_2'),
+    ) as SearchTarget;
+
+    expect(Object.getPrototypeOf(first)).toBe(Object.getPrototypeOf(second));
+    await expect(first.search({ query: 'first' })).resolves.toEqual({ results: ['first'] });
+    await expect(second.search({ query: 'second' })).resolves.toEqual({ results: ['second'] });
+  });
+
+  it('delegates disposal once and rejects calls after the wrapper is disposed', async () => {
+    const ability = searchService().abilities[0];
+    if (!ability) throw new Error('missing ability');
+    let calls = 0;
+    let disposals = 0;
+    let disposedReceiver: unknown;
+
+    class DisposableSearchHandler extends RpcTarget {
+      search(input: { query: string }) {
+        calls += 1;
+        return { results: [input.query] };
+      }
+
+      [Symbol.dispose](): void {
+        disposedReceiver = this;
+        disposals += 1;
+      }
+    }
+
+    type SearchTarget = RpcTarget &
+      Disposable & {
+        search(input: { query: string }): Promise<{ results: string[] }>;
+      };
+    const handler = new DisposableSearchHandler();
+    const target = createValidatingAbilityHandler(
+      ability,
+      handler as DisposableSearchHandler & Record<string, unknown>,
+      identity('cap_1'),
+    ) as SearchTarget;
+
+    target[Symbol.dispose]();
+    target[Symbol.dispose]();
+
+    expect(disposals).toBe(1);
+    expect(disposedReceiver).toBe(handler);
+    await expect(target.search({ query: 'after-dispose' })).rejects.toThrow('ability handler has been disposed');
+    expect(calls).toBe(0);
   });
 });

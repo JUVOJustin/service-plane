@@ -58,8 +58,9 @@ describe('service registry', () => {
       services: [
         httpsService({
           baseUrl: 'https://example.internal',
-          fetch: async (request) => {
+          fetch: async (input) => {
             fetches += 1;
+            const request = new Request(input);
             if (request.headers.get('if-none-match') === 'v1') return new Response(null, { status: 304 });
             return Response.json(document, { headers: { etag: 'v1' } });
           },
@@ -140,6 +141,24 @@ describe('service registry', () => {
 
     const snapshot = await registry.discover();
     expect(snapshot.services.map((service) => service.id)).toEqual(['example']);
+  });
+
+  it('omits discovery documents with RPC paths that replace the configured service origin', async () => {
+    const unsafeDocument: ServiceDiscoveryDocument = {
+      ...document,
+      abilities: document.abilities.map((ability) => ({ ...ability, rpc: { ...ability.rpc, path: '//other.example/rpc' } })),
+    };
+    const registry = createServiceRegistry({
+      services: [
+        httpsService({
+          baseUrl: 'https://example.internal',
+          discovery: unsafeDocument,
+          id: 'example',
+        }),
+      ],
+    });
+
+    await expect(registry.discover()).resolves.toMatchObject({ abilities: [], services: [] });
   });
 
   it('builds discovery requests against the configured origin', () => {

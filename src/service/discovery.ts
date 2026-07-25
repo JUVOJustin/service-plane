@@ -1,7 +1,9 @@
-import { RpcTarget } from 'capnweb';
+import { RpcPromise, RpcTarget } from 'capnweb';
 import type { Context, Env } from 'hono';
 import * as z from 'zod';
+import type { ConnInfo } from '../shared/conn-info.js';
 import { AbilityValidationError, CapabilityAuthError } from '../shared/errors.js';
+import { isOriginRelativePath } from '../shared/paths.js';
 import {
   type AbilityAccess,
   type AbilityExposure,
@@ -32,29 +34,53 @@ export type AbilityMethodDefinition<TInput extends AbilitySchema = AbilitySchema
   output: TOutput;
   rest?: ServiceAbilityRestProjection;
   scopes?: string[];
+  // Streaming methods return a ReadableStream of `output`-shaped items over the ordinary
+  // Cap'n Web session instead of one value; `output` validates each item.
+  stream?: true;
 };
 
 export type AbilityMethodDefinitions = Record<string, AbilityMethodDefinition>;
 
 export type ServiceAbilityHandlerFactoryInput<TEnv extends Env = Env> = {
   abilityId: string;
+  // Advisory connection info about the original client, forwarded by the control plane. Present
+  // only for brokered calls into an ingress-protected service; unlike `identity` it is not
+  // signature-verified, so use it for audit and logging, never for authorization.
+  connInfo?: ConnInfo;
   context: Context<TEnv>;
   identity: CapabilityIdentity;
 };
 
+// `Iterable & object` keeps plain strings out: a string is Iterable<string>, but handing one
+// back from a streaming method is almost certainly a bug, and the runtime rejects it.
+export type AbilityStreamSource<TItem> = AsyncIterable<TItem> | (Iterable<TItem> & object) | ReadableStream<TItem>;
+
+// Streamed items are re-validated by `output.parseAsync`, so handlers must yield the schema's
+// INPUT shape: for transforming schemas (pipes, coercions) the transformed output would fail
+// re-parsing, so unlike unary methods the output side is not accepted here.
+type AbilityMethodItem<TMethod extends AbilityMethodDefinition> = z.input<TMethod['output']>;
+
 export type AbilityImplementation<TAbility extends ServiceAbilityDefinition> = {
-  [TMethod in keyof TAbility['methods']]: (
-    input: z.output<TAbility['methods'][TMethod]['input']>,
-  ) =>
-    | Promise<z.input<TAbility['methods'][TMethod]['output']> | z.output<TAbility['methods'][TMethod]['output']>>
-    | z.input<TAbility['methods'][TMethod]['output']>
-    | z.output<TAbility['methods'][TMethod]['output']>;
+  [TMethod in keyof TAbility['methods']]: TAbility['methods'][TMethod] extends { stream: true }
+    ? (
+        input: z.output<TAbility['methods'][TMethod]['input']>,
+      ) =>
+        | AbilityStreamSource<AbilityMethodItem<TAbility['methods'][TMethod]>>
+        | Promise<AbilityStreamSource<AbilityMethodItem<TAbility['methods'][TMethod]>>>
+    : (
+        input: z.output<TAbility['methods'][TMethod]['input']>,
+      ) =>
+        | Promise<z.input<TAbility['methods'][TMethod]['output']> | z.output<TAbility['methods'][TMethod]['output']>>
+        | z.input<TAbility['methods'][TMethod]['output']>
+        | z.output<TAbility['methods'][TMethod]['output']>;
 };
 
+// Streaming methods resolve to a native Cap'n Web ReadableStream of validated items; they
+// require a session transport (WebSocket, native binding, custom bidirectional).
 export type AbilityRpc<TAbility extends ServiceAbilityDefinition> = {
-  [TMethod in keyof TAbility['methods']]: (
-    input: z.input<TAbility['methods'][TMethod]['input']>,
-  ) => Promise<z.output<TAbility['methods'][TMethod]['output']>>;
+  [TMethod in keyof TAbility['methods']]: TAbility['methods'][TMethod] extends { stream: true }
+    ? (input: z.input<TAbility['methods'][TMethod]['input']>) => Promise<ReadableStream<z.output<TAbility['methods'][TMethod]['output']>>>
+    : (input: z.input<TAbility['methods'][TMethod]['input']>) => Promise<z.output<TAbility['methods'][TMethod]['output']>>;
 };
 
 export type ServiceAbilityHandlerFactory<TEnv extends Env = Env> = (
@@ -118,9 +144,9 @@ export type DefineServiceOptions = {
   requireAbilityScopes?: boolean;
 };
 
-export function abilityMethod<TInput extends AbilitySchema, TOutput extends AbilitySchema>(
-  definition: AbilityMethodDefinition<TInput, TOutput>,
-): AbilityMethodDefinition<TInput, TOutput> {
+// Returns the definition's own type (not the widened AbilityMethodDefinition) so the
+// `stream: true` discriminator survives into AbilityRpc and AbilityImplementation.
+export function abilityMethod<TDefinition extends AbilityMethodDefinition>(definition: TDefinition): TDefinition {
   return definition;
 }
 
@@ -162,10 +188,34 @@ export function defaultAbilityRpcPath(abilityId: string): string {
   return `/rpc/${abilityId}`;
 }
 
+export type CreateValidatingAbilityHandlerOptions = {
+  // Cap'n Web streams need an ongoing session. Defaults to false (fail-closed): a caller must
+  // opt in only for a session transport (WebSocket upgrade, native binding). Over HTTP-batch,
+  // streaming methods then fail with a clear 405 instead of a dangling stub after the batch ends.
+  allowStreaming?: boolean;
+};
+
+type ValidatingAbilityHandlerState = {
+  abilityId: string;
+  allowStreaming: boolean;
+  disposed: boolean;
+  handler: RpcTarget & Record<string, unknown>;
+  methods: Record<string, NormalizedAbilityMethodDefinition>;
+};
+
+type ValidatingAbilityHandlerConstructor = new () => RpcTarget;
+
+// Ability definitions are long-lived while handler instances are created per session. Reusing
+// the generated class avoids rebuilding an identical prototype on every authenticated call while
+// WeakMap state keeps caller-specific data out of Cap'n Web's remotely visible object surface.
+const validatingHandlerConstructorByAbility = new WeakMap<object, ValidatingAbilityHandlerConstructor>();
+const validatingHandlerStateByTarget = new WeakMap<object, ValidatingAbilityHandlerState>();
+
 export function createValidatingAbilityHandler<TEnv extends Env>(
   ability: NormalizedServiceAbility<TEnv>,
   handler: RpcTarget & Record<string, unknown>,
   identity: CapabilityIdentity,
+  options: CreateValidatingAbilityHandlerOptions = {},
 ): RpcTarget {
   // A handler instance carries one caller's identity; a factory that returns a shared
   // instance would let concurrent sessions overwrite each other's identity and scopes.
@@ -174,35 +224,168 @@ export function createValidatingAbilityHandler<TEnv extends Env>(
   }
   bindCapabilityIdentity(handler, identity);
 
+  const ValidatingAbilityHandler = validatingAbilityHandlerConstructor(ability);
+  const target = new ValidatingAbilityHandler();
+  validatingHandlerStateByTarget.set(target, {
+    abilityId: ability.id,
+    allowStreaming: options.allowStreaming ?? false,
+    disposed: false,
+    handler,
+    methods: ability.methods,
+  });
+  return bindCapabilityIdentity(target, identity);
+}
+
+function validatingAbilityHandlerConstructor<TEnv extends Env>(
+  ability: NormalizedServiceAbility<TEnv>,
+): ValidatingAbilityHandlerConstructor {
+  const cached = validatingHandlerConstructorByAbility.get(ability);
+  if (cached) return cached;
+
   class ValidatingAbilityHandler extends RpcTarget {
-    async invoke(methodName: string, args: unknown[]): Promise<unknown> {
-      const method = ability.methods[methodName];
-      if (!method) throw new AbilityValidationError(`Unknown Service-Plane ability method: ${methodName}`, 404);
-      if (args.length !== 1) {
-        throw new AbilityValidationError(`Service-Plane ability method expects a single input object: ${methodName}`, 422);
-      }
-
-      requireScopes(this, ...method.scopes);
-      const implementation = handler[methodName];
-      if (typeof implementation !== 'function') {
-        throw new AbilityValidationError(`Service-Plane ability handler does not implement method: ${methodName}`, 500);
-      }
-
-      const input = await method.input.parseAsync(args[0]);
-      const output = await implementation.call(handler, input);
-      return method.output.parseAsync(output);
+    [Symbol.dispose](): void {
+      disposeValidatingAbilityHandler(this);
     }
   }
 
   for (const methodName of Object.keys(ability.methods)) {
     Object.defineProperty(ValidatingAbilityHandler.prototype, methodName, {
-      async value(this: ValidatingAbilityHandler, ...args: unknown[]) {
-        return this.invoke(methodName, args);
+      async value(this: RpcTarget, ...args: unknown[]) {
+        return invokeValidatingAbilityMethod(this, methodName, args);
       },
     });
   }
 
-  return bindCapabilityIdentity(new ValidatingAbilityHandler(), identity);
+  validatingHandlerConstructorByAbility.set(ability, ValidatingAbilityHandler);
+  return ValidatingAbilityHandler;
+}
+
+async function invokeValidatingAbilityMethod(target: RpcTarget, methodName: string, args: unknown[]): Promise<unknown> {
+  const state = activeValidatingAbilityHandlerState(target);
+  const method = state.methods[methodName];
+  if (!method) throw new AbilityValidationError(`Unknown Service-Plane ability method: ${methodName}`, 404);
+  if (method.stream && !state.allowStreaming) {
+    throw new AbilityValidationError(
+      `Service-Plane streaming method requires a session transport (WebSocket, native binding, or custom bidirectional): ${methodName}`,
+      405,
+    );
+  }
+  if (args.length !== 1) {
+    throw new AbilityValidationError(`Service-Plane ability method expects a single input object: ${methodName}`, 422);
+  }
+
+  requireScopes(target, ...method.scopes);
+  const implementation = state.handler[methodName];
+  if (typeof implementation !== 'function') {
+    throw new AbilityValidationError(`Service-Plane ability handler does not implement method: ${methodName}`, 500);
+  }
+
+  const input = await method.input.parseAsync(args[0]);
+  activeValidatingAbilityHandlerState(target);
+  const output = await implementation.call(state.handler, input);
+  // Streaming methods return their items as a native Cap'n Web ReadableStream, validated
+  // one item at a time as the consumer pulls.
+  if (method.stream) return validatedAbilityItemStream(method, methodName, output);
+  return method.output.parseAsync(output);
+}
+
+function activeValidatingAbilityHandlerState(target: RpcTarget): ValidatingAbilityHandlerState {
+  const state = validatingHandlerStateByTarget.get(target);
+  if (!state) throw new AbilityValidationError('Service-Plane ability handler is not initialized', 500);
+  if (state.disposed) {
+    throw new AbilityValidationError(`Service-Plane ability handler has been disposed: ${state.abilityId}`, 410);
+  }
+  return state;
+}
+
+function disposeValidatingAbilityHandler(target: RpcTarget): void {
+  const state = validatingHandlerStateByTarget.get(target);
+  if (!state || state.disposed) return;
+  state.disposed = true;
+  const dispose = (state.handler as RpcTarget & Partial<Disposable>)[Symbol.dispose];
+  dispose?.call(state.handler);
+}
+
+// Wraps a handler's stream source into a ReadableStream that validates each item lazily, so
+// backpressure from the consumer reaches the handler's generator untouched.
+function validatedAbilityItemStream(
+  method: NormalizedAbilityMethodDefinition,
+  methodName: string,
+  source: unknown,
+): ReadableStream<unknown> {
+  const puller = abilityStreamPuller(source, methodName);
+  return new ReadableStream<unknown>({
+    cancel(reason) {
+      // Cancel the underlying source directly and without awaiting: an async generator's
+      // return() queues behind an in-flight next(), and a disconnected consumer must not
+      // keep the handler pinned while it waits for the next chunk that may never come.
+      puller.cancel(reason);
+    },
+    async pull(controller) {
+      try {
+        const next = await puller.next();
+        if (next.done) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(await method.output.parseAsync(next.value));
+      } catch (error) {
+        // A failed pull or invalid item errors the stream, which can no longer be cancelled by
+        // the consumer. Release the handler's source here so iterator return/finally cleanup and
+        // reader locks are not stranded.
+        puller.cancel(error);
+        throw error;
+      }
+    },
+  });
+}
+
+type AbilityStreamPuller = {
+  cancel(reason?: unknown): void;
+  next(): Promise<IteratorResult<unknown>>;
+};
+
+function abilityStreamPuller(source: unknown, methodName: string): AbilityStreamPuller {
+  if (source instanceof ReadableStream) {
+    const reader = (source as ReadableStream<unknown>).getReader();
+    return {
+      cancel(reason) {
+        void reader.cancel(reason).catch(() => undefined);
+      },
+      async next() {
+        const { done, value } = await reader.read();
+        return done ? { done: true, value: undefined } : { done: false, value };
+      },
+    };
+  }
+  if (source && typeof source === 'object' && Symbol.asyncIterator in source) {
+    const iterator = (source as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+    return {
+      cancel() {
+        void Promise.resolve()
+          .then(() => iterator.return?.(undefined))
+          .catch(() => undefined);
+      },
+      next: () => iterator.next(),
+    };
+  }
+  if (source && typeof source === 'object' && Symbol.iterator in source) {
+    const iterator = (source as Iterable<unknown>)[Symbol.iterator]();
+    return {
+      cancel() {
+        try {
+          iterator.return?.(undefined);
+        } catch {
+          // best effort: sync iterator cleanup must not fail cancellation
+        }
+      },
+      next: async () => iterator.next(),
+    };
+  }
+  throw new AbilityValidationError(
+    `Service-Plane streaming method must return an async iterable, iterable, or ReadableStream: ${methodName}`,
+    500,
+  );
 }
 
 export { SERVICE_DISCOVERY_PATH };
@@ -238,6 +421,19 @@ function normalizeAbilities<TEnv extends Env>(
     const path = normalizePath(ability.rpc?.path ?? defaultAbilityRpcPath(id), id);
     if (seenPaths.has(path)) throw new CapabilityAuthError(`Duplicate Service-Plane ability RPC path: ${path}`, 500);
     seenPaths.add(path);
+    const transports = normalizeAbilityTransports(ability.rpc?.transports ?? ['http-batch']);
+    // Cap'n Web streams need an ongoing session; the one-round-trip HTTP-batch transport
+    // cannot carry them, so fail at setup instead of at the first streamed call.
+    if (
+      Object.values(methods).some((method) => method.stream) &&
+      !transports.includes('websocket') &&
+      !transports.includes('cloudflare-binding-rpc')
+    ) {
+      throw new CapabilityAuthError(
+        `Service-Plane ability with streaming methods must enable a session transport (websocket or cloudflare-binding-rpc): ${id}`,
+        500,
+      );
+    }
 
     return {
       ...ability,
@@ -247,16 +443,21 @@ function normalizeAbilities<TEnv extends Env>(
       methods,
       rpc: {
         path,
-        transports: normalizeAbilityTransports(ability.rpc?.transports ?? ['http-batch']),
+        transports,
       },
       scopes,
     };
   });
 }
 
-// Members of the validating wrapper itself; an ability method with one of these names
-// would shadow the dispatcher and recurse instead of reaching the handler.
-const RESERVED_METHOD_NAMES = new Set(['constructor', 'invoke']);
+const CAPNWEB_RPC_PROMISE_PROTOTYPE = (RpcPromise as unknown as { prototype: object }).prototype;
+
+// Cap'n Web treats its promise/stub prototype members as local control operations rather than
+// remote method names. Reject them when defining the ability instead of publishing an API that a
+// caller cannot invoke. `invoke` is retained for compatibility with the former wrapper dispatcher.
+function isReservedMethodName(methodName: string): boolean {
+  return methodName === 'invoke' || methodName in CAPNWEB_RPC_PROMISE_PROTOTYPE;
+}
 
 function normalizeMethods(
   abilityId: string,
@@ -272,7 +473,7 @@ function normalizeMethods(
   return Object.fromEntries(
     names.map((methodName) => {
       const name = normalizeValue(methodName, `method name for ${abilityId}`);
-      if (RESERVED_METHOD_NAMES.has(name)) {
+      if (isReservedMethodName(name)) {
         throw new CapabilityAuthError(`Service-Plane ability method name is reserved: ${abilityId}/${name}`, 500);
       }
       const method = methods[methodName];
@@ -283,6 +484,16 @@ function normalizeMethods(
       }
       validateKnownScopes(scopes, knownScopes, capabilities, `Service-Plane ability method requires unknown scope`);
       validateMethodScopesDeclaredByAbility(abilityId, name, scopes, abilityScopes);
+      if (method.stream && (method.mcpPrompt || method.mcpResource)) {
+        // MCP prompts and resources are single-response protocol surfaces; only tools can
+        // be backed by streaming methods.
+        throw new CapabilityAuthError(`Service-Plane streaming method cannot project an MCP prompt or resource: ${abilityId}/${name}`, 500);
+      }
+      if (method.stream && method.rest) {
+        // The generated OpenAPI documents request/response operations; a streamed return has
+        // no REST serving semantics here.
+        throw new CapabilityAuthError(`Service-Plane streaming method cannot project a REST operation: ${abilityId}/${name}`, 500);
+      }
       const rest = method.rest ? normalizeRestProjection(abilityId, name, method.rest) : undefined;
       const mcp = method.mcp ? normalizeMcpProjection(abilityId, name, method.mcp) : undefined;
       const mcpPrompt = method.mcpPrompt ? normalizeMcpPromptProjection(abilityId, name, method.mcpPrompt) : undefined;
@@ -298,6 +509,7 @@ function normalizeMethods(
           outputSchema: zodToJsonSchema(method.output, 'output', `${abilityId}/${name}`),
           ...(rest ? { rest } : {}),
           scopes,
+          ...(method.stream ? { stream: true as const } : {}),
         },
       ];
     }),
@@ -337,6 +549,7 @@ function abilityDiscovery<TEnv extends Env>(ability: NormalizedServiceAbility<TE
           outputSchema: method.outputSchema,
           ...(method.rest ? { rest: method.rest } : {}),
           scopes: method.scopes,
+          ...(method.stream ? { stream: true as const } : {}),
         } satisfies ServiceAbilityMethodDiscovery,
       ]),
     ),
@@ -448,10 +661,10 @@ function normalizeAbilityTransports(transports: AbilityTransport[]): AbilityTran
 
 function normalizePath(path: string, source: string): string {
   const normalized = path.trim();
-  if (!normalized.startsWith('/')) {
-    throw new CapabilityAuthError(`Service-Plane path must start with /: ${source}`, 500);
+  if (!normalized.startsWith('/') || normalized.startsWith('//') || normalized.includes('\\')) {
+    throw new CapabilityAuthError(`Service-Plane path must be origin-relative and start with a single /: ${source}`, 500);
   }
-  if (normalized.includes('?') || normalized.includes('#')) {
+  if (!isOriginRelativePath(normalized)) {
     throw new CapabilityAuthError(`Service-Plane path must not include query or fragment: ${source}`, 500);
   }
   return normalized.replace(/\/+$/u, '') || '/';

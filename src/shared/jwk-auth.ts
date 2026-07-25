@@ -133,8 +133,9 @@ export function servicePlaneJwkAuthorization(assertion: string): string {
 export function extractServicePlaneJwkAssertion(request: Request): string {
   const authorization = request.headers.get('authorization')?.trim();
   if (!authorization) throw new CapabilityAuthError('Missing Service-Plane JWK authorization', 401);
-  const [scheme, assertion] = authorization.split(/\s+/u, 2);
-  if (scheme !== SERVICE_PLANE_JWK_AUTHORIZATION_SCHEME || !assertion) {
+  const parts = authorization.split(/\s+/u);
+  const [scheme, assertion] = parts;
+  if (parts.length !== 2 || scheme?.toLowerCase() !== SERVICE_PLANE_JWK_AUTHORIZATION_SCHEME.toLowerCase() || !assertion) {
     throw new CapabilityAuthError('Invalid Service-Plane JWK authorization scheme', 401);
   }
   return assertion;

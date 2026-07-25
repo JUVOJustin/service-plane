@@ -11,7 +11,8 @@ import {
 } from '../service/index.js';
 import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
 import type { ServicePlaneBrokerLogEvent } from '../shared/logging.js';
-import { brokerCallerSubject, createControlPlaneRpcBroker } from './broker.js';
+import type { DiscoveredServiceAbility } from '../shared/types.js';
+import { brokerCallerSubject, createControlPlaneRpcBroker, transportForAbility } from './broker.js';
 import { createCapabilityIssuer, defineServiceGrants } from './capabilities.js';
 import { cloudflareServiceBinding } from './endpoints.js';
 
@@ -69,7 +70,7 @@ describe('control-plane RPC broker', () => {
       issuer,
       services: [
         cloudflareServiceBinding({
-          binding: { fetch: (request) => service.fetch(request) },
+          binding: { fetch: async (request) => service.fetch(request) },
           id: 'example',
           origin: 'https://example.internal',
         }),
@@ -143,7 +144,7 @@ describe('control-plane RPC broker', () => {
       services: [
         cloudflareServiceBinding({
           binding: {
-            fetch: (request) => {
+            fetch: async (request) => {
               seenRequests.push(request);
               return service.fetch(request);
             },
@@ -235,7 +236,7 @@ describe('control-plane RPC broker', () => {
       log: (event) => brokerEvents.push(event),
       services: [
         cloudflareServiceBinding({
-          binding: { fetch: (request) => service.fetch(request) },
+          binding: { fetch: async (request) => service.fetch(request) },
           id: 'example',
           origin: 'https://example.internal',
         }),
@@ -308,6 +309,56 @@ describe('control-plane RPC broker', () => {
         }
       ).ability('example', 'example.sync'),
     ).rejects.toThrow('requires service access');
+  });
+
+  it('keeps WebSocket transport URLs on the registered service origin', () => {
+    const service = {
+      fetch: async () => new Response(null, { status: 404 }),
+      id: 'example',
+      origin: 'https://example.internal',
+    };
+    const ability = {
+      access: 'plane',
+      exposure: 'private',
+      id: 'example.sync',
+      methods: {},
+      rpc: { path: '//other.example/rpc', transports: ['websocket'] },
+      scopes: ['example.sync.run'],
+      service,
+      serviceId: 'example',
+      serviceTitle: 'Example',
+      serviceVersion: '0.1.0',
+    } as DiscoveredServiceAbility;
+
+    expect(() => transportForAbility(ability)).toThrow('RPC path must be origin-relative');
+  });
+
+  it('keeps unary methods on HTTP-batch and forwards the endpoint WebSocket factory for streams', () => {
+    const createWebSocket = (_url: string) => ({}) as WebSocket;
+    const service = {
+      createWebSocket,
+      fetch: async () => new Response(null, { status: 404 }),
+      id: 'example',
+      origin: 'https://example.internal',
+    };
+    const ability = {
+      access: 'plane',
+      exposure: 'private',
+      id: 'example.mixed',
+      methods: {
+        read: { inputSchema: {}, outputSchema: {}, scopes: ['example.read'], stream: true },
+        stat: { inputSchema: {}, outputSchema: {}, scopes: ['example.read'] },
+      },
+      rpc: { path: '/rpc/example.mixed', transports: ['http-batch', 'websocket'] },
+      scopes: ['example.read'],
+      service,
+      serviceId: 'example',
+      serviceTitle: 'Example',
+      serviceVersion: '0.1.0',
+    } as DiscoveredServiceAbility;
+
+    expect(transportForAbility(ability, { requiresStreaming: false })).toMatchObject({ kind: 'fetch' });
+    expect(transportForAbility(ability, { requiresStreaming: true })).toMatchObject({ createWebSocket, kind: 'websocket' });
   });
 });
 

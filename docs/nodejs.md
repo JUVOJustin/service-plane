@@ -22,7 +22,6 @@ const service = new ServicePlaneService({
     issuer: 'control-plane',
     jwks: jwksFromUrl('https://plane.example.com/.well-known/service-plane/jwks.json'),
   },
-  ingress: {},
   capabilities,
   abilities: [asanaTasks],
 });
@@ -37,7 +36,7 @@ GET  /.well-known/service-plane/service.json
 POST /rpc/asana.tasks
 ```
 
-## Caller Over HTTP-Batch
+## Local Caller Over HTTP-Batch
 
 HTTP-batch is the default self-hosted request/response transport.
 
@@ -71,7 +70,10 @@ await asana.createTask({
 });
 ```
 
-If the service enables `ingress`, direct HTTP-batch callers must not be used. Send calls through the control-plane broker so the token carries the signed broker claim.
+This local-development example deliberately leaves `ingress` disabled. Production services should
+enable `ingress: {}` and expose the ability through the control-plane broker instead of calling the
+service URL directly. Direct HTTP-batch calls with ordinary tokens are rejected when ingress is
+enabled.
 
 ## HMAC Fallback
 
@@ -81,7 +83,7 @@ Use HMAC caller auth when a private JWK is not practical.
 controlPlaneHmacTokenRequester({
   clientId: 'workflow-runner',
   controlPlaneUrl: 'https://plane.example.com',
-  secret: process.env.WORKFLOW_RUNNER_SECRET,
+  clientSecret: process.env.WORKFLOW_RUNNER_SECRET,
 });
 ```
 
@@ -95,6 +97,33 @@ Use WebSocket only when the session is long-lived, interactive, or chatty.
 transport: websocketRpc('wss://asana.example.com/rpc/asana.tasks')
 ```
 
-For normal request/response calls, prefer HTTP-batch. It is easier to deploy, cache, observe, and retry.
+If the Node runtime does not provide a global `WebSocket`, inject the standards-compatible client
+you already use. The factory receives the final URL, including Service Plane's propagated request
+id:
+
+```ts
+transport: websocketRpc('wss://asana.example.com/rpc/asana.tasks', {
+  createWebSocket, // (url: string) => WebSocket from your client adapter
+});
+```
+
+The control-plane broker and MCP projection use the same factory through the service endpoint:
+
+```ts
+import { httpsService } from 'service-plane/control-plane';
+
+httpsService({
+  id: 'asana',
+  baseUrl: 'https://asana.example.com',
+  createWebSocket,
+});
+```
+
+This keeps WebSocket construction runtime-owned and does not require application code to install a
+persistent global. With Cap'n Web 0.10, Service Plane temporarily supplies
+`WebSocket.CONNECTING` only during synchronous session construction and restores the previous
+global immediately.
+
+For normal request/response calls, prefer HTTP-batch. It is easier to deploy, cache, observe, and retry. Streaming ability methods require a session transport; wire `upgradeWebSocket` from `@hono/node-ws` into the service shell as shown in [Streaming](streaming.md#serve-websocket-sessions). On long-running Node processes WebSockets are essentially free, so chatty service pairs should hold a session — the full decision guide is [Choosing A Transport](transports.md).
 
 Next: [auth](auth.md), [OpenAPI and MCP](openapi-mcp.md), and [reference](reference.md).

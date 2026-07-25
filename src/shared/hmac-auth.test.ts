@@ -1,7 +1,21 @@
 import { describe, expect, it } from 'vitest';
-import { servicePlaneHmacRequestParts } from './hmac-auth.js';
+import { extractServicePlaneHmacSignature, servicePlaneHmacRequestParts } from './hmac-auth.js';
 
 describe('Service-Plane HMAC auth helpers', () => {
+  it('parses the authorization scheme case-insensitively and rejects extra credentials', () => {
+    expect(
+      extractServicePlaneHmacSignature(
+        new Request('https://control-plane.internal', { headers: { authorization: 'serviceplane-hmac signature' } }),
+      ),
+    ).toBe('signature');
+
+    expect(() =>
+      extractServicePlaneHmacSignature(
+        new Request('https://control-plane.internal', { headers: { authorization: 'ServicePlane-HMAC signature extra' } }),
+      ),
+    ).toThrow('Invalid Service-Plane HMAC authorization scheme');
+  });
+
   it('rejects request bodies larger than the configured hash limit', async () => {
     await expect(
       servicePlaneHmacRequestParts(

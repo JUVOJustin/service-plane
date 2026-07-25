@@ -186,6 +186,7 @@ export function mountCapabilityTokenEndpoint(
     ...endpointFactory.createHandlers(async (context) => {
       // Token responses carry bearer credentials; keep them out of shared caches (RFC 6749 §5.1).
       context.header('cache-control', 'no-store');
+      context.header('pragma', 'no-cache');
       const caller = await options.authenticateCaller(context);
       if (caller instanceof Response) return caller;
       const resolvedIssuer = typeof issuer === 'function' ? await issuer(context) : issuer;

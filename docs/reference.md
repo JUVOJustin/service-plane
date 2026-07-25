@@ -52,6 +52,37 @@ abilityMethod({
 
 Each method accepts one input object and returns one output value. The wrapper validates both with Zod.
 
+## Streaming Methods
+
+Some methods produce many results over time — large file transfers, long exports. Declare them with `stream: true`; the `output` schema then validates **each streamed item**, and the handler returns an async iterable (usually an async generator), a sync iterable, or a `ReadableStream`:
+
+```ts
+abilityMethod({
+  input: z.object({ path: z.string() }),
+  output: z.object({ chunk: z.string() }), // validates each streamed item
+  scopes: ['hub.files.read'],
+  stream: true,
+});
+```
+
+There is no custom wire protocol: the wrapper returns the items as a **native Cap'n Web `ReadableStream`** with built-in flow control, so callers receive them exactly like any other RPC value:
+
+```ts
+const api = await abilitySession<AbilityRpc<typeof hubFiles>>({ ... });
+const stream = await api.readFile({ path: '/big.bin' }); // ReadableStream<{ chunk: string }>
+for await (const item of stream) {
+  // ...
+}
+```
+
+Cap'n Web streams ride the ongoing session, so streaming methods require a **session transport**: WebSocket (`websocketRpc`), the Cloudflare native binding (`cloudflareNativeRpc`), or a custom bidirectional transport. The one-round-trip HTTP-batch transport cannot carry them — calling a streaming method over HTTP-batch fails with a 405, and an ability that declares streaming methods must enable `websocket` or `cloudflare-binding-rpc` in `rpc.transports` (checked at setup). Unary methods on the same ability keep working over HTTP-batch.
+
+Through the broker, streams proxy transparently: connect to `/rpc/broker` over WebSocket, and the plane reaches the service over its own session transport — preferring the endpoint's native ability RPC binding (`ServiceEndpoint.abilityRpc`, set explicitly via `cloudflareServiceBinding({ abilityRpc })` — a Workers stub answers any property with a callable proxy, so it cannot be detected), then WebSocket. When the caller's own leg cannot carry a stream (HTTP-batch), the ability's streaming methods are rejected with a 405 and the plane leg stays on HTTP-batch — no socket is opened for a stream that could never be returned. Streaming methods cannot project MCP prompts, resources, or REST operations (single-response surfaces); MCP tools are supported.
+
+For high-frequency streams (LLM token deltas), batch deltas in the handler and declare the batch as the item (`output: z.array(...)`) — see the coalescing recipe in [Streaming](streaming.md#high-frequency-streams).
+
+Full guide, including per-runtime WebSocket wiring and performance guidance: [Streaming](streaming.md).
+
 ## Discovery Document
 
 ```ts
@@ -64,7 +95,7 @@ type ServiceDiscoveryDocument = {
 };
 ```
 
-Ability discovery includes exposure, access, scopes, RPC path, transports, method names, method scopes, JSON Schemas, optional REST metadata, and optional MCP metadata.
+Ability discovery includes exposure, access, scopes, RPC path, transports, method names, method scopes, JSON Schemas, optional REST metadata, and optional MCP metadata. Streaming methods carry `stream: true`, with their `outputSchema` describing one streamed item.
 
 ## Service
 
@@ -98,9 +129,9 @@ new ServicePlaneControlPlane({
   signingSecret,
   authenticateCaller,
   services,
-  registry,
   openapi,
   broker,
+  mcp,
 });
 ```
 
@@ -116,7 +147,22 @@ ALL  /rpc/broker
 
 The plane serves the OpenAPI document only. Mount a documentation UI yourself on `plane.app` (e.g. `@hono/swagger-ui` or `@scalar/hono-api-reference`) pointed at `/openapi.json`.
 
-`httpCache` is optional and mirrors the service option: when set, the OpenAPI and JWKS routes emit `Cache-Control` and `Cache-Tag` headers. The capability-token endpoint always responds with `Cache-Control: no-store`. Broker and MCP RPC responses are never cache-eligible.
+`httpCache` is optional and mirrors the service option: when set, the OpenAPI and JWKS routes emit `Cache-Control` and `Cache-Tag` headers. The capability-token endpoint always responds with `Cache-Control: no-store` and `Pragma: no-cache`. Broker and MCP RPC responses are never cache-eligible.
+
+`broker.cache` and `mcp.cache` cache the discovery snapshots used by those surfaces. `openapi.cache` caches the generated document; set its TTL with `openapi.cacheTtlSeconds`. Keep discovery and OpenAPI caches separate.
+
+`broker.caller` and `mcp.caller` use `BrokerCallerResolver`. The resolver may return a
+`BrokerCaller`, an application-owned `Response`, or `undefined`. A returned response passes through
+unchanged, which lets existing Hono auth middleware or the resolver emit the correct
+`WWW-Authenticate` challenge with a `401`. Returning `undefined` is a generic `403` refusal; an
+omitted resolver is a configuration error and returns `500`.
+
+`mcp.streamLimits` accepts `maxItems` and `maxBytes` for streaming tools (defaults: 10,000 items and 1 MiB). `maxBytes` independently caps serialized item aggregation and cumulative optional progress-notification bytes. Exhausting the item aggregation budget fails the tool call in-band; exhausting only the progress budget stops further notifications while the bounded final result continues.
+
+The MCP endpoint accepts protocol revisions `2025-11-25`, `2025-06-18`, and `2025-03-26`; missing
+`MCP-Protocol-Version` means `2025-03-26`, while unsupported values return `400`. Incoming browser
+`Origin` headers must match the endpoint origin. `mcp.allowedOrigins` adds exact trusted origins for
+intentional cross-origin clients; other origins return `403` before caller resolution.
 
 ## Caller
 
@@ -131,15 +177,43 @@ const api = await abilitySession<AbilityRpc<typeof asanaTasks>>({
 });
 ```
 
+Persistent WebSocket/custom sessions and native binding targets are disposable. Prefer `using` so
+the transport closes at the end of the block:
+
+```ts
+{
+  using api = await abilitySession<AbilityRpc<typeof asanaTasks>>({ ... });
+  await api.createTask(input);
+}
+```
+
+Otherwise, call `await disposeAbilitySession(api)` from `finally`. Disposal is idempotent. For a
+stateless transport there is no connection to release, but disposal still permanently closes the
+session object so accidental reuse fails consistently.
+
 Transports:
 
 - `cloudflareServiceBindingRpc(binding)`
 - `cloudflareNativeRpc(binding)`
 - `httpBatchRpc(url)`
-- `websocketRpc(url)`
+- `websocketRpc(url, { createWebSocket? })` — the optional factory receives the final URL after
+  `request_id` propagation, allowing Node runtimes without a global `WebSocket` to inject a
+  standards-compatible client without requiring the application to install a persistent global;
+  the Cap'n Web 0.10 compatibility path uses a temporary synchronous shim that is restored
+  immediately.
 - `customRpcTransport(transport)`
 
 `cloudflareNativeRpc(...)` can call ingress-protected services only with brokered capability tokens. Normal direct caller tokens are rejected.
+
+Control-plane endpoints may additionally provide `ServiceEndpoint.createWebSocket`. Configure it
+with `httpsService({ createWebSocket })` (or `cloudflareServiceBinding({ createWebSocket })`) so
+broker and MCP calls can reach WebSocket-only abilities on runtimes without a global client.
+
+`ServiceEndpoint.abilityRpc` is likewise explicit: pass `cloudflareServiceBinding({ abilityRpc: env.ASANA })`
+for a binding whose target forwards `connectAbility(...)`. It is never inferred from the binding,
+because a Workers service-binding stub returns a callable RPC proxy for every property name.
+
+Which transport fits which pair of services — by environment, performance, and cost — is covered in [Choosing A Transport](transports.md).
 
 Token requesters:
 
@@ -151,7 +225,7 @@ Token requesters:
 
 Capability tokens are ES256 JWS tokens with a closed claim set. Unknown claims are dropped at verification.
 
-Tokens come in two shapes, and `sub` always answers the same question: who is this token about. A plain service-to-service token is about the calling service. A delegated token (RFC 8693) is about the end user; the calling service does not disappear — it moves into the `act` (actor) claim. The presence of `act` is what switches the interpretation, and the verifier resolves it for you: `identity.serviceId` is always the calling service, and `identity.subject` is set only when a user is delegated.
+Tokens come in two shapes, and `sub` always answers the same question: who is this token about. A plain service-to-service token is about the calling service. A delegated token uses RFC 8693's `act` actor-claim semantics: it is about the end user, while the calling service moves into `act.sub`. The presence of `act` is what switches the interpretation, and the verifier resolves it for you: `identity.serviceId` is always the calling service, and `identity.subject` is set only when a user is delegated.
 
 Plain service token:
 
@@ -181,11 +255,15 @@ Delegated (user-brokered) token:
 | `jti` | token id → `identity.tokenId` | same |
 | `exp` | expiry → `identity.expiresAt`; `iat`/`nbf` are also enforced | same |
 
+Only the `act` delegation relationship comes from RFC 8693. `scp`, `spo`, and `spb` are Service Plane-specific claims, and `/.well-known/service-plane/capability-token` is the package's JSON capability endpoint, not an RFC 8693 token-exchange endpoint.
+
 Delegated subjects are minted only by control-plane code — the broker/MCP caller resolver (a `BrokerCaller` with `kind: 'user'` and optional `orgId`) or a direct `issueCapabilityToken({ subject, ... })` call. The capability-token endpoint and `issueCapabilityTokenForCaller` reject caller-supplied subjects with 403, and the shipped token requesters fail fast locally instead of transmitting one. Direct issue mints a non-brokered token, so ingress-required targets must be reached through the broker, which selects `issueBrokeredCapabilityToken` automatically. See [auth](auth.md#subject-delegation).
 
 ## Logging And Request Correlation
 
 Every request that enters a `ServicePlaneControlPlane` gets an `X-Request-Id` (incoming header value or a generated UUID, via `hono/request-id`). The broker and MCP endpoints forward that id on every outbound call to a service: as the `X-Request-Id` header for HTTP-batch and service-binding transports, as the `request_id` query parameter for WebSocket transports (`SERVICE_PLANE_REQUEST_ID_QUERY_PARAM`), and as the `requestId` field on `connectAbility(...)` for Cloudflare native RPC. `ServicePlaneService` adopts the propagated id into its own `requestId` context variable and echoes it on responses, so one id correlates plane and service logs end to end.
+
+Connection info about the original client rides the same three channels when `broker.connInfo` / `mcp.connInfo` are configured: the `X-Service-Plane-Conn-Info` header, the `conn_info` query parameter (`SERVICE_PLANE_CONN_INFO_QUERY_PARAM`), and the `connInfo` field on `connectAbility(...)`. Services expose it to handlers as `connInfo` only for brokered calls with ingress enabled — see [Forwarded Connection Info](auth.md#forwarded-connection-info).
 
 Both shells log structured JSON events to the console by default. Every event carries `event`, `level`, and (when known) `requestId`.
 

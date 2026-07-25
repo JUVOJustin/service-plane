@@ -29,6 +29,10 @@ class ExampleApi extends RpcTarget {
     return input.values.length;
   }
 
+  async list(input: { values: string[] }) {
+    return input.values;
+  }
+
   async fail(): Promise<{ ok: boolean }> {
     throw new Error('tool exploded');
   }
@@ -134,6 +138,12 @@ async function createFixture(options: FixtureOptions = {}) {
             input: z.object({ values: z.array(z.string()) }),
             mcp: { name: 'example_count' },
             output: z.number(),
+            scopes: ['example.read'],
+          }),
+          list: abilityMethod({
+            input: z.object({ values: z.array(z.string()) }),
+            mcp: { name: 'example_list' },
+            output: z.array(z.string()),
             scopes: ['example.read'],
           }),
           fail: abilityMethod({
@@ -287,7 +297,7 @@ async function createFixture(options: FixtureOptions = {}) {
     },
     services: () => [
       cloudflareServiceBinding({
-        binding: { fetch: (request) => service.fetch(request) },
+        binding: { fetch: async (request) => service.fetch(request) },
         grants: [
           { caller: 'control-plane', scopes: ['example.read'] },
           { caller: 'gateway-svc', scopes: ['example.read'] },
@@ -323,7 +333,7 @@ describe('control-plane MCP endpoint', () => {
       result: { tools: Array<Record<string, unknown>> };
     };
     const toolNames = tools.result.tools.map((tool) => tool.name);
-    expect(toolNames).toEqual(expect.arrayContaining(['example_search', 'example_count', 'example_fail', 'internal_tool']));
+    expect(toolNames).toEqual(expect.arrayContaining(['example_search', 'example_count', 'example_list', 'example_fail', 'internal_tool']));
     expect(toolNames).not.toContain('hidden_tool');
     expect(tools.result.tools.find((tool) => tool.name === 'example_search')).toMatchObject({
       _meta: { servicePlane: { abilityId: 'example.search', method: 'search', scopes: ['example.read'], serviceId: 'example' } },
@@ -331,6 +341,8 @@ describe('control-plane MCP endpoint', () => {
       inputSchema: { properties: { query: { type: 'string' } }, type: 'object' },
       outputSchema: { type: 'object' },
     });
+    expect(tools.result.tools.find((tool) => tool.name === 'example_count')).not.toHaveProperty('outputSchema');
+    expect(tools.result.tools.find((tool) => tool.name === 'example_list')).not.toHaveProperty('outputSchema');
 
     const resources = (await (await mcp(rpc('resources/list'))).json()) as {
       result: { resources: Array<Record<string, unknown>> };
@@ -389,6 +401,11 @@ describe('control-plane MCP endpoint', () => {
       },
     });
 
+    const previous = (await (await mcp(rpc('initialize', { protocolVersion: '2025-06-18' }))).json()) as {
+      result: { protocolVersion: string };
+    };
+    expect(previous.result.protocolVersion).toBe('2025-06-18');
+
     const unsupported = (await (await mcp(rpc('initialize', { protocolVersion: '1999-01-01' }))).json()) as {
       result: { protocolVersion: string };
     };
@@ -424,6 +441,12 @@ describe('control-plane MCP endpoint', () => {
     };
     expect(count.result.content).toEqual([{ text: '2', type: 'text' }]);
     expect(count.result).not.toHaveProperty('structuredContent');
+
+    const list = (await (await mcp(rpc('tools/call', { arguments: { values: ['a', 'b'] }, name: 'example_list' }))).json()) as {
+      result: Record<string, unknown>;
+    };
+    expect(list.result.content).toEqual([{ text: '["a","b"]', type: 'text' }]);
+    expect(list.result).not.toHaveProperty('structuredContent');
 
     const nothing = (await (await mcp(rpc('tools/call', { arguments: {}, name: 'example_nothing' }))).json()) as {
       result: Record<string, unknown>;
@@ -640,8 +663,8 @@ describe('handleControlPlaneMcpRequest protocol plumbing', () => {
     };
   }
 
-  function post(body: string) {
-    return new Request('https://plane.internal/rpc/mcp', { body, method: 'POST' });
+  function post(body: string, headers?: HeadersInit) {
+    return new Request('https://plane.internal/rpc/mcp', { body, ...(headers ? { headers } : {}), method: 'POST' });
   }
 
   it('only accepts POST', async () => {
@@ -651,6 +674,39 @@ describe('handleControlPlaneMcpRequest protocol plumbing', () => {
 
     const del = await handleControlPlaneMcpRequest(new Request('https://plane.internal/rpc/mcp', { method: 'DELETE' }), handlerOptions());
     expect(del.status).toBe(405);
+  });
+
+  it('validates browser origins and permits explicitly configured origins', async () => {
+    const body = JSON.stringify({ id: 1, jsonrpc: '2.0', method: 'ping' });
+    const sameOrigin = await handleControlPlaneMcpRequest(post(body, { origin: 'https://plane.internal' }), handlerOptions());
+    expect(sameOrigin.status).toBe(200);
+
+    const rejected = await handleControlPlaneMcpRequest(post(body, { origin: 'https://app.example' }), handlerOptions());
+    expect(rejected.status).toBe(403);
+
+    const allowed = await handleControlPlaneMcpRequest(post(body, { origin: 'https://app.example' }), {
+      ...handlerOptions(),
+      allowedOrigins: ['https://app.example'],
+    });
+    expect(allowed.status).toBe(200);
+  });
+
+  it('rejects unsupported MCP protocol-version headers', async () => {
+    const body = JSON.stringify({ id: 1, jsonrpc: '2.0', method: 'ping' });
+    const unsupported = await handleControlPlaneMcpRequest(post(body, { 'mcp-protocol-version': '1999-01-01' }), handlerOptions());
+    expect(unsupported.status).toBe(400);
+
+    const previous = await handleControlPlaneMcpRequest(post(body, { 'mcp-protocol-version': '2025-06-18' }), handlerOptions());
+    expect(previous.status).toBe(200);
+
+    const initialStreamableHttp = await handleControlPlaneMcpRequest(
+      post(body, { 'mcp-protocol-version': '2025-03-26' }),
+      handlerOptions(),
+    );
+    expect(initialStreamableHttp.status).toBe(200);
+
+    const omitted = await handleControlPlaneMcpRequest(post(body), handlerOptions());
+    expect(omitted.status).toBe(200);
   });
 
   it('rejects malformed JSON-RPC payloads', async () => {
@@ -674,21 +730,43 @@ describe('handleControlPlaneMcpRequest protocol plumbing', () => {
     await expect(wrongVersion.json()).resolves.toMatchObject({ error: { code: -32600 } });
   });
 
-  it('acknowledges notifications and client responses without a body', async () => {
+  it('acknowledges notifications and valid client responses without a body', async () => {
     const notification = await handleControlPlaneMcpRequest(
       post(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })),
       handlerOptions(),
     );
     expect(notification.status).toBe(202);
 
+    // Cancellation is optional in MCP. This stateless endpoint acknowledges the notification but
+    // cannot correlate it with request-scoped work across isolates.
+    const cancelled = await handleControlPlaneMcpRequest(
+      post(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 99 } })),
+      handlerOptions(),
+    );
+    expect(cancelled.status).toBe(202);
+
     const response = await handleControlPlaneMcpRequest(post(JSON.stringify({ id: 5, jsonrpc: '2.0', result: {} })), handlerOptions());
     expect(response.status).toBe(202);
+  });
 
+  it('rejects malformed JSON-RPC ids, methods, and client responses', async () => {
     const invalidId = await handleControlPlaneMcpRequest(
       post(JSON.stringify({ id: true, jsonrpc: '2.0', method: 'ping' })),
       handlerOptions(),
     );
-    expect(invalidId.status).toBe(202);
+    expect(invalidId.status).toBe(400);
+    await expect(invalidId.json()).resolves.toMatchObject({ error: { code: -32600 }, id: null });
+
+    const invalidMethod = await handleControlPlaneMcpRequest(
+      post(JSON.stringify({ id: 1, jsonrpc: '2.0', method: true })),
+      handlerOptions(),
+    );
+    expect(invalidMethod.status).toBe(400);
+    await expect(invalidMethod.json()).resolves.toMatchObject({ error: { code: -32600 }, id: null });
+
+    const invalidResponse = await handleControlPlaneMcpRequest(post(JSON.stringify({ id: 1, jsonrpc: '2.0' })), handlerOptions());
+    expect(invalidResponse.status).toBe(400);
+    await expect(invalidResponse.json()).resolves.toMatchObject({ error: { code: -32600 }, id: null });
   });
 
   it('answers ping, echoes null ids, and rejects unsupported methods', async () => {
@@ -887,7 +965,7 @@ describe('handleControlPlaneMcpRequest protocol plumbing', () => {
       signingSecret: await generateCapabilitySigningSecret(),
     });
     const registry = createServiceRegistry({
-      services: [{ fetch: (request: Request) => service.fetch(request), id: 'example', origin: 'https://example.internal' }],
+      services: [{ fetch: async (request: Request) => service.fetch(request), id: 'example', origin: 'https://example.internal' }],
     });
     const events: ServicePlaneBrokerLogEvent[] = [];
 

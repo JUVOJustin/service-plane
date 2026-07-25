@@ -67,7 +67,9 @@ flowchart TD
 
 Hono middleware sees the HTTP or WebSocket request. Cap'n Web sees the logical method call. That is why method auth and validation live in the Service Plane RPC wrapper, not in Hono middleware.
 
-Services that must only process brokered traffic can enable service-plane ingress protection. In that mode, `/rpc/<abilityId>` rejects valid but non-brokered capability tokens before input validation or handler creation. The broker mints a signed broker claim with the same capability issuer and JWKS trust chain the service already uses.
+Production services should enable service-plane ingress protection so only brokered traffic reaches ability handlers. In that mode, `/rpc/<abilityId>` rejects valid but non-brokered capability tokens before input validation or handler creation. The broker mints a signed broker claim with the same capability issuer and JWKS trust chain the service already uses.
+
+Methods that return many results over time (`stream: true`) use Cap'n Web's native stream support: the validating wrapper returns a `ReadableStream` of per-item-validated results with built-in flow control. Streams ride the ongoing RPC session, so they work over WebSocket, native Workers RPC bindings, and custom bidirectional transports — but not over the one-round-trip HTTP-batch transport, where streaming calls fail with a clear 405. The broker proxies these streams transparently, and MCP tools backed by streaming methods answer over SSE. The security model is unchanged — only the return shape differs. See [Streaming](streaming.md).
 
 ## Observability
 
@@ -98,9 +100,11 @@ Only `exposure: 'published'` methods with REST metadata enter OpenAPI. Only publ
 - Handler: implementation object returned by the ability factory.
 - Context: runtime access such as Hono context, env, bindings, and execution context.
 - Identity: verified Service Plane caller and scope claims, plus the delegated end-user subject on user-brokered calls.
-- Subject: the end user (and org) a delegated call is made on behalf of, carried per RFC 8693 (`sub` = user, `act` = acting service, `spo` = org).
+- Subject: the end user (and optional org) a delegated call is made on behalf of. The `sub` user
+  and `act.sub` acting-service relationship follows RFC 8693 actor semantics; `spo` is a
+  Service Plane-specific organization claim.
 - Access: whether an ability is plane-callable or restricted to service callers.
 - Private: ability excluded from OpenAPI and MCP.
 - Published: ability eligible for OpenAPI, MCP, or user-facing transports.
 
-Next: [create a service](service-creation.md), then [create a control plane](plane-creation.md).
+Next: [create a service](service-creation.md), [create a control plane](plane-creation.md), and [choosing a transport](transports.md).

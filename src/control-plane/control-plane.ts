@@ -1,20 +1,28 @@
 import { newRpcResponse } from '@hono/capnweb';
-import { type Context, type Env, Hono } from 'hono';
+import { Context, type Env, Hono } from 'hono';
 import { etag } from 'hono/etag';
 import { type RequestIdVariables, requestId } from 'hono/request-id';
 import type { UpgradeWebSocket } from 'hono/ws';
+import { type ConnInfo, normalizeConnInfo } from '../shared/conn-info.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
 import { defaultServicePlaneLogSink, type ServicePlaneControlPlaneLogEvent, type ServicePlaneLogSink } from '../shared/logging.js';
 import {
   type RegistryCache,
+  SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
   SERVICE_PLANE_OPENAPI_PATH,
   SERVICE_PLANE_REQUEST_ID_HEADER,
   type ServiceEndpoint,
   type ServiceGrant,
+  type ServiceRegistry,
 } from '../shared/types.js';
 import { type BrokerCaller, createControlPlaneRpcBroker } from './broker.js';
 import { type CapabilityIssuer, type MountCapabilityEndpointsOptions, mountCapabilityEndpoints } from './capabilities.js';
-import { type ControlPlaneMcpServerInfo, DEFAULT_MCP_PATH, handleControlPlaneMcpRequest } from './mcp.js';
+import {
+  type ControlPlaneMcpServerInfo,
+  DEFAULT_MCP_PATH,
+  handleControlPlaneMcpRequest,
+  validateControlPlaneMcpTransportRequest,
+} from './mcp.js';
 import {
   type ControlPlaneOpenApiOptions,
   controlPlaneOpenApiCacheKey,
@@ -31,10 +39,25 @@ type ServicePlaneControlPlaneEnv<TEnv extends Env> = TEnv & {
 
 type ServicePlaneRequestIdOptions = NonNullable<Parameters<typeof requestId>[0]>;
 
-// Resolves the authenticated broker/MCP caller from a request. Returning undefined rejects the
-// request (401); omitting the resolver entirely fails closed (500), mirroring the token endpoint.
-// This is the trust boundary for the broker and MCP surfaces: no authenticated caller, no brokering.
-type BrokerCallerResolver<TEnv extends Env> = (context: Context<TEnv>) => BrokerCaller | Promise<BrokerCaller | undefined> | undefined;
+// Resolves the authenticated broker/MCP caller from a request. A resolver-owned Response lets the
+// application preserve its authentication scheme's exact challenge and body. Returning undefined
+// refuses the request with 403; omitting the resolver entirely fails closed with 500.
+export type BrokerCallerResolver<TEnv extends Env = Env> = (
+  context: Context<TEnv>,
+) => BrokerCaller | Promise<BrokerCaller | Response | undefined> | Response | undefined;
+
+// Supplies the original client's connection info for forwarding to services. `getConnInfo` is
+// runtime-specific in Hono (`hono/cloudflare-workers`, `@hono/node-server/conninfo`, ...), so the
+// application picks the right one: `connInfo: (c) => getConnInfo(c)`.
+export type ConnInfoResolver<TEnv extends Env = Env> = (context: Context<TEnv>) => ConnInfo | undefined;
+
+type BrokeredRequest = {
+  caller: BrokerCaller;
+  connInfo: ConnInfo | undefined;
+  issuer: CapabilityIssuer;
+  registry: ServiceRegistry;
+  requestId: string | undefined;
+};
 
 export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
   app?: Hono<TEnv>;
@@ -44,6 +67,7 @@ export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
     | {
         cache?: RegistryCache;
         caller?: BrokerCallerResolver<TEnv>;
+        connInfo?: ConnInfoResolver<TEnv>;
         path?: string;
         upgradeWebSocket?: UpgradeWebSocket;
       };
@@ -55,10 +79,13 @@ export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
   mcp?:
     | false
     | {
+        allowedOrigins?: string[];
         cache?: RegistryCache;
         caller?: BrokerCallerResolver<TEnv>;
+        connInfo?: ConnInfoResolver<TEnv>;
         path?: string;
         serverInfo?: Partial<ControlPlaneMcpServerInfo>;
+        streamLimits?: { maxBytes?: number; maxItems?: number };
       };
   openapi?: false | ControlPlaneOpenApiOptions;
   requestId?: ServicePlaneRequestIdOptions;
@@ -110,33 +137,30 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     input: IssueCapabilityTokenForCallerInput,
     bindings: TEnv['Bindings'],
   ): Promise<RpcIssuedCapabilityToken> {
-    const context = { env: bindings } as Context<TEnv>;
+    const context = nativeControlPlaneContext<TEnv>(bindings);
     return issueCapabilityTokenForCaller(await this.issuerFor(context), callerServiceId, input);
   }
 
   private mountBroker(brokerOptions: Exclude<ServicePlaneControlPlaneOptions<TEnv>['broker'], false | undefined>): void {
     const path = brokerOptions.path ?? '/rpc/broker';
     this.app.all(path, async (context) => {
-      const caller = await resolveBrokerCaller(context as Context<TEnv>, brokerOptions.caller);
-      if (caller instanceof Response) return caller;
-      const services = await this.options.services(context as Context<TEnv>);
-      const issuer = await this.issuerFor(context as Context<TEnv>, services);
-      const registry = createServiceRegistry({
-        ...(brokerOptions.cache ? { cache: brokerOptions.cache } : {}),
-        services,
-      });
-      const requestId = brokerRequestId(context);
+      const resolved = await this.resolveBrokeredRequest(context as Context<TEnv>, brokerOptions);
+      if (resolved instanceof Response) return resolved;
       const log = this.log;
       const broker = createControlPlaneRpcBroker({
+        ...(resolved.connInfo ? { connInfo: resolved.connInfo } : {}),
         controlPlaneServiceId: this.options.controlPlaneServiceId ?? 'control-plane',
-        issuer,
+        issuer: resolved.issuer,
         ...(log ? { log: (event) => log(event, context) } : {}),
-        registry,
-        ...(requestId ? { requestId } : {}),
+        registry: resolved.registry,
+        ...(resolved.requestId ? { requestId: resolved.requestId } : {}),
       });
+      // Only a WebSocket-upgraded caller leg can carry a returned stream back; over HTTP-batch
+      // the broker rejects streaming methods with a clear 405 instead of a dangling stub.
+      const allowStreaming = context.req.header('upgrade')?.toLowerCase() === 'websocket';
       return newRpcResponse(
         context,
-        broker.rootCapability(caller),
+        broker.rootCapability(resolved.caller, { allowStreaming }),
         brokerOptions.upgradeWebSocket ? { upgradeWebSocket: brokerOptions.upgradeWebSocket } : undefined,
       );
     });
@@ -145,24 +169,28 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   private mountMcp(mcpOptions: Exclude<ServicePlaneControlPlaneOptions<TEnv>['mcp'], false | undefined>): void {
     const path = mcpOptions.path ?? DEFAULT_MCP_PATH;
     this.app.all(path, async (context) => {
-      const caller = await resolveBrokerCaller(context as Context<TEnv>, mcpOptions.caller);
-      if (caller instanceof Response) return caller;
-      const services = await this.options.services(context as Context<TEnv>);
-      const issuer = await this.issuerFor(context as Context<TEnv>, services);
-      const registry = createServiceRegistry({
-        ...(mcpOptions.cache ? { cache: mcpOptions.cache } : {}),
-        services,
-      });
-      const requestId = brokerRequestId(context);
+      const transportError = validateControlPlaneMcpTransportRequest(context.req.raw, mcpOptions.allowedOrigins);
+      if (transportError) return transportError;
+      // This implementation is stateless POST-only. Reject unsupported transport methods before
+      // caller resolution or service discovery so a documented 405 cannot turn into an auth or
+      // configuration error (and does not allocate an issuer for a request we will not handle).
+      if (context.req.method !== 'POST') {
+        return new Response('Method Not Allowed', { headers: { allow: 'POST' }, status: 405 });
+      }
+      const resolved = await this.resolveBrokeredRequest(context as Context<TEnv>, mcpOptions);
+      if (resolved instanceof Response) return resolved;
       const log = this.log;
       return handleControlPlaneMcpRequest(context.req.raw, {
-        caller,
+        ...(mcpOptions.allowedOrigins ? { allowedOrigins: mcpOptions.allowedOrigins } : {}),
+        caller: resolved.caller,
+        ...(resolved.connInfo ? { connInfo: resolved.connInfo } : {}),
         controlPlaneServiceId: this.options.controlPlaneServiceId ?? 'control-plane',
-        issuer,
+        issuer: resolved.issuer,
         ...(log ? { log: (event) => log(event, context) } : {}),
-        registry,
-        ...(requestId ? { requestId } : {}),
+        registry: resolved.registry,
+        ...(resolved.requestId ? { requestId: resolved.requestId } : {}),
         ...(mcpOptions.serverInfo ? { serverInfo: mcpOptions.serverInfo } : {}),
+        ...(mcpOptions.streamLimits ? { streamLimits: mcpOptions.streamLimits } : {}),
       });
     });
   }
@@ -189,6 +217,27 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       await openApiOptions.cache?.set(cacheKey, document, openApiOptions.cacheTtlSeconds ?? DEFAULT_OPENAPI_CACHE_TTL_SECONDS);
       return context.json(document);
     });
+  }
+
+  // Broker and MCP need the same request-scoped bundle: an authenticated caller, the request's
+  // endpoint set, an issuer over it, and a registry over it. This stays a plain method rather than
+  // middleware so each mount keeps deciding what it validates *before* caller resolution — MCP
+  // rejects non-POST first, which middleware ordering would invert.
+  private async resolveBrokeredRequest(
+    context: Context<TEnv>,
+    mountOptions: { cache?: RegistryCache; caller?: BrokerCallerResolver<TEnv>; connInfo?: ConnInfoResolver<TEnv> },
+  ): Promise<Response | BrokeredRequest> {
+    const caller = await resolveBrokerCaller(context, mountOptions.caller);
+    if (caller instanceof Response) return caller;
+    const services = await this.options.services(context);
+    return {
+      caller,
+      // Normalized at the boundary so the plane never forwards a value the service would reject.
+      connInfo: normalizeConnInfo(mountOptions.connInfo?.(context)),
+      issuer: await this.issuerFor(context, services),
+      registry: createServiceRegistry({ ...(mountOptions.cache ? { cache: mountOptions.cache } : {}), services }),
+      requestId: brokerRequestId(context),
+    };
   }
 
   private async issuerFor(context: Context<TEnv>, services?: ServiceEndpoint[]): Promise<CapabilityIssuer> {
@@ -222,6 +271,18 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   }
 }
 
+function nativeControlPlaneContext<TEnv extends Env>(bindings: TEnv['Bindings']): Context<TEnv> {
+  const requestId = crypto.randomUUID();
+  const path = SERVICE_PLANE_CAPABILITY_TOKEN_PATH;
+  const request = new Request(new URL(path, 'https://service-plane-control-plane-native.internal'), {
+    headers: { [SERVICE_PLANE_REQUEST_ID_HEADER]: requestId },
+    method: 'POST',
+  });
+  const context = new Context<ServicePlaneControlPlaneEnv<TEnv>>(request, { env: bindings, path });
+  context.set('requestId', requestId);
+  return context as unknown as Context<TEnv>;
+}
+
 function missingAuthenticateCaller(context: Context, log: ServicePlaneLogSink | undefined): Response {
   const requestId = brokerRequestId(context);
   const event: ServicePlaneControlPlaneLogEvent = {
@@ -239,16 +300,17 @@ function brokerRequestId(context: Context): string | undefined {
   return requestIdFromContext(context) ?? context.req.header(SERVICE_PLANE_REQUEST_ID_HEADER)?.trim() ?? undefined;
 }
 
-// Fails closed: a broker/MCP request with no configured resolver is a 500 (misconfiguration), and a
-// resolver that returns no caller is a 401. Only an authenticated caller reaches the brokering logic.
+// Fails closed: a broker/MCP request with no configured resolver is a 500 (misconfiguration). A
+// resolver-owned response is preserved; undefined is a generic refusal, not a made-up auth scheme.
 async function resolveBrokerCaller<TEnv extends Env>(
   context: Context<TEnv>,
   resolver: BrokerCallerResolver<TEnv> | undefined,
 ): Promise<BrokerCaller | Response> {
   if (!resolver) return brokerCallerNotConfigured(context);
-  const caller = await resolver(context);
-  if (!caller) return context.json({ error: 'Unauthorized' }, 401);
-  return caller;
+  const resolved = await resolver(context);
+  if (resolved instanceof Response) return resolved;
+  if (!resolved) return context.json({ error: 'Forbidden' }, 403);
+  return resolved;
 }
 
 function brokerCallerNotConfigured(context: Context): Response {

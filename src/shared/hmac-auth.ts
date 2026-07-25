@@ -92,8 +92,9 @@ export function servicePlaneHmacAuthorization(signature: string): string {
 export function extractServicePlaneHmacSignature(request: Request): string {
   const authorization = request.headers.get('authorization')?.trim();
   if (!authorization) throw new CapabilityAuthError('Missing Service-Plane HMAC authorization', 401);
-  const [scheme, signature] = authorization.split(/\s+/u, 2);
-  if (scheme !== SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME || !signature) {
+  const parts = authorization.split(/\s+/u);
+  const [scheme, signature] = parts;
+  if (parts.length !== 2 || scheme?.toLowerCase() !== SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME.toLowerCase() || !signature) {
     throw new CapabilityAuthError('Invalid Service-Plane HMAC authorization scheme', 401);
   }
   return signature;

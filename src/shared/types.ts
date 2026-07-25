@@ -1,3 +1,5 @@
+import type { ConnInfo } from './conn-info.js';
+
 export const SERVICE_DISCOVERY_PATH = '/.well-known/service-plane/service.json';
 export const SERVICE_PLANE_OPENAPI_PATH = '/openapi.json';
 export const SERVICE_PLANE_CAPABILITY_JWKS_PATH = '/.well-known/service-plane/jwks.json';
@@ -82,6 +84,9 @@ export type ServiceAbilityMethodDiscovery = {
   outputSchema: OpenApiObject;
   rest?: ServiceAbilityRestProjection;
   scopes: string[];
+  // Streaming methods return a ReadableStream of output items over a Cap'n Web session
+  // transport; `outputSchema` then describes one streamed item, not the whole response.
+  stream?: true;
 };
 
 export type ServiceAbilityDiscovery = {
@@ -127,7 +132,16 @@ export type ServiceGrantDefinition = {
   grants: ServiceGrant[];
 };
 
+// Native ability RPC surface a service can expose next to `fetch` (e.g. a Cloudflare
+// WorkerEntrypoint forwarding to ServicePlaneService.connectAbility). Session-shaped, so
+// streaming method returns flow through it natively.
+export type ServiceAbilityNativeRpcBinding = {
+  connectAbility(input: { abilityId: string; connInfo?: ConnInfo; requestId?: string; token: string }): Promise<object> | object;
+};
+
 export type ServiceEndpoint = {
+  abilityRpc?: ServiceAbilityNativeRpcBinding;
+  createWebSocket?: (url: string) => WebSocket;
   discovery?: ServiceDiscoveryDocument | (() => Promise<ServiceDiscoveryDocument> | ServiceDiscoveryDocument);
   fetch(request: Request): Promise<Response>;
   grants?: ServiceEndpointGrant[];
@@ -196,6 +210,8 @@ export type McpServicePlaneMeta = {
     method: string;
     scopes: string[];
     serviceId: string;
+    // The projected method streams; tools/call answers over SSE per MCP Streamable HTTP.
+    stream?: true;
   };
 };
 
@@ -204,7 +220,9 @@ export type McpToolDiscovery = {
   description?: string;
   inputSchema: OpenApiObject;
   name: string;
-  outputSchema: OpenApiObject;
+  // MCP structured tool output is object-shaped. Primitive/array ability outputs are returned as
+  // text content and intentionally do not advertise an incompatible output schema.
+  outputSchema?: OpenApiObject;
 };
 
 export type McpResourceDiscovery = {

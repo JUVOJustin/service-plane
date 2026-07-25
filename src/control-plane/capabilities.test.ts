@@ -340,18 +340,17 @@ describe('capability issuer', () => {
     });
 
     expect((await app.request('/.well-known/service-plane/jwks.json')).status).toBe(200);
-    expect(
-      (
-        await app.request('/.well-known/service-plane/capability-token', {
-          body: JSON.stringify({
-            scopes: ['fizzy.users.lookup'],
-            targetServiceId: 'fizzy',
-          }),
-          headers: { 'content-type': 'application/json' },
-          method: 'POST',
-        })
-      ).status,
-    ).toBe(200);
+    const tokenResponse = await app.request('/.well-known/service-plane/capability-token', {
+      body: JSON.stringify({
+        scopes: ['fizzy.users.lookup'],
+        targetServiceId: 'fizzy',
+      }),
+      headers: { 'content-type': 'application/json' },
+      method: 'POST',
+    });
+    expect(tokenResponse.status).toBe(200);
+    expect(tokenResponse.headers.get('cache-control')).toBe('no-store');
+    expect(tokenResponse.headers.get('pragma')).toBe('no-cache');
   });
 
   it('serves JWKS with ETag revalidation', async () => {

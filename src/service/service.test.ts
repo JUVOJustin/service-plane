@@ -4,7 +4,7 @@ import { createControlPlaneRpcBroker } from '../control-plane/broker.js';
 import { createCapabilityIssuer, defineServiceGrants } from '../control-plane/capabilities.js';
 import { cloudflareServiceBinding } from '../control-plane/endpoints.js';
 import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
-import { SERVICE_DISCOVERY_PATH } from '../shared/types.js';
+import { SERVICE_DISCOVERY_PATH, SERVICE_PLANE_REQUEST_ID_HEADER } from '../shared/types.js';
 import {
   abilitySession,
   cloudflareNativeRpc,
@@ -37,6 +37,16 @@ describe('ServicePlaneService', () => {
       privateJwk: keys.privateJwk,
     });
 
+    let handlerContext:
+      | {
+          contentType: string | null;
+          marker: unknown;
+          method: string;
+          path: string;
+          requestIdHeader: string | undefined;
+          requestIdVariable: unknown;
+        }
+      | undefined;
     const syncAbility = defineAbility({
       id: 'example.sync',
       methods: {
@@ -46,8 +56,20 @@ describe('ServicePlaneService', () => {
           scopes: ['example.sync.run'],
         }),
       },
+      rpc: { transports: ['http-batch', 'cloudflare-binding-rpc'] },
       scopes: ['example.sync.run'],
-      handler: () => new ExampleApi() as ExampleApi & Record<string, unknown>,
+      handler: ({ context }) => {
+        const response = context.json({ ok: true });
+        handlerContext = {
+          contentType: response.headers.get('content-type'),
+          marker: (context.env as { marker?: unknown } | undefined)?.marker,
+          method: context.req.method,
+          path: context.req.path,
+          requestIdHeader: context.req.header(SERVICE_PLANE_REQUEST_ID_HEADER),
+          requestIdVariable: (context.get as (key: string) => unknown)('requestId'),
+        };
+        return new ExampleApi() as ExampleApi & Record<string, unknown>;
+      },
     });
 
     const service = new ServicePlaneService({
@@ -75,7 +97,7 @@ describe('ServicePlaneService', () => {
       scopes: ['example.sync.run'],
       targetServiceId: 'example',
     });
-    const binding = { fetch: (request: Request) => service.fetch(request) };
+    const binding = { fetch: async (request: Request) => service.fetch(request) };
 
     const api = await abilitySession<AbilityRpc<typeof syncAbility>>({
       abilityId: 'example.sync',
@@ -96,16 +118,50 @@ describe('ServicePlaneService', () => {
     const nativeApi = await abilitySession<AbilityRpc<typeof syncAbility>>({
       abilityId: 'example.sync',
       callerServiceId: 'worker-a',
+      requestId: 'native-request-1',
       requestToken: async () => issued,
       scopes: ['example.sync.run'],
       targetServiceId: 'example',
-      transport: cloudflareNativeRpc(service),
+      transport: cloudflareNativeRpc({
+        connectAbility: (input) => service.connectAbility(input, { marker: 'native-binding' } as never),
+      }),
     });
 
     await expect(nativeApi.runSync({ since: '2026-05-10T00:00:00.000Z' })).resolves.toMatchObject({
       caller: 'worker-a',
       since: '2026-05-10T00:00:00.000Z',
     });
+    expect(handlerContext).toEqual({
+      contentType: 'application/json',
+      marker: 'native-binding',
+      method: 'POST',
+      path: '/rpc/example.sync',
+      requestIdHeader: 'native-request-1',
+      requestIdVariable: 'native-request-1',
+    });
+  });
+
+  it('rejects native binding RPC for abilities that do not declare it', async () => {
+    const service = new ServicePlaneService({
+      abilities: [
+        defineAbility({
+          id: 'example.http-only',
+          methods: {
+            run: abilityMethod({ input: z.object({}), output: z.object({ ok: z.boolean() }), scopes: ['example.sync.run'] }),
+          },
+          scopes: ['example.sync.run'],
+          handler: () => new ExampleApi() as ExampleApi & Record<string, unknown>,
+        }),
+      ],
+      auth: { issuer: 'control-plane', jwks: { keys: [] } },
+      capabilities: defineCapabilities({ scopes: [{ id: 'example.sync.run' }], serviceId: 'example' }),
+      id: 'example',
+      logger: false,
+      title: 'Example',
+      version: '0.1.0',
+    });
+
+    await expect(service.connectAbility({ abilityId: 'example.http-only', token: 'not-read' })).rejects.toMatchObject({ status: 405 });
   });
 
   it('blocks direct ability RPC when service-plane ingress protection is enabled', async () => {
@@ -135,6 +191,7 @@ describe('ServicePlaneService', () => {
           scopes: ['example.sync.run'],
         }),
       },
+      rpc: { transports: ['http-batch', 'cloudflare-binding-rpc'] },
       scopes: ['example.sync.run'],
       handler: () => {
         handlerCreations += 1;
@@ -160,7 +217,7 @@ describe('ServicePlaneService', () => {
       scopes: ['example.sync.run'],
       targetServiceId: 'example',
     });
-    const directBinding = { fetch: (request: Request) => service.fetch(request) };
+    const directBinding = { fetch: async (request: Request) => service.fetch(request) };
     const directApi = await abilitySession<AbilityRpc<typeof syncAbility>>({
       abilityId: 'example.sync',
       callerServiceId: 'worker-a',
