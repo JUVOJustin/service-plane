@@ -8,7 +8,7 @@ Service Plane offers four transports. They are interchangeable at the ability le
 | --- | --- | --- | --- |
 | `cloudflareNativeRpc(binding)` | session (Workers RPC) | yes | Cloudflare, same account |
 | `cloudflareServiceBindingRpc(binding)` / `httpBatchRpc(url)` | one HTTP request per call (with pipelining) | no | everywhere |
-| `websocketRpc(url)` | long-lived session | yes | everywhere both ends can hold a socket |
+| `websocketRpc(url, { createWebSocket? })` | long-lived session | yes | everywhere both ends can hold a socket |
 | `customRpcTransport(transport)` | whatever you bring | yes | tests, message ports, exotic links |
 
 ## Decision Rules

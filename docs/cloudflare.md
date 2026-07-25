@@ -4,9 +4,10 @@ Goal: use Service Plane with Workers, Service Bindings, Durable Objects, and Dyn
 
 Cloudflare-to-Cloudflare calls should use bindings when possible. Use HTTP-batch for self-hosted services and WebSocket for explicit long-lived sessions.
 
-## Worker-To-Worker Calls
+## Local Worker-To-Worker Calls
 
-The caller asks the control plane for a token through a private binding, then calls the service through a service binding.
+For local development, the caller can request a token through a private binding and call the service
+binding directly. Production services should enable ingress and route the caller through the broker.
 
 ```ts
 import {
@@ -30,19 +31,90 @@ const asana = await abilitySession<AbilityRpc<typeof asanaTasks>>({
 });
 ```
 
-`cloudflareServiceBindingRpc(...)` sends HTTP-batch RPC through the binding and defaults to `/rpc/<abilityId>`. If the target service enables ingress protection, route calls through the control-plane broker so the token carries the signed broker claim.
+`cloudflareServiceBindingRpc(...)` sends HTTP-batch RPC through the binding and defaults to
+`/rpc/<abilityId>`. This direct transport is for ingress-disabled local/development setups;
+production ingress routes through the broker.
 
 ## Native Binding RPC
 
-When the service binding exposes `connectAbility(...)`, use native binding RPC instead of HTTP-batch unless the service enables ingress protection for direct callers.
+When the service binding exposes `connectAbility(...)`, native binding RPC is the lowest-overhead
+session transport. Direct caller use is for ingress-disabled local/development setups; in production,
+the control-plane broker can use the same binding with a brokered token.
+
+Expose both Hono HTTP routes and the native method from a `WorkerEntrypoint`:
+
+```ts
+import { WorkerEntrypoint } from 'cloudflare:workers';
+
+const service = new ServicePlaneService<{ Bindings: Env }>({
+  // ...
+});
+
+export default class AsanaService extends WorkerEntrypoint<Env> {
+  fetch(request: Request) {
+    return service.fetch(request, this.env, this.ctx);
+  }
+
+  connectAbility(input: { abilityId: string; requestId?: string; token: string }) {
+    return service.connectAbility(input, this.env);
+  }
+}
+```
 
 ```ts
 transport: cloudflareNativeRpc(env.ASANA)
 ```
 
+Wrap a direct native `abilitySession` in `using`, or call `disposeAbilitySession` in `finally`; the
+session caches its `connectAbility` target and disposal releases that target.
+
+For the control plane to use the same path, register the binding as the endpoint's `abilityRpc`:
+
+```ts
+cloudflareServiceBinding({ abilityRpc: env.ASANA, binding: env.ASANA, id: 'asana' });
+```
+
+This is always explicit — a service-binding stub answers any property access with a callable RPC
+proxy, so the presence of `connectAbility` proves nothing about the target.
+
 Both transports use the same ability wrapper: token verification, Zod validation, method scopes, handler call, and output validation.
 
+Native binding calls do not traverse the Hono middleware chain, but the ability handler still
+receives a real Hono `Context` with the ability's POST path, supplied bindings, and propagated
+request id. No HTTP execution context is fabricated for the RPC call.
+
 Ingress-protected services reject native binding RPC when the caller uses a normal non-brokered capability token.
+
+For private token requests, expose a caller-pinned control-plane entrypoint instead of trusting a
+caller id supplied over RPC:
+
+```ts
+import { WorkerEntrypoint } from 'cloudflare:workers';
+import type { IssueCapabilityTokenInput } from 'service-plane/control-plane';
+
+const plane = new ServicePlaneControlPlane<{ Bindings: Env }>({
+  // ...
+});
+
+export default class WorkflowRunnerPlane extends WorkerEntrypoint<Env> {
+  fetch(request: Request) {
+    return plane.fetch(request, this.env, this.ctx);
+  }
+
+  issueCapabilityToken(input: IssueCapabilityTokenInput) {
+    const { callerServiceId, ...request } = input;
+    return plane.issueCapabilityTokenForCaller(
+      'workflow-runner',
+      { ...request, callerServiceId },
+      this.env,
+    );
+  }
+}
+```
+
+Give that entrypoint binding only to `workflow-runner`. `controlPlaneRpcTokenRequester` can call
+its `issueCapabilityToken` method directly; the adapter pins and verifies the deployment-owned
+identity before the control plane checks grants.
 
 ## Durable Objects For User Connections
 

@@ -1,7 +1,9 @@
-import { RpcTarget } from 'capnweb';
+import { RpcPromise, RpcTarget } from 'capnweb';
 import type { Context, Env } from 'hono';
 import * as z from 'zod';
+import type { ConnInfo } from '../shared/conn-info.js';
 import { AbilityValidationError, CapabilityAuthError } from '../shared/errors.js';
+import { isOriginRelativePath } from '../shared/paths.js';
 import {
   type AbilityAccess,
   type AbilityExposure,
@@ -41,6 +43,10 @@ export type AbilityMethodDefinitions = Record<string, AbilityMethodDefinition>;
 
 export type ServiceAbilityHandlerFactoryInput<TEnv extends Env = Env> = {
   abilityId: string;
+  // Advisory connection info about the original client, forwarded by the control plane. Present
+  // only for brokered calls into an ingress-protected service; unlike `identity` it is not
+  // signature-verified, so use it for audit and logging, never for authorization.
+  connInfo?: ConnInfo;
   context: Context<TEnv>;
   identity: CapabilityIdentity;
 };
@@ -189,13 +195,28 @@ export type CreateValidatingAbilityHandlerOptions = {
   allowStreaming?: boolean;
 };
 
+type ValidatingAbilityHandlerState = {
+  abilityId: string;
+  allowStreaming: boolean;
+  disposed: boolean;
+  handler: RpcTarget & Record<string, unknown>;
+  methods: Record<string, NormalizedAbilityMethodDefinition>;
+};
+
+type ValidatingAbilityHandlerConstructor = new () => RpcTarget;
+
+// Ability definitions are long-lived while handler instances are created per session. Reusing
+// the generated class avoids rebuilding an identical prototype on every authenticated call while
+// WeakMap state keeps caller-specific data out of Cap'n Web's remotely visible object surface.
+const validatingHandlerConstructorByAbility = new WeakMap<object, ValidatingAbilityHandlerConstructor>();
+const validatingHandlerStateByTarget = new WeakMap<object, ValidatingAbilityHandlerState>();
+
 export function createValidatingAbilityHandler<TEnv extends Env>(
   ability: NormalizedServiceAbility<TEnv>,
   handler: RpcTarget & Record<string, unknown>,
   identity: CapabilityIdentity,
   options: CreateValidatingAbilityHandlerOptions = {},
 ): RpcTarget {
-  const allowStreaming = options.allowStreaming ?? false;
   // A handler instance carries one caller's identity; a factory that returns a shared
   // instance would let concurrent sessions overwrite each other's identity and scopes.
   if (capabilityIdentity(handler)) {
@@ -203,44 +224,86 @@ export function createValidatingAbilityHandler<TEnv extends Env>(
   }
   bindCapabilityIdentity(handler, identity);
 
+  const ValidatingAbilityHandler = validatingAbilityHandlerConstructor(ability);
+  const target = new ValidatingAbilityHandler();
+  validatingHandlerStateByTarget.set(target, {
+    abilityId: ability.id,
+    allowStreaming: options.allowStreaming ?? false,
+    disposed: false,
+    handler,
+    methods: ability.methods,
+  });
+  return bindCapabilityIdentity(target, identity);
+}
+
+function validatingAbilityHandlerConstructor<TEnv extends Env>(
+  ability: NormalizedServiceAbility<TEnv>,
+): ValidatingAbilityHandlerConstructor {
+  const cached = validatingHandlerConstructorByAbility.get(ability);
+  if (cached) return cached;
+
   class ValidatingAbilityHandler extends RpcTarget {
-    async invoke(methodName: string, args: unknown[]): Promise<unknown> {
-      const method = ability.methods[methodName];
-      if (!method) throw new AbilityValidationError(`Unknown Service-Plane ability method: ${methodName}`, 404);
-      if (method.stream && !allowStreaming) {
-        throw new AbilityValidationError(
-          `Service-Plane streaming method requires a session transport (WebSocket, native binding, or custom bidirectional): ${methodName}`,
-          405,
-        );
-      }
-      if (args.length !== 1) {
-        throw new AbilityValidationError(`Service-Plane ability method expects a single input object: ${methodName}`, 422);
-      }
-
-      requireScopes(this, ...method.scopes);
-      const implementation = handler[methodName];
-      if (typeof implementation !== 'function') {
-        throw new AbilityValidationError(`Service-Plane ability handler does not implement method: ${methodName}`, 500);
-      }
-
-      const input = await method.input.parseAsync(args[0]);
-      const output = await implementation.call(handler, input);
-      // Streaming methods return their items as a native Cap'n Web ReadableStream, validated
-      // one item at a time as the consumer pulls.
-      if (method.stream) return validatedAbilityItemStream(method, methodName, output);
-      return method.output.parseAsync(output);
+    [Symbol.dispose](): void {
+      disposeValidatingAbilityHandler(this);
     }
   }
 
   for (const methodName of Object.keys(ability.methods)) {
     Object.defineProperty(ValidatingAbilityHandler.prototype, methodName, {
-      async value(this: ValidatingAbilityHandler, ...args: unknown[]) {
-        return this.invoke(methodName, args);
+      async value(this: RpcTarget, ...args: unknown[]) {
+        return invokeValidatingAbilityMethod(this, methodName, args);
       },
     });
   }
 
-  return bindCapabilityIdentity(new ValidatingAbilityHandler(), identity);
+  validatingHandlerConstructorByAbility.set(ability, ValidatingAbilityHandler);
+  return ValidatingAbilityHandler;
+}
+
+async function invokeValidatingAbilityMethod(target: RpcTarget, methodName: string, args: unknown[]): Promise<unknown> {
+  const state = activeValidatingAbilityHandlerState(target);
+  const method = state.methods[methodName];
+  if (!method) throw new AbilityValidationError(`Unknown Service-Plane ability method: ${methodName}`, 404);
+  if (method.stream && !state.allowStreaming) {
+    throw new AbilityValidationError(
+      `Service-Plane streaming method requires a session transport (WebSocket, native binding, or custom bidirectional): ${methodName}`,
+      405,
+    );
+  }
+  if (args.length !== 1) {
+    throw new AbilityValidationError(`Service-Plane ability method expects a single input object: ${methodName}`, 422);
+  }
+
+  requireScopes(target, ...method.scopes);
+  const implementation = state.handler[methodName];
+  if (typeof implementation !== 'function') {
+    throw new AbilityValidationError(`Service-Plane ability handler does not implement method: ${methodName}`, 500);
+  }
+
+  const input = await method.input.parseAsync(args[0]);
+  activeValidatingAbilityHandlerState(target);
+  const output = await implementation.call(state.handler, input);
+  // Streaming methods return their items as a native Cap'n Web ReadableStream, validated
+  // one item at a time as the consumer pulls.
+  if (method.stream) return validatedAbilityItemStream(method, methodName, output);
+  return method.output.parseAsync(output);
+}
+
+function activeValidatingAbilityHandlerState(target: RpcTarget): ValidatingAbilityHandlerState {
+  const state = validatingHandlerStateByTarget.get(target);
+  if (!state) throw new AbilityValidationError('Service-Plane ability handler is not initialized', 500);
+  if (state.disposed) {
+    throw new AbilityValidationError(`Service-Plane ability handler has been disposed: ${state.abilityId}`, 410);
+  }
+  return state;
+}
+
+function disposeValidatingAbilityHandler(target: RpcTarget): void {
+  const state = validatingHandlerStateByTarget.get(target);
+  if (!state || state.disposed) return;
+  state.disposed = true;
+  const dispose = (state.handler as RpcTarget & Partial<Disposable>)[Symbol.dispose];
+  dispose?.call(state.handler);
 }
 
 // Wraps a handler's stream source into a ReadableStream that validates each item lazily, so
@@ -259,16 +322,16 @@ function validatedAbilityItemStream(
       puller.cancel(reason);
     },
     async pull(controller) {
-      const next = await puller.next();
-      if (next.done) {
-        controller.close();
-        return;
-      }
       try {
+        const next = await puller.next();
+        if (next.done) {
+          controller.close();
+          return;
+        }
         controller.enqueue(await method.output.parseAsync(next.value));
       } catch (error) {
-        // An invalid item errors the stream, and an errored stream can no longer be cancelled
-        // by the consumer — release the handler's source here so generator finally blocks and
+        // A failed pull or invalid item errors the stream, which can no longer be cancelled by
+        // the consumer. Release the handler's source here so iterator return/finally cleanup and
         // reader locks are not stranded.
         puller.cancel(error);
         throw error;
@@ -387,9 +450,14 @@ function normalizeAbilities<TEnv extends Env>(
   });
 }
 
-// Members of the validating wrapper itself; an ability method with one of these names
-// would shadow the dispatcher and recurse instead of reaching the handler.
-const RESERVED_METHOD_NAMES = new Set(['constructor', 'invoke']);
+const CAPNWEB_RPC_PROMISE_PROTOTYPE = (RpcPromise as unknown as { prototype: object }).prototype;
+
+// Cap'n Web treats its promise/stub prototype members as local control operations rather than
+// remote method names. Reject them when defining the ability instead of publishing an API that a
+// caller cannot invoke. `invoke` is retained for compatibility with the former wrapper dispatcher.
+function isReservedMethodName(methodName: string): boolean {
+  return methodName === 'invoke' || methodName in CAPNWEB_RPC_PROMISE_PROTOTYPE;
+}
 
 function normalizeMethods(
   abilityId: string,
@@ -405,7 +473,7 @@ function normalizeMethods(
   return Object.fromEntries(
     names.map((methodName) => {
       const name = normalizeValue(methodName, `method name for ${abilityId}`);
-      if (RESERVED_METHOD_NAMES.has(name)) {
+      if (isReservedMethodName(name)) {
         throw new CapabilityAuthError(`Service-Plane ability method name is reserved: ${abilityId}/${name}`, 500);
       }
       const method = methods[methodName];
@@ -593,10 +661,10 @@ function normalizeAbilityTransports(transports: AbilityTransport[]): AbilityTran
 
 function normalizePath(path: string, source: string): string {
   const normalized = path.trim();
-  if (!normalized.startsWith('/')) {
-    throw new CapabilityAuthError(`Service-Plane path must start with /: ${source}`, 500);
+  if (!normalized.startsWith('/') || normalized.startsWith('//') || normalized.includes('\\')) {
+    throw new CapabilityAuthError(`Service-Plane path must be origin-relative and start with a single /: ${source}`, 500);
   }
-  if (normalized.includes('?') || normalized.includes('#')) {
+  if (!isOriginRelativePath(normalized)) {
     throw new CapabilityAuthError(`Service-Plane path must not include query or fragment: ${source}`, 500);
   }
   return normalized.replace(/\/+$/u, '') || '/';

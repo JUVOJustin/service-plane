@@ -1,3 +1,4 @@
+export { type ConnInfo, SERVICE_PLANE_CONN_INFO_HEADER, SERVICE_PLANE_CONN_INFO_QUERY_PARAM } from '../shared/conn-info.js';
 export { AbilityValidationError, CapabilityAuthError, ServicePlaneError } from '../shared/errors.js';
 export {
   DEFAULT_HTTP_CACHE_MAX_AGE_SECONDS,
@@ -107,6 +108,8 @@ export {
   mountCapabilityTokenEndpoint,
 } from './capabilities.js';
 export {
+  type BrokerCallerResolver,
+  type ConnInfoResolver,
   ServicePlaneControlPlane,
   type ServicePlaneControlPlaneOptions,
 } from './control-plane.js';

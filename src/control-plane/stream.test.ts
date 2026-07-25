@@ -1,5 +1,6 @@
 import { RpcSession } from 'capnweb';
-import { describe, expect, it } from 'vitest';
+import type { UpgradeWebSocket } from 'hono/ws';
+import { describe, expect, it, vi } from 'vitest';
 import * as z from 'zod';
 import { abilityMethod, defineAbility, defineCapabilities, RpcTarget, requireScopes, ServicePlaneService } from '../service/index.js';
 import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
@@ -15,11 +16,24 @@ const ISSUED_AT = new Date('2026-07-22T12:00:00.000Z');
 const VERIFIED_AT = new Date('2026-07-22T12:00:01.000Z');
 
 class HubApi extends RpcTarget {
-  async *readFile(input: { parts: number }) {
+  constructor(private readonly onReadFileCancel: () => void) {
+    super();
+  }
+
+  readFile(input: { chunk?: string; parts: number }) {
     requireScopes(this, 'hub.read');
-    for (let index = 0; index < input.parts; index += 1) {
-      yield { chunk: `part-${index}` };
-    }
+    let index = 0;
+    return new ReadableStream<{ chunk: string }>({
+      cancel: this.onReadFileCancel,
+      pull(controller) {
+        if (index >= input.parts) {
+          controller.close();
+          return;
+        }
+        controller.enqueue({ chunk: input.chunk ?? `part-${index}` });
+        index += 1;
+      },
+    });
   }
 
   async stat(_input: Record<string, never>) {
@@ -27,10 +41,16 @@ class HubApi extends RpcTarget {
   }
 }
 
+const unusedUpgradeWebSocket = (() => () => {
+  throw new Error('unexpected WebSocket upgrade on the service');
+}) as unknown as UpgradeWebSocket;
+
 type FixtureOptions = {
   ingress?: boolean;
   streamLimits?: { maxBytes?: number; maxItems?: number };
-  // Drop connectAbility from the endpoint so only HTTP-batch remains reachable.
+  // Advertise WebSocket instead of native RPC so transport selection can escalate for streams.
+  websocketTransport?: boolean;
+  // Drop the native ability RPC binding so only HTTP-batch remains reachable.
   withoutNativeRpc?: boolean;
 };
 
@@ -48,6 +68,7 @@ async function createFixture(options: FixtureOptions = {}) {
     privateJwk: keys.privateJwk,
   });
 
+  let upstreamCancellations = 0;
   const service = new ServicePlaneService({
     abilities: [
       defineAbility({
@@ -56,7 +77,7 @@ async function createFixture(options: FixtureOptions = {}) {
         id: 'hub.files',
         methods: {
           readFile: abilityMethod({
-            input: z.object({ parts: z.number() }),
+            input: z.object({ chunk: z.string().optional(), parts: z.number() }),
             mcp: { description: 'Read a hub file', name: 'hub_read_file' },
             output: z.object({ chunk: z.string() }),
             scopes: ['hub.read'],
@@ -69,9 +90,9 @@ async function createFixture(options: FixtureOptions = {}) {
             scopes: ['hub.read'],
           }),
         },
-        rpc: { transports: ['http-batch', 'cloudflare-binding-rpc'] },
+        rpc: { transports: options.websocketTransport ? ['http-batch', 'websocket'] : ['http-batch', 'cloudflare-binding-rpc'] },
         scopes: ['hub.read'],
-        handler: () => new HubApi() as HubApi & Record<string, unknown>,
+        handler: () => new HubApi(() => (upstreamCancellations += 1)) as HubApi & Record<string, unknown>,
       }),
     ],
     auth: {
@@ -82,27 +103,49 @@ async function createFixture(options: FixtureOptions = {}) {
     capabilities,
     id: 'hub',
     ...(options.ingress ? { ingress: { brokerServiceIds: ['control-plane'] } } : {}),
+    // Only needed so the service accepts an ability advertising the websocket transport; these
+    // tests assert the plane never upgrades, so the helper is never invoked.
+    ...(options.websocketTransport ? { rpc: { upgradeWebSocket: unusedUpgradeWebSocket } } : {}),
     title: 'Hub',
     version: '0.1.0',
   });
 
-  const endpoint = cloudflareServiceBinding({
-    binding: options.withoutNativeRpc
-      ? { fetch: async (request: Request) => service.fetch(request) }
-      : {
-          connectAbility: (input: { abilityId: string; requestId?: string; token: string }) => service.connectAbility(input),
-          fetch: async (request: Request) => service.fetch(request),
+  let nativeConnections = 0;
+  let nativeDisposals = 0;
+  const abilityRpc = {
+    async connectAbility(input: { abilityId: string; requestId?: string; token: string }) {
+      nativeConnections += 1;
+      const target = await service.connectAbility(input);
+      Object.defineProperty(target, Symbol.dispose, {
+        value() {
+          nativeDisposals += 1;
         },
+      });
+      return target;
+    },
+  };
+  let webSocketConnections = 0;
+  const endpoint = cloudflareServiceBinding({
+    ...(options.withoutNativeRpc || options.websocketTransport ? {} : { abilityRpc }),
+    binding: { fetch: async (request: Request) => service.fetch(request) },
+    ...(options.websocketTransport
+      ? {
+          createWebSocket: (_url: string): WebSocket => {
+            webSocketConnections += 1;
+            throw new Error('unexpected WebSocket connection to the service');
+          },
+        }
+      : {}),
     id: 'hub',
     origin: 'https://hub.internal',
   });
   const registry = createServiceRegistry({ services: [endpoint] });
 
-  const mcpRequest = (body: unknown) =>
+  const mcpRequest = (body: unknown, headers: Record<string, string> = {}) =>
     handleControlPlaneMcpRequest(
       new Request('https://plane.internal/rpc/mcp', {
         body: JSON.stringify(body),
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', ...headers },
         method: 'POST',
       }),
       {
@@ -114,7 +157,16 @@ async function createFixture(options: FixtureOptions = {}) {
       },
     );
 
-  return { issuer, mcpRequest, registry, service };
+  return {
+    issuer,
+    mcpRequest,
+    nativeConnectionCount: () => nativeConnections,
+    nativeDisposalCount: () => nativeDisposals,
+    registry,
+    service,
+    upstreamCancellationCount: () => upstreamCancellations,
+    webSocketConnectionCount: () => webSocketConnections,
+  };
 }
 
 async function drainStream<T>(stream: ReadableStream<T>): Promise<T[]> {
@@ -146,7 +198,7 @@ describe('brokered streaming abilities', () => {
     type Brokered = {
       connect(scopes: string[]): Promise<{ readFile(input: { parts: number }): Promise<ReadableStream<{ chunk: string }>> }>;
     };
-    const root = broker.rootCapability({ id: 'user-1', kind: 'user' }) as unknown as {
+    const root = broker.rootCapability({ id: 'user-1', kind: 'user' }, { allowStreaming: true }) as unknown as {
       ability(serviceId: string, abilityId: string): Promise<Brokered>;
     };
     const api = await (await root.ability('hub', 'hub.files')).connect(['hub.read']);
@@ -168,14 +220,40 @@ describe('brokered streaming abilities', () => {
         stat(input: Record<string, never>): Promise<{ size: number }>;
       }>;
     };
-    // allowStreaming:false models an HTTP-batch caller leg to the broker.
-    const root = broker.rootCapability({ id: 'user-1', kind: 'user' }, { allowStreaming: false }) as unknown as {
+    // The fail-closed default models an HTTP-batch caller leg to the broker.
+    const root = broker.rootCapability({ id: 'user-1', kind: 'user' }) as unknown as {
       ability(serviceId: string, abilityId: string): Promise<Brokered>;
     };
     const api = await (await root.ability('hub', 'hub.files')).connect(['hub.read']);
     // Unary methods still work; only streaming methods are rejected.
     await expect(api.stat({})).resolves.toEqual({ size: 3 });
     await expect(api.readFile({ parts: 2 })).rejects.toThrow('requires a session transport');
+  });
+
+  it('keeps the plane leg on HTTP-batch when streaming methods are rejected anyway', async () => {
+    const fixture = await createFixture({ websocketTransport: true });
+    const broker = createControlPlaneRpcBroker({
+      controlPlaneServiceId: 'control-plane',
+      issuer: fixture.issuer,
+      registry: fixture.registry,
+    });
+
+    type Brokered = {
+      connect(scopes: string[]): Promise<{
+        readFile(input: { parts: number }): Promise<ReadableStream<{ chunk: string }>>;
+        stat(input: Record<string, never>): Promise<{ size: number }>;
+      }>;
+    };
+    const root = broker.rootCapability({ id: 'user-1', kind: 'user' }) as unknown as {
+      ability(serviceId: string, abilityId: string): Promise<Brokered>;
+    };
+    const api = await (await root.ability('hub', 'hub.files')).connect(['hub.read']);
+
+    await expect(api.stat({})).resolves.toEqual({ size: 3 });
+    await expect(api.readFile({ parts: 2 })).rejects.toThrow('requires a session transport');
+    // An HTTP-batch caller never receives a stream, so the ability's streaming methods must not
+    // cost this connect a persistent socket to the service.
+    expect(fixture.webSocketConnectionCount()).toBe(0);
   });
 });
 
@@ -191,7 +269,7 @@ describe('remote broker sessions', () => {
     // The caller talks to the broker over an actual wire: every message is serialized, so this
     // catches session objects that would not survive being returned by reference.
     const { left, right } = memoryRpcTransportPair();
-    new RpcSession(right, broker.rootCapability({ id: 'user-1', kind: 'user' }));
+    new RpcSession(right, broker.rootCapability({ id: 'user-1', kind: 'user' }, { allowStreaming: true }));
     const root = new RpcSession<{
       ability(
         serviceId: string,
@@ -213,6 +291,29 @@ describe('remote broker sessions', () => {
 });
 
 describe('control-plane MCP streaming tools', () => {
+  it('prefers native RPC for unary and streaming methods when the endpoint provides it', async () => {
+    const { mcpRequest, nativeConnectionCount, nativeDisposalCount } = await createFixture();
+    const unary = await mcpRequest({
+      id: 1,
+      jsonrpc: '2.0',
+      method: 'tools/call',
+      params: { arguments: {}, name: 'hub_stat' },
+    });
+    await expect(unary.json()).resolves.toMatchObject({ result: { structuredContent: { size: 3 } } });
+    expect(nativeConnectionCount()).toBe(1);
+    expect(nativeDisposalCount()).toBe(1);
+
+    const streamed = await mcpRequest({
+      id: 2,
+      jsonrpc: '2.0',
+      method: 'tools/call',
+      params: { arguments: { parts: 1 }, name: 'hub_read_file' },
+    });
+    await streamed.text();
+    expect(nativeConnectionCount()).toBe(2);
+    expect(nativeDisposalCount()).toBe(2);
+  });
+
   it('projects streaming tools with an aggregated output schema and stream marker', async () => {
     const { mcpRequest } = await createFixture();
     const response = await mcpRequest({ id: 1, jsonrpc: '2.0', method: 'tools/list' });
@@ -254,6 +355,31 @@ describe('control-plane MCP streaming tools', () => {
     ]);
   });
 
+  it('negotiates SSE and rejects a streaming tool call from a JSON-only client', async () => {
+    const fixture = await createFixture();
+    const call = { id: 9, jsonrpc: '2.0', method: 'tools/call', params: { arguments: { parts: 2 }, name: 'hub_read_file' } };
+
+    const rejected = await fixture.mcpRequest(call, { accept: 'application/json' });
+    expect(rejected.status).toBe(406);
+    // Negotiation happens before the plane opens the backing ability session.
+    expect(fixture.nativeConnectionCount()).toBe(0);
+
+    for (const accept of ['application/json, text/event-stream', 'text/event-stream', '*/*']) {
+      const accepted = await fixture.mcpRequest(call, { accept });
+      expect(accepted.status).toBe(200);
+      expect(accepted.headers.get('content-type')).toBe('text/event-stream');
+      await accepted.text();
+    }
+
+    // Unary tools stay usable for JSON-only clients.
+    const unary = await fixture.mcpRequest(
+      { id: 10, jsonrpc: '2.0', method: 'tools/call', params: { arguments: {}, name: 'hub_stat' } },
+      { accept: 'application/json' },
+    );
+    expect(unary.status).toBe(200);
+    expect((await unary.json()) as unknown).toMatchObject({ result: { structuredContent: { size: 3 } } });
+  });
+
   it('omits progress notifications without a progressToken', async () => {
     const { mcpRequest } = await createFixture();
     const response = await mcpRequest({
@@ -269,7 +395,7 @@ describe('control-plane MCP streaming tools', () => {
   });
 
   it('caps stream aggregation and fails the tool call in-band', async () => {
-    const { mcpRequest } = await createFixture({ streamLimits: { maxItems: 2 } });
+    const { mcpRequest, nativeDisposalCount } = await createFixture({ streamLimits: { maxItems: 2 } });
     const response = await mcpRequest({
       id: 20,
       jsonrpc: '2.0',
@@ -280,6 +406,56 @@ describe('control-plane MCP streaming tools', () => {
     const final = events.at(-1) as { result: { content: Array<{ text: string }>; isError?: boolean } };
     expect(final.result.isError).toBe(true);
     expect(final.result.content[0]?.text).toContain('aggregation limits');
+    expect(nativeDisposalCount()).toBe(1);
+  });
+
+  it('measures stream aggregation limits in UTF-8 bytes', async () => {
+    const { mcpRequest, nativeDisposalCount } = await createFixture({ streamLimits: { maxBytes: 18, maxItems: 10 } });
+    const response = await mcpRequest({
+      id: 23,
+      jsonrpc: '2.0',
+      method: 'tools/call',
+      params: { arguments: { chunk: '😀😀', parts: 1 }, name: 'hub_read_file' },
+    });
+    const events = parseSse(await response.text());
+    expect(events.at(-1)).toMatchObject({ result: { isError: true } });
+    expect(nativeDisposalCount()).toBe(1);
+  });
+
+  it('bounds optional progress notifications without truncating the final tool result', async () => {
+    const { mcpRequest } = await createFixture({ streamLimits: { maxBytes: 512, maxItems: 100 } });
+    const response = await mcpRequest({
+      id: 21,
+      jsonrpc: '2.0',
+      method: 'tools/call',
+      params: {
+        _meta: { progressToken: 'p'.repeat(400) },
+        arguments: { parts: 20 },
+        name: 'hub_read_file',
+      },
+    });
+    const events = parseSse(await response.text()) as Array<Record<string, unknown>>;
+    const progress = events.filter((event) => event.method === 'notifications/progress');
+    expect(progress.length).toBeLessThanOrEqual(1);
+    expect(events.at(-1)).toMatchObject({
+      id: 21,
+      result: { structuredContent: { items: expect.arrayContaining([{ chunk: 'part-19' }]) } },
+    });
+  });
+
+  it('rejects stream limits that would silently disable bounds', async () => {
+    const { mcpRequest } = await createFixture({ streamLimits: { maxBytes: Number.NaN } });
+    const response = await mcpRequest({
+      id: 22,
+      jsonrpc: '2.0',
+      method: 'tools/call',
+      params: { arguments: { parts: 1 }, name: 'hub_read_file' },
+    });
+
+    await expect(response.json()).resolves.toMatchObject({
+      error: { data: { status: 500 }, message: expect.stringContaining('streamLimits.maxBytes') },
+      id: 22,
+    });
   });
 
   it('hoists root-relative $refs when wrapping a streaming tool output schema', () => {
@@ -364,7 +540,7 @@ describe('control-plane MCP streaming tools', () => {
   });
 
   it('reports invalid input as an in-band tool error before any stream starts', async () => {
-    const { mcpRequest } = await createFixture();
+    const { mcpRequest, nativeDisposalCount } = await createFixture();
     const response = await mcpRequest({
       id: 9,
       jsonrpc: '2.0',
@@ -374,6 +550,27 @@ describe('control-plane MCP streaming tools', () => {
     expect(response.headers.get('content-type')).toContain('application/json');
     const parsed = (await response.json()) as { result: { isError?: boolean } };
     expect(parsed.result.isError).toBe(true);
+    expect(nativeDisposalCount()).toBe(1);
+  });
+
+  it('aborts the upstream stream and disposes its session when SSE delivery is abandoned', async () => {
+    const { mcpRequest, nativeDisposalCount, upstreamCancellationCount } = await createFixture();
+    const response = await mcpRequest({
+      id: 24,
+      jsonrpc: '2.0',
+      method: 'tools/call',
+      params: {
+        _meta: { progressToken: 'cancel-me' },
+        arguments: { parts: 5 },
+        name: 'hub_read_file',
+      },
+    });
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    await reader?.read();
+    await reader?.cancel('client disconnected');
+    await vi.waitFor(() => expect(nativeDisposalCount()).toBe(1));
+    expect(upstreamCancellationCount()).toBe(1);
   });
 
   it('degrades to an in-band error when the endpoint has no session transport', async () => {

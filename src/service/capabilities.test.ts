@@ -8,14 +8,17 @@ import {
   capabilityIdentity,
   capabilityRpcSession,
   capabilityTokenCacheKey,
+  cloudflareNativeRpc,
   cloudflareServiceBindingRpc,
   controlPlaneHmacTokenRequester,
   controlPlaneRpcTokenRequester,
   createCapabilityTokenProvider,
   defineCapabilities,
+  disposeAbilitySession,
   RpcTarget,
   requireScopes,
   verifyAuthenticationToken,
+  websocketRpc,
 } from './capabilities.js';
 
 const ISSUED_AT = new Date('2026-05-09T12:00:00.000Z');
@@ -133,6 +136,38 @@ describe('Cap’n Web service capabilities', () => {
     now = new Date('2026-05-09T12:04:55.000Z');
     await expect(second.token()).resolves.toBe('token-2');
     expect(issuedCount).toBe(2);
+  });
+
+  it('deduplicates concurrent token requests and retries after a failed request', async () => {
+    let attempts = 0;
+    const provider = createCapabilityTokenProvider({
+      callerServiceId: 'moco',
+      requestToken: async () => {
+        attempts += 1;
+        await Promise.resolve();
+        if (attempts === 1) throw new Error('temporary issuer failure');
+        return { expiresAt: new Date('2026-05-09T12:05:00.000Z'), token: 'token-2' };
+      },
+      scopes: ['example.users.lookup'],
+      targetServiceId: 'example',
+    });
+
+    await expect(Promise.all([provider.token(), provider.token()])).rejects.toThrow('temporary issuer failure');
+    expect(attempts).toBe(1);
+    await expect(Promise.all([provider.token(), provider.token()])).resolves.toEqual(['token-2', 'token-2']);
+    expect(attempts).toBe(2);
+  });
+
+  it('rejects invalid token refresh skew at setup', () => {
+    expect(() =>
+      createCapabilityTokenProvider({
+        callerServiceId: 'moco',
+        refreshSkewSeconds: Number.NaN,
+        requestToken: async () => ({ expiresAt: new Date('2026-05-09T12:05:00.000Z'), token: 'token' }),
+        scopes: ['example.users.lookup'],
+        targetServiceId: 'example',
+      }),
+    ).toThrow('refresh skew must be a non-negative integer');
   });
 
   it('builds stable token cache keys regardless of scope order', () => {
@@ -272,8 +307,136 @@ describe('Cap’n Web service capabilities', () => {
 
     await expect(api.ping()).resolves.toBe('token-1');
     await expect(api.ping()).resolves.toBe('token-2');
+    await expect((api as unknown as { missing(): Promise<unknown> }).missing()).rejects.toThrow('ability method is not available: missing');
+  });
+
+  it('creates a WebSocket after adding the request id and restores an absent runtime global', async () => {
+    const globalObject = globalThis as typeof globalThis & { WebSocket?: typeof WebSocket };
+    const descriptor = Object.getOwnPropertyDescriptor(globalObject, 'WebSocket');
+    const socket = new FakeWebSocket();
+    let createdUrl: string | undefined;
+    let createdSockets = 0;
+    let tokenAttempts = 0;
+    Reflect.deleteProperty(globalObject, 'WebSocket');
+
+    try {
+      const api = await capabilityRpcSession<{ ping(): Promise<string> }>({
+        abilityId: 'example.sync',
+        authenticate: () => ({ ping: async () => 'pong' }),
+        callerServiceId: 'worker-a',
+        requestId: 'request-42',
+        scopes: ['example.sync.run'],
+        targetServiceId: 'example',
+        tokenProvider: {
+          async token() {
+            tokenAttempts += 1;
+            await Promise.resolve();
+            if (tokenAttempts === 1) throw new Error('temporary token failure');
+            return 'capability-token';
+          },
+        },
+        transport: websocketRpc('ws://example.internal/rpc/example.sync?existing=1', {
+          createWebSocket(url) {
+            createdSockets += 1;
+            createdUrl = url;
+            return socket as unknown as WebSocket;
+          },
+        }),
+      });
+
+      await expect(api.ping()).rejects.toThrow('temporary token failure');
+      await expect(Promise.all([api.ping(), api.ping()])).resolves.toEqual(['pong', 'pong']);
+      await expect(api.ping()).resolves.toBe('pong');
+      expect(tokenAttempts).toBe(2);
+      expect(createdSockets).toBe(1);
+      expect(createdUrl).toBe('ws://example.internal/rpc/example.sync?existing=1&request_id=request-42');
+      expect(socket.binaryType).toBe('arraybuffer');
+      expect(Object.hasOwn(globalObject, 'WebSocket')).toBe(false);
+      await disposeAbilitySession(api);
+    } finally {
+      if (descriptor) Object.defineProperty(globalObject, 'WebSocket', descriptor);
+      else Reflect.deleteProperty(globalObject, 'WebSocket');
+    }
+  });
+
+  it('opens a native binding once for concurrent and later calls', async () => {
+    let connections = 0;
+    let calls = 0;
+    let disposals = 0;
+    let tokenRequests = 0;
+    const target = {
+      [Symbol.dispose]() {
+        disposals += 1;
+      },
+      async ping() {
+        calls += 1;
+        return 'pong';
+      },
+    };
+    const api = await capabilityRpcSession<{ ping(): Promise<string> }>({
+      abilityId: 'example.sync',
+      callerServiceId: 'worker-a',
+      scopes: ['example.sync.run'],
+      targetServiceId: 'example',
+      tokenProvider: {
+        async token() {
+          tokenRequests += 1;
+          await Promise.resolve();
+          return 'capability-token';
+        },
+      },
+      transport: cloudflareNativeRpc({
+        async connectAbility() {
+          connections += 1;
+          await Promise.resolve();
+          return target;
+        },
+      }),
+    });
+
+    await expect(Promise.all([api.ping(), api.ping()])).resolves.toEqual(['pong', 'pong']);
+    await expect(api.ping()).resolves.toBe('pong');
+    expect({ calls, connections, tokenRequests }).toEqual({ calls: 3, connections: 1, tokenRequests: 1 });
+    await disposeAbilitySession(api);
+    expect(disposals).toBe(1);
+  });
+
+  it('invokes methods directly on a native binding RPC stub', async () => {
+    class NativeAbility extends RpcTarget {
+      async ping() {
+        return 'pong';
+      }
+    }
+    class NativeBinding extends RpcTarget {
+      connectAbility() {
+        return new NativeAbility();
+      }
+    }
+    const { left, right } = memoryRpcTransportPair();
+    new RpcSession(right, new NativeBinding());
+    const binding = new RpcSession<{ connectAbility(input: { abilityId: string; token: string }): Promise<object> }>(left).getRemoteMain();
+    const api = await capabilityRpcSession<{ ping(): Promise<string> }>({
+      abilityId: 'example.sync',
+      callerServiceId: 'worker-a',
+      scopes: ['example.sync.run'],
+      targetServiceId: 'example',
+      tokenProvider: { token: async () => 'capability-token' },
+      transport: cloudflareNativeRpc(binding),
+    });
+
+    await expect(api.ping()).resolves.toBe('pong');
+    await disposeAbilitySession(api);
   });
 });
+
+class FakeWebSocket extends EventTarget {
+  binaryType: BinaryType = 'blob';
+  readonly readyState = 0;
+
+  close(): void {}
+
+  send(): void {}
+}
 
 async function testKeys() {
   const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);

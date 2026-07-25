@@ -311,7 +311,7 @@ type BrokeredLlm = {
   streamTokens(input: Record<string, never>): Promise<unknown>;
 };
 const brokerPair = memoryRpcTransportPair();
-new RpcSession(brokerPair.right, broker.rootCapability({ id: 'bench-caller', kind: 'service' }));
+new RpcSession(brokerPair.right, broker.rootCapability({ id: 'bench-caller', kind: 'service' }, { allowStreaming: true }));
 const brokerWireRoot = new RpcSession<{
   ability(serviceId: string, abilityId: string): Promise<{ connect(scopes: string[]): Promise<BrokeredLlm> }>;
 }>(brokerPair.left).getRemoteMain();

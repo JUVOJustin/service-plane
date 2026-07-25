@@ -34,8 +34,24 @@ type StreamItem = { caller: string; index: number };
 type StreamAbilityRpc = AbilityRpc<ReturnType<typeof streamAbility>>;
 
 let badItemSourceClosed = false;
+let failingIteratorReturned = false;
+let readableSourceCancelled = false;
 
 class StreamApi extends RpcTarget {
+  cancellable(_input: Record<string, never>) {
+    return new ReadableStream<StreamItem>({
+      cancel() {
+        readableSourceCancelled = true;
+      },
+      pull() {
+        return new Promise<void>(() => undefined);
+      },
+      start(controller) {
+        controller.enqueue({ caller: 'example', index: 0 });
+      },
+    });
+  }
+
   async *listChunks(input: { count: number }) {
     const caller = requireScopes(this, 'example.read');
     for (let index = 0; index < input.count; index += 1) {
@@ -46,6 +62,22 @@ class StreamApi extends RpcTarget {
   async *failMid(_input: Record<string, never>) {
     yield { caller: 'example', index: 0 };
     throw new Error('stream exploded');
+  }
+
+  failingNext(_input: Record<string, never>): AsyncIterable<StreamItem> {
+    return {
+      [Symbol.asyncIterator]() {
+        return {
+          async next() {
+            throw new Error('iterator next exploded');
+          },
+          async return() {
+            failingIteratorReturned = true;
+            return { done: true, value: undefined };
+          },
+        };
+      },
+    };
   }
 
   async *badItem(_input: Record<string, never>) {
@@ -59,7 +91,7 @@ class StreamApi extends RpcTarget {
 
   async *hang(_input: Record<string, never>) {
     yield { caller: 'example', index: 0 };
-    await new Promise(() => undefined); // never settles; only cancellation ends this stream
+    await new Promise(() => undefined); // never settles; generator return() queues behind it
   }
 
   async single(_input: Record<string, never>) {
@@ -77,7 +109,19 @@ function streamAbility() {
         scopes: ['example.read'],
         stream: true,
       }),
+      cancellable: abilityMethod({
+        input: z.object({}),
+        output: z.object({ caller: z.string(), index: z.number() }),
+        scopes: ['example.read'],
+        stream: true,
+      }),
       failMid: abilityMethod({
+        input: z.object({}),
+        output: z.object({ caller: z.string(), index: z.number() }),
+        scopes: ['example.read'],
+        stream: true,
+      }),
+      failingNext: abilityMethod({
         input: z.object({}),
         output: z.object({ caller: z.string(), index: z.number() }),
         scopes: ['example.read'],
@@ -318,8 +362,18 @@ describe('streaming ability methods', () => {
       async *badItem() {
         yield { caller: 'x', index: 1 };
       },
+      cancellable() {
+        return new ReadableStream<StreamItem>();
+      },
       async *failMid() {
         yield { caller: 'x', index: 1 };
+      },
+      failingNext() {
+        return {
+          async *[Symbol.asyncIterator]() {
+            yield { caller: 'x', index: 1 };
+          },
+        };
       },
       async *hang() {
         yield { caller: 'x', index: 0 };
@@ -360,6 +414,24 @@ describe('streaming ability methods', () => {
     expect(outcome).toBe('cancelled');
   });
 
+  it('runs a ReadableStream handler source cancellation hook while its next pull is pending', async () => {
+    readableSourceCancelled = false;
+    const fixture = await createFixture();
+    const api = await abilitySession<StreamAbilityRpc>({
+      abilityId: 'example.stream',
+      callerServiceId: 'worker-a',
+      requestToken: async () => fixture.issued,
+      scopes: ['example.read'],
+      targetServiceId: 'example',
+      transport: cloudflareNativeRpc(fixture.service),
+    });
+    const reader = (await api.cancellable({})).getReader();
+    await expect(reader.read()).resolves.toEqual({ done: false, value: { caller: 'example', index: 0 } });
+
+    await reader.cancel('client went away');
+    expect(readableSourceCancelled).toBe(true);
+  });
+
   it('releases the handler source when an item fails output validation', async () => {
     badItemSourceClosed = false;
     const fixture = await createFixture();
@@ -375,6 +447,22 @@ describe('streaming ability methods', () => {
     // The generator's finally block runs once the wrapper cancels the source.
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(badItemSourceClosed).toBe(true);
+  });
+
+  it('releases an async iterator when its next call rejects', async () => {
+    failingIteratorReturned = false;
+    const fixture = await createFixture();
+    const api = await abilitySession<StreamAbilityRpc>({
+      abilityId: 'example.stream',
+      callerServiceId: 'worker-a',
+      requestToken: async () => fixture.issued,
+      scopes: ['example.read'],
+      targetServiceId: 'example',
+      transport: cloudflareNativeRpc(fixture.service),
+    });
+    await expect(drainStream(await api.failingNext({}))).rejects.toThrow('iterator next exploded');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(failingIteratorReturned).toBe(true);
   });
 
   it('rejects a websocket transport declaration without an upgrade helper at construction', async () => {
@@ -448,10 +536,111 @@ describe('streaming ability methods', () => {
       transport: customRpcTransport(left),
     });
 
+    expectTypeOf(api).toExtend<Disposable>();
     await expect(api.single({})).resolves.toEqual({ ok: true });
     // Disposal is wired (previously the proxy returned undefined for symbol keys) and idempotent.
     await expect(disposeAbilitySession(api)).resolves.toBeUndefined();
     await expect(disposeAbilitySession(api)).resolves.toBeUndefined();
+    await expect(api.single({})).rejects.toThrow('session has been disposed');
+  });
+
+  it('disposes an asynchronous native binding once and cannot invoke it after disposal', async () => {
+    let resolveBinding: ((target: object) => void) | undefined;
+    let markConnectionStarted: (() => void) | undefined;
+    const connectionStarted = new Promise<void>((resolve) => {
+      markConnectionStarted = resolve;
+    });
+    const bindingReady = new Promise<object>((resolve) => {
+      resolveBinding = resolve;
+    });
+    let targetDisposals = 0;
+    let targetInvocations = 0;
+    const target = {
+      [Symbol.dispose]() {
+        targetDisposals += 1;
+      },
+      async single() {
+        targetInvocations += 1;
+        return { ok: true };
+      },
+    };
+    const api = await abilitySession<{ single(input: Record<string, never>): Promise<{ ok: boolean }> }>({
+      abilityId: 'example.stream',
+      callerServiceId: 'worker-a',
+      scopes: ['example.read'],
+      targetServiceId: 'example',
+      tokenProvider: { token: async () => 'capability-token' },
+      transport: cloudflareNativeRpc({
+        connectAbility() {
+          markConnectionStarted?.();
+          return bindingReady;
+        },
+      }),
+    });
+
+    const capturedMethod = api.single;
+    const inFlight = capturedMethod({});
+    await connectionStarted;
+    await disposeAbilitySession(api);
+    resolveBinding?.(target);
+
+    await expect(inFlight).rejects.toThrow('session has been disposed');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(targetDisposals).toBe(1);
+    expect(targetInvocations).toBe(0);
+    await expect(capturedMethod({})).rejects.toThrow('session has been disposed');
+    await expect(disposeAbilitySession(api)).resolves.toBeUndefined();
+    expect(targetDisposals).toBe(1);
+  });
+
+  it('releases a nested session when a remote Cap’n Web caller disposes its returned stub', async () => {
+    const fixture = await createFixture();
+
+    class SessionRoot extends RpcTarget {
+      authenticate(token: string) {
+        return fixture.service.connectAbility({ abilityId: 'example.stream', token });
+      }
+    }
+
+    const inner = memoryRpcTransportPair();
+    new RpcSession(inner.right, new SessionRoot());
+    let markAborted: (() => void) | undefined;
+    const aborted = new Promise<void>((resolve) => {
+      markAborted = resolve;
+    });
+    const trackedInnerTransport = {
+      ...inner.left,
+      abort(reason?: unknown) {
+        inner.left.abort?.(reason);
+        markAborted?.();
+      },
+    };
+
+    class OuterRoot extends RpcTarget {
+      connect() {
+        return abilitySession<StreamAbilityRpc>({
+          abilityId: 'example.stream',
+          callerServiceId: 'worker-a',
+          requestToken: async () => fixture.issued,
+          scopes: ['example.read'],
+          targetServiceId: 'example',
+          transport: customRpcTransport(trackedInnerTransport),
+        });
+      }
+    }
+
+    const outer = memoryRpcTransportPair();
+    new RpcSession(outer.right, new OuterRoot());
+    const remote = new RpcSession<{ connect(): Promise<StreamAbilityRpc> }>(outer.left).getRemoteMain();
+    const api = await remote.connect();
+    await expect(api.single({})).resolves.toEqual({ ok: true });
+
+    // A remotely received Cap'n Web stub exposes only the standard synchronous disposer;
+    // the public helper must fall back to it and release the nested transport.
+    await disposeAbilitySession(api);
+    await expect(
+      Promise.race([aborted.then(() => true), new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 500))]),
+    ).resolves.toBe(true);
   });
 
   it('rejects streaming connections without a brokered token when ingress protection is enabled', async () => {

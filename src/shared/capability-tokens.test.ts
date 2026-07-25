@@ -1,10 +1,22 @@
+import { sign } from 'hono/jwt';
 import { describe, expect, it } from 'vitest';
-import { publicJwkFromPrivateJwk, signCapabilityToken, verifyCapabilityToken } from './capability-tokens.js';
+import { extractServicePlaneToken, publicJwkFromPrivateJwk, signCapabilityToken, verifyCapabilityToken } from './capability-tokens.js';
 import { CapabilityAuthError } from './errors.js';
+import { SERVICE_PLANE_JWK_ALGORITHM, servicePlaneJwkSigningKey } from './jwk-auth.js';
 
 const NOW = new Date('2026-05-09T12:00:00.000Z');
 
 describe('STS capability tokens', () => {
+  it('parses the authorization scheme case-insensitively and rejects extra credentials', () => {
+    expect(extractServicePlaneToken(new Request('https://service.internal', { headers: { authorization: 'serviceplane token' } }))).toBe(
+      'token',
+    );
+
+    expect(() =>
+      extractServicePlaneToken(new Request('https://service.internal', { headers: { authorization: 'ServicePlane token extra' } })),
+    ).toThrow('Invalid Service-Plane authorization scheme');
+  });
+
   it('issues and verifies ES256 JWS tokens', async () => {
     const keys = await testKeys();
     const issued = await signCapabilityToken({
@@ -114,22 +126,10 @@ describe('STS capability tokens', () => {
       ).rejects.toThrow('Invalid Service-Plane capability actor claim');
     }
 
-    // Our signer refuses to mint spo without act, so craft the payload by hand; the verifier
-    // checks claims before the signature, so the splice never reaches signature validation.
-    const signable = await signCapabilityToken({
-      claims: {
-        aud: 'fizzy',
-        iss: 'control-plane',
-        scp: ['fizzy.users.lookup'],
-        sub: 'moco',
-      },
-      keyId: 'test-key',
-      now: NOW,
-      privateJwk: keys.privateJwk,
-    });
-    const [header, , signature] = signable.token.split('.');
-    const orgWithoutActPayload = btoa(
-      JSON.stringify({
+    // The public signer refuses this combination, so sign the malformed but authentic claims
+    // directly to prove the verifier enforces the same invariant after signature validation.
+    const orgWithoutAct = await sign(
+      {
         aud: 'fizzy',
         exp: 9999999999,
         iat: 1,
@@ -139,14 +139,13 @@ describe('STS capability tokens', () => {
         scp: ['fizzy.users.lookup'],
         spo: 'org-42',
         sub: 'moco',
-      }),
-    )
-      .replace(/\+/gu, '-')
-      .replace(/\//gu, '_')
-      .replace(/=+$/u, '');
+      },
+      servicePlaneJwkSigningKey(keys.privateJwk, 'test-key'),
+      SERVICE_PLANE_JWK_ALGORITHM,
+    );
 
     await expect(
-      verifyCapabilityToken(`${header}.${orgWithoutActPayload}.${signature}`, {
+      verifyCapabilityToken(orgWithoutAct, {
         expectedAudience: 'fizzy',
         jwks: keys.jwks,
         now: new Date('2026-05-09T12:01:00.000Z'),
@@ -179,7 +178,7 @@ describe('STS capability tokens', () => {
       claims: {
         aud: 'fizzy',
         iss: 'control-plane',
-        scp: ['fizzy.users.lookup'],
+        scp: ['fizzy.other'],
         sub: 'moco',
       },
       keyId: 'test-key',
@@ -209,8 +208,9 @@ describe('STS capability tokens', () => {
         expectedAudience: 'fizzy',
         jwks: keys.jwks,
         now: new Date('2026-05-09T12:01:00.000Z'),
+        requiredScopes: ['fizzy.users.lookup'],
       }),
-    ).rejects.toThrow(CapabilityAuthError);
+    ).rejects.toThrow('Invalid Service-Plane capability signature');
   });
 
   it('rejects malformed signatures and invalid JWKS keys as capability auth errors', async () => {

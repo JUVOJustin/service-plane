@@ -1,8 +1,10 @@
 import { type RpcStub, RpcTarget } from 'capnweb';
 import { abilitySession, cloudflareNativeRpc, cloudflareServiceBindingRpc, websocketRpc } from '../service/capabilities.js';
 import { normalizeCapabilitySubject } from '../shared/capability-tokens.js';
+import type { ConnInfo } from '../shared/conn-info.js';
 import { CapabilityAuthError } from '../shared/errors.js';
 import type { ServicePlaneBrokerLogEvent } from '../shared/logging.js';
+import { isOriginRelativePath } from '../shared/paths.js';
 import type { CapabilitySubject, DiscoveredServiceAbility, ServiceEndpoint, ServiceRegistry } from '../shared/types.js';
 import type { CapabilityIssuer } from './capabilities.js';
 import { createServiceRegistry } from './registry.js';
@@ -34,6 +36,9 @@ export function brokerCallerLogFields(caller: BrokerCaller | undefined): {
 }
 
 export type CreateControlPlaneRpcBrokerOptions = {
+  // Advisory connection info about the original client, forwarded to the target service. Services
+  // surface it to handlers only for brokered calls with ingress enabled.
+  connInfo?: ConnInfo;
   controlPlaneServiceId: string;
   issuer: CapabilityIssuer;
   log?: (event: ServicePlaneBrokerLogEvent) => void;
@@ -43,8 +48,9 @@ export type CreateControlPlaneRpcBrokerOptions = {
 };
 
 export type RootCapabilityOptions = {
-  // False when the caller's own leg to the broker is HTTP-batch and cannot carry a returned
-  // stream; streaming methods are then rejected with a clear 405 instead of a dangling stub.
+  // Enable only when the caller's own leg to the broker is a session transport that can carry a
+  // returned stream. The default is false so custom shells cannot accidentally return dangling
+  // stream stubs over HTTP-batch.
   allowStreaming?: boolean;
 };
 
@@ -58,7 +64,8 @@ export function createControlPlaneRpcBroker(options: CreateControlPlaneRpcBroker
     rootCapability(caller, rootOptions) {
       return new BrokerRoot(
         {
-          allowStreaming: rootOptions?.allowStreaming ?? true,
+          allowStreaming: rootOptions?.allowStreaming ?? false,
+          ...(options.connInfo ? { connInfo: options.connInfo } : {}),
           controlPlaneServiceId: options.controlPlaneServiceId,
           issuer: options.issuer,
           ...(options.log ? { log: options.log } : {}),
@@ -75,6 +82,7 @@ class BrokerRoot extends RpcTarget {
   constructor(
     private readonly options: {
       allowStreaming: boolean;
+      connInfo?: ConnInfo;
       controlPlaneServiceId: string;
       issuer: CapabilityIssuer;
       log?: (event: ServicePlaneBrokerLogEvent) => void;
@@ -96,6 +104,7 @@ class BrokerRoot extends RpcTarget {
       return new BrokeredAbility({
         allowStreaming: this.options.allowStreaming,
         brokerServiceId: this.options.controlPlaneServiceId,
+        ...(this.options.connInfo ? { connInfo: this.options.connInfo } : {}),
         caller: this.caller,
         callerServiceId: this.caller?.kind === 'service' ? this.caller.id : this.options.controlPlaneServiceId,
         issuer: this.options.issuer,
@@ -117,6 +126,7 @@ class BrokeredAbility extends RpcTarget {
       allowStreaming: boolean;
       brokerServiceId: string;
       caller: BrokerCaller | undefined;
+      connInfo?: ConnInfo;
       callerServiceId: string;
       issuer: CapabilityIssuer;
       log?: (event: ServicePlaneBrokerLogEvent) => void;
@@ -155,6 +165,7 @@ class BrokeredAbility extends RpcTarget {
       const session = (await abilitySession<unknown>({
         abilityId: this.input.ability.id,
         callerServiceId: this.input.callerServiceId,
+        ...(this.input.connInfo ? { connInfo: this.input.connInfo } : {}),
         ...(subject ? { subject } : {}),
         ...(rejectStreamMethods && rejectStreamMethods.length > 0 ? { rejectStreamMethods } : {}),
         ...(this.input.requestId ? { requestId: this.input.requestId } : {}),
@@ -164,7 +175,9 @@ class BrokeredAbility extends RpcTarget {
             : this.input.issuer.issueCapabilityToken(input),
         scopes: requested,
         targetServiceId: this.input.ability.serviceId,
-        transport: transportForAbility(this.input.ability),
+        // Streaming methods are rejected outright when the caller's leg cannot carry a stream, so
+        // the plane→service leg must not escalate to a persistent WebSocket it would never use.
+        transport: transportForAbility(this.input.ability, this.input.allowStreaming ? {} : { requiresStreaming: false }),
       })) as RpcStub<unknown>;
       this.input.log?.({
         abilityId: this.input.ability.id,
@@ -206,26 +219,40 @@ function authorizeAbility(ability: DiscoveredServiceAbility, caller: BrokerCalle
   throw new CapabilityAuthError('Service-Plane broker ability requires service access', 403);
 }
 
-// Shared transport selection for broker and MCP so the two cannot drift. Streaming
-// methods need a session transport: prefer the endpoint's native ability RPC binding, then
-// WebSocket. Unary-only abilities fall through to HTTP-batch.
-export function transportForAbility(ability: DiscoveredServiceAbility) {
-  // Streaming methods need a session transport: prefer the endpoint's native ability RPC
-  // binding, then WebSocket. Falling through to HTTP-batch keeps unary methods working; the
-  // service rejects streaming calls there with a clear 405.
-  if (Object.values(ability.methods).some((method) => method.stream)) {
-    if (ability.service.abilityRpc && ability.rpc.transports.includes('cloudflare-binding-rpc')) {
-      return cloudflareNativeRpc(ability.service.abilityRpc);
-    }
+// Shared transport selection for broker and MCP so the two cannot drift. The broker opens the
+// whole ability and uses its default all-methods view; single-method projections such as MCP can
+// request a session transport only for the method that needs one.
+export function transportForAbility(ability: DiscoveredServiceAbility, options: { requiresStreaming?: boolean } = {}) {
+  const requiresStreaming = options.requiresStreaming ?? Object.values(ability.methods).some((method) => method.stream);
+  // Native Workers RPC is session-shaped without holding a WebSocket and is the cheapest
+  // same-account path for both unary and streaming methods.
+  if (ability.service.abilityRpc && ability.rpc.transports.includes('cloudflare-binding-rpc')) {
+    return cloudflareNativeRpc(ability.service.abilityRpc);
+  }
+  if (requiresStreaming) {
     if (ability.rpc.transports.includes('websocket')) {
-      return websocketRpc(new URL(ability.rpc.path, ability.service.origin.replace(/^http/u, 'ws')).toString());
+      return abilityWebSocketTransport(ability);
     }
   }
   if (ability.rpc.transports.includes('http-batch')) {
     return cloudflareServiceBindingRpc(ability.service, ability.rpc.path, ability.service.origin);
   }
   if (ability.rpc.transports.includes('websocket')) {
-    return websocketRpc(new URL(ability.rpc.path, ability.service.origin.replace(/^http/u, 'ws')).toString());
+    return abilityWebSocketTransport(ability);
   }
   throw new CapabilityAuthError(`Service-Plane ability has no supported RPC transport: ${ability.serviceId}/${ability.id}`, 500);
+}
+
+function abilityWebSocketTransport(ability: DiscoveredServiceAbility) {
+  const url = abilityWebSocketUrl(ability);
+  return websocketRpc(url, ability.service.createWebSocket ? { createWebSocket: ability.service.createWebSocket } : {});
+}
+
+function abilityWebSocketUrl(ability: DiscoveredServiceAbility): string {
+  // Registry discovery applies the same check, but custom ServiceRegistry implementations can
+  // supply abilities directly. Keep transport construction on the configured service origin.
+  if (!isOriginRelativePath(ability.rpc.path)) {
+    throw new CapabilityAuthError(`Service-Plane ability RPC path must be origin-relative: ${ability.serviceId}/${ability.id}`, 500);
+  }
+  return new URL(ability.rpc.path, ability.service.origin.replace(/^http/u, 'ws')).toString();
 }

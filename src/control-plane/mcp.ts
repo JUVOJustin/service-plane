@@ -1,4 +1,5 @@
 import { abilitySession, disposeAbilitySession } from '../service/index.js';
+import type { ConnInfo } from '../shared/conn-info.js';
 import { CapabilityAuthError } from '../shared/errors.js';
 import type { ServicePlaneBrokerLogEvent } from '../shared/logging.js';
 import {
@@ -25,7 +26,12 @@ export type ControlPlaneMcpServerInfo = {
 };
 
 export type ControlPlaneMcpHandlerOptions = {
+  // Browser requests must come from the MCP endpoint's own origin by default. Deployments
+  // intentionally serving browser clients from another origin can allow exact origins here.
+  allowedOrigins?: string[];
   caller?: BrokerCaller;
+  // Advisory connection info about the original client, forwarded to the target service.
+  connInfo?: ConnInfo;
   controlPlaneServiceId: string;
   issuer: CapabilityIssuer;
   log?: (event: ServicePlaneBrokerLogEvent) => void;
@@ -33,7 +39,8 @@ export type ControlPlaneMcpHandlerOptions = {
   requestId?: string;
   serverInfo?: Partial<ControlPlaneMcpServerInfo>;
   // Streaming tools must aggregate into one MCP result, so unbounded sources would grow
-  // control-plane memory without limit; calls exceeding these caps fail in-band.
+  // control-plane memory without limit; calls exceeding these caps fail in-band. maxBytes also
+  // independently caps optional progress-notification bytes so an opaque token is not amplified.
   streamLimits?: { maxBytes?: number; maxItems?: number };
 };
 
@@ -42,9 +49,10 @@ const DEFAULT_MCP_STREAM_MAX_BYTES = 1_048_576;
 
 export const DEFAULT_MCP_PATH = SERVICE_PLANE_MCP_PATH;
 
-// Latest protocol revision this endpoint implements; older revisions are echoed back when a client asks for one.
-export const MCP_PROTOCOL_VERSION = '2025-06-18';
-const SUPPORTED_MCP_PROTOCOL_VERSIONS = [MCP_PROTOCOL_VERSION, '2025-03-26', '2024-11-05'];
+// Latest protocol revision this endpoint implements; preceding Streamable HTTP revisions are
+// accepted for stateless requests and can be negotiated during initialization.
+export const MCP_PROTOCOL_VERSION = '2025-11-25';
+const SUPPORTED_MCP_PROTOCOL_VERSIONS = [MCP_PROTOCOL_VERSION, '2025-06-18', '2025-03-26'];
 
 const JSON_RPC_PARSE_ERROR = -32700;
 const JSON_RPC_INVALID_REQUEST = -32600;
@@ -89,13 +97,13 @@ export function generateMcpDiscovery(snapshot: ServiceRegistrySnapshot): McpDisc
           throw new Error(`Duplicate MCP tool name across published methods: ${method.mcp.name}`);
         }
         seenToolNames.add(method.mcp.name);
+        const outputSchema = mcpToolOutputSchema(method);
         tools.push({
           _meta: meta,
           ...(method.mcp.description ? { description: method.mcp.description } : {}),
           inputSchema: method.inputSchema,
           name: method.mcp.name,
-          // A streaming method's output schema describes one item; the tool result carries them all.
-          outputSchema: method.stream ? streamToolOutputSchema(method.outputSchema) : method.outputSchema,
+          ...(outputSchema ? { outputSchema } : {}),
         });
       }
       if (method.mcpResource) {
@@ -130,9 +138,11 @@ export function generateMcpDiscovery(snapshot: ServiceRegistrySnapshot): McpDisc
   return { prompts, resourceTemplates, resources, tools };
 }
 
-// Stateless MCP streamable-HTTP endpoint: each POST carries one JSON-RPC message, responses are plain
-// JSON (no SSE stream, no session id), so stock MCP clients can connect without Cap'n Web.
+// Stateless MCP Streamable HTTP endpoint: each POST carries one JSON-RPC message, responses are
+// JSON except streaming tool calls over SSE, and no session id is issued.
 export async function handleControlPlaneMcpRequest(request: Request, options: ControlPlaneMcpHandlerOptions): Promise<Response> {
+  const transportError = validateControlPlaneMcpTransportRequest(request, options.allowedOrigins);
+  if (transportError) return transportError;
   if (request.method !== 'POST') {
     return new Response(null, { headers: { allow: 'POST' }, status: 405 });
   }
@@ -150,12 +160,27 @@ export async function handleControlPlaneMcpRequest(request: Request, options: Co
     return jsonRpcError(null, JSON_RPC_INVALID_REQUEST, 'Invalid JSON-RPC message', 400);
   }
 
-  const id = jsonRpcIdOf(message);
-  const method = typeof message.method === 'string' ? message.method : undefined;
-  // Client responses (no method) and notifications (no id) get acknowledged without a body.
-  if (method === undefined || id === undefined) {
+  const hasMethod = Object.hasOwn(message, 'method');
+  if (!hasMethod) {
+    // This stateless endpoint does not issue server requests, but a well-formed client response is
+    // harmless and receives the Streamable HTTP acknowledgement required for responses.
+    const hasId = Object.hasOwn(message, 'id');
+    const hasResult = Object.hasOwn(message, 'result');
+    const hasError = Object.hasOwn(message, 'error');
+    if (!hasId || jsonRpcIdOf(message) === undefined || hasResult === hasError) {
+      return jsonRpcError(null, JSON_RPC_INVALID_REQUEST, 'Invalid JSON-RPC response', 400);
+    }
     return new Response(null, { status: 202 });
   }
+  if (typeof message.method !== 'string') {
+    return jsonRpcError(null, JSON_RPC_INVALID_REQUEST, 'Invalid JSON-RPC method', 400);
+  }
+  // Requests without ids are notifications. An explicitly present id must still have one of the
+  // JSON-RPC scalar id types; do not silently reinterpret malformed requests as notifications.
+  if (!Object.hasOwn(message, 'id')) return new Response(null, { status: 202 });
+  const id = jsonRpcIdOf(message);
+  if (id === undefined) return jsonRpcError(null, JSON_RPC_INVALID_REQUEST, 'Invalid JSON-RPC id', 400);
+  const method = message.method;
 
   switch (method) {
     case 'initialize':
@@ -165,7 +190,7 @@ export async function handleControlPlaneMcpRequest(request: Request, options: Co
     case 'tools/list':
       return jsonRpcResult(id, { tools: (await discover(options)).tools });
     case 'tools/call':
-      return callTool(id, message.params, options);
+      return callTool(id, message.params, options, acceptsEventStream(request));
     case 'resources/list':
       return jsonRpcResult(id, { resources: (await discover(options)).resources });
     case 'resources/templates/list':
@@ -178,6 +203,45 @@ export async function handleControlPlaneMcpRequest(request: Request, options: Co
       return getPrompt(id, message.params, options);
     default:
       return jsonRpcError(id, JSON_RPC_METHOD_NOT_FOUND, `Unsupported MCP method: ${method}`);
+  }
+}
+
+export function validateControlPlaneMcpTransportRequest(request: Request, configuredOrigins: string[] | undefined): Response | undefined {
+  const protocolVersion = request.headers.get('mcp-protocol-version')?.trim();
+  if (protocolVersion && !SUPPORTED_MCP_PROTOCOL_VERSIONS.includes(protocolVersion)) {
+    return new Response('Unsupported MCP-Protocol-Version', { status: 400 });
+  }
+
+  const originHeader = request.headers.get('origin');
+  if (!originHeader) return undefined;
+  const origin = parseOrigin(originHeader);
+  if (!origin) return new Response('Invalid Origin', { status: 403 });
+
+  const allowedOrigins = [new URL(request.url).origin, ...(configuredOrigins ?? [])];
+  if (!allowedOrigins.some((allowed) => parseOrigin(allowed) === origin)) {
+    return new Response('Origin is not allowed', { status: 403 });
+  }
+  return undefined;
+}
+
+// MCP Streamable HTTP clients are required to accept both `application/json` and
+// `text/event-stream` on POST. Treat an absent header as "anything goes" (the HTTP default) so
+// clients that only ever call unary tools keep working, but honour an explicit narrow Accept.
+function acceptsEventStream(request: Request): boolean {
+  const header = request.headers.get('accept');
+  if (header === null) return true;
+  return header
+    .split(',')
+    .map((entry) => entry.split(';')[0]?.trim().toLowerCase())
+    .some((type) => type === 'text/event-stream' || type === 'text/*' || type === '*/*');
+}
+
+function parseOrigin(value: string): string | undefined {
+  try {
+    const url = new URL(value);
+    return url.origin === 'null' || url.pathname !== '/' || url.search || url.hash ? undefined : url.origin;
+  } catch {
+    return undefined;
   }
 }
 
@@ -201,7 +265,12 @@ function initializeResult(params: unknown, options: ControlPlaneMcpHandlerOption
   };
 }
 
-async function callTool(id: JsonRpcId, params: unknown, options: ControlPlaneMcpHandlerOptions): Promise<Response> {
+async function callTool(
+  id: JsonRpcId,
+  params: unknown,
+  options: ControlPlaneMcpHandlerOptions,
+  clientAcceptsEventStream: boolean,
+): Promise<Response> {
   const startedAt = Date.now();
   const name = isRecord(params) && typeof params.name === 'string' ? params.name : undefined;
   if (!name) return jsonRpcError(id, JSON_RPC_INVALID_PARAMS, 'MCP tools/call requires a tool name');
@@ -212,6 +281,15 @@ async function callTool(id: JsonRpcId, params: unknown, options: ControlPlaneMcp
     const match = findMcpMethod(snapshot, (method) => method.mcp?.name === name);
     if (!match) throw new CapabilityAuthError(`Service-Plane MCP tool not found: ${name}`, 404);
     if (match.ability.methods[match.method]?.stream) {
+      // A streaming tool can only be answered as SSE. Negotiate before opening the backing
+      // session so a JSON-only client gets the Streamable HTTP 406 instead of a body it cannot
+      // parse — and so the plane does not pay for a session whose result it cannot deliver.
+      if (!clientAcceptsEventStream) {
+        return new Response('MCP streaming tools require Accept: text/event-stream', {
+          headers: { 'content-type': 'text/plain; charset=utf-8' },
+          status: 406,
+        });
+      }
       return await streamToolCall(id, name, input, match, options, params);
     }
 
@@ -252,6 +330,7 @@ async function streamToolCall(
   params: unknown,
 ): Promise<Response> {
   const startedAt = Date.now();
+  const limits = resolveMcpStreamLimits(options.streamLimits);
   const { api, dispose } = await openMethodSession(match, options);
   let stream: ReadableStream<unknown>;
   try {
@@ -275,14 +354,17 @@ async function streamToolCall(
     });
   }
   const reader = stream.getReader();
-  const state = { cancelled: false };
-  return sseResponse(streamToolEvents(id, name, match, options, reader, dispose, state, progressTokenOf(params), startedAt), (reason) => {
-    // Cancel the upstream reader directly on client disconnect: the generator's queued
-    // return() would wait behind an in-flight read() while the consumer is already gone. The
-    // flag lets the generator distinguish this abort from a natural end-of-stream.
-    state.cancelled = true;
-    void reader.cancel(reason).catch(() => undefined);
-  });
+  const state = { deliveryAborted: false };
+  return sseResponse(
+    streamToolEvents(id, name, match, options, limits, reader, dispose, state, progressTokenOf(params), startedAt),
+    (reason) => {
+      // This stateless endpoint has no resumable response path after SSE delivery is abandoned.
+      // Abort the request-owned upstream reader promptly so serverless work and its session do
+      // not leak; the flag distinguishes delivery abandonment from natural completion.
+      state.deliveryAborted = true;
+      void reader.cancel(reason).catch(() => undefined);
+    },
+  );
 }
 
 async function* streamToolEvents(
@@ -290,28 +372,30 @@ async function* streamToolEvents(
   name: string,
   match: McpMethodMatch,
   options: ControlPlaneMcpHandlerOptions,
+  limits: { maxBytes: number; maxItems: number },
   reader: ReadableStreamDefaultReader<unknown>,
   dispose: () => Promise<void>,
-  state: { cancelled: boolean },
+  state: { deliveryAborted: boolean },
   progressToken: string | number | undefined,
   startedAt: number,
 ): AsyncGenerator<string> {
-  const maxItems = options.streamLimits?.maxItems ?? DEFAULT_MCP_STREAM_MAX_ITEMS;
-  const maxBytes = options.streamLimits?.maxBytes ?? DEFAULT_MCP_STREAM_MAX_BYTES;
+  const { maxBytes, maxItems } = limits;
   const encoder = new TextEncoder();
   const items: unknown[] = [];
   let aggregatedBytes = 0;
+  let progressBytes = 0;
+  let sendProgress = progressToken !== undefined;
   try {
     while (true) {
       const { done, value } = await reader.read();
-      // A client disconnect resolves the pending read as done via reader.cancel; treat it as an
-      // abort, not a successful completion, and skip the pointless full aggregation.
-      if (state.cancelled) {
+      // Abandoning SSE delivery resolves the pending read as done via reader.cancel; treat it as
+      // an aborted delivery, not a successful completion, and skip pointless aggregation.
+      if (state.deliveryAborted) {
         logMcpFailed(
           options,
           'service_plane.mcp.tool.failed',
           { tool: name },
-          new CapabilityAuthError('client disconnected', 499),
+          new CapabilityAuthError('SSE delivery abandoned', 499),
           startedAt,
         );
         return;
@@ -329,8 +413,17 @@ async function* streamToolEvents(
         yield sseEvent({ id, jsonrpc: '2.0', result: { content: [{ text: message, type: 'text' }], isError: true } });
         return;
       }
-      if (progressToken !== undefined) {
-        yield sseEvent({ jsonrpc: '2.0', method: 'notifications/progress', params: { progress: items.length, progressToken } });
+      if (sendProgress) {
+        const event = sseEvent({ jsonrpc: '2.0', method: 'notifications/progress', params: { progress: items.length, progressToken } });
+        const eventBytes = encoder.encode(event).length;
+        if (progressBytes + eventBytes <= maxBytes) {
+          progressBytes += eventBytes;
+          yield event;
+        } else {
+          // Progress is optional in MCP. Stop emitting it once its independent wire budget is
+          // exhausted, while still returning the complete, bounded tool result.
+          sendProgress = false;
+        }
       }
     }
     const serialized = JSON.stringify({ items });
@@ -359,7 +452,30 @@ async function* streamToolEvents(
 function progressTokenOf(params: unknown): string | number | undefined {
   if (!isRecord(params) || !isRecord(params._meta)) return undefined;
   const token = params._meta.progressToken;
-  return typeof token === 'string' || typeof token === 'number' ? token : undefined;
+  if (typeof token === 'string') return token;
+  return typeof token === 'number' && Number.isSafeInteger(token) ? token : undefined;
+}
+
+function resolveMcpStreamLimits(limits: ControlPlaneMcpHandlerOptions['streamLimits']): { maxBytes: number; maxItems: number } {
+  return {
+    maxBytes: positiveMcpStreamLimit(limits?.maxBytes, DEFAULT_MCP_STREAM_MAX_BYTES, 'maxBytes'),
+    maxItems: positiveMcpStreamLimit(limits?.maxItems, DEFAULT_MCP_STREAM_MAX_ITEMS, 'maxItems'),
+  };
+}
+
+function positiveMcpStreamLimit(value: number | undefined, fallback: number, name: string): number {
+  const resolved = value ?? fallback;
+  if (!Number.isSafeInteger(resolved) || resolved <= 0) {
+    throw new CapabilityAuthError(`Service-Plane MCP streamLimits.${name} must be a positive safe integer`, 500);
+  }
+  return resolved;
+}
+
+function mcpToolOutputSchema(method: DiscoveredServiceAbility['methods'][string]): OpenApiObject | undefined {
+  // MCP structuredContent is always a JSON object. Streaming results are explicitly wrapped in
+  // `{ items }`; unary primitive and array schemas remain available through text content only.
+  if (method.stream) return streamToolOutputSchema(method.outputSchema);
+  return method.outputSchema.type === 'object' ? method.outputSchema : undefined;
 }
 
 function streamToolOutputSchema(itemSchema: OpenApiObject): OpenApiObject {
@@ -410,7 +526,7 @@ function sseResponse(events: AsyncGenerator<string>, onCancel?: (reason: unknown
       onCancel?.(reason);
       // Fire-and-forget: awaiting the generator's return() would queue behind an in-flight
       // read while the client is already gone.
-      void events.return?.(undefined);
+      void events.return?.(undefined).catch(() => undefined);
     },
     async pull(controller) {
       const next = await events.next();
@@ -476,6 +592,7 @@ async function openMethodSession(
   const api = await abilitySession<Record<string, (methodInput: unknown) => Promise<unknown>>>({
     abilityId: match.ability.id,
     callerServiceId: options.caller?.kind === 'service' ? options.caller.id : options.controlPlaneServiceId,
+    ...(options.connInfo ? { connInfo: options.connInfo } : {}),
     ...(subject ? { subject } : {}),
     ...(options.requestId ? { requestId: options.requestId } : {}),
     requestToken: (tokenInput) =>
@@ -484,7 +601,9 @@ async function openMethodSession(
         : options.issuer.issueCapabilityToken(tokenInput),
     scopes: match.scopes,
     targetServiceId: match.ability.serviceId,
-    transport: transportForAbility(match.ability),
+    transport: transportForAbility(match.ability, {
+      requiresStreaming: match.ability.methods[match.method]?.stream === true,
+    }),
   });
   return { api, dispose: () => disposeAbilitySession(api) };
 }
@@ -669,5 +788,5 @@ function jsonRpcError(id: JsonRpcId, code: number, message: string, status = 200
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

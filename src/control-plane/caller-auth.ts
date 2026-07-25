@@ -1,8 +1,8 @@
 import type { Context } from 'hono';
-import { jwk } from 'hono/jwk';
 import { CapabilityAuthError } from '../shared/errors.js';
 import {
   extractServicePlaneHmacSignature,
+  SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME,
   SERVICE_PLANE_HMAC_CLIENT_HEADER,
   SERVICE_PLANE_HMAC_TIMESTAMP_HEADER,
   servicePlaneHmacRequestParts,
@@ -14,9 +14,11 @@ import {
   extractServicePlaneJwkAssertion,
   SERVICE_PLANE_JWK_ALGORITHM,
   SERVICE_PLANE_JWK_ASSERTION_AUDIENCE,
+  SERVICE_PLANE_JWK_AUTHORIZATION_SCHEME,
   SERVICE_PLANE_JWK_CLIENT_HEADER,
   SERVICE_PLANE_JWK_KEY_ID_HEADER,
   servicePlaneJwkRequestParts,
+  verifyServicePlaneJwkSignature,
 } from '../shared/jwk-auth.js';
 import { type CapabilityJwks, type RegistryCache, SERVICE_PLANE_REQUEST_ID_HEADER, type ServiceEndpoint } from '../shared/types.js';
 import { createServiceRegistry } from './registry.js';
@@ -125,8 +127,8 @@ export function hmacServiceClientAuth(options: HmacServiceClientAuthOptions) {
   const clientIdHeader = options.clientIdHeader ?? SERVICE_PLANE_HMAC_CLIENT_HEADER;
   const timestampHeader = options.timestampHeader ?? SERVICE_PLANE_HMAC_TIMESTAMP_HEADER;
   const requestIdHeader = options.requestIdHeader ?? SERVICE_PLANE_REQUEST_ID_HEADER;
-  const maxSkewSeconds = options.maxSkewSeconds ?? DEFAULT_HMAC_MAX_SKEW_SECONDS;
-  const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_HMAC_MAX_BODY_BYTES;
+  const maxSkewSeconds = normalizePositiveAuthLimit(options.maxSkewSeconds ?? DEFAULT_HMAC_MAX_SKEW_SECONDS, 'HMAC max clock skew');
+  const maxBodyBytes = normalizePositiveAuthLimit(options.maxBodyBytes ?? DEFAULT_HMAC_MAX_BODY_BYTES, 'HMAC max body size');
   const log = options.log ?? defaultHmacCallerAuthLog;
 
   return async (context: Context): Promise<Response | string> => {
@@ -134,19 +136,19 @@ export function hmacServiceClientAuth(options: HmacServiceClientAuthOptions) {
       const clientId = context.req.header(clientIdHeader)?.trim();
       if (!clientId) {
         log(hmacUnauthorizedEvent(context, 'missing_client', 'Missing Service-Plane HMAC client id'));
-        return context.json({ error: 'Unauthorized' }, 401);
+        return callerAuthUnauthorized(context, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME);
       }
 
       const timestamp = context.req.header(timestampHeader)?.trim();
       if (!timestamp) {
         log(hmacUnauthorizedEvent(context, 'missing_timestamp', 'Missing Service-Plane HMAC timestamp'));
-        return context.json({ error: 'Unauthorized' }, 401);
+        return callerAuthUnauthorized(context, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME);
       }
 
       const timestampError = validateHmacTimestamp(timestamp, options.now?.() ?? new Date(), maxSkewSeconds);
       if (timestampError) {
         log(hmacUnauthorizedEvent(context, timestampError, hmacTimestampMessage(timestampError)));
-        return context.json({ error: 'Unauthorized' }, 401);
+        return callerAuthUnauthorized(context, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME);
       }
 
       let signature: string;
@@ -155,7 +157,7 @@ export function hmacServiceClientAuth(options: HmacServiceClientAuthOptions) {
       } catch (error) {
         if (error instanceof CapabilityAuthError) {
           log(hmacUnauthorizedEvent(context, 'missing_signature', error.message));
-          return context.json({ error: 'Unauthorized' }, 401);
+          return callerAuthUnauthorized(context, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME);
         }
         throw error;
       }
@@ -164,7 +166,7 @@ export function hmacServiceClientAuth(options: HmacServiceClientAuthOptions) {
       const client = clients.find((candidate) => timingSafeEqual(candidate.clientId, clientId));
       if (!client) {
         log(hmacUnauthorizedEvent(context, 'client_not_found', 'Unknown Service-Plane HMAC client'));
-        return context.json({ error: 'Unauthorized' }, 401);
+        return callerAuthUnauthorized(context, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME);
       }
 
       const expected = await servicePlaneHmacSignature(
@@ -173,42 +175,47 @@ export function hmacServiceClientAuth(options: HmacServiceClientAuthOptions) {
       );
       if (!timingSafeEqual(signature, expected)) {
         log(hmacUnauthorizedEvent(context, 'invalid_signature', 'Invalid Service-Plane HMAC signature'));
-        return context.json({ error: 'Unauthorized' }, 401);
+        return callerAuthUnauthorized(context, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME);
       }
       if (
         options.replayCache &&
         (await isHmacReplay(options.replayCache, clientId, context.req.header(requestIdHeader)?.trim() || signature, maxSkewSeconds))
       ) {
         log(hmacUnauthorizedEvent(context, 'invalid_signature', 'Replayed Service-Plane HMAC signature'));
-        return context.json({ error: 'Unauthorized' }, 401);
+        return callerAuthUnauthorized(context, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME);
       }
 
       return client.serviceId ?? client.clientId;
     } catch (error) {
       if (error instanceof CapabilityAuthError) {
         log(hmacUnauthorizedEvent(context, 'invalid_signature', error.message));
-        return context.json({ error: 'Unauthorized' }, 401);
+        return callerAuthUnauthorized(context, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME);
       }
       throw error;
     }
   };
 }
 
-// Authenticates token requests with a short-lived asymmetric JWT assertion verified by Hono's JWK middleware.
+// Authenticates token requests with a short-lived asymmetric JWT assertion. Signature
+// verification uses Hono's verifyWithJwks helper directly because its JWK middleware only
+// accepts the Bearer scheme, while these request-bound assertions have their own scheme.
 export function jwkServiceClientAuth(options: JwkServiceClientAuthOptions) {
   const clientIdHeader = options.clientIdHeader ?? SERVICE_PLANE_JWK_CLIENT_HEADER;
   const keyIdHeader = options.keyIdHeader ?? SERVICE_PLANE_JWK_KEY_ID_HEADER;
   const requestIdHeader = options.requestIdHeader ?? SERVICE_PLANE_REQUEST_ID_HEADER;
-  const maxSkewSeconds = options.maxSkewSeconds ?? DEFAULT_JWK_MAX_SKEW_SECONDS;
-  const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_JWK_MAX_BODY_BYTES;
-  const maxAssertionTtlSeconds = options.maxAssertionTtlSeconds ?? DEFAULT_JWK_MAX_ASSERTION_TTL_SECONDS;
+  const maxSkewSeconds = normalizePositiveAuthLimit(options.maxSkewSeconds ?? DEFAULT_JWK_MAX_SKEW_SECONDS, 'JWK max clock skew');
+  const maxBodyBytes = normalizePositiveAuthLimit(options.maxBodyBytes ?? DEFAULT_JWK_MAX_BODY_BYTES, 'JWK max body size');
+  const maxAssertionTtlSeconds = normalizePositiveAuthLimit(
+    options.maxAssertionTtlSeconds ?? DEFAULT_JWK_MAX_ASSERTION_TTL_SECONDS,
+    'JWK max assertion TTL',
+  );
   const log = options.log ?? defaultJwkCallerAuthLog;
 
   return async (context: Context): Promise<Response | string> => {
     const clientId = context.req.header(clientIdHeader)?.trim();
     if (!clientId) {
       log(jwkUnauthorizedEvent(context, 'missing_client', 'Missing Service-Plane JWK client id'));
-      return context.json({ error: 'Unauthorized' }, 401);
+      return callerAuthUnauthorized(context, SERVICE_PLANE_JWK_AUTHORIZATION_SCHEME);
     }
 
     let assertion: string;
@@ -217,7 +224,7 @@ export function jwkServiceClientAuth(options: JwkServiceClientAuthOptions) {
     } catch (error) {
       if (error instanceof CapabilityAuthError) {
         log(jwkUnauthorizedEvent(context, 'missing_signature', error.message));
-        return context.json({ error: 'Unauthorized' }, 401);
+        return callerAuthUnauthorized(context, SERVICE_PLANE_JWK_AUTHORIZATION_SCHEME);
       }
       throw error;
     }
@@ -225,33 +232,24 @@ export function jwkServiceClientAuth(options: JwkServiceClientAuthOptions) {
     const client = await resolveJwkServiceClient(context, options, clientId);
     if (!client) {
       log(jwkUnauthorizedEvent(context, 'client_not_found', 'Unknown Service-Plane JWK client'));
-      return context.json({ error: 'Unauthorized' }, 401);
+      return callerAuthUnauthorized(context, SERVICE_PLANE_JWK_AUTHORIZATION_SCHEME);
     }
 
     const jwks = await resolveJwkClientJwks(client);
     if (jwks.keys.length === 0) {
       log(jwkUnauthorizedEvent(context, 'missing_key', 'Service-Plane JWK client has no verification keys'));
-      return context.json({ error: 'Unauthorized' }, 401);
+      return callerAuthUnauthorized(context, SERVICE_PLANE_JWK_AUTHORIZATION_SCHEME);
     }
 
     try {
-      const auth = jwk({
-        alg: [SERVICE_PLANE_JWK_ALGORITHM],
-        keys: jwks.keys,
-        verification: {
-          exp: false,
-          iat: false,
-          nbf: false,
-        },
-      });
-      await auth(context, async () => undefined);
+      await verifyServicePlaneJwkSignature(assertion, jwks);
 
       const { header, payload } = decodeServicePlaneJwkAssertion(assertion);
       const claims = parseJwkAssertionClaims(payload);
       const keyId = context.req.header(keyIdHeader)?.trim();
       if (!keyId) {
         log(jwkUnauthorizedEvent(context, 'missing_key', 'Missing Service-Plane JWK key id'));
-        return context.json({ error: 'Unauthorized' }, 401);
+        return callerAuthUnauthorized(context, SERVICE_PLANE_JWK_AUTHORIZATION_SCHEME);
       }
       const headerKeyId = validateJwkAssertionHeader(header, keyId);
       const audience = await resolveJwkAssertionAudience(context, options);
@@ -277,19 +275,24 @@ export function jwkServiceClientAuth(options: JwkServiceClientAuthOptions) {
         ))
       ) {
         log(jwkUnauthorizedEvent(context, 'replayed_assertion', 'Replayed Service-Plane JWK assertion'));
-        return context.json({ error: 'Unauthorized' }, 401);
+        return callerAuthUnauthorized(context, SERVICE_PLANE_JWK_AUTHORIZATION_SCHEME);
       }
 
       return client.serviceId ?? client.clientId;
     } catch (error) {
       if (error instanceof CapabilityAuthError) {
         log(jwkUnauthorizedEvent(context, 'invalid_claims', error.message));
-        return context.json({ error: 'Unauthorized' }, 401);
+        return callerAuthUnauthorized(context, SERVICE_PLANE_JWK_AUTHORIZATION_SCHEME);
       }
       log(jwkUnauthorizedEvent(context, 'invalid_assertion', 'Invalid Service-Plane JWK assertion'));
-      return context.json({ error: 'Unauthorized' }, 401);
+      return callerAuthUnauthorized(context, SERVICE_PLANE_JWK_AUTHORIZATION_SCHEME);
     }
   };
+}
+
+function callerAuthUnauthorized(context: Context, scheme: string): Response {
+  context.header('www-authenticate', scheme);
+  return context.json({ error: 'Unauthorized' }, 401);
 }
 
 function hmacUnauthorizedEvent(
@@ -338,6 +341,13 @@ function validateHmacTimestamp(timestamp: string, now: Date, maxSkewSeconds: num
   const skewMs = Math.abs(now.getTime() - parsed.getTime());
   if (skewMs > maxSkewSeconds * 1000) return 'timestamp_skew';
   return undefined;
+}
+
+function normalizePositiveAuthLimit(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new CapabilityAuthError(`Service-Plane ${name} must be a positive safe integer`, 500);
+  }
+  return value;
 }
 
 function hmacTimestampMessage(reason: 'invalid_timestamp' | 'timestamp_skew'): string {

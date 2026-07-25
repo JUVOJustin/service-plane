@@ -47,7 +47,7 @@ Cap'n Web streams ride the ongoing RPC session, so streaming methods need a **se
 | Transport | Streams | Notes |
 | --- | --- | --- |
 | `cloudflareNativeRpc(binding)` | yes | Workers RPC streams natively; preferred same-account on Cloudflare |
-| `websocketRpc(url)` | yes | long-lived Cap'n Web session |
+| `websocketRpc(url, { createWebSocket? })` | yes | long-lived Cap'n Web session; inject a client factory when the runtime has no global `WebSocket` |
 | `customRpcTransport(transport)` | yes | any bidirectional transport |
 | `cloudflareServiceBindingRpc(binding)` / `httpBatchRpc(url)` | no | one round trip; streaming calls fail with 405 |
 
@@ -111,22 +111,66 @@ for await (const item of stream) {
 }
 ```
 
-Cancel by exiting the loop early (or `reader.cancel()`); cancellation propagates to the handler's generator. A handler failure or an item that fails output validation surfaces as a stream error on `read()`.
+Persistent WebSocket/custom sessions and cached `cloudflareNativeRpc` targets own transport
+resources. Dispose every ability session when its work is complete; TypeScript's explicit resource
+management handles the normal case:
+
+```ts
+{
+  using api = await abilitySession<AbilityRpc<typeof hubFiles>>({
+    // ...the same session options
+  });
+
+  const stream = await api.readFile({ path: '/big.bin' });
+  for await (const item of stream) {
+    // ...
+  }
+} // closes the persistent session or disposes the native target
+```
+
+When `using` is not available, use `disposeAbilitySession` in `finally`:
+
+```ts
+const api = await abilitySession<AbilityRpc<typeof hubFiles>>({
+  // ...the same session options
+});
+
+try {
+  const stream = await api.readFile({ path: '/big.bin' });
+  // consume the stream
+} finally {
+  await disposeAbilitySession(api);
+}
+```
+
+Disposal is safe for every transport and idempotent. It closes persistent sockets/custom sessions,
+disposes a cached native binding target, and has no transport resource to release for per-call
+HTTP-batch/fetch. In every case the session object is permanently closed and must not be reused.
+
+Cancel by exiting the loop early (or `reader.cancel()`). For a handler-owned `ReadableStream`, its standard `cancel()` hook runs even while a pull is pending, so use that form when cancellation must interrupt an upstream fetch, subscription, or other long wait. Async iterators receive `return()`, but JavaScript queues it behind an already-running `next()`; an async generator parked in a non-settling `await` must therefore make that wait cooperative or return a cancellable `ReadableStream` instead. A handler failure or an item that fails output validation surfaces as a stream error on `read()`.
 
 ## Stream Through The Broker
 
 Streams proxy transparently across broker sessions — no extra routes. Connect to `/rpc/broker` over WebSocket; the plane authorizes the caller, mints the (brokered) token, and reaches the service over its own session transport:
 
-1. the endpoint's native ability RPC binding, when available (`ServiceEndpoint.abilityRpc` — picked up automatically by `cloudflareServiceBinding` when the binding exposes `connectAbility`),
+1. the endpoint's native ability RPC binding, when available (`ServiceEndpoint.abilityRpc` — pass it explicitly as `cloudflareServiceBinding({ abilityRpc })`),
 2. otherwise WebSocket.
 
 ```ts
 const ability = await broker.ability('hub', 'hub.files');
-const api = await ability.connect(['hub.files.read']);
-const stream = await api.readFile({ path: '/big.bin' });
+{
+  using api = await ability.connect(['hub.files.read']);
+  const stream = await api.readFile({ path: '/big.bin' });
+  // consume the stream before the session leaves scope
+}
 ```
 
 Ingress-protected services work unchanged: the broker's token carries the signed broker claim, and the stream flows service → plane → caller with flow control on each hop.
+
+`ServicePlaneControlPlane` enables broker streaming only for an upgraded WebSocket caller. If you
+embed `createControlPlaneRpcBroker` in a custom shell, `rootCapability` defaults to rejecting
+streaming methods; pass `{ allowStreaming: true }` only when that shell has established a session
+transport to the caller.
 
 ## High-Frequency Streams
 
@@ -166,7 +210,7 @@ In the benchmark (100,000 deltas per stream) this cuts a stream from ~1.0 s to ~
 
 Two more levers for hot paths:
 
-- **Keep the plane out of the data path.** The plane is a control plane: it mints the token, and the caller opens a direct session to the service (`websocketRpc`, `cloudflareNativeRpc`). Route through the broker only when you need it — ingress-protected services, or callers that must never hold tokens. Direct-vs-brokered is an explicit choice, not a hidden mode.
+- **Choose the data path explicitly.** Production ingress-protected services stream through the broker. Direct `websocketRpc`/`cloudflareNativeRpc` sessions are for local development or deployments that intentionally opt out of ingress; they keep the plane out of the data path but make the service directly reachable.
 - **Prefer persistent sessions over HTTP-batch for chatty callers.** A batch call verifies the capability token per request; a session verifies once at `authenticate` and then costs microseconds per call.
 
 ## MCP Streaming Tools

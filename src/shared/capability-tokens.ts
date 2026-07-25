@@ -71,6 +71,13 @@ export async function verifyCapabilityToken(token: string, options: VerifyCapabi
     throw new CapabilityAuthError('Invalid Service-Plane capability token header');
   }
 
+  // Authenticate the compact JWS before using any claim for authorization or error selection.
+  // The unverified header is used only to select the advertised key id and pinned algorithm.
+  const jwks = await resolveJwks(options.jwks);
+  const key = jwks.keys.find((candidate) => candidate.kid === header.kid);
+  if (!key) throw new CapabilityAuthError('Unknown Service-Plane capability key id');
+  await verifyTokenSignature(token, key);
+
   const claims = parseCapabilityClaims(payload);
   if (options.issuer && claims.iss !== options.issuer) throw new CapabilityAuthError('Invalid Service-Plane capability issuer');
   if (claims.aud !== options.expectedAudience) throw new CapabilityAuthError('Invalid Service-Plane capability audience');
@@ -82,12 +89,6 @@ export async function verifyCapabilityToken(token: string, options: VerifyCapabi
 
   const missingScope = (options.requiredScopes ?? []).find((scope) => !claims.scp.includes(scope));
   if (missingScope) throw new CapabilityAuthError(`Missing Service-Plane capability scope: ${missingScope}`, 403);
-
-  const jwks = await resolveJwks(options.jwks);
-  const key = jwks.keys.find((candidate) => candidate.kid === header.kid);
-  if (!key) throw new CapabilityAuthError('Unknown Service-Plane capability key id');
-
-  await verifyTokenSignature(token, key);
 
   // RFC 8693 delegation: with an act claim, sub is the end-user subject and act.sub is the acting
   // service; without one, sub is the calling service itself.
@@ -126,8 +127,11 @@ export function servicePlaneAuthorization(token: string): string {
 export function extractServicePlaneToken(request: Request): string {
   const authorization = request.headers.get('authorization')?.trim();
   if (!authorization) throw new CapabilityAuthError('Missing Service-Plane capability token');
-  const [scheme, token] = authorization.split(/\s+/u, 2);
-  if (scheme !== SERVICE_PLANE_AUTHORIZATION_SCHEME || !token) throw new CapabilityAuthError('Invalid Service-Plane authorization scheme');
+  const parts = authorization.split(/\s+/u);
+  const [scheme, token] = parts;
+  if (parts.length !== 2 || scheme?.toLowerCase() !== SERVICE_PLANE_AUTHORIZATION_SCHEME.toLowerCase() || !token) {
+    throw new CapabilityAuthError('Invalid Service-Plane authorization scheme');
+  }
   return token;
 }
 

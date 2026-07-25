@@ -57,7 +57,7 @@ Every inbound request gets an `X-Request-Id` (adopted from the caller or generat
 
 ## Service-Plane Ingress
 
-If services must reject direct application calls, configure `ServicePlaneService` with `ingress: {}` and send callers through the control-plane broker.
+For production services, configure `ServicePlaneService` with `ingress: {}` and send callers through the control-plane broker.
 
 ```ts
 cloudflareServiceBinding({
@@ -88,19 +88,23 @@ If a caller asks for an unknown service, unknown scope, or ungranted scope, the 
 
 ## Discovery Cache
 
-The registry can cache service discovery documents. Cache discovery separately from generated OpenAPI.
+The broker and MCP surfaces can each cache service discovery documents. Pass the same cache to both when they share the same service catalog; the registry creates distinct cache keys from the configured service ids and origins.
 
 ```ts
 const plane = new ServicePlaneControlPlane({
-  registry: {
+  broker: {
     cache: env.SERVICE_DISCOVERY_CACHE,
-    ttlSeconds: 60,
+    caller: resolveCaller,
+  },
+  mcp: {
+    cache: env.SERVICE_DISCOVERY_CACHE,
+    caller: resolveCaller,
   },
   // ...
 });
 ```
 
-Use discovery caching to avoid repeatedly fetching `/.well-known/service-plane/service.json` from every service.
+Use discovery caching to avoid repeatedly fetching `/.well-known/service-plane/service.json` from every service. Cache discovery separately from generated OpenAPI; broker and MCP discovery entries use the built-in registry TTL.
 
 ## OpenAPI Cache
 
@@ -110,7 +114,7 @@ The control plane can cache the bundled OpenAPI document.
 const plane = new ServicePlaneControlPlane({
   openapi: {
     cache: env.OPENAPI_CACHE,
-    ttlSeconds: 300,
+    cacheTtlSeconds: 300,
   },
   // ...
 });
@@ -120,24 +124,30 @@ The document is derived from published ability metadata. Individual services do 
 
 ## Optional Broker
 
-The broker lets a caller discover and connect to abilities through the plane. The broker and MCP endpoints are **fail closed**: you must supply a `caller` resolver that authenticates the request and returns the caller identity. A request with no configured resolver returns `500`; a resolver that returns no caller returns `401`. Nothing is brokered without an authenticated caller.
+The broker lets a caller discover and connect to abilities through the plane. The broker and MCP endpoints are **fail closed**: you must supply a `caller` resolver that authenticates the request and returns the caller identity. A request with no configured resolver returns `500`; returning `undefined` refuses the request with `403`. For retryable authentication failures, return a Hono `401` response with the authentication scheme's `WWW-Authenticate` challenge. Nothing is brokered without an authenticated caller.
 
 ```ts
 new ServicePlaneControlPlane({
   broker: {
     path: '/rpc/broker',
-    // Authenticate the request however your deployment does (gateway header, session,
-    // mTLS, service binding). Return undefined to reject with 401.
-    caller: (c) => {
-      const serviceId = c.req.header('x-authenticated-service');
-      return serviceId ? { id: serviceId, kind: 'service' } : undefined;
+    // Use your deployment's verifier here. The resolver owns the exact challenge.
+    caller: async (c) => {
+      const serviceId = await authenticateBrokerRequest(c);
+      if (!serviceId) {
+        return c.json({ error: 'Unauthorized' }, 401, {
+          'WWW-Authenticate': 'Bearer realm="service-plane"',
+        });
+      }
+      return { id: serviceId, kind: 'service' };
     },
   },
   // ...
 });
 ```
 
-`caller` returns a `BrokerCaller` — `{ id, kind: 'service' | 'user' }`. Service callers (`kind: 'service'`) can reach `access: 'service'` abilities and are brokered under their own service id; other callers are brokered under the control-plane identity for `access: 'plane'` abilities. To intentionally allow anonymous access, return a fixed caller from the resolver — it is always an explicit choice, never a default.
+Both mounts also accept `connInfo`, an opt-in resolver that forwards the original client's connection to the target service (`connInfo: (c) => getConnInfo(c)`, importing `getConnInfo` from your runtime's Hono adapter). It reaches handlers only on brokered calls into ingress-protected services and is advisory — see [Forwarded Connection Info](auth.md#forwarded-connection-info).
+
+`caller` returns a `BrokerCaller` — `{ id, kind: 'service' | 'user' }` — or an application-owned `Response`. Existing Hono authentication middleware is the preferred place to generate a challenge when it already owns that policy. Service callers (`kind: 'service'`) can reach `access: 'service'` abilities and are brokered under their own service id; other callers are brokered under the control-plane identity for `access: 'plane'` abilities. To intentionally allow anonymous access, return a fixed caller from the resolver — it is always an explicit choice, never a default.
 
 The broker connects by ability:
 
@@ -147,6 +157,6 @@ broker.ability('asana', 'asana.tasks').connect(['asana.tasks.write']);
 
 When service-plane ingress protection is enabled, callers must use the broker or another approved service-plane component that can mint brokered capability tokens.
 
-Streaming ability methods proxy through the broker as native Cap'n Web `ReadableStream`s: connect to the broker over WebSocket (`upgradeWebSocket`), and the plane reaches the service over its own session transport — the endpoint's native ability RPC binding when available (a binding exposing `connectAbility` is picked up automatically by `cloudflareServiceBinding`), otherwise WebSocket. See [Streaming](streaming.md).
+Streaming ability methods proxy through the broker as native Cap'n Web `ReadableStream`s: connect to the broker over WebSocket (`upgradeWebSocket`), and the plane reaches the service over its own session transport — the endpoint's native ability RPC binding when available (pass it as `cloudflareServiceBinding({ abilityRpc })`), otherwise WebSocket. See [Streaming](streaming.md).
 
 Next: [auth](auth.md), [OpenAPI and MCP](openapi-mcp.md), and [Cloudflare](cloudflare.md).

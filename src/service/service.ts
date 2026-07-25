@@ -1,8 +1,15 @@
 import { newRpcResponse } from '@hono/capnweb';
-import { type Context, type Env, Hono, type MiddlewareHandler } from 'hono';
+import { Context, type Env, Hono, type MiddlewareHandler } from 'hono';
 import { etag } from 'hono/etag';
 import { type RequestIdVariables, requestId } from 'hono/request-id';
 import type { UpgradeWebSocket } from 'hono/ws';
+import {
+  type ConnInfo,
+  normalizeConnInfo,
+  parseConnInfo,
+  SERVICE_PLANE_CONN_INFO_HEADER,
+  SERVICE_PLANE_CONN_INFO_QUERY_PARAM,
+} from '../shared/conn-info.js';
 import { CapabilityAuthError } from '../shared/errors.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
 import {
@@ -111,12 +118,18 @@ export class ServicePlaneService<TEnv extends Env = Env> {
 
   fetch: Hono<ServicePlaneServiceEnv<TEnv>>['fetch'] = (request, env, executionCtx) => this.app.fetch(request, env, executionCtx);
 
-  async connectAbility(input: { abilityId: string; requestId?: string; token: string }, bindings?: TEnv['Bindings']): Promise<RpcTarget> {
+  async connectAbility(
+    input: { abilityId: string; connInfo?: ConnInfo; requestId?: string; token: string },
+    bindings?: TEnv['Bindings'],
+  ): Promise<RpcTarget> {
     const ability = this.definition.abilities.find((candidate) => candidate.id === input.abilityId);
     if (!ability) throw new CapabilityAuthError(`Service-Plane ability not found: ${input.abilityId}`, 404);
-    const context = syntheticContext<TEnv>(bindings, input.requestId);
+    if (!ability.rpc.transports.includes('cloudflare-binding-rpc')) {
+      throw new CapabilityAuthError(`Service-Plane native binding RPC is not enabled for ability: ${input.abilityId}`, 405);
+    }
+    const context = nativeBindingContext<TEnv>(ability.rpc.path, bindings, input.requestId);
     // Native bindings are session-shaped (Workers RPC), so streaming returns are allowed.
-    const root = new AuthRoot(this.options.auth, this.options.ingress, this.definition.id, ability, context, true);
+    const root = new AuthRoot(this.options.auth, this.options.ingress, this.definition.id, ability, context, true, input.connInfo);
     return root.authenticate(input.token);
   }
 
@@ -154,7 +167,15 @@ export class ServicePlaneService<TEnv extends Env = Env> {
       // leave the returned stream stub dangling.
       return newRpcResponse(
         context,
-        new AuthRoot(this.options.auth, this.options.ingress, this.definition.id, ability, context as unknown as Context<TEnv>, upgrade),
+        new AuthRoot(
+          this.options.auth,
+          this.options.ingress,
+          this.definition.id,
+          ability,
+          context as unknown as Context<TEnv>,
+          upgrade,
+          forwardedConnInfo(context),
+        ),
         this.options.rpc,
       );
     });
@@ -169,6 +190,7 @@ class AuthRoot<TEnv extends Env> extends RpcTarget {
     private readonly ability: NormalizedServiceAbility<TEnv>,
     private readonly context: Context<TEnv>,
     private readonly allowStreaming: boolean,
+    private readonly connInfo: ConnInfo | undefined,
   ) {
     super();
   }
@@ -176,8 +198,14 @@ class AuthRoot<TEnv extends Env> extends RpcTarget {
   async authenticate(token: string) {
     const identity = await verifyAuthenticationToken(token, await serviceVerifier(this.auth, this.serviceId, this.context));
     await verifyServiceIngress(this.auth, this.ingress, identity, this.context);
+    // Connection info is an unsigned assertion about a connection this service never saw, so it is
+    // only trustworthy once the peer is proven to be the broker: ingress restricts the service to
+    // brokered tokens, and `brokerServiceId` is a signed claim only the control plane can mint.
+    // Without ingress any direct caller could set the header, so handlers see nothing.
+    const connInfo = this.ingress && identity.brokerServiceId ? normalizeConnInfo(this.connInfo) : undefined;
     const handler = await this.ability.handler({
       abilityId: this.ability.id,
+      ...(connInfo ? { connInfo } : {}),
       context: this.context,
       identity,
     });
@@ -211,26 +239,45 @@ async function verifyServiceIngress<TEnv extends Env>(
   throw new CapabilityAuthError('Service-Plane brokered capability token is required', 403);
 }
 
+// WebSocket upgrades cannot carry custom headers portably, so both forwarded values also have a
+// query-parameter form. Parsing re-validates the payload; nothing here is trusted yet.
+function forwardedConnInfo(context: Context): ConnInfo | undefined {
+  return parseConnInfo(context.req.header(SERVICE_PLANE_CONN_INFO_HEADER) ?? context.req.query(SERVICE_PLANE_CONN_INFO_QUERY_PARAM));
+}
+
 // Mirrors hono/request-id's header validation so a query-supplied id cannot smuggle
 // arbitrary characters into logs.
 function brokeredRequestId(context: Context): string | undefined {
-  const candidate = context.req.query(SERVICE_PLANE_REQUEST_ID_QUERY_PARAM)?.trim();
+  return validRequestId(context.req.query(SERVICE_PLANE_REQUEST_ID_QUERY_PARAM));
+}
+
+function validRequestId(value: string | undefined): string | undefined {
+  const candidate = value?.trim();
   if (!candidate || candidate.length > 255 || /[^\w\-=]/.test(candidate)) return undefined;
   return candidate;
 }
 
-// Native-binding calls skip the Hono shell, so hand handlers a minimal context that still
-// resolves bindings and the brokered request id.
-function syntheticContext<TEnv extends Env>(bindings: TEnv['Bindings'] | undefined, requestId: string | undefined): Context<TEnv> {
-  const variables = new Map<string, unknown>();
-  if (requestId) variables.set('requestId', requestId);
-  return {
+// Native-binding calls skip Hono routing, but handlers still receive an actual Hono Context.
+// This keeps request helpers and response construction available without pretending that the
+// normal middleware chain ran for a Workers RPC invocation.
+function nativeBindingContext<TEnv extends Env>(
+  abilityPath: string,
+  bindings: TEnv['Bindings'] | undefined,
+  requestId: string | undefined,
+): Context<TEnv> {
+  const normalizedRequestId = validRequestId(requestId);
+  const headers = new Headers();
+  if (normalizedRequestId) headers.set(SERVICE_PLANE_REQUEST_ID_HEADER, normalizedRequestId);
+  const request = new Request(new URL(abilityPath, 'https://service-plane-native.internal'), {
+    headers,
+    method: 'POST',
+  });
+  const context = new Context<ServicePlaneServiceEnv<TEnv>>(request, {
     env: bindings ?? ({} as TEnv['Bindings']),
-    get: (key: string) => variables.get(key),
-    set: (key: string, value: unknown) => {
-      variables.set(key, value);
-    },
-  } as unknown as Context<TEnv>;
+    path: abilityPath,
+  });
+  if (normalizedRequestId) context.set('requestId', normalizedRequestId);
+  return context as unknown as Context<TEnv>;
 }
 
 async function resolveServiceJwks<TEnv extends Env>(

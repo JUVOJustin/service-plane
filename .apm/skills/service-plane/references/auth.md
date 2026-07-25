@@ -27,6 +27,12 @@ sequenceDiagram
 
 Tokens are short-lived ES256 JWS tokens. The control plane signs them. Services verify them with the control-plane JWKS.
 
+Treat an issued capability token as a bearer credential: use TLS outside private runtime bindings,
+never put it in URLs, cookies, or logs, and honor the token endpoint's `Cache-Control: no-store` and
+`Pragma: no-cache` response headers. These are the credential-handling principles from
+[RFC 6750](https://www.rfc-editor.org/rfc/rfc6750), not a claim that Service Plane implements the
+OAuth Bearer protocol.
+
 ## Generate The STS Signing Secret
 
 Run once:
@@ -67,9 +73,14 @@ Use HMAC caller auth as a shared-secret fallback:
 controlPlaneHmacTokenRequester({
   clientId: 'workflow-runner',
   controlPlaneUrl: 'https://plane.example.com',
-  secret: env.WORKFLOW_RUNNER_SECRET,
+  clientSecret: env.WORKFLOW_RUNNER_SECRET,
 });
 ```
+
+The built-in HTTP authenticators follow HTTP authentication grammar: scheme names are
+case-insensitive, credentials must contain exactly one scheme and one value, and a `401` response
+includes the corresponding `WWW-Authenticate` challenge. The JWK assertion remains a Service
+Plane request-bound format rather than an OAuth client assertion.
 
 ## Context And Identity
 
@@ -96,7 +107,9 @@ Keep identity small. It carries Service Plane caller and authorization claims, p
 
 ## Subject Delegation
 
-When the control plane brokers a call for an authenticated end user, the token follows RFC 8693 delegation semantics: `sub` carries the end user, the `act` (actor) claim names the acting service, and `spo` carries the user's org. Services read the user as `identity.subject`, while `identity.serviceId` stays the acting service.
+When the control plane brokers a call for an authenticated end user, the token uses RFC 8693's `act` actor-claim semantics: `sub` carries the end user and `act.sub` names the acting service. The `spo` organization claim is Service Plane-specific. Services read the user as `identity.subject`, while `identity.serviceId` stays the acting service.
+
+Service Plane does not expose the RFC 8693 token-exchange protocol. `/.well-known/service-plane/capability-token` is a package-specific JSON capability endpoint, and `scp`, `spo`, and `spb` are Service Plane-specific claims. The established claim names stay the same; only `act` borrows RFC 8693's delegation relationship.
 
 The flow with an application identity provider such as Supabase:
 
@@ -120,7 +133,11 @@ const plane = new ServicePlaneControlPlane({
   broker: {
     caller: async (context) => {
       const user = await verifySupabaseJwt(context); // application-owned verification
-      if (!user) return undefined;
+      if (!user) {
+        return context.json({ error: 'Unauthorized' }, 401, {
+          'WWW-Authenticate': 'Bearer realm="service-plane"',
+        });
+      }
       return { id: user.id, kind: 'user', orgId: user.orgId };
     },
   },
@@ -144,6 +161,38 @@ Boundaries to keep in mind:
 - Only control-plane code asserts subjects: the broker caller resolver or direct `issueCapabilityToken({ subject, ... })` calls. The HTTP token endpoint rejects caller-supplied `subject` fields, and the shipped token requesters (`controlPlaneHmacTokenRequester`, `controlPlaneJwkTokenRequester`, `controlPlaneRpcTokenRequester`) refuse to send one, so an authenticated service cannot claim it acts for an arbitrary user. The `subject` option on `createCapabilityTokenProvider` therefore only works with a `requestToken` that calls the issuer in-process.
 - Direct `issueCapabilityToken({ subject, ... })` mints a non-brokered token. For a target with `ingress` required, delegate through the broker instead — it selects `issueBrokeredCapabilityToken` automatically; a directly issued token is rejected by the ingress check.
 - Tokens delegated to a subject are cached per subject. `capabilityTokenCacheKey` includes the subject, so a token minted for one user is never served for another.
+
+## Forwarded Connection Info
+
+The plane terminates the client connection; the service only ever sees the plane. A service can therefore learn where a call came from only if the plane forwards it — and forwarding is opt-in, because it is an unsigned assertion.
+
+Wire the resolver on the broker and MCP mounts. `getConnInfo` is runtime-specific in Hono, so the application supplies the right one:
+
+```ts
+import { getConnInfo } from 'hono/cloudflare-workers'; // or 'hono/deno', '@hono/node-server/conninfo', ...
+
+new ServicePlaneControlPlane({
+  broker: { caller: resolveCaller, connInfo: (c) => getConnInfo(c) },
+  mcp: { caller: resolveCaller, connInfo: (c) => getConnInfo(c) },
+  // ...
+});
+```
+
+The plane then forwards it on every outbound call, exactly where it forwards the request id: the `X-Service-Plane-Conn-Info` header for HTTP-batch and service-binding transports, the `conn_info` query parameter for WebSocket, and the `connInfo` field on `connectAbility(...)` for native binding RPC.
+
+Services receive it as `connInfo` on the ability handler factory input:
+
+```ts
+handler: ({ connInfo, identity }) => new TasksHandler(identity, connInfo?.remote.address),
+```
+
+Rules the package enforces:
+
+- **Ingress is required.** Handlers see `connInfo` only when the service is configured with `ingress` **and** the token is brokered (`brokerServiceId` is a signed claim only the control plane can mint). Without ingress the service has no proof its peer is the plane, so a forwarded value would be indistinguishable from one a direct caller invented — it is dropped.
+- **The shape is validated on both ends.** Only Hono's `ConnInfo` fields survive, with a bounded address charset, a port in range, and the `tcp`/`udp` and `IPv4`/`IPv6` enumerations. Anything else is dropped rather than passed through.
+- **It is not in the token.** Connection info is request-scoped while capability tokens are cached and reused; putting an address in a claim would partition the token cache per client and write client PII into it.
+
+Treat it as advisory, for audit records and logs. It is not signature-verified, so it must never gate access — authorization stays with scopes, grants, and ingress. Per-client rate limiting belongs at the plane, which is where the connection actually terminates.
 
 ## Scope Checks
 

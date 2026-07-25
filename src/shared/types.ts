@@ -1,3 +1,5 @@
+import type { ConnInfo } from './conn-info.js';
+
 export const SERVICE_DISCOVERY_PATH = '/.well-known/service-plane/service.json';
 export const SERVICE_PLANE_OPENAPI_PATH = '/openapi.json';
 export const SERVICE_PLANE_CAPABILITY_JWKS_PATH = '/.well-known/service-plane/jwks.json';
@@ -134,11 +136,12 @@ export type ServiceGrantDefinition = {
 // WorkerEntrypoint forwarding to ServicePlaneService.connectAbility). Session-shaped, so
 // streaming method returns flow through it natively.
 export type ServiceAbilityNativeRpcBinding = {
-  connectAbility(input: { abilityId: string; requestId?: string; token: string }): Promise<object> | object;
+  connectAbility(input: { abilityId: string; connInfo?: ConnInfo; requestId?: string; token: string }): Promise<object> | object;
 };
 
 export type ServiceEndpoint = {
   abilityRpc?: ServiceAbilityNativeRpcBinding;
+  createWebSocket?: (url: string) => WebSocket;
   discovery?: ServiceDiscoveryDocument | (() => Promise<ServiceDiscoveryDocument> | ServiceDiscoveryDocument);
   fetch(request: Request): Promise<Response>;
   grants?: ServiceEndpointGrant[];
@@ -217,7 +220,9 @@ export type McpToolDiscovery = {
   description?: string;
   inputSchema: OpenApiObject;
   name: string;
-  outputSchema: OpenApiObject;
+  // MCP structured tool output is object-shaped. Primitive/array ability outputs are returned as
+  // text content and intentionally do not advertise an incompatible output schema.
+  outputSchema?: OpenApiObject;
 };
 
 export type McpResourceDiscovery = {
