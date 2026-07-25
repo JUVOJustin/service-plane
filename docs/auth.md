@@ -57,7 +57,9 @@ closed: an unknown service, scope, or grant is rejected, and an unreachable gran
 rather than a token.
 
 `createCapabilitySigningAuthorityFromSigningSecret({ signingSecret, issuer, keyId })` builds that half
-directly, and `mountCapabilityJwksEndpoint` accepts it, if you publish JWKS from your own Hono app.
+directly if you publish JWKS from your own Hono app. `mountCapabilityJwksEndpoint` takes it, and
+`mountCapabilityEndpoints` requires an explicit `jwks` provider — passing the issuer there is legal but
+re-couples key publication to service discovery, so the choice is yours to make on purpose.
 
 ## Caller Authentication Options
 
@@ -97,6 +99,160 @@ The built-in HTTP authenticators follow HTTP authentication grammar: scheme name
 case-insensitive, credentials must contain exactly one scheme and one value, and a `401` response
 includes the corresponding `WWW-Authenticate` challenge. The JWK assertion remains a Service
 Plane request-bound format rather than an OAuth client assertion.
+
+## Replay Protection
+
+A captured HMAC or JWK token request can be sent twice. Work out what that buys an attacker before
+deciding how much machinery to spend on it.
+
+### Risk Assessment
+
+| | |
+| --- | --- |
+| **Precondition** | The attacker holds the signed request bytes. That means TLS interception, access to retained request logs or headers, or a proxy, sidecar, or gateway in the path. In most of those positions the *response* is also readable — and the response already contains the token, so replay is the slower path to the same thing. |
+| **Gain** | One more capability token for the same caller, the same target service, and the same scopes. Issuance still runs the full grant check, so it is a duplicate of a token the caller is entitled to. |
+| **Exposure window** | HMAC: the timestamp skew window, default 60s (`maxSkewSeconds`). JWK: the assertion's `exp` plus the skew window, with the lifetime capped at 300s (`maxAssertionTtlSeconds`). Past that the request is rejected on timestamp grounds whether or not a store exists. |
+| **Not reachable by replay** | Editing the request — method, path, body hash, client id, and request id are all signed. Retargeting to another service, widening scopes, impersonating another caller, or extending the token TTL past the plane's maximum. |
+| **Residual risk with no store** | A handful of extra tokens inside a ≤60s window, each capped at the plane's token TTL, each carrying scopes the caller already holds. |
+
+**Assessment: low.** A replay store narrows an already-narrow window and does not lower the ceiling
+on what an attacker obtains. So replay protection here is **defense in depth**. The controls that do
+the real work are always on and need no configuration:
+
+- TLS between caller and plane.
+- Request binding: the signature covers method, path, body hash, client id, and request id.
+- The timestamp skew window and, for JWK, the assertion lifetime.
+- Short capability-token TTLs, and grant checks at issuance.
+
+The cheapest way to shrink the window further needs no infrastructure at all: lower `maxSkewSeconds`
+(to the tightest value your clock discipline tolerates) and `maxAssertionTtlSeconds`. Do that before
+reaching for a store.
+
+Cases where a store does earn its cost: request headers are retained in logs or an APM while
+responses are not; a component can replay a request it could not observe the response to; one-time-use
+assertions are a compliance requirement; or duplicate token issuance is itself an audit finding.
+
+### Precedent
+
+This baseline — bind the request, bound the window, treat replay reservation as optional hardening —
+is where the specifications and the large deployments land. Cited as precedent for the shape of the
+control, not as a compliance claim:
+
+- **RFC 7523 §3** (JWT profile for OAuth 2.0 client authentication) makes it explicitly optional: an
+  authorization server "MAY ensure that JWTs are not replayed by maintaining the set of used `jti`
+  values for the length of time for which the JWT would be considered valid". A MAY, and bounded to
+  the assertion's own validity window — which is exactly the TTL Service Plane passes to `reserve()`.
+- **RFC 9449 §11.1** (DPoP) treats proof replay the same way: a server *can* store each proof's `jti`
+  for the window in which that proof would still be accepted. Where DPoP wants a stronger guarantee it
+  does not reach for a bigger cache, it adds a server-issued nonce.
+- **RFC 9421** (HTTP Message Signatures) keeps `nonce` an optional signature parameter and leans on
+  `created` / `expires` for replay windows, leaving nonce tracking to verifiers that need it.
+- **AWS SigV4** ships no replay store at all. A signed request is accepted inside a 5-minute skew
+  window, on TLS, at AWS's scale — the same trade this package makes by default.
+- **Stripe webhooks** sign with HMAC and a timestamp, default a 5-minute tolerance, and hand
+  duplicate suppression to the consumer as idempotent event handling rather than guaranteeing
+  exactly-once delivery themselves.
+
+`replayCache` is therefore **optional and off by default**. There is one supported configuration on
+each side of that choice:
+
+| Configuration | Guarantee |
+| --- | --- |
+| No `replayCache` (default) | A captured request is reusable until its skew window or assertion lifetime expires. Horizontal scaling is unaffected. |
+| A shared store | Exactly one copy of a request wins, regardless of which replica or isolate receives it. |
+
+There is no third option on purpose. A process- or isolate-local cache is not offered, because it
+would look like protection while only the replica that saw the first copy rejects the second, with
+nothing reporting the gap. Nor is a store with a separate read and write: two replicas can both
+observe "absent" before either writes, and that failure is invisible too. `replayCache` accepts one
+operation, `reserve(key, ttlSeconds)`, and it must be atomic and reachable by every replica.
+
+Configuring a store is opting into the guarantee, so it is enforced without further settings:
+
+```ts
+hmacServiceClientAuth({
+  clients,
+  replayCache: redisReplayCache(env.REDIS_URL),
+});
+```
+
+### Two Node Replicas
+
+Both replicas run the same image behind a load balancer and share one Redis. `SET key value NX EX ttl`
+is the atomic reservation: it succeeds only if the key does not exist.
+
+```ts
+function redisReplayCache(redis: { set(...args: string[]): Promise<string | null> }): ServicePlaneReplayCache {
+  return {
+    // NX makes the write conditional; EX bounds it. One command, so no read/write gap to race.
+    async reserve(key, ttlSeconds) {
+      return (await redis.set(key, '1', 'NX', 'EX', String(ttlSeconds))) === 'OK';
+    },
+  };
+}
+
+const authenticateCaller = jwkServiceClientAuth({
+  clients,
+  replayCache: redisReplayCache(redis),
+});
+```
+
+Replica A accepts the request and reserves the key. Replica B receives the replay, finds the key
+present, and answers `401`. Only the replay cache is shared: signing configuration is identical on
+both replicas, but each keeps its own issuer, registry, and OpenAPI caches.
+
+### Two Cloudflare Isolates
+
+Several isolates may serve one Worker deployment, in different locations, created and evicted at any
+time. An isolate-local `Map` cannot see a sibling's reservations. Route every replay key to one
+Durable Object instead — `idFromName(key)` gives consistent routing, and the object's single-threaded
+storage gives atomicity:
+
+```ts
+function durableObjectReplayCache(namespace: DurableObjectNamespace): ServicePlaneReplayCache {
+  return {
+    async reserve(key, ttlSeconds) {
+      const stub = namespace.get(namespace.idFromName(key));
+      const response = await stub.fetch('https://replay.internal/reserve', {
+        body: JSON.stringify({ key, ttlSeconds }),
+        method: 'POST',
+      });
+      return (await response.json<{ reserved: boolean }>()).reserved;
+    },
+  };
+}
+```
+
+Cloudflare KV is not suitable here: its reads are eventually consistent, so two isolates can both
+read "absent" for a key one of them has already written. Use KV for discovery snapshots and OpenAPI
+documents, not for replay reservations.
+
+### When The Store Is Unavailable
+
+Redis restarts. Durable Objects have bad minutes. If `reserve()` throws, the request is refused with
+`503` and `{ "error": "Service-Plane replay verification unavailable" }`, and a
+`replay_cache_unavailable` event is logged. There is no `401` and no `WWW-Authenticate` challenge:
+the caller's credentials were valid and re-signing would not help.
+
+This is not configurable, and the trade-off is worth being explicit about. Wiring a store is a
+statement that replay must not happen, so serving unprotected would quietly break that statement —
+and a switch to permit it is a switch that gets flipped once during an incident and never flipped
+back. The cost is real: **the replay store becomes a hard dependency of token issuance**, so a store
+outage is a token outage, and every brokered call fails with it. Give it the same uptime budget,
+health checks, and alerting as the plane itself.
+
+If that dependency is not one you want, do not configure a store. The default is a documented
+baseline, not a broken state.
+
+### Out Of Scope
+
+Cloudflare same-account `controlPlaneRpcTokenRequester` calls are not part of this problem. The
+caller identity is pinned by the private service-binding entrypoint and no HMAC or JWK HTTP assertion
+is sent, so there is nothing to capture and replay.
+
+Issued capability tokens are separate too. They are bearer credentials and may be reused on purpose
+until they expire; replay protection is about re-using a caller-authentication request to mint
+another token.
 
 ## Context And Identity
 

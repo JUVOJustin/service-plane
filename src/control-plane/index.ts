@@ -83,12 +83,12 @@ export {
   type HmacServiceClient,
   type HmacServiceClientAuthLogEvent,
   type HmacServiceClientAuthOptions,
-  type HmacServiceClientReplayCache,
   hmacServiceClientAuth,
   type JwkServiceClient,
   type JwkServiceClientAuthLogEvent,
   type JwkServiceClientAuthOptions,
   jwkServiceClientAuth,
+  type ServicePlaneReplayCache,
 } from './caller-auth.js';
 export {
   type CapabilityIssuer,

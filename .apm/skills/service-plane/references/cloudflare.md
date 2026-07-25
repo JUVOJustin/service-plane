@@ -139,6 +139,12 @@ The service ability stays stateless. The Durable Object owns provider state:
 
 Use `identity.subject` (when the control plane delegates the call to an end user) together with validated input fields such as `connectionId` to route to the Durable Object. Do not pass provider credentials through Dynamic Workflow metadata or Service Plane identity.
 
+A Durable Object is also the right home for caller-auth replay reservations: several isolates may
+serve one control-plane deployment, so module-scope memory cannot reject a request replayed against a
+sibling isolate. Route each replay key with `idFromName(key)` and reserve inside the object — see
+[auth.md](auth.md#two-cloudflare-isolates). Cloudflare KV is not usable for this: eventually
+consistent reads let two isolates both see a key as absent.
+
 ## Dynamic Workers And Workflows
 
 The loader can inject a small binding into the dynamic workflow.

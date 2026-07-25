@@ -88,9 +88,10 @@ export type MountCapabilityJwksEndpointOptions = {
 export type MountCapabilityEndpointsOptions = {
   authenticateCaller(context: Context): Promise<Response | string> | Response | string;
   httpCache?: ServicePlaneHttpCacheOption;
-  // Serves JWKS from a signing authority instead of the token issuer, so key publication stays up
-  // while the authorization catalog is unavailable. Defaults to the issuer.
-  jwks?: CapabilityJwksProviderResolver;
+  // Required, and separate from the issuer on purpose: passing the issuer here couples key
+  // publication to the authorization catalog, so a service-discovery outage takes JWKS down with it.
+  // Pass a signing authority unless you have a reason to accept that coupling.
+  jwks: CapabilityJwksProviderResolver;
   jwksPath?: string;
   tokenPath?: string;
 };
@@ -259,7 +260,7 @@ export function mountCapabilityEndpoints(
     authenticateCaller: options.authenticateCaller,
     ...(options.tokenPath ? { path: options.tokenPath } : {}),
   });
-  mountCapabilityJwksEndpoint(app, options.jwks ?? issuer, {
+  mountCapabilityJwksEndpoint(app, options.jwks, {
     ...(options.httpCache === undefined ? {} : { httpCache: options.httpCache }),
     ...(options.jwksPath ? { path: options.jwksPath } : {}),
   });

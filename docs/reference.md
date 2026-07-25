@@ -286,7 +286,7 @@ Control-plane events:
 - `service_plane.mcp.resource.completed` / `service_plane.mcp.resource.failed` (`ServicePlaneBrokerLogEvent`)
 - `service_plane.mcp.prompt.completed` / `service_plane.mcp.prompt.failed` (`ServicePlaneBrokerLogEvent`)
 - `service_plane.caller_auth.not_configured` (`ServicePlaneControlPlaneLogEvent`)
-- `service_plane.caller_auth.hmac_unauthorized` / `service_plane.caller_auth.jwk_unauthorized` (caller-auth middleware, own `log` option)
+- `service_plane.caller_auth.hmac_unauthorized` / `service_plane.caller_auth.jwk_unauthorized` (caller-auth middleware, own `log` option). The `reason` field names the check that failed, including `replayed_signature` / `replayed_assertion` for a lost replay reservation and `replay_cache_unavailable` for a replay-store error.
 
 Where the events go is up to the app. Each surface takes a `log` callback that is invoked once per event; when it is omitted, the package writes the event as one JSON line to the console. The package never talks to a logging framework itself — you forward events to whatever logger the app uses:
 
@@ -317,6 +317,31 @@ Use separate caches for:
 
 Token cache keys include caller id, target service id, ability id, normalized scopes, optional TTL, and the delegated subject when present — a token minted for one end user is never served for another.
 
+### Replay Cache
+
+`hmacServiceClientAuth` and `jwkServiceClientAuth` accept the same `replayCache`:
+
+```ts
+type ServicePlaneReplayCache = {
+  reserve(key: string, ttlSeconds: number): Promise<boolean> | boolean;
+};
+```
+
+`reserve(key, ttlSeconds)` must:
+
+- **be atomic** — one create-if-absent operation. Return `true` if this call created the key, `false` if it already existed. Concurrent calls for one key must produce exactly one `true`.
+- **be routed consistently** — every copy of a given key must reach the same authoritative store or object. Consistent hashing on the key, or `idFromName(key)` for a Durable Object, satisfies this; per-replica memory does not.
+- **expire on its own** — honor `ttlSeconds` as a floor. Service Plane passes the HMAC skew window, or the JWK assertion `exp` plus the skew window, so a reservation always outlives the credential it guards. Never expire a key early; expiring late only costs storage.
+- **read its own writes** — eventually consistent stores (Cloudflare KV) cannot provide this and are unsuitable.
+
+Keys are already namespaced by Service Plane as `service-plane:hmac:<clientId>:<requestId|signature>` and `service-plane:jwk:<clientId>:<requestId|jti>`. Add your own prefix if the store is shared with other workloads.
+
+There is deliberately no separate-read-then-write form of this interface. It would be racy across replicas — both could observe "absent" before either writes — and the failure is invisible, so the unsafe shape simply is not expressible.
+
+`replayCache` is optional and there are no accompanying settings: configuring a store means the guarantee is enforced. A lost reservation is a `401`; a store that throws is a `503` with no `WWW-Authenticate` (see [auth.md](auth.md#when-the-store-is-unavailable) — this makes the store a hard dependency of token issuance). Omitting it leaves replay bounded by the request binding plus the skew window.
+
+Both authenticators log `replayed_signature` / `replayed_assertion` when a reservation is lost and `replay_cache_unavailable` when the store errors. See [auth.md](auth.md#replay-protection) for what a replay actually buys an attacker and for deployment examples.
+
 HTTP edge caching of the metadata GET routes (discovery, OpenAPI, JWKS) is separate from these data caches and is controlled by the `httpCache` option on `ServicePlaneService` and `ServicePlaneControlPlane`:
 
 ```ts
@@ -333,6 +358,7 @@ Built-in tags: `service-plane` on every cached route, plus `service-plane:discov
 
 - Missing or invalid token: `CapabilityAuthError` with 401-style status.
 - Missing scope: `CapabilityAuthError` with 403-style status.
+- Configured replay store unavailable: `503` with no `WWW-Authenticate` challenge.
 - Invalid caller input: `AbilityValidationError` with 422-style status.
 - Invalid service output: `AbilityValidationError` with 500-style status.
 

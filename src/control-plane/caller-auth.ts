@@ -48,6 +48,8 @@ export type HmacServiceClientAuthLogEvent = {
     | 'missing_client'
     | 'missing_signature'
     | 'missing_timestamp'
+    | 'replay_cache_unavailable'
+    | 'replayed_signature'
     | 'timestamp_skew';
   requestId?: string;
 };
@@ -59,19 +61,22 @@ export type HmacServiceClientAuthOptions = {
   maxBodyBytes?: number;
   maxSkewSeconds?: number;
   now?: () => Date;
-  replayCache?: HmacServiceClientReplayCache;
+  replayCache?: ServicePlaneReplayCache;
   requestIdHeader?: string;
   timestampHeader?: string;
 };
 
-export type HmacServiceClientReplayCache =
-  | {
-      reserve(key: string, ttlSeconds: number): Promise<boolean> | boolean;
-    }
-  | {
-      get(key: string): Promise<boolean> | boolean;
-      set(key: string, ttlSeconds: number): Promise<void> | void;
-    };
+// Optional. Without it, replay is bounded by the request binding plus the skew window, which is the
+// documented baseline and scales horizontally on its own.
+//
+// Configuring one is opting into a guarantee, so it is enforced without further settings: one atomic
+// create-if-absent per key, backed by a store every replica reaches. Exactly one copy of a replayed
+// request can win, and a store that cannot answer refuses the request rather than serving unprotected.
+// Separate read-then-write is deliberately not accepted — two replicas can both observe "absent"
+// before either writes, which loses the guarantee with no visible symptom.
+export type ServicePlaneReplayCache = {
+  reserve(key: string, ttlSeconds: number): Promise<boolean> | boolean;
+};
 
 export type JwkServiceClient = {
   clientId: string;
@@ -92,6 +97,7 @@ export type JwkServiceClientAuthLogEvent = {
     | 'missing_client'
     | 'missing_key'
     | 'missing_signature'
+    | 'replay_cache_unavailable'
     | 'replayed_assertion'
     | 'timestamp_skew';
   requestId?: string;
@@ -110,7 +116,7 @@ export type JwkServiceClientAuthOptions = {
   registryCache?: RegistryCache;
   registryCacheKey?: string;
   registryCacheTtlSeconds?: number;
-  replayCache?: HmacServiceClientReplayCache;
+  replayCache?: ServicePlaneReplayCache;
   requestIdHeader?: string;
   services?: ServiceEndpoint[] | ((context: Context) => Promise<ServiceEndpoint[]> | ServiceEndpoint[]);
 };
@@ -177,12 +183,22 @@ export function hmacServiceClientAuth(options: HmacServiceClientAuthOptions) {
         log(hmacUnauthorizedEvent(context, 'invalid_signature', 'Invalid Service-Plane HMAC signature'));
         return callerAuthUnauthorized(context, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME);
       }
-      if (
-        options.replayCache &&
-        (await isHmacReplay(options.replayCache, clientId, context.req.header(requestIdHeader)?.trim() || signature, maxSkewSeconds))
-      ) {
-        log(hmacUnauthorizedEvent(context, 'invalid_signature', 'Replayed Service-Plane HMAC signature'));
-        return callerAuthUnauthorized(context, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME);
+      if (options.replayCache) {
+        // The signature is the fallback replay key: it already binds method, path, body, timestamp,
+        // and client, so a captured request replays under the same key even without a request id.
+        const reservation = await reserveReplayKey(
+          options.replayCache,
+          `service-plane:hmac:${clientId}:${context.req.header(requestIdHeader)?.trim() || signature}`,
+          maxSkewSeconds,
+        );
+        if (reservation.decision === 'replayed') {
+          log(hmacUnauthorizedEvent(context, 'replayed_signature', 'Replayed Service-Plane HMAC signature'));
+          return callerAuthUnauthorized(context, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME);
+        }
+        if (reservation.decision === 'unavailable') {
+          log(hmacUnauthorizedEvent(context, 'replay_cache_unavailable', replayCacheUnavailableMessage(reservation.error)));
+          return replayVerificationUnavailable(context);
+        }
       }
 
       return client.serviceId ?? client.clientId;
@@ -265,17 +281,22 @@ export function jwkServiceClientAuth(options: JwkServiceClientAuthOptions) {
         now,
         requestIdHeader,
       });
-      if (
-        options.replayCache &&
-        (await isCallerAuthReplay(
+      if (options.replayCache) {
+        // TTL outlives the assertion plus the accepted skew, so a reservation can never expire while
+        // the assertion it guards would still verify.
+        const reservation = await reserveReplayKey(
           options.replayCache,
-          clientId,
-          claims.requestId ?? claims.jti,
+          `service-plane:jwk:${clientId}:${claims.requestId ?? claims.jti}`,
           jwkReplayTtlSeconds(claims, now, maxSkewSeconds),
-        ))
-      ) {
-        log(jwkUnauthorizedEvent(context, 'replayed_assertion', 'Replayed Service-Plane JWK assertion'));
-        return callerAuthUnauthorized(context, SERVICE_PLANE_JWK_AUTHORIZATION_SCHEME);
+        );
+        if (reservation.decision === 'replayed') {
+          log(jwkUnauthorizedEvent(context, 'replayed_assertion', 'Replayed Service-Plane JWK assertion'));
+          return callerAuthUnauthorized(context, SERVICE_PLANE_JWK_AUTHORIZATION_SCHEME);
+        }
+        if (reservation.decision === 'unavailable') {
+          log(jwkUnauthorizedEvent(context, 'replay_cache_unavailable', replayCacheUnavailableMessage(reservation.error)));
+          return replayVerificationUnavailable(context);
+        }
       }
 
       return client.serviceId ?? client.clientId;
@@ -512,30 +533,29 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
-async function isHmacReplay(
-  replayCache: HmacServiceClientReplayCache,
-  clientId: string,
-  idempotencyKey: string,
-  ttlSeconds: number,
-): Promise<boolean> {
-  const key = `service-plane:hmac:${clientId}:${idempotencyKey}`;
-  if ('reserve' in replayCache) return !(await replayCache.reserve(key, ttlSeconds));
-  if (await replayCache.get(key)) return true;
-  await replayCache.set(key, ttlSeconds);
-  return false;
+type ReplayReservation = {
+  decision: 'accepted' | 'replayed' | 'unavailable';
+  error?: string;
+};
+
+// One reservation attempt per authenticated request. A store error is reported rather than thrown so
+// the caller-auth path decides between refusing the request and accepting it without protection.
+async function reserveReplayKey(replayCache: ServicePlaneReplayCache, key: string, ttlSeconds: number): Promise<ReplayReservation> {
+  try {
+    return { decision: (await replayCache.reserve(key, ttlSeconds)) ? 'accepted' : 'replayed' };
+  } catch (error) {
+    return { decision: 'unavailable', error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
-async function isCallerAuthReplay(
-  replayCache: HmacServiceClientReplayCache,
-  clientId: string,
-  idempotencyKey: string,
-  ttlSeconds: number,
-): Promise<boolean> {
-  const key = `service-plane:jwk:${clientId}:${idempotencyKey}`;
-  if ('reserve' in replayCache) return !(await replayCache.reserve(key, ttlSeconds));
-  if (await replayCache.get(key)) return true;
-  await replayCache.set(key, ttlSeconds);
-  return false;
+function replayCacheUnavailableMessage(error: string | undefined): string {
+  return `Service-Plane replay cache is unavailable${error ? `: ${error}` : ''}`;
+}
+
+// Not a credential problem, so no 401 and no challenge: the caller signed correctly and the plane
+// cannot currently prove the request is fresh.
+function replayVerificationUnavailable(context: Context): Response {
+  return context.json({ error: 'Service-Plane replay verification unavailable' }, 503);
 }
 
 function requestIdFromContext(context: Context): string | undefined {
