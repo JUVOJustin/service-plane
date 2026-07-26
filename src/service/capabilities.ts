@@ -301,16 +301,19 @@ export function createCapabilityTokenProvider(options: CreateCapabilityTokenProv
   const scopes = normalizeScopes(options.scopes);
   const ttlSeconds = options.ttlSeconds === undefined ? undefined : normalizeTtlSeconds(options.ttlSeconds);
   const subject = options.subject === undefined ? undefined : normalizeCapabilitySubject(options.subject);
-  // A caller-supplied cacheKey is still partitioned by the delegated subject: services authorize
-  // per user from identity.subject, so one user's cached token must never serve another.
+  const senderConstrained = Boolean((options.requestToken as CapabilityTokenRequester | undefined)?.proveTokenPossession);
+  // A caller-supplied cacheKey is still partitioned by the delegated subject and by binding: services
+  // authorize per user from identity.subject, so one user's cached token must never serve another, and a
+  // proof-capable provider must never reuse an entry written by an unbound one.
   const cacheKey = options.cacheKey
     ? subject
-      ? `${options.cacheKey}:subject:${encodeURIComponent(JSON.stringify({ id: subject.id, orgId: subject.orgId ?? null }))}`
-      : options.cacheKey
+      ? `${options.cacheKey}${senderConstrained ? ':cnf' : ''}:subject:${encodeURIComponent(JSON.stringify({ id: subject.id, orgId: subject.orgId ?? null }))}`
+      : `${options.cacheKey}${senderConstrained ? ':cnf' : ''}`
     : capabilityTokenCacheKey({
         ...(options.abilityId ? { abilityId: normalizeValue(options.abilityId, 'ability id') } : {}),
         callerServiceId,
         scopes,
+        ...(senderConstrained ? { senderConstrained } : {}),
         ...(subject ? { subject } : {}),
         targetServiceId,
         ...(ttlSeconds === undefined ? {} : { ttlSeconds }),
@@ -357,6 +360,7 @@ export function capabilityTokenCacheKey(input: {
   abilityId?: string;
   callerServiceId: string;
   scopes: string[];
+  senderConstrained?: boolean;
   subject?: CapabilitySubject;
   targetServiceId: string;
   ttlSeconds?: number;
@@ -365,6 +369,10 @@ export function capabilityTokenCacheKey(input: {
     abilityId: input.abilityId ?? null,
     callerServiceId: input.callerServiceId,
     scopes: [...input.scopes].sort(),
+    // Partitions proof-capable entries from unbound ones. A shared cache can hold an unbound token for
+    // the same caller, target, and scopes — minted through HMAC, or before binding existed — and reusing
+    // it would skip the proof and hand the service a bearer token, silently losing the binding.
+    ...(input.senderConstrained ? { senderConstrained: true } : {}),
     // Included conditionally so subject-less keys stay byte-identical with earlier releases; tokens
     // delegated to a subject must never be shared across subjects through the token cache.
     ...(input.subject ? { subject: { id: input.subject.id, orgId: input.subject.orgId ?? null } } : {}),

@@ -1,7 +1,7 @@
 import { RpcTarget } from 'capnweb';
 import { describe, expect, it } from 'vitest';
 import * as z from 'zod';
-import { abilitySession } from '../service/capabilities.js';
+import { abilitySession, createCapabilityTokenProvider } from '../service/capabilities.js';
 import {
   abilityMethod,
   controlPlaneJwkTokenRequester,
@@ -139,6 +139,39 @@ describe('sender-constrained capability tokens', () => {
         token: issued.token,
       }),
     ).rejects.toThrow(/does not match the capability token it accompanies/u);
+  });
+
+  it('never reuses an unbound cached token for a proof-capable caller', async () => {
+    const caller = await callerKeys();
+    const { requestToken } = await deployment(caller);
+    const entries = new Map<string, { expiresAt: Date | string; token: string }>();
+    const cache = {
+      get: async (key: string) => entries.get(key),
+      set: async (key: string, value: { expiresAt: Date | string; token: string }) => {
+        entries.set(key, value);
+      },
+    };
+    const shared = {
+      callerServiceId: CALLER,
+      cache,
+      scopes: ['example.sync.run'],
+      targetServiceId: 'example',
+    };
+
+    // An unbound token for the same caller, target, and scopes — what an HMAC provider, or a release
+    // from before binding existed, would have written into a shared cache.
+    const unbound = createCapabilityTokenProvider({
+      ...shared,
+      requestToken: async () => ({ expiresAt: new Date(Date.now() + 60_000), token: 'unbound.token.value' }),
+    });
+    await unbound.token();
+
+    // The proof-capable provider must not read that entry: it carries no cnf, so the session would skip
+    // the proof and hand the service a bearer token, silently losing the binding.
+    const boundProvider = createCapabilityTokenProvider({ ...shared, requestToken });
+    const token = await boundProvider.token();
+    expect(token).not.toBe('unbound.token.value');
+    expect((decodeCapabilityTokenPayload(token) as unknown as { cnf?: unknown }).cnf).toBeDefined();
   });
 
   it('leaves HMAC callers unbound, since a shared secret has no key to confirm', async () => {

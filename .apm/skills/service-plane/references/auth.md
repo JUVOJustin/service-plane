@@ -164,10 +164,6 @@ Cloudflare same-account `controlPlaneRpcTokenRequester` calls are not part of th
 caller identity is pinned by the private service-binding entrypoint and no HMAC or JWK HTTP assertion
 is sent, so there is nothing to capture and replay.
 
-Issued capability tokens are a separate problem, and a larger one — replay protection is about
-re-using a caller-authentication *request*, and does nothing about a stolen token. That is what
-sender-constrained tokens are for.
-
 ## Sender-Constrained Tokens
 
 A capability token is a bearer credential by default: whoever holds the bytes can use it. So the
@@ -209,16 +205,6 @@ does not use a shipped requester, or signs with a different key.
 
 Unbound tokens cost nothing: the session checks for `cnf` before signing, so callers that are not
 sender-constrained never pay for a signature.
-
-### Rolling It Out
-
-Upgrade callers before the plane. A caller on the new release signs a proof only when the token carries
-a lock, so it behaves identically against an old plane. Once the plane upgrades and starts locking
-tokens, those callers already prove possession. Services can be upgraded whenever — an older service
-ignores the claim and treats the token as a bearer credential, which is where it started.
-
-Note that only JWK callers are affected at all. HMAC callers have no key to lock to, and Cloudflare
-service-binding callers never send a token over a network.
 
 ### Where It Applies
 
