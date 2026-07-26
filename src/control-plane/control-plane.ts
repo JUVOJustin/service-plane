@@ -293,8 +293,10 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       ...(this.options.ttlSeconds ? { ttlSeconds: this.options.ttlSeconds } : {}),
     });
     this.issuers.set(cacheKey, issuer);
-    // A rejected issuer (an unreachable grant target, say) must not be memoized as a permanent
-    // failure; the next request re-resolves the catalog once discovery recovers.
+    // Construction failures — bad key material, a duplicate service id in the discovered catalog —
+    // must not be memoized as permanent; the next request rebuilds. Catalog drift no longer lands
+    // here: an unknown grant target or scope resolves and refuses that target at issuance instead,
+    // so the cache key (which embeds the discovered capabilities) is what expires it on recovery.
     issuer.catch(() => {
       if (this.issuers.get(cacheKey) === issuer) this.issuers.delete(cacheKey);
     });

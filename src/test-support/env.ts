@@ -1,5 +1,6 @@
 import type { UpgradeWebSocket } from 'hono/ws';
 import { cloudflareServiceBinding } from '../control-plane/endpoints.js';
+import { type CapabilityRpcTransport, cloudflareNativeRpc, httpBatchRpc } from '../service/index.js';
 import type { AbilityTransport, ServiceAbilityNativeRpcBinding, ServiceEndpoint, ServiceEndpointGrant } from '../shared/types.js';
 
 export type DemoEnvironmentName = 'http-batch' | 'native-rpc' | 'websocket';
@@ -17,11 +18,20 @@ export type DemoEndpointInput = {
   service: DemoServiceHost;
 };
 
+export type DemoCallerTransportInput = {
+  abilityId: string;
+  origin: string;
+  service: DemoServiceHost;
+};
+
 // A deployment shape a service can be reached through. Specs stay environment-agnostic: they take
 // `transports` for their ability declarations, and the environment wires the matching endpoint. That
 // is what lets one scenario run as a matrix instead of being pinned to whichever transport its
 // author happened to pick.
 export type DemoEnvironment = {
+  // How a direct (non-brokered) caller reaches the service here. Without this the caller leg would
+  // be HTTP-batch in every environment, and a transport sweep would compare identical rows.
+  callerTransport(input: DemoCallerTransportInput): CapabilityRpcTransport;
   endpoint(input: DemoEndpointInput): ServiceEndpoint;
   name: DemoEnvironmentName;
   transports: AbilityTransport[];
@@ -32,6 +42,7 @@ export type DemoEnvironment = {
 // Plain Worker-to-Worker fetch. The baseline every service supports.
 export function httpBatchEnv(): DemoEnvironment {
   return {
+    callerTransport: (input) => httpBatchRpc(`${input.origin}/rpc/${input.abilityId}`),
     endpoint: (input) =>
       cloudflareServiceBinding({
         binding: { fetch: async (request) => input.service.fetch(request) },
@@ -48,18 +59,22 @@ export function httpBatchEnv(): DemoEnvironment {
 // The hooks exist because "did the plane actually take this path, and did it clean up?" is the
 // question these tests are usually asking.
 export function nativeRpcEnv(options: { onConnect?: () => void; onDispose?: () => void } = {}): DemoEnvironment {
+  const binding = (service: DemoServiceHost): ServiceAbilityNativeRpcBinding => ({
+    async connectAbility(connect) {
+      options.onConnect?.();
+      const target = await service.connectAbility(connect);
+      // Replaces the real disposer, matching what a counting test wants to observe.
+      if (options.onDispose) Object.defineProperty(target, Symbol.dispose, { value: options.onDispose });
+      return target;
+    },
+  });
+
   return {
+    // A same-account caller reaches a native binding directly, without HTTP in between.
+    callerTransport: (input) => cloudflareNativeRpc(binding(input.service)),
     endpoint: (input) =>
       cloudflareServiceBinding({
-        abilityRpc: {
-          async connectAbility(connect) {
-            options.onConnect?.();
-            const target = await input.service.connectAbility(connect);
-            // Replaces the real disposer, matching what a counting test wants to observe.
-            if (options.onDispose) Object.defineProperty(target, Symbol.dispose, { value: options.onDispose });
-            return target;
-          },
-        },
+        abilityRpc: binding(input.service),
         binding: { fetch: async (request) => input.service.fetch(request) },
         grants: input.grants,
         id: input.id,
@@ -80,6 +95,10 @@ export function websocketEnv(options: { createWebSocket?: (url: string) => WebSo
       throw new Error('unexpected WebSocket connection to the service');
     });
   return {
+    // Deliberately HTTP-batch: there is no socket to accept in-memory. The point of this row is
+    // that *advertising* websocket must not change how a unary call is routed — if anything dialed,
+    // `createWebSocket` would throw and the test would fail.
+    callerTransport: (input) => httpBatchRpc(`${input.origin}/rpc/${input.abilityId}`),
     endpoint: (input) =>
       cloudflareServiceBinding({
         binding: { fetch: async (request) => input.service.fetch(request) },

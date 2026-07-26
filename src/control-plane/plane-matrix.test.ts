@@ -3,9 +3,16 @@ import * as z from 'zod';
 import { abilityMethod, defineAbility, RpcTarget, requireScopes } from '../service/index.js';
 import { DEMO_CALLER_ID, type DemoApp, type DemoServiceSpec, demoApp, demoEnvironments } from '../test-support/index.js';
 
-// The same two-service plane, deployed through every transport the package supports. Single-service
-// fixtures pinned to one transport are how a plane-wide coupling bug (#24) stayed invisible; this
-// sweeps both dimensions so a regression has nowhere to hide.
+// The same two-service plane, deployed through each transport shape. Single-service fixtures pinned
+// to one transport are how a plane-wide coupling bug (#24) stayed invisible, so this sweeps both
+// dimensions. What each row pins:
+//
+// - http-batch: both legs go over fetch.
+// - native-rpc: both legs go through the binding — `transportForAbility` picks it for the plane leg,
+//   `env.callerTransport` for the direct leg.
+// - websocket: the ability advertises a session transport that nothing should dial for unary calls.
+//   `websocketEnv` throws on `createWebSocket`, so an accidental upgrade fails the row rather than
+//   passing as a duplicate of http-batch.
 type EchoApiShape = { echo(input: { value: string }): Promise<{ caller: string; service: string; value: string }> };
 
 describe.each(demoEnvironments())('two-service plane over $name', (env) => {

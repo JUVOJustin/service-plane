@@ -2,13 +2,7 @@ import { newHttpBatchRpcSession } from 'capnweb';
 import type { BrokerCaller } from '../control-plane/broker.js';
 import { ServicePlaneControlPlane, type ServicePlaneControlPlaneOptions } from '../control-plane/control-plane.js';
 import { generateCapabilitySigningSecret } from '../control-plane/signing-secret.js';
-import {
-  type AnyServiceAbilityDefinition,
-  abilitySession,
-  defineCapabilities,
-  httpBatchRpc,
-  ServicePlaneService,
-} from '../service/index.js';
+import { type AnyServiceAbilityDefinition, abilitySession, defineCapabilities, ServicePlaneService } from '../service/index.js';
 import type { ServicePlaneLoggableEvent } from '../shared/logging.js';
 import {
   type AbilityTransport,
@@ -220,7 +214,10 @@ export async function demoApp(options: DemoAppOptions): Promise<DemoApp> {
 
     redeploy(serviceId, changes) {
       const current = deployment(serviceId);
-      deploy({ ...current.spec, ...changes }, { available: current.available, grants: current.grants });
+      // `id` is pinned to the argument, not taken from `changes`: TypeScript skips excess-property
+      // checks on spreads, so a spread-in spec carrying a different id would otherwise register a
+      // second deployment while the named one kept running its old service.
+      deploy({ ...current.spec, ...changes, id: serviceId }, { available: current.available, grants: current.grants });
     },
 
     service: (serviceId) => deployment(serviceId).service,
@@ -239,7 +236,7 @@ export async function demoApp(options: DemoAppOptions): Promise<DemoApp> {
         },
         scopes,
         targetServiceId: serviceId,
-        transport: httpBatchRpc(`${target.origin}/rpc/${abilityId}`),
+        transport: env.callerTransport({ abilityId, origin: target.origin, service: host(target) }),
       });
     },
 

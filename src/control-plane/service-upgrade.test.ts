@@ -24,7 +24,7 @@ describe('one plane, two services, one upgraded', () => {
     await expect(runDirect(app, 'beta', 'beta.run')).resolves.toMatchObject({ caller: DEMO_CALLER_ID, service: 'beta' });
 
     // `beta` deploys: `beta.run` becomes `beta.execute`. The plane's grant still says `beta.run`.
-    app.redeploy('beta', { ...jobsService('beta', 'beta.execute'), version: '2.0.0' });
+    upgradeBeta(app, 'beta.execute');
 
     const alphaToken = await app.token({ scopes: ['alpha.run'], targetServiceId: 'alpha' });
     expect(alphaToken.status).toBe(200);
@@ -70,7 +70,7 @@ describe('one plane, two services, one upgraded', () => {
 
   it('brokers and projects the upgraded service again once its grant catches up', async () => {
     app = await demoApp({ services: [jobsService('alpha', 'alpha.run'), jobsService('beta', 'beta.run')] });
-    app.redeploy('beta', { ...jobsService('beta', 'beta.execute'), version: '2.0.0' });
+    upgradeBeta(app, 'beta.execute');
 
     const stale = await app.mcp({
       id: 1,
@@ -92,6 +92,12 @@ describe('one plane, two services, one upgraded', () => {
     await expect(runBrokered(app, 'alpha', 'alpha.run')).resolves.toMatchObject({ caller: 'control-plane', service: 'alpha' });
   });
 });
+
+// A real deploy replaces what the service publishes; the plane's grant is untouched.
+function upgradeBeta(app: DemoApp, scopeId: string) {
+  const next = jobsService('beta', scopeId);
+  app.redeploy('beta', { abilities: next.abilities, scopes: next.scopes, version: '2.0.0' });
+}
 
 function runDirect(app: DemoApp, serviceId: string, scope: string) {
   return app.session<JobsApiShape>(serviceId, `${serviceId}.jobs`, [scope]).then((session) => session.run({ job: 'nightly' }));
