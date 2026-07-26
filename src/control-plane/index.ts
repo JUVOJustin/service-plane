@@ -21,6 +21,7 @@ export type {
   CapabilityActorClaim,
   CapabilityCatalog,
   CapabilityClaims,
+  CapabilityConfirmation,
   CapabilityJwks,
   CapabilityScopeDefinition,
   CapabilitySubject,
@@ -83,7 +84,6 @@ export {
   type HmacServiceClient,
   type HmacServiceClientAuthLogEvent,
   type HmacServiceClientAuthOptions,
-  type HmacServiceClientReplayCache,
   hmacServiceClientAuth,
   type JwkServiceClient,
   type JwkServiceClientAuthLogEvent,
@@ -91,6 +91,8 @@ export {
   jwkServiceClientAuth,
 } from './caller-auth.js';
 export {
+  type CallerAuthenticator,
+  type CallerAuthResult,
   type CapabilityIssuer,
   type CapabilityIssuerResolver,
   type CapabilityJwksProvider,

@@ -340,6 +340,7 @@ describe('capability issuer', () => {
     const app = new Hono();
     mountCapabilityEndpoints(app, issuer, {
       authenticateCaller: () => 'moco',
+      jwks: createCapabilitySigningAuthority({ issuer: 'control-plane', keyId: 'test-key', privateJwk: keys.privateJwk }),
     });
 
     expect((await app.request('/.well-known/service-plane/jwks.json')).status).toBe(200);
@@ -368,8 +369,10 @@ describe('capability issuer', () => {
       privateJwk: keys.privateJwk,
     });
     const app = new Hono();
+    // A full issuer is still a valid JWKS provider; passing it just accepts the discovery coupling.
     mountCapabilityEndpoints(app, issuer, {
       authenticateCaller: () => 'moco',
+      jwks: issuer,
     });
 
     const first = await app.request('/.well-known/service-plane/jwks.json');

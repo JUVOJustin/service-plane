@@ -119,7 +119,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
   fetch: Hono<ServicePlaneServiceEnv<TEnv>>['fetch'] = (request, env, executionCtx) => this.app.fetch(request, env, executionCtx);
 
   async connectAbility(
-    input: { abilityId: string; connInfo?: ConnInfo; requestId?: string; token: string },
+    input: { abilityId: string; connInfo?: ConnInfo; proof?: string; requestId?: string; token: string },
     bindings?: TEnv['Bindings'],
   ): Promise<RpcTarget> {
     const ability = this.definition.abilities.find((candidate) => candidate.id === input.abilityId);
@@ -130,7 +130,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
     const context = nativeBindingContext<TEnv>(ability.rpc.path, bindings, input.requestId);
     // Native bindings are session-shaped (Workers RPC), so streaming returns are allowed.
     const root = new AuthRoot(this.options.auth, this.options.ingress, this.definition.id, ability, context, true, input.connInfo);
-    return root.authenticate(input.token);
+    return root.authenticate(input.token, input.proof);
   }
 
   private mountDiscovery(): void {
@@ -195,8 +195,15 @@ class AuthRoot<TEnv extends Env> extends RpcTarget {
     super();
   }
 
-  async authenticate(token: string) {
-    const identity = await verifyAuthenticationToken(token, await serviceVerifier(this.auth, this.serviceId, this.context));
+  // `proof` is a proof of possession for a sender-constrained token. It is optional on the wire and
+  // required by the verifier whenever the token carries a `cnf` claim, so a caller cannot downgrade a
+  // sender-constrained token to a bearer token by simply omitting it.
+  async authenticate(token: string, proof?: string) {
+    const identity = await verifyAuthenticationToken(token, {
+      ...(await serviceVerifier(this.auth, this.serviceId, this.context)),
+      abilityId: this.ability.id,
+      ...(proof === undefined ? {} : { proof }),
+    });
     await verifyServiceIngress(this.auth, this.ingress, identity, this.context);
     // Connection info is an unsigned assertion about a connection this service never saw, so it is
     // only trustworthy once the peer is proven to be the broker: ingress restricts the service to

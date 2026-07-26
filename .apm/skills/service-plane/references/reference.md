@@ -258,10 +258,11 @@ Delegated (user-brokered) token:
 | `aud` | target service id → `identity.audience` | same |
 | `scp` | granted scopes → `identity.scopes` | same |
 | `spb` | broker service id on brokered (ingress) tokens → `identity.brokerServiceId` | same |
+| `cnf` | `{ jkt }` on tokens bound to a caller key (always, for JWK callers) → `identity.confirmation`, only after a matching proof verified | same |
 | `jti` | token id → `identity.tokenId` | same |
 | `exp` | expiry → `identity.expiresAt`; `iat`/`nbf` are also enforced | same |
 
-Only the `act` delegation relationship comes from RFC 8693. `scp`, `spo`, and `spb` are Service Plane-specific claims, and `/.well-known/service-plane/capability-token` is the package's JSON capability endpoint, not an RFC 8693 token-exchange endpoint.
+The `act` delegation relationship comes from RFC 8693 and `cnf` from RFC 7800 (with the `jkt` confirmation method registered by RFC 9449). `scp`, `spo`, and `spb` are Service Plane-specific claims, and `/.well-known/service-plane/capability-token` is the package's JSON capability endpoint, not an RFC 8693 token-exchange endpoint.
 
 Delegated subjects are minted only by control-plane code — the broker/MCP caller resolver (a `BrokerCaller` with `kind: 'user'` and optional `orgId`) or a direct `issueCapabilityToken({ subject, ... })` call. The capability-token endpoint and `issueCapabilityTokenForCaller` reject caller-supplied subjects with 403, and the shipped token requesters fail fast locally instead of transmitting one. Direct issue mints a non-brokered token, so ingress-required targets must be reached through the broker, which selects `issueBrokeredCapabilityToken` automatically. See [auth](auth.md#subject-delegation).
 
@@ -286,7 +287,7 @@ Control-plane events:
 - `service_plane.mcp.resource.completed` / `service_plane.mcp.resource.failed` (`ServicePlaneBrokerLogEvent`)
 - `service_plane.mcp.prompt.completed` / `service_plane.mcp.prompt.failed` (`ServicePlaneBrokerLogEvent`)
 - `service_plane.caller_auth.not_configured` (`ServicePlaneControlPlaneLogEvent`)
-- `service_plane.caller_auth.hmac_unauthorized` / `service_plane.caller_auth.jwk_unauthorized` (caller-auth middleware, own `log` option)
+- `service_plane.caller_auth.hmac_unauthorized` / `service_plane.caller_auth.jwk_unauthorized` (caller-auth middleware, own `log` option). The `reason` field names the check that failed.
 
 Where the events go is up to the app. Each surface takes a `log` callback that is invoked once per event; when it is omitted, the package writes the event as one JSON line to the console. The package never talks to a logging framework itself — you forward events to whatever logger the app uses:
 
@@ -313,21 +314,8 @@ Use separate caches for:
 - generated OpenAPI document
 - control-plane JWKS fetched by services
 - caller capability tokens
-- HMAC or JWK replay protection
 
 Token cache keys include caller id, target service id, ability id, normalized scopes, optional TTL, and the delegated subject when present — a token minted for one end user is never served for another.
-
-HTTP edge caching of the metadata GET routes (discovery, OpenAPI, JWKS) is separate from these data caches and is controlled by the `httpCache` option on `ServicePlaneService` and `ServicePlaneControlPlane`:
-
-```ts
-type ServicePlaneHttpCacheOptions = {
-  maxAgeSeconds?: number; // default 30 (DEFAULT_HTTP_CACHE_MAX_AGE_SECONDS)
-  staleWhileRevalidateSeconds?: number; // default 300
-  tags?: string[]; // appended to the built-in service-plane:* Cache-Tag values
-};
-```
-
-Built-in tags: `service-plane` on every cached route, plus `service-plane:discovery` and `service-plane:service:<id>` on discovery, `service-plane:openapi` on OpenAPI, and `service-plane:jwks` on JWKS.
 
 ## Errors
 

@@ -8,7 +8,12 @@ import {
   RpcTarget,
   type RpcTransport,
 } from 'capnweb';
-import { decodeCapabilityTokenPayload, normalizeCapabilitySubject, verifyCapabilityToken } from '../shared/capability-tokens.js';
+import {
+  decodeCapabilityTokenPayload,
+  normalizeCapabilitySubject,
+  publicJwkFromPrivateJwk,
+  verifyCapabilityToken,
+} from '../shared/capability-tokens.js';
 import {
   type ConnInfo,
   normalizeConnInfo,
@@ -22,8 +27,10 @@ import {
   SERVICE_PLANE_JWK_ASSERTION_AUDIENCE,
   SERVICE_PLANE_JWK_CLIENT_HEADER,
   SERVICE_PLANE_JWK_KEY_ID_HEADER,
+  servicePlaneJwkThumbprint,
   signServicePlaneJwkRequest,
 } from '../shared/jwk-auth.js';
+import { signCapabilityProof } from '../shared/proof-of-possession.js';
 import {
   type CapabilityCatalog,
   type CapabilityIdentity,
@@ -133,7 +140,13 @@ export type ControlPlaneRpcTokenRequesterOptions = {
 };
 
 export type CloudflareAbilityRpcBinding = {
-  connectAbility(input: { abilityId: string; connInfo?: ConnInfo; requestId?: string; token: string }): Promise<object> | object;
+  connectAbility(input: {
+    abilityId: string;
+    connInfo?: ConnInfo;
+    proof?: string;
+    requestId?: string;
+    token: string;
+  }): Promise<object> | object;
 };
 
 export type WebSocketRpcOptions = {
@@ -143,8 +156,19 @@ export type WebSocketRpcOptions = {
 };
 
 export interface AuthenticatedRoot<Scoped> {
-  authenticate(token: string): Scoped;
+  authenticate(token: string, proof?: string): Scoped;
 }
+
+// Signs a proof of possession for a sender-constrained token. Supplied by the caller because only the
+// caller holds the private key its tokens are bound to.
+export type CapabilityProofSigner = (input: { abilityId: string; targetServiceId: string; token: string }) => Promise<string> | string;
+
+// A token requester, optionally carrying the prover for the key it authenticates with. Callers that use
+// a shipped requester therefore need no extra wiring for sender-constrained tokens: the key is already
+// configured once, in one place.
+export type CapabilityTokenRequester = CreateCapabilityTokenProviderOptions['requestToken'] & {
+  proveTokenPossession?: CapabilityProofSigner;
+};
 
 export type CapabilityRpcTransport =
   | { binding: CloudflareAbilityRpcBinding; kind: 'cloudflare-binding-rpc' }
@@ -161,10 +185,13 @@ export type CapabilityRpcSessionOptions<Scoped> = (
     >)
 ) & {
   abilityId?: string;
-  authenticate?: (root: AuthenticatedRoot<Scoped>, token: string) => Scoped;
+  authenticate?: (root: AuthenticatedRoot<Scoped>, token: string, proof?: string) => Scoped;
   // Advisory connection info about the original client, forwarded to the service alongside the
   // request id. Only a brokered call into an ingress-protected service surfaces it to handlers.
   connInfo?: ConnInfo;
+  // Required when the plane sender-constrains this caller's tokens (`cnf`), because such a token is
+  // rejected by the service without a matching proof.
+  proveTokenPossession?: CapabilityProofSigner;
   // Method names whose streamed results cannot travel back over the caller's own transport
   // (e.g. a brokered ability handed to a caller whose leg to the broker is HTTP-batch). Calls
   // to them are rejected with a clear 405 instead of returning a stream that fails to serialize.
@@ -274,16 +301,19 @@ export function createCapabilityTokenProvider(options: CreateCapabilityTokenProv
   const scopes = normalizeScopes(options.scopes);
   const ttlSeconds = options.ttlSeconds === undefined ? undefined : normalizeTtlSeconds(options.ttlSeconds);
   const subject = options.subject === undefined ? undefined : normalizeCapabilitySubject(options.subject);
-  // A caller-supplied cacheKey is still partitioned by the delegated subject: services authorize
-  // per user from identity.subject, so one user's cached token must never serve another.
+  const senderConstrained = Boolean((options.requestToken as CapabilityTokenRequester | undefined)?.proveTokenPossession);
+  // A caller-supplied cacheKey is still partitioned by the delegated subject and by binding: services
+  // authorize per user from identity.subject, so one user's cached token must never serve another, and a
+  // proof-capable provider must never reuse an entry written by an unbound one.
   const cacheKey = options.cacheKey
     ? subject
-      ? `${options.cacheKey}:subject:${encodeURIComponent(JSON.stringify({ id: subject.id, orgId: subject.orgId ?? null }))}`
-      : options.cacheKey
+      ? `${options.cacheKey}${senderConstrained ? ':cnf' : ''}:subject:${encodeURIComponent(JSON.stringify({ id: subject.id, orgId: subject.orgId ?? null }))}`
+      : `${options.cacheKey}${senderConstrained ? ':cnf' : ''}`
     : capabilityTokenCacheKey({
         ...(options.abilityId ? { abilityId: normalizeValue(options.abilityId, 'ability id') } : {}),
         callerServiceId,
         scopes,
+        ...(senderConstrained ? { senderConstrained } : {}),
         ...(subject ? { subject } : {}),
         targetServiceId,
         ...(ttlSeconds === undefined ? {} : { ttlSeconds }),
@@ -330,6 +360,7 @@ export function capabilityTokenCacheKey(input: {
   abilityId?: string;
   callerServiceId: string;
   scopes: string[];
+  senderConstrained?: boolean;
   subject?: CapabilitySubject;
   targetServiceId: string;
   ttlSeconds?: number;
@@ -338,6 +369,10 @@ export function capabilityTokenCacheKey(input: {
     abilityId: input.abilityId ?? null,
     callerServiceId: input.callerServiceId,
     scopes: [...input.scopes].sort(),
+    // Partitions proof-capable entries from unbound ones. A shared cache can hold an unbound token for
+    // the same caller, target, and scopes — minted through HMAC, or before binding existed — and reusing
+    // it would skip the proof and hand the service a bearer token, silently losing the binding.
+    ...(input.senderConstrained ? { senderConstrained: true } : {}),
     // Included conditionally so subject-less keys stay byte-identical with earlier releases; tokens
     // delegated to a subject must never be shared across subjects through the token cache.
     ...(input.subject ? { subject: { id: input.subject.id, orgId: input.subject.orgId ?? null } } : {}),
@@ -354,6 +389,21 @@ export function capabilityTokenCacheKey(input: {
 export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSessionOptions<Scoped>): Promise<AbilitySession<Scoped>> {
   const tokenProvider = options.tokenProvider ?? createCapabilityTokenProvider(options as CreateCapabilityTokenProviderOptions);
   const authenticate = options.authenticate ?? defaultAuthenticate<Scoped>;
+  // One proof per session, freshly signed each time a session opens: it is bound to the token and
+  // ability, so it cannot be reused for another session on another service.
+  // An explicit signer wins; otherwise a shipped requester supplies one for the key it already holds.
+  const proveTokenPossession =
+    options.proveTokenPossession ?? (options as { requestToken?: CapabilityTokenRequester }).requestToken?.proveTokenPossession;
+  const proveToken = async (token: string): Promise<string | undefined> => {
+    // Only sender-constrained tokens need a proof. Skipping the signature for the rest keeps the
+    // unbound path free rather than sending something the service would ignore.
+    if (!proveTokenPossession || !decodeCapabilityTokenPayload(token).cnf) return undefined;
+    return proveTokenPossession({
+      abilityId: options.abilityId ?? missingAbilityId(),
+      targetServiceId: options.targetServiceId,
+      token,
+    });
+  };
   const rejectStreamMethods = options.rejectStreamMethods ? new Set(options.rejectStreamMethods) : undefined;
   // The persistent session's Cap'n Web root stub is Disposable; keep it so the underlying
   // transport (socket) can be released — the scoped stub alone does not close the session.
@@ -399,9 +449,11 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
       throw new CapabilityAuthError('Cloudflare native RPC transport is required', 500);
     }
     const connInfo = normalizeConnInfo(options.connInfo);
+    const proof = await proveToken(token);
     const target = await options.transport.binding.connectAbility({
       abilityId: options.abilityId ?? missingAbilityId(),
       ...(connInfo ? { connInfo } : {}),
+      ...(proof ? { proof } : {}),
       ...(options.requestId ? { requestId: options.requestId } : {}),
       token,
     });
@@ -414,11 +466,12 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
   };
   const openPersistentSession = async (): Promise<void> => {
     const token = await tokenProvider.token();
+    const proof = await proveToken(token);
     assertActive();
     const root = openSession<Scoped>(options);
     persistentRoot = root;
     try {
-      const scoped = authenticate(root, token);
+      const scoped = authenticate(root, token, proof);
       persistent = scoped;
     } catch (error) {
       if (persistentRoot === root) persistentRoot = undefined;
@@ -468,8 +521,9 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
         let scoped: Scoped;
         if (options.transport.kind === 'http-batch' || options.transport.kind === 'fetch') {
           const token = await tokenProvider.token();
+          const proof = await proveToken(token);
           assertActive();
-          scoped = authenticate(openSession<Scoped>(options), token);
+          scoped = authenticate(openSession<Scoped>(options), token, proof);
         } else {
           if (persistent === undefined) {
             persistentOpening ??= openPersistentSession();
@@ -591,16 +645,52 @@ export function controlPlaneHmacTokenRequester(
   };
 }
 
-export function controlPlaneJwkTokenRequester(
-  options: ControlPlaneJwkTokenRequesterOptions,
-): CreateCapabilityTokenProviderOptions['requestToken'] {
+export type JwkCapabilityProofSignerOptions = {
+  now?: () => Date;
+  privateJwk: JsonWebKey | (() => Promise<JsonWebKey> | JsonWebKey);
+  ttlSeconds?: number;
+};
+
+// Signs proofs with the same private key the caller authenticates to the control plane with, so a
+// sender-constrained token can be used without registering or distributing anything further.
+export function jwkCapabilityProofSigner(options: JwkCapabilityProofSignerOptions): CapabilityProofSigner {
+  return async (input) => {
+    const privateJwk = await resolvePrivateJwk(options.privateJwk);
+    // A rotating key resolver can outrun the token cache: the provider may still hold a token bound to
+    // the previous key, and signing that with the new one produces a proof the service rejects. Catch
+    // it here, where the cause is visible, instead of shipping a proof that fails remotely as a 401.
+    await assertProofKeyMatchesToken(privateJwk, input.token);
+    return signCapabilityProof({
+      abilityId: input.abilityId,
+      ...(options.now ? { now: options.now() } : {}),
+      privateJwk,
+      targetServiceId: input.targetServiceId,
+      token: input.token,
+      ...(options.ttlSeconds === undefined ? {} : { ttlSeconds: options.ttlSeconds }),
+    });
+  };
+}
+
+async function assertProofKeyMatchesToken(privateJwk: JsonWebKey, token: string): Promise<void> {
+  const bound = decodeCapabilityTokenPayload(token).cnf?.jkt;
+  if (!bound) return;
+  const thumbprint = await servicePlaneJwkThumbprint(publicJwkFromPrivateJwk(privateJwk, 'service-plane-pop'));
+  if (thumbprint !== bound) {
+    throw new CapabilityAuthError(
+      'Service-Plane proof of possession key does not match the capability token it accompanies; the token was issued for a different key (a rotated signing key outrunning a cached token is the usual cause)',
+      401,
+    );
+  }
+}
+
+export function controlPlaneJwkTokenRequester(options: ControlPlaneJwkTokenRequesterOptions): CapabilityTokenRequester {
   const fetcher = options.fetch ?? fetch;
   const tokenUrl = new URL(options.tokenPath ?? SERVICE_PLANE_CAPABILITY_TOKEN_PATH, options.controlPlaneUrl);
   const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
   const clientIdHeaderName = options.clientIdHeaderName ?? SERVICE_PLANE_JWK_CLIENT_HEADER;
   const keyIdHeaderName = options.keyIdHeaderName ?? SERVICE_PLANE_JWK_KEY_ID_HEADER;
 
-  return async (input) => {
+  const requestToken: CapabilityTokenRequester = async (input) => {
     rejectRequesterSubject(input);
     const headers = new Headers(typeof options.headers === 'function' ? await options.headers() : options.headers);
     headers.set('content-type', 'application/json');
@@ -631,6 +721,14 @@ export function controlPlaneJwkTokenRequester(
     if (!response.ok) throw new CapabilityAuthError(`Unable to fetch Service-Plane capability token: ${response.status}`, response.status);
     return parseIssuedCapabilityToken(await readJson(response, 'Invalid Service-Plane capability token response'));
   };
+
+  // The same key authenticates the token request and proves possession of the token it returns, so a
+  // session opened with this requester satisfies sender-constrained tokens without further config.
+  requestToken.proveTokenPossession = jwkCapabilityProofSigner({
+    privateJwk: options.privateJwk,
+    ...(options.now ? { now: options.now } : {}),
+  });
+  return requestToken;
 }
 
 export function controlPlaneRpcTokenRequester(
@@ -672,8 +770,8 @@ export { RpcTarget };
 
 class SessionProxyTarget extends RpcTarget {}
 
-function defaultAuthenticate<Scoped>(root: AuthenticatedRoot<Scoped>, token: string): Scoped {
-  return root.authenticate(token);
+function defaultAuthenticate<Scoped>(root: AuthenticatedRoot<Scoped>, token: string, proof?: string): Scoped {
+  return proof === undefined ? root.authenticate(token) : root.authenticate(token, proof);
 }
 
 // capnweb's generics are instantiated with an untyped root so RpcCompatible never sees the

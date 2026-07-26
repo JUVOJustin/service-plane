@@ -186,6 +186,26 @@ export async function verifyServicePlaneJwkSignature(token: string, jwks: Capabi
   });
 }
 
+// RFC 7638 JWK thumbprint: SHA-256 over the required members only, lexicographically ordered, no
+// whitespace. For the EC keys this package signs with that is exactly crv, kty, x, y — so the digest
+// is stable across any extra members (kid, use, alg) a caller happens to publish.
+export async function servicePlaneJwkThumbprint(jwk: JsonWebKey): Promise<string> {
+  if (jwk.kty !== 'EC' || typeof jwk.crv !== 'string' || typeof jwk.x !== 'string' || typeof jwk.y !== 'string') {
+    throw new CapabilityAuthError('Service-Plane JWK thumbprint requires an EC public key', 500);
+  }
+  const canonical = JSON.stringify({ crv: jwk.crv, kty: 'EC', x: jwk.x, y: jwk.y });
+  return sha256Base64Url(new TextEncoder().encode(canonical));
+}
+
+// Picks the key a verified assertion was actually signed with. Hono's verifyWithJwks requires a `kid`
+// header and verifies against that one key, so matching on `kid` after a successful verification
+// identifies the signer rather than merely a key the caller claims to have used.
+export function servicePlaneJwkSigner(jwks: CapabilityJwks, keyId: string): JsonWebKey {
+  const key = jwks.keys.find((candidate) => candidate.kid === keyId);
+  if (!key) throw new CapabilityAuthError('Service-Plane JWK signer is not in the client key set', 401);
+  return key;
+}
+
 async function requestBodyBytes(request: Request, maxBodyBytes?: number): Promise<Uint8Array> {
   return boundedRequestBodyBytes(request, maxBodyBytes, {
     invalidMaxBodyBytesMessage: 'Service-Plane JWK max body size must be a positive integer',

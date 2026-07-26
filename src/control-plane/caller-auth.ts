@@ -18,9 +18,12 @@ import {
   SERVICE_PLANE_JWK_CLIENT_HEADER,
   SERVICE_PLANE_JWK_KEY_ID_HEADER,
   servicePlaneJwkRequestParts,
+  servicePlaneJwkSigner,
+  servicePlaneJwkThumbprint,
   verifyServicePlaneJwkSignature,
 } from '../shared/jwk-auth.js';
 import { type CapabilityJwks, type RegistryCache, SERVICE_PLANE_REQUEST_ID_HEADER, type ServiceEndpoint } from '../shared/types.js';
+import type { CallerAuthResult } from './capabilities.js';
 import { createServiceRegistry } from './registry.js';
 
 const HMAC_CLIENT_SECRET_BYTES = 32;
@@ -59,19 +62,9 @@ export type HmacServiceClientAuthOptions = {
   maxBodyBytes?: number;
   maxSkewSeconds?: number;
   now?: () => Date;
-  replayCache?: HmacServiceClientReplayCache;
   requestIdHeader?: string;
   timestampHeader?: string;
 };
-
-export type HmacServiceClientReplayCache =
-  | {
-      reserve(key: string, ttlSeconds: number): Promise<boolean> | boolean;
-    }
-  | {
-      get(key: string): Promise<boolean> | boolean;
-      set(key: string, ttlSeconds: number): Promise<void> | void;
-    };
 
 export type JwkServiceClient = {
   clientId: string;
@@ -92,7 +85,6 @@ export type JwkServiceClientAuthLogEvent = {
     | 'missing_client'
     | 'missing_key'
     | 'missing_signature'
-    | 'replayed_assertion'
     | 'timestamp_skew';
   requestId?: string;
 };
@@ -110,7 +102,6 @@ export type JwkServiceClientAuthOptions = {
   registryCache?: RegistryCache;
   registryCacheKey?: string;
   registryCacheTtlSeconds?: number;
-  replayCache?: HmacServiceClientReplayCache;
   requestIdHeader?: string;
   services?: ServiceEndpoint[] | ((context: Context) => Promise<ServiceEndpoint[]> | ServiceEndpoint[]);
 };
@@ -132,6 +123,7 @@ export function hmacServiceClientAuth(options: HmacServiceClientAuthOptions) {
   const log = options.log ?? defaultHmacCallerAuthLog;
 
   return async (context: Context): Promise<Response | string> => {
+    const now = options.now?.() ?? new Date();
     try {
       const clientId = context.req.header(clientIdHeader)?.trim();
       if (!clientId) {
@@ -145,7 +137,7 @@ export function hmacServiceClientAuth(options: HmacServiceClientAuthOptions) {
         return callerAuthUnauthorized(context, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME);
       }
 
-      const timestampError = validateHmacTimestamp(timestamp, options.now?.() ?? new Date(), maxSkewSeconds);
+      const timestampError = validateHmacTimestamp(timestamp, now, maxSkewSeconds);
       if (timestampError) {
         log(hmacUnauthorizedEvent(context, timestampError, hmacTimestampMessage(timestampError)));
         return callerAuthUnauthorized(context, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME);
@@ -177,14 +169,6 @@ export function hmacServiceClientAuth(options: HmacServiceClientAuthOptions) {
         log(hmacUnauthorizedEvent(context, 'invalid_signature', 'Invalid Service-Plane HMAC signature'));
         return callerAuthUnauthorized(context, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME);
       }
-      if (
-        options.replayCache &&
-        (await isHmacReplay(options.replayCache, clientId, context.req.header(requestIdHeader)?.trim() || signature, maxSkewSeconds))
-      ) {
-        log(hmacUnauthorizedEvent(context, 'invalid_signature', 'Replayed Service-Plane HMAC signature'));
-        return callerAuthUnauthorized(context, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME);
-      }
-
       return client.serviceId ?? client.clientId;
     } catch (error) {
       if (error instanceof CapabilityAuthError) {
@@ -211,7 +195,7 @@ export function jwkServiceClientAuth(options: JwkServiceClientAuthOptions) {
   );
   const log = options.log ?? defaultJwkCallerAuthLog;
 
-  return async (context: Context): Promise<Response | string> => {
+  return async (context: Context): Promise<Response | CallerAuthResult> => {
     const clientId = context.req.header(clientIdHeader)?.trim();
     if (!clientId) {
       log(jwkUnauthorizedEvent(context, 'missing_client', 'Missing Service-Plane JWK client id'));
@@ -265,20 +249,15 @@ export function jwkServiceClientAuth(options: JwkServiceClientAuthOptions) {
         now,
         requestIdHeader,
       });
-      if (
-        options.replayCache &&
-        (await isCallerAuthReplay(
-          options.replayCache,
-          clientId,
-          claims.requestId ?? claims.jti,
-          jwkReplayTtlSeconds(claims, now, maxSkewSeconds),
-        ))
-      ) {
-        log(jwkUnauthorizedEvent(context, 'replayed_assertion', 'Replayed Service-Plane JWK assertion'));
-        return callerAuthUnauthorized(context, SERVICE_PLANE_JWK_AUTHORIZATION_SCHEME);
-      }
-
-      return client.serviceId ?? client.clientId;
+      // Report the key that actually authenticated, so issuance sender-constrains the token to it. Not
+      // optional: reaching here means the caller signed with a private key, so it can always prove
+      // possession, and leaving the token usable by anyone holding the bytes would be the weaker default.
+      // `verifyWithJwks` pins the signer by `kid`, so selecting on the validated key id names the
+      // signer rather than a key the caller merely claimed to use.
+      return {
+        confirmation: { jkt: await servicePlaneJwkThumbprint(servicePlaneJwkSigner(jwks, headerKeyId)) },
+        serviceId: client.serviceId ?? client.clientId,
+      };
     } catch (error) {
       if (error instanceof CapabilityAuthError) {
         log(jwkUnauthorizedEvent(context, 'invalid_claims', error.message));
@@ -487,11 +466,6 @@ async function validateJwkAssertionClaims(
   }
 }
 
-function jwkReplayTtlSeconds(claims: Pick<ParsedJwkAssertionClaims, 'exp'>, now: Date, maxSkewSeconds: number): number {
-  const nowSeconds = Math.floor(now.getTime() / 1000);
-  return Math.max(1, claims.exp + maxSkewSeconds - nowSeconds);
-}
-
 function validateJwkAssertionTimestamps(
   claims: Pick<ParsedJwkAssertionClaims, 'exp' | 'iat' | 'nbf'>,
   now: Date,
@@ -510,32 +484,6 @@ function validateJwkAssertionTimestamps(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
-}
-
-async function isHmacReplay(
-  replayCache: HmacServiceClientReplayCache,
-  clientId: string,
-  idempotencyKey: string,
-  ttlSeconds: number,
-): Promise<boolean> {
-  const key = `service-plane:hmac:${clientId}:${idempotencyKey}`;
-  if ('reserve' in replayCache) return !(await replayCache.reserve(key, ttlSeconds));
-  if (await replayCache.get(key)) return true;
-  await replayCache.set(key, ttlSeconds);
-  return false;
-}
-
-async function isCallerAuthReplay(
-  replayCache: HmacServiceClientReplayCache,
-  clientId: string,
-  idempotencyKey: string,
-  ttlSeconds: number,
-): Promise<boolean> {
-  const key = `service-plane:jwk:${clientId}:${idempotencyKey}`;
-  if ('reserve' in replayCache) return !(await replayCache.reserve(key, ttlSeconds));
-  if (await replayCache.get(key)) return true;
-  await replayCache.set(key, ttlSeconds);
-  return false;
 }
 
 function requestIdFromContext(context: Context): string | undefined {

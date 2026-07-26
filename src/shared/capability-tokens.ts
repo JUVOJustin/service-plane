@@ -9,9 +9,11 @@ import {
   SERVICE_PLANE_JWK_ALGORITHM,
   servicePlaneJwkSigningKey,
 } from './jwk-auth.js';
+import { verifyCapabilityProof } from './proof-of-possession.js';
 import {
   type CapabilityActorClaim,
   type CapabilityClaims,
+  type CapabilityConfirmation,
   type CapabilityIdentity,
   type CapabilityJwks,
   type CapabilitySubject,
@@ -90,6 +92,23 @@ export async function verifyCapabilityToken(token: string, options: VerifyCapabi
   const missingScope = (options.requiredScopes ?? []).find((scope) => !claims.scp.includes(scope));
   if (missingScope) throw new CapabilityAuthError(`Missing Service-Plane capability scope: ${missingScope}`, 403);
 
+  // Enforced here rather than by each caller of this function: a sender-constrained token must be
+  // unusable as a bearer token everywhere, so the only verification entry point refuses one whose
+  // proof is missing, unverifiable, or bound to a different token, service, or ability.
+  if (claims.cnf) {
+    if (!options.proof) throw new CapabilityAuthError('Service-Plane capability token requires a proof of possession');
+    if (!options.abilityId) {
+      throw new CapabilityAuthError('Service-Plane proof of possession cannot be checked without an ability id', 500);
+    }
+    await verifyCapabilityProof(options.proof, {
+      abilityId: options.abilityId,
+      confirmation: claims.cnf,
+      ...(options.now ? { now: options.now } : {}),
+      targetServiceId: claims.aud,
+      token,
+    });
+  }
+
   // RFC 8693 delegation: with an act claim, sub is the end-user subject and act.sub is the acting
   // service; without one, sub is the calling service itself.
   const { serviceId, subject } = claims.act
@@ -98,6 +117,8 @@ export async function verifyCapabilityToken(token: string, options: VerifyCapabi
   return {
     audience: claims.aud,
     ...(claims.spb ? { brokerServiceId: claims.spb } : {}),
+    // Only reachable once the proof above verified, so its presence means the caller was proven present.
+    ...(claims.cnf ? { confirmation: claims.cnf } : {}),
     expiresAt: new Date(claims.exp * 1000),
     issuer: claims.iss,
     scopes: claims.scp,
@@ -149,7 +170,7 @@ function decodeCapabilityToken(token: string): { header: unknown; payload: unkno
 
 function parseCapabilityClaims(value: unknown): CapabilityClaims {
   if (!isRecord(value)) throw new CapabilityAuthError('Invalid Service-Plane capability claims');
-  const { act, aud, exp, iat, iss, jti, nbf, scp, spb, spo, sub } = value;
+  const { act, aud, cnf, exp, iat, iss, jti, nbf, scp, spb, spo, sub } = value;
   if (
     typeof aud !== 'string' ||
     typeof exp !== 'number' ||
@@ -184,7 +205,34 @@ function parseCapabilityClaims(value: unknown): CapabilityClaims {
       throw new CapabilityAuthError('Invalid Service-Plane capability claims');
     }
   }
-  return { ...(actor ? { act: actor } : {}), aud, exp, iat, iss, jti, nbf, scp, ...(spb ? { spb } : {}), ...(spo ? { spo } : {}), sub };
+  const confirmation = parseConfirmationClaim(cnf);
+  return {
+    ...(actor ? { act: actor } : {}),
+    aud,
+    ...(confirmation ? { cnf: confirmation } : {}),
+    exp,
+    iat,
+    iss,
+    jti,
+    nbf,
+    scp,
+    ...(spb ? { spb } : {}),
+    ...(spo ? { spo } : {}),
+    sub,
+  };
+}
+
+// Rejected rather than ignored when malformed: silently dropping an unreadable confirmation would
+// downgrade a sender-constrained token to a bearer token, which is the one failure mode `cnf` exists
+// to prevent.
+function parseConfirmationClaim(value: unknown): CapabilityConfirmation | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw new CapabilityAuthError('Invalid Service-Plane capability confirmation claim');
+  const { jkt } = value;
+  if (typeof jkt !== 'string' || !isBoundedClaimString(jkt)) {
+    throw new CapabilityAuthError('Invalid Service-Plane capability confirmation claim');
+  }
+  return { jkt };
 }
 
 function parseActorClaim(value: unknown): CapabilityActorClaim | undefined {

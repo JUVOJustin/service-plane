@@ -57,7 +57,9 @@ closed: an unknown service, scope, or grant is rejected, and an unreachable gran
 rather than a token.
 
 `createCapabilitySigningAuthorityFromSigningSecret({ signingSecret, issuer, keyId })` builds that half
-directly, and `mountCapabilityJwksEndpoint` accepts it, if you publish JWKS from your own Hono app.
+directly if you publish JWKS from your own Hono app. `mountCapabilityJwksEndpoint` takes it, and
+`mountCapabilityEndpoints` requires an explicit `jwks` provider — passing the issuer there is legal but
+re-couples key publication to service discovery, so the choice is yours to make on purpose.
 
 ## Caller Authentication Options
 
@@ -97,6 +99,135 @@ The built-in HTTP authenticators follow HTTP authentication grammar: scheme name
 case-insensitive, credentials must contain exactly one scheme and one value, and a `401` response
 includes the corresponding `WWW-Authenticate` challenge. The JWK assertion remains a Service
 Plane request-bound format rather than an OAuth client assertion.
+
+## Replay Protection
+
+A captured HMAC or JWK token request can be sent twice. Work out what that buys an attacker before
+deciding how much machinery to spend on it.
+
+### Risk Assessment
+
+| | |
+| --- | --- |
+| **Precondition** | The attacker holds the signed request bytes. That means TLS interception, access to retained request logs or headers, or a proxy, sidecar, or gateway in the path. In most of those positions the *response* is also readable — and the response already contains the token, so replay is the slower path to the same thing. |
+| **Gain** | One more capability token for the same caller, the same target service, and the same scopes. Issuance still runs the full grant check, so it is a duplicate of a token the caller is entitled to. |
+| **Exposure window** | HMAC: the timestamp skew window, default 60s (`maxSkewSeconds`). JWK: the assertion's `exp` plus the skew window, with the lifetime capped at 300s (`maxAssertionTtlSeconds`). Past that the request is rejected on timestamp grounds whether or not a store exists. |
+| **Not reachable by replay** | Editing the request — method, path, body hash, client id, and request id are all signed. Retargeting to another service, widening scopes, impersonating another caller, or extending the token TTL past the plane's maximum. |
+| **Residual risk with no store** | A handful of extra tokens inside a ≤60s window, each capped at the plane's token TTL, each carrying scopes the caller already holds. |
+
+**Assessment: low.** A replay store narrows an already-narrow window and does not lower the ceiling
+on what an attacker obtains. So replay protection here is **defense in depth**. The controls that do
+the real work are always on and need no configuration:
+
+- TLS between caller and plane.
+- Request binding: the signature covers method, path, body hash, client id, and request id.
+- The timestamp skew window and, for JWK, the assertion lifetime.
+- Short capability-token TTLs, and grant checks at issuance.
+
+The cheapest way to shrink the window further needs no infrastructure at all: lower `maxSkewSeconds`
+(to the tightest value your clock discipline tolerates) and `maxAssertionTtlSeconds`. Do that before
+reaching for a store.
+
+### Precedent
+
+This baseline — bind the request, bound the window, and do not track used requests — is where the
+specifications and the large deployments land. Cited as precedent for the shape of the control, not as
+a compliance claim:
+
+- **RFC 7523 §3** (JWT profile for OAuth 2.0 client authentication) makes it explicitly optional: an
+  authorization server "MAY ensure that JWTs are not replayed by maintaining the set of used `jti`
+  values for the length of time for which the JWT would be considered valid". A MAY, not a MUST, and
+  bounded to the assertion's own validity window.
+- **RFC 9449 §11.1** (DPoP) treats proof replay the same way: a server *can* store each proof's `jti`
+  for the window in which that proof would still be accepted. Where DPoP wants a stronger guarantee it
+  does not reach for a bigger cache, it adds a server-issued nonce.
+- **RFC 9421** (HTTP Message Signatures) keeps `nonce` an optional signature parameter and leans on
+  `created` / `expires` for replay windows, leaving nonce tracking to verifiers that need it.
+- **AWS SigV4** ships no replay store at all. A signed request is accepted inside a 5-minute skew
+  window, on TLS, at AWS's scale — the same trade this package makes by default.
+- **Stripe webhooks** sign with HMAC and a timestamp, default a 5-minute tolerance, and hand
+  duplicate suppression to the consumer as idempotent event handling rather than guaranteeing
+  exactly-once delivery themselves.
+
+No replay store ships with this package, and none is accepted as configuration. Narrowing a ~60
+second window is not worth a shared, atomically-reserving store on the critical path of every token
+request — that store becomes a hard dependency of token issuance, so its outage is a total token
+outage. If you want the window smaller, lower `maxSkewSeconds` and `maxAssertionTtlSeconds`; the cost
+is zero infrastructure.
+
+What does close the gap this leaves — a token captured in flight or at rest — is binding the token to
+the caller's key rather than tracking used requests. See [Sender-Constrained Tokens](#sender-constrained-tokens).
+
+### Out Of Scope
+
+Cloudflare same-account `controlPlaneRpcTokenRequester` calls are not part of this problem. The
+caller identity is pinned by the private service-binding entrypoint and no HMAC or JWK HTTP assertion
+is sent, so there is nothing to capture and replay.
+
+## Sender-Constrained Tokens
+
+A capability token is a bearer credential by default: whoever holds the bytes can use it. So the
+attacker in the replay risk assessment who captured the *response* rather than the request wins
+outright, no replay needed — and so does anyone who reads the plane's logs, a token cache, or the plane
+itself.
+
+Binding fixes that. RFC 7800 defines the `cnf` (confirmation) claim: the issuer names a key the
+presenter must prove it holds. Service Plane uses the `jkt` confirmation method — the RFC 7638 SHA-256
+thumbprint of the caller's public JWK, as registered by RFC 9449 (DPoP).
+
+**Always on for JWK callers, and free to use.** There is no switch: reaching this point means the caller
+signed the token request with its private key, so it can always prove possession. No new secrets and no
+extra wiring either — the plane
+already holds the caller's public key and already verifies a signature on every token request, so it
+stamps the thumbprint of the key that actually authenticated:
+
+```json
+{ "iss": "control-plane", "sub": "workflow-runner", "aud": "asana", "cnf": { "jkt": "NzbLsXh8..." } }
+```
+
+The caller signs a short-lived proof when it opens a session — and with a shipped requester that is
+automatic, because the requester already holds the key:
+
+```ts
+const api = await abilitySession<AbilityRpc<typeof asanaTasks>>({
+  abilityId: 'asana.tasks',
+  callerServiceId: 'workflow-runner',
+  targetServiceId: 'asana',
+  scopes: ['asana.tasks.write'],
+  // Carries the prover for its own key; the session picks it up.
+  requestToken: controlPlaneJwkTokenRequester({ clientId, controlPlaneUrl, keyId, privateJwk }),
+  transport: websocketRpc('wss://asana.example.com/rpc/asana.tasks'),
+});
+```
+
+Pass `proveTokenPossession: jwkCapabilityProofSigner({ privateJwk })` explicitly only if the session
+does not use a shipped requester, or signs with a different key.
+
+Unbound tokens cost nothing: the session checks for `cnf` before signing, so callers that are not
+sender-constrained never pay for a signature.
+
+### Where It Applies
+
+| Path | Binding |
+| --- | --- |
+| JWK caller → token endpoint → service | Always. This is where a token leaves the plane. |
+| HMAC caller | None. A shared secret has no key to confirm; use JWK caller auth if you want binding. |
+| Brokered calls (`/rpc/broker`) | Not applicable. The broker mints the token and uses it on its own leg to the service — the caller never receives it. Ingress plus the signed `spb` claim already restricts those tokens to brokered use. |
+| Cloudflare service bindings | Unnecessary. Identity is pinned by the binding entrypoint and no token crosses a network. |
+
+### Limits
+
+The proof is **session-scoped**, not per-call: Cap'n Web sessions are long-lived, so one proof is signed
+when the session opens. The guarantee is "the caller held the key when this session opened", not "on
+every method call".
+
+Rotating a caller key needs both keys registered on the plane until cached tokens expire: a token
+bound to the old key cannot be proved with the new one. `jwkCapabilityProofSigner` detects that
+locally and raises a clear error rather than emitting a proof the service will reject.
+
+Proofs have their own 60-second freshness window (plus skew) for the same reason token requests do —
+a proof is itself a signed artifact. It is bound to one token, one service, and one ability, so a
+captured proof cannot be pointed anywhere else, but binding narrows exposure rather than eliminating it.
 
 ## Context And Identity
 
