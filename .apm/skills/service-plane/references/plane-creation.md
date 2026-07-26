@@ -93,6 +93,8 @@ cloudflareServiceBinding({
 
 If a caller asks for an unknown service, unknown scope, or ungranted scope, the token endpoint rejects the request.
 
+Grants are checked per target service. If one service's grant goes stale — it names a scope that service renamed or removed on its next deploy, or that service is currently undiscoverable — only tokens for that target are refused. Other services keep issuing, brokering, and serving MCP normally. See [auth.md](auth.md#signing-authority-and-authorization-catalog).
+
 ## Discovery Cache
 
 The broker and MCP surfaces can each cache service discovery documents. Pass the same cache to both when they share the same service catalog; the registry creates distinct cache keys from the configured service ids and origins.

@@ -109,6 +109,12 @@ export type MountCapabilityEndpointsOptions = {
   tokenPath?: string;
 };
 
+// Per-target validation outcome: either the target's usable grants, or the error that refuses it.
+type ValidatedTargetGrants = {
+  error?: CapabilityAuthError;
+  grants: ServiceGrant[];
+};
+
 type CapabilityEndpointApp = {
   get(path: string, ...handlers: Handler[]): unknown;
   post(path: string, ...handlers: Handler[]): unknown;
@@ -141,7 +147,7 @@ export function createCapabilityIssuer(options: CreateCapabilityIssuerOptions): 
   const keyId = options.keyId ?? DEFAULT_CAPABILITY_KEY_ID;
   const signingAuthority = createCapabilitySigningAuthority({ ...options, keyId });
   const capabilitiesByService = capabilityScopesByService(options.capabilities);
-  const grants = options.grants.grants.map((grant) => validateGrant(grant, capabilitiesByService));
+  const grantsByTarget = validateGrantsByTarget(options.grants.grants, capabilitiesByService);
   const maxTtlSeconds = normalizeTtlSeconds(options.ttlSeconds ?? DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS, 500);
 
   return {
@@ -150,7 +156,7 @@ export function createCapabilityIssuer(options: CreateCapabilityIssuerOptions): 
         brokerServiceId: normalizeId(input.brokerServiceId, 'broker service id'),
         input,
         issuer: options.issuer,
-        grants,
+        grantsByTarget,
         keyId,
         maxTtlSeconds,
         ...(options.now ? { now: options.now } : {}),
@@ -161,7 +167,7 @@ export function createCapabilityIssuer(options: CreateCapabilityIssuerOptions): 
       return issueCapabilityToken({
         input,
         issuer: options.issuer,
-        grants,
+        grantsByTarget,
         keyId,
         maxTtlSeconds,
         ...(options.now ? { now: options.now } : {}),
@@ -174,7 +180,7 @@ export function createCapabilityIssuer(options: CreateCapabilityIssuerOptions): 
 
 function issueCapabilityToken(options: {
   brokerServiceId?: string;
-  grants: ServiceGrant[];
+  grantsByTarget: Map<string, ValidatedTargetGrants>;
   input: IssueCapabilityTokenInput;
   issuer: string;
   keyId: string;
@@ -183,7 +189,8 @@ function issueCapabilityToken(options: {
   privateJwk: JsonWebKey;
 }): Promise<IssuedCapabilityToken> {
   const requestedScopes = normalizeScopes(options.input.scopes, 400);
-  if (!isGranted(options.grants, options.input.callerServiceId, options.input.targetServiceId, requestedScopes)) {
+  const grants = grantsForTarget(options.grantsByTarget, options.input.targetServiceId);
+  if (!isGranted(grants, options.input.callerServiceId, requestedScopes)) {
     throw new CapabilityAuthError('Service-Plane capability grant denied', 403);
   }
   const ttlSeconds =
@@ -321,14 +328,49 @@ function normalizeGrant(grant: ServiceGrant): ServiceGrant {
   };
 }
 
-function validateGrant(grant: ServiceGrant, capabilitiesByService: Map<string, Set<string>>): ServiceGrant {
-  const normalized = normalizeGrant(grant);
-  const targetScopes = capabilitiesByService.get(normalized.target);
-  if (!targetScopes) throw new CapabilityAuthError(`Unknown Service-Plane capability target: ${normalized.target}`, 500);
-  for (const scope of normalized.scopes) {
+// Grants are validated against the discovered catalog per target, and a failure is recorded rather
+// than thrown. Every service deploys on its own cadence, so one stale or undiscoverable target must
+// not take token issuance down for the rest of the plane; the error is kept verbatim and rethrown
+// only when that target is the one actually requested.
+function validateGrantsByTarget(
+  grants: ServiceGrant[],
+  capabilitiesByService: Map<string, Set<string>>,
+): Map<string, ValidatedTargetGrants> {
+  const byTarget = new Map<string, ValidatedTargetGrants>();
+  for (const grant of grants) {
+    // Normalization failures are plane-side configuration errors, not catalog drift, and carry no
+    // trustworthy target to attribute them to — they stay fail-fast at construction.
+    const normalized = normalizeGrant(grant);
+    const entry = byTarget.get(normalized.target) ?? { grants: [] };
+    byTarget.set(normalized.target, entry);
+    if (entry.error) continue;
+    try {
+      validateGrantScopes(normalized, capabilitiesByService);
+      entry.grants.push(normalized);
+    } catch (error) {
+      if (!(error instanceof CapabilityAuthError)) throw error;
+      // One bad grant refuses the whole target: silently keeping its other grants would look like a
+      // permissions bug instead of the misconfiguration it is.
+      entry.error = error;
+      entry.grants = [];
+    }
+  }
+  return byTarget;
+}
+
+function validateGrantScopes(grant: ServiceGrant, capabilitiesByService: Map<string, Set<string>>): void {
+  const targetScopes = capabilitiesByService.get(grant.target);
+  if (!targetScopes) throw new CapabilityAuthError(`Unknown Service-Plane capability target: ${grant.target}`, 500);
+  for (const scope of grant.scopes) {
     if (!targetScopes.has(scope)) throw new CapabilityAuthError(`Unknown Service-Plane capability scope: ${scope}`, 500);
   }
-  return normalized;
+}
+
+function grantsForTarget(byTarget: Map<string, ValidatedTargetGrants>, target: string): ServiceGrant[] {
+  const entry = byTarget.get(target);
+  if (!entry) return [];
+  if (entry.error) throw entry.error;
+  return entry.grants;
 }
 
 function capabilityScopesByService(capabilities: CapabilityCatalog[]): Map<string, Set<string>> {
@@ -341,8 +383,9 @@ function capabilityScopesByService(capabilities: CapabilityCatalog[]): Map<strin
   return byService;
 }
 
-function isGranted(grants: ServiceGrant[], caller: string, target: string, scopes: string[]): boolean {
-  const matching = grants.filter((grant) => grant.caller === caller && grant.target === target);
+// Receives the requested target's grants only, so caller is the remaining dimension to match.
+function isGranted(grants: ServiceGrant[], caller: string, scopes: string[]): boolean {
+  const matching = grants.filter((grant) => grant.caller === caller);
   return scopes.every((scope) => matching.some((grant) => grant.scopes.includes(scope)));
 }
 

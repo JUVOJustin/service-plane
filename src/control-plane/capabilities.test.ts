@@ -118,17 +118,23 @@ describe('capability issuer', () => {
   it('rejects unknown scopes and unauthorized grants', async () => {
     const keys = await testKeys();
 
-    expect(() =>
-      createCapabilityIssuer({
-        capabilities: [fizzyCapabilities],
-        grants: defineServiceGrants({
-          grants: [{ caller: 'moco', scopes: ['fizzy.unknown'], target: 'fizzy' }],
-        }),
-        issuer: 'control-plane',
-        keyId: 'test-key',
-        privateJwk: keys.privateJwk,
+    const unknownScope = createCapabilityIssuer({
+      capabilities: [fizzyCapabilities],
+      grants: defineServiceGrants({
+        grants: [{ caller: 'moco', scopes: ['fizzy.unknown'], target: 'fizzy' }],
       }),
-    ).toThrow('Unknown Service-Plane capability scope: fizzy.unknown');
+      issuer: 'control-plane',
+      keyId: 'test-key',
+      privateJwk: keys.privateJwk,
+    });
+
+    await expect(
+      unknownScope.issueCapabilityToken({
+        callerServiceId: 'moco',
+        scopes: ['fizzy.users.lookup'],
+        targetServiceId: 'fizzy',
+      }),
+    ).rejects.toThrow('Unknown Service-Plane capability scope: fizzy.unknown');
 
     const issuer = createCapabilityIssuer({
       capabilities: [fizzyCapabilities],
@@ -146,6 +152,41 @@ describe('capability issuer', () => {
         scopes: ['fizzy.boards.sync'],
         targetServiceId: 'fizzy',
       }),
+    ).rejects.toThrow('Service-Plane capability grant denied');
+  });
+
+  it('confines a stale or undiscoverable grant target to that target', async () => {
+    const keys = await testKeys();
+    const issuer = createCapabilityIssuer({
+      // `buzzy` never reported a catalog (discovery outage) and `fizzy` renamed a granted scope.
+      capabilities: [fizzyCapabilities, whizzyCapabilities],
+      grants: defineServiceGrants({
+        grants: [
+          { caller: 'moco', scopes: ['fizzy.renamed'], target: 'fizzy' },
+          { caller: 'moco', scopes: ['whizzy.jobs.run'], target: 'whizzy' },
+          { caller: 'moco', scopes: ['buzzy.jobs.run'], target: 'buzzy' },
+        ],
+      }),
+      issuer: 'control-plane',
+      keyId: 'test-key',
+      privateJwk: keys.privateJwk,
+    });
+
+    await expect(
+      issuer.issueCapabilityToken({ callerServiceId: 'moco', scopes: ['whizzy.jobs.run'], targetServiceId: 'whizzy' }),
+    ).resolves.toMatchObject({ token: expect.any(String) });
+
+    await expect(
+      issuer.issueCapabilityToken({ callerServiceId: 'moco', scopes: ['fizzy.users.lookup'], targetServiceId: 'fizzy' }),
+    ).rejects.toThrow('Unknown Service-Plane capability scope: fizzy.renamed');
+
+    await expect(
+      issuer.issueCapabilityToken({ callerServiceId: 'moco', scopes: ['buzzy.jobs.run'], targetServiceId: 'buzzy' }),
+    ).rejects.toThrow('Unknown Service-Plane capability target: buzzy');
+
+    // A target nobody granted stays an ordinary authorization refusal, not a misconfiguration.
+    await expect(
+      issuer.issueCapabilityToken({ callerServiceId: 'moco', scopes: ['whizzy.jobs.run'], targetServiceId: 'unlisted' }),
     ).rejects.toThrow('Service-Plane capability grant denied');
   });
 
@@ -514,6 +555,11 @@ const fizzyCapabilities = defineCapabilities({
     { id: 'fizzy.boards.sync', title: 'Sync Fizzy boards' },
   ],
   serviceId: 'fizzy',
+});
+
+const whizzyCapabilities = defineCapabilities({
+  scopes: [{ id: 'whizzy.jobs.run', title: 'Run Whizzy jobs' }],
+  serviceId: 'whizzy',
 });
 
 async function testKeys() {

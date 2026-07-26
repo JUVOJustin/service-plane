@@ -193,6 +193,7 @@ During that window, staleness fails closed, not open:
 
 - The service verifies every token against its **current** definition. A token minted from a stale snapshot with a removed or renamed scope is rejected with 403; a call brokered to a removed RPC path gets a 404. Nothing stale grants access.
 - A removed published ability can linger in a cached `/openapi.json`; callers get errors until the caches converge. A newly added ability is simply invisible until then.
+- A grant that still names a scope the deployed service renamed or dropped refuses tokens for that service alone. The rest of the plane keeps issuing and brokering, and the refusal stays the specific `Unknown Service-Plane capability scope` error so it reads as configuration drift, not a permissions bug.
 
 To converge immediately instead of waiting out the window, purge by tag from a deploy hook:
 
