@@ -179,7 +179,9 @@ Binding fixes that. RFC 7800 defines the `cnf` (confirmation) claim: the issuer 
 presenter must prove it holds. Service Plane uses the `jkt` confirmation method — the RFC 7638 SHA-256
 thumbprint of the caller's public JWK, as registered by RFC 9449 (DPoP).
 
-**On by default for JWK callers, and free to use.** No new secrets and no extra wiring: the plane
+**Always on for JWK callers, and free to use.** There is no switch: reaching this point means the caller
+signed the token request with its private key, so it can always prove possession. No new secrets and no
+extra wiring either — the plane
 already holds the caller's public key and already verifies a signature on every token request, so it
 stamps the thumbprint of the key that actually authenticated:
 
@@ -202,41 +204,27 @@ const api = await abilitySession<AbilityRpc<typeof asanaTasks>>({
 });
 ```
 
-Pass `proveTokenPossession: jwkCapabilityProofSigner({ privateJwk })` explicitly only when the session
-does not go through a shipped requester — a hand-rolled `tokenProvider`, or a different key.
+Pass `proveTokenPossession: jwkCapabilityProofSigner({ privateJwk })` explicitly only if the session
+does not use a shipped requester, or signs with a different key.
 
 Unbound tokens cost nothing: the session checks for `cnf` before signing, so callers that are not
 sender-constrained never pay for a signature.
 
-### Turning It Off
+### Rolling It Out
 
-`jwkServiceClientAuth({ clients, senderConstrained: false })` stops the plane binding that caller's
-tokens. Use it for a caller whose sessions cannot send a proof — a hand-rolled token provider, a custom
-`authenticate` hook, or a caller pinned to an older release during a staged rollout. A bound token is
-refused without a matching proof, so such a caller would otherwise fail every call.
+Upgrade callers before the plane. A caller on the new release signs a proof only when the token carries
+a lock, so it behaves identically against an old plane. Once the plane upgrades and starts locking
+tokens, those callers already prove possession. Services can be upgraded whenever — an older service
+ignores the claim and treats the token as a bearer credential, which is where it started.
 
-Each proof is bound to the token (by hash), the target service, and the ability, and carries the public
-key so the service needs no key distribution. The service thumbprints that key, compares it to
-`cnf.jkt`, *then* checks the signature — so substituting a different key fails the comparison, and
-substituting the bound key without re-signing fails the signature.
-
-**Services enforce this with no configuration.** A token carrying `cnf` is rejected unless a matching
-proof arrives, because the requirement travels in the token rather than in local config. A caller
-cannot downgrade a sender-constrained token to a bearer token by omitting the proof, and a service
-cannot forget to check.
-
-What this buys: a token that leaks — from a captured response, a proxy log, an APM trace, or a token
-cache — is useless to whoever finds it, because using it requires the caller's private key.
-
-It does **not** bound a compromised control plane. The plane holds the signing key, so it can mint a
-fresh token with no `cnf` claim at all and present that as a bearer credential. Binding protects
-tokens against theft; it does not make the issuer untrusted.
+Note that only JWK callers are affected at all. HMAC callers have no key to lock to, and Cloudflare
+service-binding callers never send a token over a network.
 
 ### Where It Applies
 
 | Path | Binding |
 | --- | --- |
-| JWK caller → token endpoint → service | On by default. This is where a token leaves the plane. |
+| JWK caller → token endpoint → service | Always. This is where a token leaves the plane. |
 | HMAC caller | None. A shared secret has no key to confirm; use JWK caller auth if you want binding. |
 | Brokered calls (`/rpc/broker`) | Not applicable. The broker mints the token and uses it on its own leg to the service — the caller never receives it. Ingress plus the signed `spb` claim already restricts those tokens to brokered use. |
 | Cloudflare service bindings | Unnecessary. Identity is pinned by the binding entrypoint and no token crosses a network. |

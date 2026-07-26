@@ -103,14 +103,6 @@ export type JwkServiceClientAuthOptions = {
   registryCacheKey?: string;
   registryCacheTtlSeconds?: number;
   requestIdHeader?: string;
-  // Binds issued tokens to the key that authenticated (RFC 7800 `cnf`), so a leaked token is useless
-  // without that key. On by default: the shipped requesters prove possession automatically, so the
-  // normal caller needs no extra wiring.
-  //
-  // Set false only for a caller whose sessions cannot send a proof — a hand-rolled token provider, a
-  // custom `authenticate` hook, or a caller pinned to an older release during a staged rollout. A
-  // bound token is refused without a matching proof, so that caller would otherwise fail every call.
-  senderConstrained?: boolean;
   services?: ServiceEndpoint[] | ((context: Context) => Promise<ServiceEndpoint[]> | ServiceEndpoint[]);
 };
 
@@ -257,15 +249,14 @@ export function jwkServiceClientAuth(options: JwkServiceClientAuthOptions) {
         now,
         requestIdHeader,
       });
-      const serviceId = client.serviceId ?? client.clientId;
-      if (options.senderConstrained === false) return { serviceId };
-
-      // Report the key that actually authenticated, so issuance can sender-constrain the token to it.
+      // Report the key that actually authenticated, so issuance sender-constrains the token to it. Not
+      // optional: reaching here means the caller signed with a private key, so it can always prove
+      // possession, and leaving the token usable by anyone holding the bytes would be the weaker default.
       // `verifyWithJwks` pins the signer by `kid`, so selecting on the validated key id names the
       // signer rather than a key the caller merely claimed to use.
       return {
         confirmation: { jkt: await servicePlaneJwkThumbprint(servicePlaneJwkSigner(jwks, headerKeyId)) },
-        serviceId,
+        serviceId: client.serviceId ?? client.clientId,
       };
     } catch (error) {
       if (error instanceof CapabilityAuthError) {

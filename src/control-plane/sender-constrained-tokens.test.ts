@@ -101,28 +101,6 @@ describe('sender-constrained capability tokens', () => {
     await expect(mismatched.runSync({})).rejects.toThrow(/bound to a different token/u);
   });
 
-  it('binds by default and opts out only when the plane says so', async () => {
-    const caller = await callerKeys();
-    const bound = await deployment(caller);
-    const unbound = await deployment(caller, { senderConstrained: false });
-
-    const withBinding = await bound.requestToken({
-      callerServiceId: CALLER,
-      scopes: ['example.sync.run'],
-      targetServiceId: 'example',
-    });
-    expect((decodeCapabilityTokenPayload(withBinding.token) as unknown as { cnf?: unknown }).cnf).toBeDefined();
-
-    // The escape hatch exists for callers whose sessions cannot send a proof; such a caller would
-    // otherwise fail every call once the plane started binding.
-    const withoutBinding = await unbound.requestToken({
-      callerServiceId: CALLER,
-      scopes: ['example.sync.run'],
-      targetServiceId: 'example',
-    });
-    expect((decodeCapabilityTokenPayload(withoutBinding.token) as unknown as { cnf?: unknown }).cnf).toBeUndefined();
-  });
-
   it('proves possession with no session wiring when the shipped requester is used', async () => {
     const caller = await callerKeys();
     const { requestToken, service } = await deployment(caller);
@@ -182,7 +160,7 @@ async function callerKeys() {
   return { privateJwk, publicJwk, thumbprint: await servicePlaneJwkThumbprint(publicJwk) };
 }
 
-async function deployment(caller: Awaited<ReturnType<typeof callerKeys>>, options: { senderConstrained?: boolean } = {}) {
+async function deployment(caller: Awaited<ReturnType<typeof callerKeys>>) {
   const signingSecret = await generateCapabilitySigningSecret();
   // Declared up front because the two shells reference each other lazily: the service fetches JWKS
   // from the plane, and the plane discovers the service.
@@ -221,7 +199,6 @@ async function deployment(caller: Awaited<ReturnType<typeof callerKeys>>, option
     authenticateCaller: jwkServiceClientAuth({
       clients: [{ clientId: CALLER, jwks: { keys: [caller.publicJwk] } }],
       log: () => undefined,
-      ...(options.senderConstrained === false ? { senderConstrained: false } : {}),
     }),
     log: false,
     services: () => [
