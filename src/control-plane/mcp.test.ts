@@ -3,18 +3,10 @@ import { describe, expect, it } from 'vitest';
 import * as z from 'zod';
 import { abilityMethod, defineAbility, defineCapabilities, requireScopes, ServicePlaneService } from '../service/index.js';
 import type { ServicePlaneBrokerLogEvent } from '../shared/logging.js';
-import {
-  type CapabilityJwks,
-  SERVICE_PLANE_CAPABILITY_JWKS_PATH,
-  SERVICE_PLANE_MCP_PATH,
-  type ServiceAbilityDiscovery,
-  type ServiceEndpoint,
-  type ServiceRegistrySnapshot,
-} from '../shared/types.js';
+import type { ServiceAbilityDiscovery, ServiceEndpoint, ServiceRegistrySnapshot } from '../shared/types.js';
+import { type DemoServiceSpec, demoApp } from '../test-support/index.js';
 import type { BrokerCaller } from './broker.js';
 import type { CapabilityIssuer } from './capabilities.js';
-import { ServicePlaneControlPlane } from './control-plane.js';
-import { cloudflareServiceBinding } from './endpoints.js';
 import { generateMcpDiscovery, handleControlPlaneMcpRequest, MCP_PROTOCOL_VERSION } from './mcp.js';
 import { createServiceRegistry } from './registry.js';
 import { generateCapabilitySigningSecret } from './signing-secret.js';
@@ -113,10 +105,18 @@ type FixtureOptions = {
 };
 
 async function createFixture(options: FixtureOptions = {}) {
-  const capabilities = defineCapabilities({ scopes: [{ id: 'example.read' }], serviceId: 'example' });
-  let plane: ServicePlaneControlPlane | undefined;
-  const service = new ServicePlaneService({
-    abilities: [
+  const app = await demoApp({
+    ...(options.caller ? { brokerCaller: options.caller } : {}),
+    issuer: 'https://issuer.example',
+    ...(options.serverInfo ? { mcp: { serverInfo: options.serverInfo } } : {}),
+    services: [exampleService(options)],
+  });
+  return { events: app.events as ServicePlaneBrokerLogEvent[], mcp: app.mcp, plane: app.plane };
+}
+
+function exampleService(options: FixtureOptions): DemoServiceSpec {
+  return {
+    abilities: () => [
       defineAbility({
         access: 'plane',
         exposure: 'published',
@@ -271,54 +271,18 @@ async function createFixture(options: FixtureOptions = {}) {
         handler: () => new ExampleApi() as ExampleApi & Record<string, unknown>,
       }),
     ],
-    auth: {
-      issuer: 'https://issuer.example',
-      jwks: async () => {
-        if (!plane) throw new Error('Control plane is not initialized');
-        const response = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_CAPABILITY_JWKS_PATH}`));
-        return response.json() as Promise<CapabilityJwks>;
-      },
-    },
-    capabilities,
+    // `gateway-svc` is a second granted caller these tests switch to when the broker caller is a
+    // service rather than a user.
+    grants: [
+      { caller: 'control-plane', scopes: ['example.read'] },
+      { caller: 'gateway-svc', scopes: ['example.read'] },
+    ],
     id: 'example',
-    ...(options.ingress ? { ingress: { brokerServiceIds: ['control-plane'] } } : {}),
+    ingress: options.ingress ?? false,
+    scopes: ['example.read'],
     title: 'Example',
     version: '0.1.0',
-  });
-
-  const events: ServicePlaneBrokerLogEvent[] = [];
-  const signingSecret = await generateCapabilitySigningSecret();
-  plane = new ServicePlaneControlPlane({
-    issuer: 'https://issuer.example',
-    log: (event) => events.push(event as ServicePlaneBrokerLogEvent),
-    mcp: {
-      caller: () => options.caller ?? { id: 'gateway', kind: 'user' },
-      ...(options.serverInfo ? { serverInfo: options.serverInfo } : {}),
-    },
-    services: () => [
-      cloudflareServiceBinding({
-        binding: { fetch: async (request) => service.fetch(request) },
-        grants: [
-          { caller: 'control-plane', scopes: ['example.read'] },
-          { caller: 'gateway-svc', scopes: ['example.read'] },
-        ],
-        id: 'example',
-        origin: 'https://example.internal',
-      }),
-    ],
-    signingSecret: () => signingSecret,
-  });
-
-  const boundPlane = plane;
-  const mcp = (body: unknown, headers?: Record<string, string>) =>
-    boundPlane.fetch(
-      new Request(`https://plane.internal${SERVICE_PLANE_MCP_PATH}`, {
-        body: JSON.stringify(body),
-        headers: { 'content-type': 'application/json', ...headers },
-        method: 'POST',
-      }),
-    );
-  return { events, mcp, plane: boundPlane };
+  };
 }
 
 function rpc(method: string, params?: unknown, id: string | number | null = 1) {

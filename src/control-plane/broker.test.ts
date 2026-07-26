@@ -9,9 +9,9 @@ import {
   type ServicePlaneLogEvent,
   ServicePlaneService,
 } from '../service/index.js';
-import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
 import type { ServicePlaneBrokerLogEvent } from '../shared/logging.js';
 import type { DiscoveredServiceAbility } from '../shared/types.js';
+import { testKeys } from '../test-support/index.js';
 import { brokerCallerSubject, createControlPlaneRpcBroker, transportForAbility } from './broker.js';
 import { createCapabilityIssuer, defineServiceGrants } from './capabilities.js';
 import { cloudflareServiceBinding } from './endpoints.js';
@@ -402,12 +402,3 @@ const privateDiscovery = {
   title: 'Example',
   version: '0.1.0',
 };
-
-async function testKeys() {
-  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
-  const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
-  return {
-    privateJwk,
-    publicJwk: publicJwkFromPrivateJwk(privateJwk, 'test-key'),
-  };
-}

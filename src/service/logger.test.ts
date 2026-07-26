@@ -1,8 +1,8 @@
 import type { MiddlewareHandler } from 'hono';
 import { describe, expect, it, vi } from 'vitest';
 import * as z from 'zod';
-import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
 import { SERVICE_DISCOVERY_PATH } from '../shared/types.js';
+import { testKeys } from '../test-support/index.js';
 import { defineCapabilities, RpcTarget } from './capabilities.js';
 import { abilityMethod, defineAbility } from './discovery.js';
 import type { ServicePlaneLogEvent } from './logger.js';
@@ -115,13 +115,4 @@ async function testService(logger?: { log: (event: ServicePlaneLogEvent) => void
     title: 'Example',
     version: '0.1.0',
   });
-}
-
-async function testKeys() {
-  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
-  const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
-  return {
-    privateJwk,
-    publicJwk: publicJwkFromPrivateJwk(privateJwk, 'test-key'),
-  };
 }

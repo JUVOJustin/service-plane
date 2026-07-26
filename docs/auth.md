@@ -56,6 +56,12 @@ target service is unavailable. Token issuance and brokering still need both halv
 closed: an unknown service, scope, or grant is rejected, and an unreachable grant target is a `500`
 rather than a token.
 
+That refusal is scoped to the target it concerns. Grants are validated against the discovered catalog
+per target service, so a grant naming a scope the target no longer publishes — or a target that failed
+discovery — refuses tokens for **that** target only. Issuance, brokering, and MCP for every other
+service keep working, and the affected target keeps returning its specific `Unknown Service-Plane
+capability scope`/`target` error rather than a silent "not granted".
+
 `createCapabilitySigningAuthorityFromSigningSecret({ signingSecret, issuer, keyId })` builds that half
 directly if you publish JWKS from your own Hono app. `mountCapabilityJwksEndpoint` takes it, and
 `mountCapabilityEndpoints` requires an explicit `jwks` provider — passing the issuer there is legal but
