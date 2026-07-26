@@ -163,6 +163,13 @@ export interface AuthenticatedRoot<Scoped> {
 // caller holds the private key its tokens are bound to.
 export type CapabilityProofSigner = (input: { abilityId: string; targetServiceId: string; token: string }) => Promise<string> | string;
 
+// A token requester, optionally carrying the prover for the key it authenticates with. Callers that use
+// a shipped requester therefore need no extra wiring for sender-constrained tokens: the key is already
+// configured once, in one place.
+export type CapabilityTokenRequester = CreateCapabilityTokenProviderOptions['requestToken'] & {
+  proveTokenPossession?: CapabilityProofSigner;
+};
+
 export type CapabilityRpcTransport =
   | { binding: CloudflareAbilityRpcBinding; kind: 'cloudflare-binding-rpc' }
   | { kind: 'custom'; transport: RpcTransport }
@@ -376,12 +383,19 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
   const authenticate = options.authenticate ?? defaultAuthenticate<Scoped>;
   // One proof per session, freshly signed each time a session opens: it is bound to the token and
   // ability, so it cannot be reused for another session on another service.
-  const proveToken = async (token: string): Promise<string | undefined> =>
-    options.proveTokenPossession?.({
+  // An explicit signer wins; otherwise a shipped requester supplies one for the key it already holds.
+  const proveTokenPossession =
+    options.proveTokenPossession ?? (options as { requestToken?: CapabilityTokenRequester }).requestToken?.proveTokenPossession;
+  const proveToken = async (token: string): Promise<string | undefined> => {
+    // Only sender-constrained tokens need a proof. Skipping the signature for the rest keeps the
+    // unbound path free rather than sending something the service would ignore.
+    if (!proveTokenPossession || !decodeCapabilityTokenPayload(token).cnf) return undefined;
+    return proveTokenPossession({
       abilityId: options.abilityId ?? missingAbilityId(),
       targetServiceId: options.targetServiceId,
       token,
     });
+  };
   const rejectStreamMethods = options.rejectStreamMethods ? new Set(options.rejectStreamMethods) : undefined;
   // The persistent session's Cap'n Web root stub is Disposable; keep it so the underlying
   // transport (socket) can be released — the scoped stub alone does not close the session.
@@ -661,16 +675,14 @@ async function assertProofKeyMatchesToken(privateJwk: JsonWebKey, token: string)
   }
 }
 
-export function controlPlaneJwkTokenRequester(
-  options: ControlPlaneJwkTokenRequesterOptions,
-): CreateCapabilityTokenProviderOptions['requestToken'] {
+export function controlPlaneJwkTokenRequester(options: ControlPlaneJwkTokenRequesterOptions): CapabilityTokenRequester {
   const fetcher = options.fetch ?? fetch;
   const tokenUrl = new URL(options.tokenPath ?? SERVICE_PLANE_CAPABILITY_TOKEN_PATH, options.controlPlaneUrl);
   const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
   const clientIdHeaderName = options.clientIdHeaderName ?? SERVICE_PLANE_JWK_CLIENT_HEADER;
   const keyIdHeaderName = options.keyIdHeaderName ?? SERVICE_PLANE_JWK_KEY_ID_HEADER;
 
-  return async (input) => {
+  const requestToken: CapabilityTokenRequester = async (input) => {
     rejectRequesterSubject(input);
     const headers = new Headers(typeof options.headers === 'function' ? await options.headers() : options.headers);
     headers.set('content-type', 'application/json');
@@ -701,6 +713,14 @@ export function controlPlaneJwkTokenRequester(
     if (!response.ok) throw new CapabilityAuthError(`Unable to fetch Service-Plane capability token: ${response.status}`, response.status);
     return parseIssuedCapabilityToken(await readJson(response, 'Invalid Service-Plane capability token response'));
   };
+
+  // The same key authenticates the token request and proves possession of the token it returns, so a
+  // session opened with this requester satisfies sender-constrained tokens without further config.
+  requestToken.proveTokenPossession = jwkCapabilityProofSigner({
+    privateJwk: options.privateJwk,
+    ...(options.now ? { now: options.now } : {}),
+  });
+  return requestToken;
 }
 
 export function controlPlaneRpcTokenRequester(

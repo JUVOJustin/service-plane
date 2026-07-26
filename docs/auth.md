@@ -179,22 +179,16 @@ Binding fixes that. RFC 7800 defines the `cnf` (confirmation) claim: the issuer 
 presenter must prove it holds. Service Plane uses the `jkt` confirmation method — the RFC 7638 SHA-256
 thumbprint of the caller's public JWK, as registered by RFC 9449 (DPoP).
 
-**Opt in on the plane with `senderConstrained: true`.** It is off by default on purpose: a bound token
-is refused without a proof, so switching it on before callers send proofs would break every existing
-session. Turn it on together with rolling `proveTokenPossession` out to callers.
-
-```ts
-jwkServiceClientAuth({ clients, senderConstrained: true });
-```
-
-No new secrets are involved — the plane already holds the caller's public key and already verifies a
-signature on every token request, so it stamps the thumbprint of the key that actually authenticated:
+**On by default for JWK callers, and free to use.** No new secrets and no extra wiring: the plane
+already holds the caller's public key and already verifies a signature on every token request, so it
+stamps the thumbprint of the key that actually authenticated:
 
 ```json
 { "iss": "control-plane", "sub": "workflow-runner", "aud": "asana", "cnf": { "jkt": "NzbLsXh8..." } }
 ```
 
-The caller then signs a short-lived proof when it opens a session:
+The caller signs a short-lived proof when it opens a session — and with a shipped requester that is
+automatic, because the requester already holds the key:
 
 ```ts
 const api = await abilitySession<AbilityRpc<typeof asanaTasks>>({
@@ -202,12 +196,24 @@ const api = await abilitySession<AbilityRpc<typeof asanaTasks>>({
   callerServiceId: 'workflow-runner',
   targetServiceId: 'asana',
   scopes: ['asana.tasks.write'],
-  requestToken,
-  // Same private key the token requester authenticates with.
-  proveTokenPossession: jwkCapabilityProofSigner({ privateJwk }),
+  // Carries the prover for its own key; the session picks it up.
+  requestToken: controlPlaneJwkTokenRequester({ clientId, controlPlaneUrl, keyId, privateJwk }),
   transport: websocketRpc('wss://asana.example.com/rpc/asana.tasks'),
 });
 ```
+
+Pass `proveTokenPossession: jwkCapabilityProofSigner({ privateJwk })` explicitly only when the session
+does not go through a shipped requester — a hand-rolled `tokenProvider`, or a different key.
+
+Unbound tokens cost nothing: the session checks for `cnf` before signing, so callers that are not
+sender-constrained never pay for a signature.
+
+### Turning It Off
+
+`jwkServiceClientAuth({ clients, senderConstrained: false })` stops the plane binding that caller's
+tokens. Use it for a caller whose sessions cannot send a proof — a hand-rolled token provider, a custom
+`authenticate` hook, or a caller pinned to an older release during a staged rollout. A bound token is
+refused without a matching proof, so such a caller would otherwise fail every call.
 
 Each proof is bound to the token (by hash), the target service, and the ability, and carries the public
 key so the service needs no key distribution. The service thumbprints that key, compares it to
@@ -230,7 +236,7 @@ tokens against theft; it does not make the issuer untrusted.
 
 | Path | Binding |
 | --- | --- |
-| JWK caller → token endpoint → service | Opt in with `senderConstrained`. This is where a token leaves the plane. |
+| JWK caller → token endpoint → service | On by default. This is where a token leaves the plane. |
 | HMAC caller | None. A shared secret has no key to confirm; use JWK caller auth if you want binding. |
 | Brokered calls (`/rpc/broker`) | Not applicable. The broker mints the token and uses it on its own leg to the service — the caller never receives it. Ingress plus the signed `spb` claim already restricts those tokens to brokered use. |
 | Cloudflare service bindings | Unnecessary. Identity is pinned by the binding entrypoint and no token crosses a network. |

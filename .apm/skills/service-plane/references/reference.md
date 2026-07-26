@@ -258,7 +258,7 @@ Delegated (user-brokered) token:
 | `aud` | target service id → `identity.audience` | same |
 | `scp` | granted scopes → `identity.scopes` | same |
 | `spb` | broker service id on brokered (ingress) tokens → `identity.brokerServiceId` | same |
-| `cnf` | `{ jkt }` on tokens bound to a caller key → `identity.confirmation`, only after a matching proof verified | same |
+| `cnf` | `{ jkt }` on tokens bound to a caller key (JWK callers, on by default) → `identity.confirmation`, only after a matching proof verified | same |
 | `jti` | token id → `identity.tokenId` | same |
 | `exp` | expiry → `identity.expiresAt`; `iat`/`nbf` are also enforced | same |
 

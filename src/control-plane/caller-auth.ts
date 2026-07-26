@@ -103,9 +103,13 @@ export type JwkServiceClientAuthOptions = {
   registryCacheKey?: string;
   registryCacheTtlSeconds?: number;
   requestIdHeader?: string;
-  // Binds issued tokens to the key that authenticated (RFC 7800 `cnf`), so the token cannot be used
-  // by anyone else. Opt-in: a bound token is refused without a matching proof, so callers must also
-  // pass `proveTokenPossession` when opening sessions. Turning it on without that breaks them.
+  // Binds issued tokens to the key that authenticated (RFC 7800 `cnf`), so a leaked token is useless
+  // without that key. On by default: the shipped requesters prove possession automatically, so the
+  // normal caller needs no extra wiring.
+  //
+  // Set false only for a caller whose sessions cannot send a proof — a hand-rolled token provider, a
+  // custom `authenticate` hook, or a caller pinned to an older release during a staged rollout. A
+  // bound token is refused without a matching proof, so that caller would otherwise fail every call.
   senderConstrained?: boolean;
   services?: ServiceEndpoint[] | ((context: Context) => Promise<ServiceEndpoint[]> | ServiceEndpoint[]);
 };
@@ -254,7 +258,7 @@ export function jwkServiceClientAuth(options: JwkServiceClientAuthOptions) {
         requestIdHeader,
       });
       const serviceId = client.serviceId ?? client.clientId;
-      if (!options.senderConstrained) return { serviceId };
+      if (options.senderConstrained === false) return { serviceId };
 
       // Report the key that actually authenticated, so issuance can sender-constrain the token to it.
       // `verifyWithJwks` pins the signer by `kid`, so selecting on the validated key id names the

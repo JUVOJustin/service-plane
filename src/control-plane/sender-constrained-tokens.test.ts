@@ -101,14 +101,49 @@ describe('sender-constrained capability tokens', () => {
     await expect(mismatched.runSync({})).rejects.toThrow(/bound to a different token/u);
   });
 
-  it('leaves JWK callers unbound until the plane opts in, so upgrading cannot break them', async () => {
+  it('binds by default and opts out only when the plane says so', async () => {
     const caller = await callerKeys();
-    const { requestToken } = await deployment(caller, { senderConstrained: false });
+    const bound = await deployment(caller);
+    const unbound = await deployment(caller, { senderConstrained: false });
 
-    // Binding a caller's tokens requires it to send proofs. Turning that on silently would break every
-    // existing session, so the plane must ask for it.
-    const issued = await requestToken({ callerServiceId: CALLER, scopes: ['example.sync.run'], targetServiceId: 'example' });
-    expect((decodeCapabilityTokenPayload(issued.token) as unknown as { cnf?: unknown }).cnf).toBeUndefined();
+    const withBinding = await bound.requestToken({
+      callerServiceId: CALLER,
+      scopes: ['example.sync.run'],
+      targetServiceId: 'example',
+    });
+    expect((decodeCapabilityTokenPayload(withBinding.token) as unknown as { cnf?: unknown }).cnf).toBeDefined();
+
+    // The escape hatch exists for callers whose sessions cannot send a proof; such a caller would
+    // otherwise fail every call once the plane started binding.
+    const withoutBinding = await unbound.requestToken({
+      callerServiceId: CALLER,
+      scopes: ['example.sync.run'],
+      targetServiceId: 'example',
+    });
+    expect((decodeCapabilityTokenPayload(withoutBinding.token) as unknown as { cnf?: unknown }).cnf).toBeUndefined();
+  });
+
+  it('proves possession with no session wiring when the shipped requester is used', async () => {
+    const caller = await callerKeys();
+    const { requestToken, service } = await deployment(caller);
+
+    // The whole point of binding on by default: the key is configured once, on the requester, and the
+    // session picks the prover up from it. No `proveTokenPossession` anywhere in this call.
+    const api = await abilitySession<SyncApi>({
+      abilityId: 'example.sync',
+      callerServiceId: CALLER,
+      requestToken,
+      scopes: ['example.sync.run'],
+      targetServiceId: 'example',
+      transport: {
+        fetcher: { fetch: async (request: Request) => service.fetch(request) },
+        kind: 'fetch',
+        origin: 'https://example.internal',
+        path: '/rpc/example.sync',
+      },
+    });
+
+    await expect(api.runSync({})).resolves.toEqual({ boundTo: caller.thumbprint, caller: CALLER });
   });
 
   it('fails locally when the proof key no longer matches the token it accompanies', async () => {
@@ -186,7 +221,7 @@ async function deployment(caller: Awaited<ReturnType<typeof callerKeys>>, option
     authenticateCaller: jwkServiceClientAuth({
       clients: [{ clientId: CALLER, jwks: { keys: [caller.publicJwk] } }],
       log: () => undefined,
-      senderConstrained: options.senderConstrained ?? true,
+      ...(options.senderConstrained === false ? { senderConstrained: false } : {}),
     }),
     log: false,
     services: () => [
