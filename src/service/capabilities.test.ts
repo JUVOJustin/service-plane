@@ -1,7 +1,7 @@
 import { RpcSession } from 'capnweb';
 import { describe, expect, it } from 'vitest';
 import { createCapabilityIssuer, defineServiceGrants } from '../control-plane/capabilities.js';
-import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
+import { testKeys } from '../test-support/index.js';
 import { memoryCapabilityTokenCache, memoryRpcTransportPair } from '../testing/index.js';
 import {
   bindCapabilityIdentity,
@@ -436,13 +436,4 @@ class FakeWebSocket extends EventTarget {
   close(): void {}
 
   send(): void {}
-}
-
-async function testKeys() {
-  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
-  const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
-  return {
-    privateJwk,
-    publicJwk: publicJwkFromPrivateJwk(privateJwk, 'test-key'),
-  };
 }

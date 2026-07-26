@@ -2,7 +2,7 @@ import { RpcSession } from 'capnweb';
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import * as z from 'zod';
 import { createCapabilityIssuer, defineServiceGrants } from '../control-plane/capabilities.js';
-import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
+import { demoService, nativeRpcEnv, testKeys } from '../test-support/index.js';
 import { memoryRpcTransportPair } from '../testing/memory-transport.js';
 import {
   abilitySession,
@@ -153,9 +153,21 @@ function streamAbility() {
 
 async function createFixture(options: { ingress?: boolean } = {}) {
   const keys = await testKeys();
-  const capabilities = defineCapabilities({ scopes: [{ id: 'example.read' }], serviceId: 'example' });
+  const deployed = demoService({
+    env: nativeRpcEnv(),
+    issuer: 'control-plane',
+    jwks: { keys: [keys.publicJwk] },
+    now: () => VERIFIED_AT,
+    spec: {
+      abilities: () => [streamAbility()],
+      id: 'example',
+      ingress: options.ingress ?? false,
+      scopes: ['example.read'],
+      title: 'Example',
+    },
+  });
   const issuer = createCapabilityIssuer({
-    capabilities: [capabilities],
+    capabilities: [deployed.capabilities],
     grants: defineServiceGrants({
       grants: [{ caller: 'worker-a', scopes: ['example.read'], target: 'example' }],
     }),
@@ -164,25 +176,12 @@ async function createFixture(options: { ingress?: boolean } = {}) {
     now: () => ISSUED_AT,
     privateJwk: keys.privateJwk,
   });
-  const service = new ServicePlaneService({
-    abilities: [streamAbility()],
-    auth: {
-      issuer: 'control-plane',
-      jwks: { keys: [keys.publicJwk] },
-      now: () => VERIFIED_AT,
-    },
-    capabilities,
-    id: 'example',
-    ...(options.ingress ? { ingress: { brokerServiceIds: ['control-plane'] } } : {}),
-    title: 'Example',
-    version: '0.1.0',
-  });
   const issued = await issuer.issueCapabilityToken({
     callerServiceId: 'worker-a',
     scopes: ['example.read'],
     targetServiceId: 'example',
   });
-  return { issued, issuer, service };
+  return { issued, issuer, service: deployed.service };
 }
 
 async function drainStream<T>(stream: ReadableStream<T>): Promise<T[]> {
@@ -650,12 +649,3 @@ describe('streaming ability methods', () => {
     );
   });
 });
-
-async function testKeys() {
-  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
-  const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
-  return {
-    privateJwk,
-    publicJwk: publicJwkFromPrivateJwk(privateJwk, 'test-key'),
-  };
-}

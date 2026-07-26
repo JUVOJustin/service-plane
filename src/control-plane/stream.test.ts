@@ -1,14 +1,12 @@
 import { RpcSession } from 'capnweb';
-import type { UpgradeWebSocket } from 'hono/ws';
 import { describe, expect, it, vi } from 'vitest';
 import * as z from 'zod';
-import { abilityMethod, defineAbility, defineCapabilities, RpcTarget, requireScopes, ServicePlaneService } from '../service/index.js';
-import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
+import { abilityMethod, defineAbility, RpcTarget, requireScopes } from '../service/index.js';
 import type { ServiceEndpoint, ServiceRegistrySnapshot } from '../shared/types.js';
+import { demoService, httpBatchEnv, nativeRpcEnv, testKeys, websocketEnv } from '../test-support/index.js';
 import { memoryRpcTransportPair } from '../testing/index.js';
 import { createControlPlaneRpcBroker } from './broker.js';
 import { createCapabilityIssuer, defineServiceGrants } from './capabilities.js';
-import { cloudflareServiceBinding } from './endpoints.js';
 import { generateMcpDiscovery, handleControlPlaneMcpRequest } from './mcp.js';
 import { createServiceRegistry } from './registry.js';
 
@@ -41,10 +39,6 @@ class HubApi extends RpcTarget {
   }
 }
 
-const unusedUpgradeWebSocket = (() => () => {
-  throw new Error('unexpected WebSocket upgrade on the service');
-}) as unknown as UpgradeWebSocket;
-
 type FixtureOptions = {
   ingress?: boolean;
   streamLimits?: { maxBytes?: number; maxItems?: number };
@@ -56,9 +50,69 @@ type FixtureOptions = {
 
 async function createFixture(options: FixtureOptions = {}) {
   const keys = await testKeys();
-  const capabilities = defineCapabilities({ scopes: [{ id: 'hub.read' }], serviceId: 'hub' });
+  let upstreamCancellations = 0;
+  let nativeConnections = 0;
+  let nativeDisposals = 0;
+  let webSocketConnections = 0;
+
+  const env = options.websocketTransport
+    ? websocketEnv({
+        createWebSocket: (_url: string): WebSocket => {
+          webSocketConnections += 1;
+          throw new Error('unexpected WebSocket connection to the service');
+        },
+      })
+    : options.withoutNativeRpc
+      ? httpBatchEnv()
+      : nativeRpcEnv({
+          onConnect: () => (nativeConnections += 1),
+          onDispose: () => (nativeDisposals += 1),
+        });
+
+  const deployed = demoService({
+    env,
+    issuer: 'control-plane',
+    jwks: { keys: [keys.publicJwk] },
+    now: () => VERIFIED_AT,
+    spec: {
+      abilities: ({ transports }) => [
+        defineAbility({
+          access: 'plane',
+          exposure: 'published',
+          id: 'hub.files',
+          methods: {
+            readFile: abilityMethod({
+              input: z.object({ chunk: z.string().optional(), parts: z.number() }),
+              mcp: { description: 'Read a hub file', name: 'hub_read_file' },
+              output: z.object({ chunk: z.string() }),
+              scopes: ['hub.read'],
+              stream: true,
+            }),
+            stat: abilityMethod({
+              input: z.object({}),
+              mcp: { name: 'hub_stat' },
+              output: z.object({ size: z.number() }),
+              scopes: ['hub.read'],
+            }),
+          },
+          // `withoutNativeRpc` keeps the ability advertising native RPC while the endpoint drops the
+          // binding. That mismatch — discovery promises a session transport the endpoint cannot
+          // provide — is exactly what those tests are about.
+          rpc: { transports: options.withoutNativeRpc ? nativeRpcEnv().transports : transports },
+          scopes: ['hub.read'],
+          handler: () => new HubApi(() => (upstreamCancellations += 1)) as HubApi & Record<string, unknown>,
+        }),
+      ],
+      id: 'hub',
+      ingress: options.ingress ?? false,
+      scopes: ['hub.read'],
+      title: 'Hub',
+    },
+  });
+  const service = deployed.service;
+
   const issuer = createCapabilityIssuer({
-    capabilities: [capabilities],
+    capabilities: [deployed.capabilities],
     grants: defineServiceGrants({
       grants: [{ caller: 'control-plane', scopes: ['hub.read'], target: 'hub' }],
     }),
@@ -68,77 +122,7 @@ async function createFixture(options: FixtureOptions = {}) {
     privateJwk: keys.privateJwk,
   });
 
-  let upstreamCancellations = 0;
-  const service = new ServicePlaneService({
-    abilities: [
-      defineAbility({
-        access: 'plane',
-        exposure: 'published',
-        id: 'hub.files',
-        methods: {
-          readFile: abilityMethod({
-            input: z.object({ chunk: z.string().optional(), parts: z.number() }),
-            mcp: { description: 'Read a hub file', name: 'hub_read_file' },
-            output: z.object({ chunk: z.string() }),
-            scopes: ['hub.read'],
-            stream: true,
-          }),
-          stat: abilityMethod({
-            input: z.object({}),
-            mcp: { name: 'hub_stat' },
-            output: z.object({ size: z.number() }),
-            scopes: ['hub.read'],
-          }),
-        },
-        rpc: { transports: options.websocketTransport ? ['http-batch', 'websocket'] : ['http-batch', 'cloudflare-binding-rpc'] },
-        scopes: ['hub.read'],
-        handler: () => new HubApi(() => (upstreamCancellations += 1)) as HubApi & Record<string, unknown>,
-      }),
-    ],
-    auth: {
-      issuer: 'control-plane',
-      jwks: { keys: [keys.publicJwk] },
-      now: () => VERIFIED_AT,
-    },
-    capabilities,
-    id: 'hub',
-    ...(options.ingress ? { ingress: { brokerServiceIds: ['control-plane'] } } : {}),
-    // Only needed so the service accepts an ability advertising the websocket transport; these
-    // tests assert the plane never upgrades, so the helper is never invoked.
-    ...(options.websocketTransport ? { rpc: { upgradeWebSocket: unusedUpgradeWebSocket } } : {}),
-    title: 'Hub',
-    version: '0.1.0',
-  });
-
-  let nativeConnections = 0;
-  let nativeDisposals = 0;
-  const abilityRpc = {
-    async connectAbility(input: { abilityId: string; requestId?: string; token: string }) {
-      nativeConnections += 1;
-      const target = await service.connectAbility(input);
-      Object.defineProperty(target, Symbol.dispose, {
-        value() {
-          nativeDisposals += 1;
-        },
-      });
-      return target;
-    },
-  };
-  let webSocketConnections = 0;
-  const endpoint = cloudflareServiceBinding({
-    ...(options.withoutNativeRpc || options.websocketTransport ? {} : { abilityRpc }),
-    binding: { fetch: async (request: Request) => service.fetch(request) },
-    ...(options.websocketTransport
-      ? {
-          createWebSocket: (_url: string): WebSocket => {
-            webSocketConnections += 1;
-            throw new Error('unexpected WebSocket connection to the service');
-          },
-        }
-      : {}),
-    id: 'hub',
-    origin: 'https://hub.internal',
-  });
+  const endpoint = deployed.endpoint;
   const registry = createServiceRegistry({ services: [endpoint] });
 
   const mcpRequest = (body: unknown, headers: Record<string, string> = {}) =>
@@ -645,12 +629,3 @@ describe('control-plane MCP streaming tools', () => {
     expect(unaryParsed.result.structuredContent).toEqual({ size: 3 });
   });
 });
-
-async function testKeys() {
-  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
-  const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
-  return {
-    privateJwk,
-    publicJwk: publicJwkFromPrivateJwk(privateJwk, 'test-key'),
-  };
-}

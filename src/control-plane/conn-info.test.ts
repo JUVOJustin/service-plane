@@ -1,20 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import * as z from 'zod';
-import {
-  abilityMethod,
-  abilitySession,
-  cloudflareServiceBindingRpc,
-  defineAbility,
-  defineCapabilities,
-  RpcTarget,
-  requireScopes,
-  ServicePlaneService,
-} from '../service/index.js';
-import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
+import { abilityMethod, abilitySession, cloudflareServiceBindingRpc, defineAbility, RpcTarget, requireScopes } from '../service/index.js';
 import { type ConnInfo, SERVICE_PLANE_CONN_INFO_HEADER } from '../shared/conn-info.js';
+import { demoService, httpBatchEnv, nativeRpcEnv, testKeys } from '../test-support/index.js';
 import { createControlPlaneRpcBroker } from './broker.js';
 import { createCapabilityIssuer, defineServiceGrants } from './capabilities.js';
-import { cloudflareServiceBinding } from './endpoints.js';
 
 const ISSUED_AT = new Date('2026-07-24T12:00:00.000Z');
 const VERIFIED_AT = new Date('2026-07-24T12:00:01.000Z');
@@ -33,9 +23,39 @@ class AuditApi extends RpcTarget {
 
 async function createFixture(options: { ingress?: boolean; nativeRpc?: boolean } = {}) {
   const keys = await testKeys();
-  const capabilities = defineCapabilities({ scopes: [{ id: 'audit.read' }], serviceId: 'audit' });
+  const deployed = demoService({
+    env: options.nativeRpc ? nativeRpcEnv() : httpBatchEnv(),
+    issuer: 'control-plane',
+    jwks: { keys: [keys.publicJwk] },
+    now: () => VERIFIED_AT,
+    spec: {
+      abilities: ({ transports }) => [
+        defineAbility({
+          access: 'plane',
+          exposure: 'published',
+          id: 'audit.calls',
+          methods: {
+            whoCalled: abilityMethod({
+              input: z.object({}),
+              output: z.object({ address: z.string().nullable(), port: z.number().nullable() }),
+              scopes: ['audit.read'],
+            }),
+          },
+          rpc: { transports },
+          scopes: ['audit.read'],
+          // The handler factory is the only place connection info is offered to service code.
+          handler: ({ connInfo }) => new AuditApi(connInfo) as AuditApi & Record<string, unknown>,
+        }),
+      ],
+      id: 'audit',
+      ingress: options.ingress !== false,
+      scopes: ['audit.read'],
+      title: 'Audit',
+    },
+  });
+
   const issuer = createCapabilityIssuer({
-    capabilities: [capabilities],
+    capabilities: [deployed.capabilities],
     grants: defineServiceGrants({ grants: [{ caller: 'control-plane', scopes: ['audit.read'], target: 'audit' }] }),
     issuer: 'control-plane',
     keyId: 'test-key',
@@ -43,43 +63,7 @@ async function createFixture(options: { ingress?: boolean; nativeRpc?: boolean }
     privateJwk: keys.privateJwk,
   });
 
-  const service = new ServicePlaneService({
-    abilities: [
-      defineAbility({
-        access: 'plane',
-        exposure: 'published',
-        id: 'audit.calls',
-        methods: {
-          whoCalled: abilityMethod({
-            input: z.object({}),
-            output: z.object({ address: z.string().nullable(), port: z.number().nullable() }),
-            scopes: ['audit.read'],
-          }),
-        },
-        rpc: { transports: options.nativeRpc ? ['http-batch', 'cloudflare-binding-rpc'] : ['http-batch'] },
-        scopes: ['audit.read'],
-        // The handler factory is the only place connection info is offered to service code.
-        handler: ({ connInfo }) => new AuditApi(connInfo) as AuditApi & Record<string, unknown>,
-      }),
-    ],
-    auth: { issuer: 'control-plane', jwks: { keys: [keys.publicJwk] }, now: () => VERIFIED_AT },
-    capabilities,
-    id: 'audit',
-    ...(options.ingress === false ? {} : { ingress: { brokerServiceIds: ['control-plane'] } }),
-    title: 'Audit',
-    version: '0.1.0',
-  });
-
-  const endpoint = cloudflareServiceBinding({
-    ...(options.nativeRpc
-      ? { abilityRpc: { connectAbility: (input: Parameters<typeof service.connectAbility>[0]) => service.connectAbility(input) } }
-      : {}),
-    binding: { fetch: async (request: Request) => service.fetch(request) },
-    id: 'audit',
-    origin: 'https://audit.internal',
-  });
-
-  return { endpoint, issuer, keys, service };
+  return { endpoint: deployed.endpoint, issuer, keys, service: deployed.service };
 }
 
 type Brokered = {
@@ -144,9 +128,3 @@ describe('forwarded connection info', () => {
     await expect(api.whoCalled({})).resolves.toEqual({ address: null, port: null });
   });
 });
-
-async function testKeys() {
-  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
-  const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
-  return { privateJwk, publicJwk: publicJwkFromPrivateJwk(privateJwk, 'test-key') };
-}

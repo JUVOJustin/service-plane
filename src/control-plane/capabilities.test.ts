@@ -1,7 +1,8 @@
 import { Hono } from 'hono';
 import { describe, expect, it } from 'vitest';
 import { defineCapabilities } from '../service/capabilities.js';
-import { publicJwkFromPrivateJwk, verifyCapabilityToken } from '../shared/capability-tokens.js';
+import { verifyCapabilityToken } from '../shared/capability-tokens.js';
+import { testKeys } from '../test-support/index.js';
 import {
   type CapabilityIssuer,
   createCapabilityIssuer,
@@ -561,12 +562,3 @@ const whizzyCapabilities = defineCapabilities({
   scopes: [{ id: 'whizzy.jobs.run', title: 'Run Whizzy jobs' }],
   serviceId: 'whizzy',
 });
-
-async function testKeys() {
-  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
-  const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
-  return {
-    privateJwk,
-    publicJwk: publicJwkFromPrivateJwk(privateJwk, 'test-key'),
-  };
-}

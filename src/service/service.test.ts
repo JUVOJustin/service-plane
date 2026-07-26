@@ -3,8 +3,8 @@ import * as z from 'zod';
 import { createControlPlaneRpcBroker } from '../control-plane/broker.js';
 import { createCapabilityIssuer, defineServiceGrants } from '../control-plane/capabilities.js';
 import { cloudflareServiceBinding } from '../control-plane/endpoints.js';
-import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
 import { SERVICE_DISCOVERY_PATH, SERVICE_PLANE_REQUEST_ID_HEADER } from '../shared/types.js';
+import { testKeys } from '../test-support/index.js';
 import {
   abilitySession,
   cloudflareNativeRpc,
@@ -317,13 +317,4 @@ class ExampleApi extends RpcTarget {
     const caller = requireScopes(this, 'example.sync.run');
     return { caller: caller.serviceId, ok: true, since: input.since ?? null };
   }
-}
-
-async function testKeys() {
-  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
-  const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
-  return {
-    privateJwk,
-    publicJwk: publicJwkFromPrivateJwk(privateJwk, 'test-key'),
-  };
 }
