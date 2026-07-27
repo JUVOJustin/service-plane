@@ -172,9 +172,8 @@ async function createFixture(options: { ingress?: boolean } = {}) {
       grants: [{ caller: 'worker-a', scopes: ['example.read'], target: 'example' }],
     }),
     issuer: 'control-plane',
-    keyId: 'test-key',
     now: () => ISSUED_AT,
-    privateJwk: keys.privateJwk,
+    privateJwks: [keys.privateJwk],
   });
   const issued = await issuer.issueCapabilityToken({
     callerServiceId: 'worker-a',

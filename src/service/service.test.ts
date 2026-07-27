@@ -32,9 +32,8 @@ describe('ServicePlaneService', () => {
         grants: [{ caller: 'worker-a', scopes: ['example.sync.run'], target: 'example' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
       now: () => ISSUED_AT,
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
 
     let handlerContext:
@@ -176,9 +175,8 @@ describe('ServicePlaneService', () => {
         grants: [{ caller: 'worker-a', scopes: ['example.sync.run'], target: 'example' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
       now: () => ISSUED_AT,
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
     let handlerCreations = 0;
 

@@ -58,9 +58,8 @@ async function createFixture(options: { ingress?: boolean; nativeRpc?: boolean }
     capabilities: [deployed.capabilities],
     grants: defineServiceGrants({ grants: [{ caller: 'control-plane', scopes: ['audit.read'], target: 'audit' }] }),
     issuer: 'control-plane',
-    keyId: 'test-key',
     now: () => ISSUED_AT,
-    privateJwk: keys.privateJwk,
+    privateJwks: [keys.privateJwk],
   });
 
   return { endpoint: deployed.endpoint, issuer, keys, service: deployed.service };

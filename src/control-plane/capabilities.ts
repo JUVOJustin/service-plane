@@ -26,7 +26,11 @@ import {
 import { issuedCapabilityTokenRpcResponse, rejectCallerAssertedSubject } from './rpc.js';
 
 const endpointFactory = createFactory();
-const DEFAULT_CAPABILITY_KEY_ID = 'default';
+
+// Rotation makes the key id load-bearing rather than cosmetic: a verifier picks its verification key
+// by `kid` alone, so a published key without one — or two sharing one — is unusable. The type makes
+// that a compile error instead of a runtime surprise during a rollout.
+export type CapabilitySigningJwk = JsonWebKey & { kid: string };
 
 export type CapabilityIssuer = {
   issueBrokeredCapabilityToken(input: IssueCapabilityTokenInput & { brokerServiceId: string }): Promise<IssuedCapabilityToken>;
@@ -34,13 +38,16 @@ export type CapabilityIssuer = {
   jwks(): Promise<CapabilityJwks>;
 };
 
-// The signing authority owns key material only: issuer, key id, and public JWKS. It is deliberately
+// The signing authority owns key material only: issuer, key ids, and public JWKS. It is deliberately
 // separate from the authorization catalog (services, scopes, grants) so publishing JWKS never
 // depends on downstream service discovery — verifiers must be able to refresh keys during an outage.
 export type CapabilitySigningAuthority = {
   issuer: string;
   jwks(): Promise<CapabilityJwks>;
+  // The key new tokens are signed with. `jwks()` also publishes every retired key still inside the
+  // rotation overlap window, so this is not the full set a verifier may legitimately see.
   keyId: string;
+  keyIds: string[];
 };
 
 // Anything that can publish JWKS. A full CapabilityIssuer satisfies it, so JWKS mounts accept either.
@@ -50,19 +57,20 @@ export type CapabilityJwksProviderResolver =
   | CapabilityJwksProvider
   | ((context: Context) => Promise<CapabilityJwksProvider> | CapabilityJwksProvider);
 
+// `privateJwks[0]` signs; every entry is published for verification. Retired entries may be public
+// JWKs — the private members are stripped before publication either way — so old private material can
+// be destroyed the moment the active key changes.
 export type CreateCapabilitySigningAuthorityOptions = {
   issuer: string;
-  keyId?: string;
-  privateJwk: JsonWebKey;
+  privateJwks: CapabilitySigningJwk[];
 };
 
 export type CreateCapabilityIssuerOptions = {
   capabilities: CapabilityCatalog[];
   grants: ServiceGrantDefinition;
   issuer: string;
-  keyId?: string;
   now?: () => Date;
-  privateJwk: JsonWebKey;
+  privateJwks: CapabilitySigningJwk[];
   ttlSeconds?: number;
 };
 
@@ -71,7 +79,7 @@ export type CreateCapabilityIssuerFromPrivateJwkOptions = CreateCapabilityIssuer
 };
 
 export type GenerateCapabilitySigningJwkOptions = {
-  keyId?: string;
+  keyId: string;
 };
 
 // A caller-auth result. The bare string form says "authenticated, no key to bind" — which is all HMAC
@@ -129,23 +137,29 @@ export function defineServiceGrants(definition: ServiceGrantDefinition): Service
 
 // Derives the public JWKS from private key material alone. No catalog, no discovery, no I/O.
 export function createCapabilitySigningAuthority(options: CreateCapabilitySigningAuthorityOptions): CapabilitySigningAuthority {
-  const keyId = options.keyId ?? DEFAULT_CAPABILITY_KEY_ID;
-  const publicJwk = publicJwkFromPrivateJwk(options.privateJwk, keyId);
+  const privateJwks = normalizeSigningJwks(options.privateJwks);
+  const publicJwks = privateJwks.map((privateJwk) => publicJwkFromPrivateJwk(privateJwk, privateJwk.kid));
+  const keyIds = privateJwks.map((privateJwk) => privateJwk.kid);
 
   return {
     issuer: options.issuer,
     async jwks() {
+      // A fresh array per call: the authority holds this key set for its whole lifetime, and a
+      // caller aggregating or sorting the result would otherwise edit every later document.
       return {
-        keys: [publicJwk],
+        keys: [...publicJwks],
       };
     },
-    keyId,
+    keyId: keyIds[0] as string,
+    keyIds,
   };
 }
 
 export function createCapabilityIssuer(options: CreateCapabilityIssuerOptions): CapabilityIssuer {
-  const keyId = options.keyId ?? DEFAULT_CAPABILITY_KEY_ID;
-  const signingAuthority = createCapabilitySigningAuthority({ ...options, keyId });
+  const signingAuthority = createCapabilitySigningAuthority(options);
+  // Only the active key ever signs. Retired keys reach `jwks()` and nothing else.
+  const signingJwk = normalizeSigningJwks(options.privateJwks)[0] as CapabilitySigningJwk;
+  const keyId = signingJwk.kid;
   const capabilitiesByService = capabilityScopesByService(options.capabilities);
   const grantsByTarget = validateGrantsByTarget(options.grants.grants, capabilitiesByService);
   const maxTtlSeconds = normalizeTtlSeconds(options.ttlSeconds ?? DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS, 500);
@@ -160,7 +174,7 @@ export function createCapabilityIssuer(options: CreateCapabilityIssuerOptions): 
         keyId,
         maxTtlSeconds,
         ...(options.now ? { now: options.now } : {}),
-        privateJwk: options.privateJwk,
+        privateJwk: signingJwk,
       });
     },
     async issueCapabilityToken(input) {
@@ -171,7 +185,7 @@ export function createCapabilityIssuer(options: CreateCapabilityIssuerOptions): 
         keyId,
         maxTtlSeconds,
         ...(options.now ? { now: options.now } : {}),
-        privateJwk: options.privateJwk,
+        privateJwk: signingJwk,
       });
     },
     jwks: signingAuthority.jwks,
@@ -223,16 +237,17 @@ function issueCapabilityToken(options: {
 export async function createCapabilityIssuerFromPrivateJwk(
   options: CreateCapabilityIssuerFromPrivateJwkOptions,
 ): Promise<CapabilityIssuer> {
-  const keyId = options.keyId ?? DEFAULT_CAPABILITY_KEY_ID;
-  const publicJwk = publicJwkFromPrivateJwk(options.privateJwk, keyId);
+  // Only the active key is round-tripped: retired entries are allowed to be public-only, so there is
+  // no private half left to check against them.
+  const signingJwk = normalizeSigningJwks(options.privateJwks)[0] as CapabilitySigningJwk;
   if (options.validateKeyPair ?? true) {
-    await validateEs256KeyPair(options.privateJwk, publicJwk, keyId);
+    await validateEs256KeyPair(signingJwk, publicJwkFromPrivateJwk(signingJwk, signingJwk.kid), signingJwk.kid);
   }
-  return createCapabilityIssuer({ ...options, keyId });
+  return createCapabilityIssuer(options);
 }
 
-export async function generateCapabilitySigningJwk(options: GenerateCapabilitySigningJwkOptions = {}): Promise<JsonWebKey> {
-  return generateServicePlaneJwkSigningKey(options);
+export async function generateCapabilitySigningJwk(options: GenerateCapabilitySigningJwkOptions): Promise<CapabilitySigningJwk> {
+  return (await generateServicePlaneJwkSigningKey(options)) as CapabilitySigningJwk;
 }
 
 export function mountCapabilityTokenEndpoint(
@@ -307,9 +322,21 @@ export function mountCapabilityJwksEndpoint(
   app.get(
     path,
     ...endpointFactory.createHandlers(async (context) => {
-      applyHttpCacheHeaders(cacheHeaders, (name, value) => context.header(name, value));
-      const provider = typeof jwks === 'function' ? await jwks(context) : jwks;
-      return context.json(await provider.jwks());
+      try {
+        const provider = typeof jwks === 'function' ? await jwks(context) : jwks;
+        const document = await provider.jwks();
+        // Applied only once the document exists: a shared cache told to keep a key-misconfiguration
+        // error for max-age + stale-while-revalidate would take key publication down for the whole
+        // window, during exactly the deploy that caused it.
+        applyHttpCacheHeaders(cacheHeaders, (name, value) => context.header(name, value));
+        return context.json(document);
+      } catch (error) {
+        if (error instanceof CapabilityAuthError) {
+          context.header('cache-control', 'no-store');
+          return context.json({ error: error.message }, error.status as 400 | 401 | 403 | 500);
+        }
+        throw error;
+      }
     }),
   );
 }
@@ -453,6 +480,22 @@ function normalizeTtlSeconds(ttlSeconds: number, status: number): number {
     );
   }
   return ttlSeconds;
+}
+
+// Rotation is only safe if a verifier can tell the published keys apart. A missing or duplicated key
+// id is refused at construction rather than published, because the failure it causes downstream — a
+// verifier picking the wrong key for a `kid` it has cached — surfaces as an unexplained signature
+// error on every request, which reads as a crypto bug rather than a rollout mistake.
+function normalizeSigningJwks(privateJwks: CapabilitySigningJwk[]): CapabilitySigningJwk[] {
+  if (privateJwks.length === 0) throw new CapabilityAuthError('Service-Plane signing keys cannot be empty', 500);
+  const seen = new Set<string>();
+  return privateJwks.map((privateJwk) => {
+    const kid = typeof privateJwk.kid === 'string' ? privateJwk.kid.trim() : '';
+    if (!kid) throw new CapabilityAuthError('Service-Plane signing key id cannot be empty', 500);
+    if (seen.has(kid)) throw new CapabilityAuthError(`Duplicate Service-Plane signing key id: ${kid}`, 500);
+    seen.add(kid);
+    return { ...privateJwk, kid };
+  });
 }
 
 async function validateEs256KeyPair(privateJwk: JsonWebKey, publicJwk: JsonWebKey, keyId: string): Promise<void> {

@@ -112,7 +112,7 @@ import {
 } from 'service-plane/control-plane';
 
 export default new ServicePlaneControlPlane({
-  signingSecret: (env) => env.STS_SIGNING_SECRET,
+  signingKeys: (env) => [{ kid: '2026-07', secret: env.STS_SIGNING_SECRET }],
   authenticateCaller: (c) =>
     hmacServiceClientAuth({
       clients: [{ clientId: 'workflow-runner', secret: c.env.WORKFLOW_RUNNER_SECRET }],

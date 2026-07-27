@@ -126,7 +126,7 @@ ALL /rpc/<abilityId>
 
 ```ts
 new ServicePlaneControlPlane({
-  signingSecret,
+  signingKeys,
   authenticateCaller,
   services,
   openapi,
@@ -147,7 +147,7 @@ ALL  /rpc/broker
 
 The plane serves the OpenAPI document only. Mount a documentation UI yourself on `plane.app` (e.g. `@hono/swagger-ui` or `@scalar/hono-api-reference`) pointed at `/openapi.json`.
 
-The JWKS route is served from the signing authority (`signingSecret`, `issuer`, `keyId`) and never
+The JWKS route is served from the signing authority (`signingKeys`, `issuer`) and never
 resolves `services` or fetches discovery documents, so key publication survives a service-discovery
 outage. The capability-token, broker, and MCP routes additionally need the authorization catalog
 (discovered capabilities and grants) and fail closed when it cannot be built. See

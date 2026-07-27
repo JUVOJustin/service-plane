@@ -9,7 +9,7 @@ import type { BrokerCaller } from './broker.js';
 import type { CapabilityIssuer } from './capabilities.js';
 import { generateMcpDiscovery, handleControlPlaneMcpRequest, MCP_PROTOCOL_VERSION } from './mcp.js';
 import { createServiceRegistry } from './registry.js';
-import { generateCapabilitySigningSecret } from './signing-secret.js';
+import { generateCapabilitySigningSecret } from './signing-keys.js';
 
 class ExampleApi extends RpcTarget {
   async search(input: { query: string }) {
@@ -889,7 +889,7 @@ describe('handleControlPlaneMcpRequest protocol plumbing', () => {
   });
 
   it('completes invocations without caller or request id context', async () => {
-    const { createCapabilityIssuerFromSigningSecret } = await import('./signing-secret.js');
+    const { createCapabilityIssuerFromSigningKeys } = await import('./signing-keys.js');
     const capabilities = defineCapabilities({ scopes: [{ id: 'example.read' }], serviceId: 'example' });
     let issuer: CapabilityIssuer | undefined;
     const service = new ServicePlaneService({
@@ -922,11 +922,11 @@ describe('handleControlPlaneMcpRequest protocol plumbing', () => {
       title: 'Example',
       version: '0.1.0',
     });
-    issuer = await createCapabilityIssuerFromSigningSecret({
+    issuer = await createCapabilityIssuerFromSigningKeys({
       capabilities: [capabilities],
       grants: { grants: [{ caller: 'control-plane', scopes: ['example.read'], target: 'example' }] },
       issuer: 'https://issuer.example',
-      signingSecret: await generateCapabilitySigningSecret(),
+      keys: [{ kid: 'test-key', secret: await generateCapabilitySigningSecret() }],
     });
     const registry = createServiceRegistry({
       services: [{ fetch: async (request: Request) => service.fetch(request), id: 'example', origin: 'https://example.internal' }],

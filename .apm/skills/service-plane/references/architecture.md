@@ -77,6 +77,46 @@ One request id follows a call across the whole plane. The control plane assigns 
 
 Both shells emit typed, token-safe JSON log events (requests, broker connects, MCP tool calls, caller-auth rejections) to the console by default. The package never owns the application logger: every surface accepts a `log` callback that forwards events to whatever logger the app uses, and events are also exposed on the Hono context for app middleware. See the logging section in [the reference](reference.md).
 
+## Horizontal Scaling
+
+A control plane is designed to run as several independent replicas behind a load balancer — an
+autoscaled Cloudflare deployment, or a set of on-premises instances. Replicas share **configuration
+only**: the signing keys, the issuer, the service list, and the grants. They share no runtime state.
+
+What that buys, and what it costs:
+
+- **Any replica can verify any replica's tokens.** JWKS is derived from `signingKeys` alone, so two
+  replicas on the same configuration publish byte-identical documents. A token issued by one replica
+  verifies against JWKS served by another.
+- **Authorization is identical on every replica.** Grants and scope checks come from configuration,
+  not from a local cache. A replica holding a stale registry or OpenAPI snapshot cannot authorize
+  anything the fleet would refuse — projections are descriptive, and the service remains the only
+  authority on what it currently exposes.
+- **Replicas may disagree about the active signing key.** That is the normal state during a rolling
+  key rotation and needs no coordination, because both configurations publish both keys. See
+  [Rotate The Signing Key](auth.md#rotate-the-signing-key).
+- **Replay protection needs no shared store.** What bounds a replayed token request is per-request
+  signing plus a short timestamp window, and both are stateless — so there is deliberately nothing
+  for replicas to agree on. JWK callers narrow it further: issuance sender-constrains their token to
+  the key that authenticated, so the bytes alone are not enough to use it. HMAC callers get an
+  ordinary bearer token, and their residual risk is the duplicate-token window described in
+  [Replay Protection](auth.md#replay-protection).
+- **Sessions are bound to the replica that serves them.** HTTP-batch carries no cross-request state,
+  which is what makes the fleet safe to load-balance. A long-lived WebSocket session, by contrast,
+  lives on one replica: if that replica goes away the session fails and the caller must reconnect.
+  There is no session failover, and none is planned — reconnect logic belongs to the caller.
+
+Misconfiguration is refused rather than absorbed silently. A replica with a divergent issuer produces
+tokens every service rejects, and a replica signing with a key the fleet does not publish is refused
+with `Unknown Service-Plane capability key id`.
+
+That last guarantee is real only for services whose JWKS is stale relative to the divergent replica —
+a cached snapshot, or a refresh the balancer happened to route elsewhere. A divergent replica serves
+JWKS through the same balancer as its peers, so a service that refreshes *from it* learns its key and
+accepts its tokens. Key material is fleet-wide configuration, and nothing in the plane detects that
+one replica is holding a different set; keep the key list identical across replicas outside the
+deliberate overlap of a rotation.
+
 ## Discovery And Projections
 
 Services publish metadata at `/.well-known/service-plane/service.json`. The control plane fetches that metadata, validates grants, and builds projections.

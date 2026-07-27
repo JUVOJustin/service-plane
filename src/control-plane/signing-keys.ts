@@ -3,13 +3,13 @@ import { type CapabilityCatalog, DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS, type Serv
 import {
   type CapabilityIssuer,
   type CapabilitySigningAuthority,
+  type CapabilitySigningJwk,
   type CreateCapabilityIssuerFromPrivateJwkOptions,
   createCapabilityIssuerFromPrivateJwk,
   createCapabilitySigningAuthority,
 } from './capabilities.js';
 
 const DEFAULT_CAPABILITY_ISSUER = 'control-plane';
-const DEFAULT_CAPABILITY_KEY_ID = 'default';
 const P256_P = hexToBigInt('ffffffff00000001000000000000000000000000ffffffffffffffffffffffff');
 const P256_N = hexToBigInt('ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551');
 const P256_A = P256_P - 3n;
@@ -20,21 +20,27 @@ const P256_G = {
 
 type Point = { x: bigint; y: bigint } | undefined;
 
-export type CreateCapabilityIssuerFromSigningSecretOptions = {
+// One stored secret plus the key id verifiers select it by. Ordering carries the rotation state:
+// `keys[0]` signs, and every later entry stays published so tokens minted before the rotation — and
+// by control-plane replicas that have not restarted yet — keep verifying.
+export type CapabilitySigningKey = {
+  kid: string;
+  secret: string;
+};
+
+export type CreateCapabilityIssuerFromSigningKeysOptions = {
   capabilities: CapabilityCatalog[];
   grants: ServiceGrantDefinition;
   issuer?: string;
-  keyId?: string;
+  keys: CapabilitySigningKey[];
   now?: () => Date;
-  signingSecret: string;
   ttlSeconds?: number;
   validateKeyPair?: boolean;
 };
 
-export type CreateCapabilitySigningAuthorityFromSigningSecretOptions = {
+export type CreateCapabilitySigningAuthorityFromSigningKeysOptions = {
   issuer?: string;
-  keyId?: string;
-  signingSecret: string;
+  keys: CapabilitySigningKey[];
 };
 
 // Generates the only value that needs to be stored as the control-plane secret.
@@ -46,10 +52,7 @@ export async function generateCapabilitySigningSecret(): Promise<string> {
 }
 
 // Rebuilds the ES256 private JWK from the stored P-256 scalar and library defaults.
-export function privateJwkFromCapabilitySigningSecret(
-  signingSecret: string,
-  keyId = DEFAULT_CAPABILITY_KEY_ID,
-): JsonWebKey & { kid?: string } {
+export function privateJwkFromCapabilitySigningSecret(signingSecret: string, keyId: string): CapabilitySigningJwk {
   const d = normalizeSigningSecret(signingSecret);
   const scalar = base64UrlToBigInt(d);
   if (scalar <= 0n || scalar >= P256_N) throw new CapabilityAuthError('Invalid Service-Plane signing secret', 500);
@@ -69,35 +72,36 @@ export function privateJwkFromCapabilitySigningSecret(
   };
 }
 
-// Builds only the signing authority from the stored scalar. Publishing JWKS needs nothing else, so
+// Builds only the signing authority from the stored scalars. Publishing JWKS needs nothing else, so
 // this path never touches the service catalog.
-export function createCapabilitySigningAuthorityFromSigningSecret(
-  options: CreateCapabilitySigningAuthorityFromSigningSecretOptions,
+export function createCapabilitySigningAuthorityFromSigningKeys(
+  options: CreateCapabilitySigningAuthorityFromSigningKeysOptions,
 ): CapabilitySigningAuthority {
-  const keyId = options.keyId ?? DEFAULT_CAPABILITY_KEY_ID;
   return createCapabilitySigningAuthority({
     issuer: options.issuer ?? DEFAULT_CAPABILITY_ISSUER,
-    keyId,
-    privateJwk: privateJwkFromCapabilitySigningSecret(options.signingSecret, keyId),
+    privateJwks: privateJwksFromSigningKeys(options.keys),
   });
 }
 
-// Builds a full issuer from a single stored scalar plus strong Service-Plane defaults.
-export async function createCapabilityIssuerFromSigningSecret(
-  options: CreateCapabilityIssuerFromSigningSecretOptions,
+// Builds a full issuer from the stored scalars plus strong Service-Plane defaults.
+export async function createCapabilityIssuerFromSigningKeys(
+  options: CreateCapabilityIssuerFromSigningKeysOptions,
 ): Promise<CapabilityIssuer> {
-  const keyId = options.keyId ?? DEFAULT_CAPABILITY_KEY_ID;
   const input: CreateCapabilityIssuerFromPrivateJwkOptions = {
     capabilities: options.capabilities,
     grants: options.grants,
     issuer: options.issuer ?? DEFAULT_CAPABILITY_ISSUER,
-    keyId,
-    privateJwk: privateJwkFromCapabilitySigningSecret(options.signingSecret, keyId),
+    privateJwks: privateJwksFromSigningKeys(options.keys),
     ttlSeconds: options.ttlSeconds ?? DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
     validateKeyPair: options.validateKeyPair ?? true,
     ...(options.now ? { now: options.now } : {}),
   };
   return createCapabilityIssuerFromPrivateJwk(input);
+}
+
+function privateJwksFromSigningKeys(keys: CapabilitySigningKey[]): CapabilitySigningJwk[] {
+  if (keys.length === 0) throw new CapabilityAuthError('Service-Plane signing keys cannot be empty', 500);
+  return keys.map((key) => privateJwkFromCapabilitySigningSecret(key.secret, key.kid));
 }
 
 function normalizeSigningSecret(signingSecret: string): string {

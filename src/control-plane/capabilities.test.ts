@@ -24,9 +24,8 @@ describe('capability issuer', () => {
         grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
       now: () => new Date('2026-05-09T12:00:00.000Z'),
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
 
     const issued = await issuer.issueCapabilityToken({
@@ -55,9 +54,8 @@ describe('capability issuer', () => {
         grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
       now: () => new Date('2026-05-09T12:00:00.000Z'),
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
 
     const issued = await issuer.issueBrokeredCapabilityToken({
@@ -85,9 +83,8 @@ describe('capability issuer', () => {
         grants: [{ caller: 'control-plane', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
       now: () => new Date('2026-05-09T12:00:00.000Z'),
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
 
     const issued = await issuer.issueCapabilityToken({
@@ -125,8 +122,7 @@ describe('capability issuer', () => {
         grants: [{ caller: 'moco', scopes: ['fizzy.unknown'], target: 'fizzy' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
 
     await expect(
@@ -143,8 +139,7 @@ describe('capability issuer', () => {
         grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
 
     await expect(
@@ -169,8 +164,7 @@ describe('capability issuer', () => {
         ],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
 
     await expect(
@@ -199,8 +193,7 @@ describe('capability issuer', () => {
         grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
 
     await expect(
@@ -220,9 +213,8 @@ describe('capability issuer', () => {
         grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
       now: () => new Date('2026-05-09T12:00:00.000Z'),
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
       ttlSeconds: 300,
     });
 
@@ -270,8 +262,7 @@ describe('capability issuer', () => {
         grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
     const app = new Hono();
     mountCapabilityTokenEndpoint(app, issuer, {
@@ -309,8 +300,7 @@ describe('capability issuer', () => {
         grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
     const app = new Hono();
     mountCapabilityTokenEndpoint(app, issuer, {
@@ -346,8 +336,7 @@ describe('capability issuer', () => {
         grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
     const app = new Hono();
     mountCapabilityTokenEndpoint(app, issuer, {
@@ -376,13 +365,12 @@ describe('capability issuer', () => {
         grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
     const app = new Hono();
     mountCapabilityEndpoints(app, issuer, {
       authenticateCaller: () => 'moco',
-      jwks: createCapabilitySigningAuthority({ issuer: 'control-plane', keyId: 'test-key', privateJwk: keys.privateJwk }),
+      jwks: createCapabilitySigningAuthority({ issuer: 'control-plane', privateJwks: [keys.privateJwk] }),
     });
 
     expect((await app.request('/.well-known/service-plane/jwks.json')).status).toBe(200);
@@ -407,8 +395,7 @@ describe('capability issuer', () => {
         grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
     const app = new Hono();
     // A full issuer is still a valid JWKS provider; passing it just accepts the discovery coupling.
@@ -438,8 +425,7 @@ describe('capability issuer', () => {
         grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
-      privateJwk,
+      privateJwks: [privateJwk],
     });
 
     const jwks = await issuer.jwks();
@@ -470,8 +456,7 @@ describe('capability issuer', () => {
         grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
 
     await expect(issuer.jwks()).resolves.toEqual({ keys: [keys.publicJwk] });
@@ -483,8 +468,7 @@ describe('capability issuer', () => {
           grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
         }),
         issuer: 'control-plane',
-        keyId: 'test-key',
-        privateJwk: { crv: 'P-256', kty: 'EC' },
+        privateJwks: [{ crv: 'P-256', kid: 'test-key', kty: 'EC' }],
       }),
     ).rejects.toThrow('Service-Plane public JWK does not match private signing key');
   });
@@ -493,8 +477,7 @@ describe('capability issuer', () => {
     const keys = await testKeys();
     const authority = createCapabilitySigningAuthority({
       issuer: 'control-plane',
-      keyId: 'test-key',
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
     const issuer = createCapabilityIssuer({
       capabilities: [fizzyCapabilities],
@@ -502,8 +485,7 @@ describe('capability issuer', () => {
         grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
 
     await expect(authority.jwks()).resolves.toEqual({ keys: [keys.publicJwk] });
@@ -513,10 +495,7 @@ describe('capability issuer', () => {
   it('mounts the JWKS route on a signing authority that cannot issue tokens', async () => {
     const keys = await testKeys();
     const app = new Hono();
-    mountCapabilityJwksEndpoint(
-      app,
-      createCapabilitySigningAuthority({ issuer: 'control-plane', keyId: 'test-key', privateJwk: keys.privateJwk }),
-    );
+    mountCapabilityJwksEndpoint(app, createCapabilitySigningAuthority({ issuer: 'control-plane', privateJwks: [keys.privateJwk] }));
 
     const response = await app.request('/.well-known/service-plane/jwks.json');
     expect(response.status).toBe(200);
@@ -533,7 +512,7 @@ describe('capability issuer', () => {
       },
       {
         authenticateCaller: () => 'moco',
-        jwks: createCapabilitySigningAuthority({ issuer: 'control-plane', keyId: 'test-key', privateJwk: keys.privateJwk }),
+        jwks: createCapabilitySigningAuthority({ issuer: 'control-plane', privateJwks: [keys.privateJwk] }),
       },
     );
 

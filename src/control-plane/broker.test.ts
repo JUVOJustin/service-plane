@@ -32,9 +32,8 @@ describe('control-plane RPC broker', () => {
         grants: [{ caller: 'control-plane', scopes: ['example.events.ingest'], target: 'example' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
       now: () => ISSUED_AT,
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
 
     const ingestAbility = defineAbility({
@@ -99,9 +98,8 @@ describe('control-plane RPC broker', () => {
         grants: [{ caller: 'control-plane', scopes: ['example.events.ingest'], target: 'example' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
       now: () => ISSUED_AT,
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
 
     const ingestAbility = defineAbility({
@@ -196,9 +194,8 @@ describe('control-plane RPC broker', () => {
         grants: [{ caller: 'control-plane', scopes: ['example.events.ingest'], target: 'example' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
       now: () => ISSUED_AT,
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
 
     const ingestAbility = defineAbility({
@@ -282,8 +279,7 @@ describe('control-plane RPC broker', () => {
       capabilities: [defineCapabilities({ scopes: [{ id: 'example.sync.run' }], serviceId: 'example' })],
       grants: defineServiceGrants({ grants: [{ caller: 'worker-a', scopes: ['example.sync.run'], target: 'example' }] }),
       issuer: 'control-plane',
-      keyId: 'test-key',
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
     const broker = createControlPlaneRpcBroker({
       controlPlaneServiceId: 'control-plane',

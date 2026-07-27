@@ -25,7 +25,7 @@ import {
 import { hmacServiceClientAuth, jwkServiceClientAuth } from './caller-auth.js';
 import { type BrokerCallerResolver, ServicePlaneControlPlane } from './control-plane.js';
 import { cloudflareServiceBinding } from './endpoints.js';
-import { generateCapabilitySigningSecret } from './signing-secret.js';
+import { generateCapabilitySigningSecret } from './signing-keys.js';
 
 const discovery: ServiceDiscoveryDocument = {
   abilities: [
@@ -74,7 +74,7 @@ describe('ServicePlaneControlPlane', () => {
         resolvedServices = true;
         return [serviceEndpoint()];
       },
-      signingSecret: async () => generateCapabilitySigningSecret(),
+      signingKeys: async () => [{ kid: 'test-key', secret: await generateCapabilitySigningSecret() }],
     });
     const body = JSON.stringify({ id: 1, jsonrpc: '2.0', method: 'ping' });
 
@@ -105,7 +105,7 @@ describe('ServicePlaneControlPlane', () => {
         resolvedServices = true;
         return [serviceEndpoint()];
       },
-      signingSecret: async () => generateCapabilitySigningSecret(),
+      signingKeys: async () => [{ kid: 'test-key', secret: await generateCapabilitySigningSecret() }],
     });
 
     const response = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_MCP_PATH}`));
@@ -117,7 +117,7 @@ describe('ServicePlaneControlPlane', () => {
   it('fails closed when caller authentication is not configured', async () => {
     const plane = new ServicePlaneControlPlane({
       services: () => [serviceEndpoint()],
-      signingSecret: async () => generateCapabilitySigningSecret(),
+      signingKeys: async () => [{ kid: 'test-key', secret: await generateCapabilitySigningSecret() }],
     });
 
     const response = await plane.fetch(
@@ -139,12 +139,12 @@ describe('ServicePlaneControlPlane', () => {
         now: () => new Date('2026-05-09T12:00:00.000Z'),
       }),
       services: () => [serviceEndpoint()],
-      signingSecret: () => signingSecret,
+      signingKeys: () => [{ kid: 'test-key', secret: signingSecret }],
     });
 
     const jwks = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_CAPABILITY_JWKS_PATH}`));
     expect(jwks.status).toBe(200);
-    await expect(jwks.json()).resolves.toMatchObject({ keys: [{ kid: 'default' }] });
+    await expect(jwks.json()).resolves.toMatchObject({ keys: [{ kid: 'test-key' }] });
 
     const requestToken = controlPlaneHmacTokenRequester({
       clientId: 'worker-a',
@@ -186,7 +186,7 @@ describe('ServicePlaneControlPlane', () => {
           }),
         ];
       },
-      signingSecret: () => signingSecret,
+      signingKeys: () => [{ kid: 'test-key', secret: signingSecret }],
     });
     const jwksRequest = () => new Request(`https://plane.internal${SERVICE_PLANE_CAPABILITY_JWKS_PATH}`);
     const tokenRequest = (scopes: string[]) =>
@@ -199,7 +199,7 @@ describe('ServicePlaneControlPlane', () => {
     const outageJwks = await plane.fetch(jwksRequest());
     expect(outageJwks.status).toBe(200);
     const published = (await outageJwks.json()) as CapabilityJwks;
-    expect(published.keys[0]).toMatchObject({ crv: 'P-256', kid: 'default', kty: 'EC' });
+    expect(published.keys[0]).toMatchObject({ crv: 'P-256', kid: 'test-key', kty: 'EC' });
     expect(published.keys[0]).not.toHaveProperty('d');
     // JWKS depends on the signing secret only: no endpoint set is resolved and nothing is fetched.
     expect(serviceResolutions).toBe(0);
@@ -242,7 +242,7 @@ describe('ServicePlaneControlPlane', () => {
         now: () => now,
       }),
       services: () => [serviceEndpoint()],
-      signingSecret: () => signingSecret,
+      signingKeys: () => [{ kid: 'test-key', secret: signingSecret }],
     });
     const requestToken = controlPlaneJwkTokenRequester({
       clientId: 'worker-a',
@@ -277,9 +277,9 @@ describe('ServicePlaneControlPlane', () => {
         observed.response = context.json({ ok: true });
         return [serviceEndpoint()];
       },
-      signingSecret: (bindings, context) => {
+      signingKeys: (bindings, context) => {
         expect(context.env).toBe(bindings);
-        return signingSecret;
+        return [{ kid: 'test-key', secret: signingSecret }];
       },
     });
 
@@ -323,7 +323,7 @@ describe('ServicePlaneControlPlane', () => {
           id: 'example',
         }),
       ],
-      signingSecret: async () => generateCapabilitySigningSecret(),
+      signingKeys: async () => [{ kid: 'test-key', secret: await generateCapabilitySigningSecret() }],
     });
 
     const response = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`));
@@ -356,7 +356,7 @@ describe('ServicePlaneControlPlane', () => {
     const plane = new ServicePlaneControlPlane({
       httpCache: true,
       services: () => [serviceEndpoint()],
-      signingSecret: async () => generateCapabilitySigningSecret(),
+      signingKeys: async () => [{ kid: 'test-key', secret: await generateCapabilitySigningSecret() }],
     });
 
     const openapi = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`));
@@ -380,16 +380,36 @@ describe('ServicePlaneControlPlane', () => {
 
     const uncachedPlane = new ServicePlaneControlPlane({
       services: () => [serviceEndpoint()],
-      signingSecret: async () => generateCapabilitySigningSecret(),
+      signingKeys: async () => [{ kid: 'test-key', secret: await generateCapabilitySigningSecret() }],
     });
     const uncachedOpenapi = await uncachedPlane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`));
     expect(uncachedOpenapi.headers.get('cache-control')).toBeNull();
   });
 
+  it('refuses a misconfigured key set on JWKS without letting a shared cache keep the failure', async () => {
+    const secret = await generateCapabilitySigningSecret();
+    const plane = new ServicePlaneControlPlane({
+      httpCache: true,
+      services: () => [serviceEndpoint()],
+      signingKeys: () => [
+        { kid: 'test-key', secret },
+        { kid: 'test-key', secret },
+      ],
+    });
+
+    const jwks = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_CAPABILITY_JWKS_PATH}`));
+    expect(jwks.status).toBe(500);
+    await expect(jwks.json()).resolves.toEqual({ error: 'Duplicate Service-Plane signing key id: test-key' });
+    // The failure lasts exactly as long as the misconfiguration: an edge holding this for max-age
+    // plus stale-while-revalidate would keep key publication down after the fix deploys.
+    expect(jwks.headers.get('cache-control')).toBe('no-store');
+    expect(jwks.headers.get('cache-tag')).toBeNull();
+  });
+
   it('serves the OpenAPI document without a bundled UI', async () => {
     const plane = new ServicePlaneControlPlane({
       services: () => [serviceEndpoint()],
-      signingSecret: async () => generateCapabilitySigningSecret(),
+      signingKeys: async () => [{ kid: 'test-key', secret: await generateCapabilitySigningSecret() }],
     });
 
     const openapi = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`));
@@ -406,7 +426,7 @@ describe('ServicePlaneControlPlane', () => {
     const plane = new ServicePlaneControlPlane({
       broker: {},
       services: () => [serviceEndpoint()],
-      signingSecret: async () => generateCapabilitySigningSecret(),
+      signingKeys: async () => [{ kid: 'test-key', secret: await generateCapabilitySigningSecret() }],
     });
 
     const mcp = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_MCP_PATH}`, { method: 'POST' }));
@@ -428,9 +448,9 @@ describe('ServicePlaneControlPlane', () => {
         serviceCalls += 1;
         return [serviceEndpoint()];
       },
-      signingSecret: async () => {
+      signingKeys: async () => {
         issuerCalls += 1;
-        return generateCapabilitySigningSecret();
+        return [{ kid: 'test-key', secret: await generateCapabilitySigningSecret() }];
       },
     });
 
@@ -456,7 +476,7 @@ describe('ServicePlaneControlPlane', () => {
         serviceCalls += 1;
         return [serviceEndpoint()];
       },
-      signingSecret: async () => generateCapabilitySigningSecret(),
+      signingKeys: async () => [{ kid: 'test-key', secret: await generateCapabilitySigningSecret() }],
     });
 
     const mcp = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_MCP_PATH}`, { method: 'POST' }));
@@ -474,7 +494,7 @@ describe('ServicePlaneControlPlane', () => {
     const plane = new ServicePlaneControlPlane({
       mcp: { caller: () => ({ id: 'gateway', kind: 'user' }) },
       services: () => [serviceEndpoint()],
-      signingSecret: async () => generateCapabilitySigningSecret(),
+      signingKeys: async () => [{ kid: 'test-key', secret: await generateCapabilitySigningSecret() }],
     });
 
     const initialize = await mcpRequest(plane, {
@@ -573,7 +593,7 @@ describe('ServicePlaneControlPlane', () => {
           origin: 'https://example.internal',
         }),
       ],
-      signingSecret: () => signingSecret,
+      signingKeys: () => [{ kid: 'test-key', secret: signingSecret }],
     });
 
     const response = await mcpRequest(plane, {
@@ -649,7 +669,7 @@ describe('ServicePlaneControlPlane', () => {
           origin: 'https://example.internal',
         }),
       ],
-      signingSecret: () => signingSecret,
+      signingKeys: () => [{ kid: 'test-key', secret: signingSecret }],
     });
 
     const response = await mcpRequest(

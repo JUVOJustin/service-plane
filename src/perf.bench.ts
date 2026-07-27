@@ -4,7 +4,7 @@ import { bench, describe } from 'vitest';
 import * as z from 'zod';
 import {
   cloudflareServiceBinding,
-  createCapabilityIssuerFromSigningSecret,
+  createCapabilityIssuerFromSigningKeys,
   createControlPlaneRpcBroker,
   createServiceRegistry,
   defineServiceGrants,
@@ -232,7 +232,7 @@ plane = new ServicePlaneControlPlane({
   broker: { caller: () => ({ id: 'bench-caller', kind: 'service' as const }) },
   log: false,
   services: () => [hubEndpoint],
-  signingSecret: () => signingSecret,
+  signingKeys: () => [{ kid: 'test-key', secret: signingSecret }],
   ttlSeconds: 3600,
 });
 const boundPlane = plane;
@@ -295,10 +295,10 @@ const rawApi = new RpcSession<RawLlmTarget>(rawPair.left).getRemoteMain();
 
 // Plane in the data path over a real wire: a broker session with one serialized hop
 // (caller <-> plane); the plane reaches the service over the in-process native binding.
-const brokerIssuer = await createCapabilityIssuerFromSigningSecret({
+const brokerIssuer = await createCapabilityIssuerFromSigningKeys({
   capabilities: [capabilities],
   grants: defineServiceGrants({ grants: GRANTS.map((grant) => ({ ...grant, target: 'hub' })) }),
-  signingSecret,
+  keys: [{ kid: 'bench-key', secret: signingSecret }],
   ttlSeconds: 3600,
 });
 const broker = createControlPlaneRpcBroker({

@@ -98,6 +98,7 @@ export {
   type CapabilityJwksProvider,
   type CapabilityJwksProviderResolver,
   type CapabilitySigningAuthority,
+  type CapabilitySigningJwk,
   type CreateCapabilityIssuerFromPrivateJwkOptions,
   type CreateCapabilityIssuerOptions,
   type CreateCapabilitySigningAuthorityOptions,
@@ -151,10 +152,11 @@ export {
   type RpcIssuedCapabilityToken,
 } from './rpc.js';
 export {
-  type CreateCapabilityIssuerFromSigningSecretOptions,
-  type CreateCapabilitySigningAuthorityFromSigningSecretOptions,
-  createCapabilityIssuerFromSigningSecret,
-  createCapabilitySigningAuthorityFromSigningSecret,
+  type CapabilitySigningKey,
+  type CreateCapabilityIssuerFromSigningKeysOptions,
+  type CreateCapabilitySigningAuthorityFromSigningKeysOptions,
+  createCapabilityIssuerFromSigningKeys,
+  createCapabilitySigningAuthorityFromSigningKeys,
   generateCapabilitySigningSecret,
   privateJwkFromCapabilitySigningSecret,
-} from './signing-secret.js';
+} from './signing-keys.js';

@@ -36,7 +36,11 @@ import {
 } from './openapi.js';
 import { createServiceRegistry } from './registry.js';
 import { type IssueCapabilityTokenForCallerInput, issueCapabilityTokenForCaller, type RpcIssuedCapabilityToken } from './rpc.js';
-import { createCapabilityIssuerFromSigningSecret, createCapabilitySigningAuthorityFromSigningSecret } from './signing-secret.js';
+import {
+  type CapabilitySigningKey,
+  createCapabilityIssuerFromSigningKeys,
+  createCapabilitySigningAuthorityFromSigningKeys,
+} from './signing-keys.js';
 
 type ServicePlaneControlPlaneEnv<TEnv extends Env> = TEnv & {
   Variables: RequestIdVariables;
@@ -79,7 +83,6 @@ export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
   controlPlaneServiceId?: string;
   httpCache?: ServicePlaneHttpCacheOption;
   issuer?: string;
-  keyId?: string;
   log?: false | ServicePlaneLogSink;
   mcp?:
     | false
@@ -95,7 +98,14 @@ export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
   openapi?: false | ControlPlaneOpenApiOptions;
   requestId?: ServicePlaneRequestIdOptions;
   services: (context: Context<TEnv>) => ServiceEndpoint[] | Promise<ServiceEndpoint[]>;
-  signingSecret: (bindings: TEnv['Bindings'], context: Context<TEnv>) => string | Promise<string>;
+  // `keys[0]` signs every new token; the rest are published in JWKS for verification only. Rotating
+  // is two deploys, not one: append the new key so every verifier can see it, wait the overlap
+  // window in `docs/auth.md`, and only then move it to the front. Prepending a key straight away
+  // signs with a `kid` services holding an older JWKS cannot resolve. The old key stays listed for
+  // one more window before it is dropped. Resolved per request so a replica picks up a rotation
+  // without a redeploy, and so replicas mid-rollout can disagree about the active key without
+  // downtime.
+  signingKeys: (bindings: TEnv['Bindings'], context: Context<TEnv>) => CapabilitySigningKey[] | Promise<CapabilitySigningKey[]>;
   ttlSeconds?: number;
 };
 
@@ -104,8 +114,8 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   readonly app: Hono<ServicePlaneControlPlaneEnv<TEnv>>;
   private readonly issuers = new Map<string, Promise<CapabilityIssuer>>();
   private readonly log: ServicePlaneLogSink | undefined;
-  // Single slot rather than a map: JWKS is a hot route, and the only reason the derived key changes
-  // is a secret or key-id rotation, which should replace the memo instead of growing it.
+  // Single slot rather than a map: JWKS is a hot route, and the only reason the derived key set
+  // changes is a rotation, which should replace the memo instead of growing it.
   private signingAuthority: { authority: CapabilitySigningAuthority; cacheKey: string } | undefined;
 
   constructor(private readonly options: ServicePlaneControlPlaneOptions<TEnv>) {
@@ -253,13 +263,14 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
 
   // Signing authority: key material only. Deliberately does not resolve `services`.
   private async signingAuthorityFor(context: Context<TEnv>): Promise<CapabilitySigningAuthority> {
-    const signingSecret = await this.options.signingSecret(context.env, context);
+    const keys = await this.options.signingKeys(context.env, context);
     const issuer = this.options.issuer ?? 'control-plane';
-    const keyId = this.options.keyId ?? 'default';
-    const cacheKey = JSON.stringify({ issuer, keyId, signingSecret });
+    // The whole ordered key set is the identity: rotating the active key, retiring an old one, and
+    // reordering after a rollback must each invalidate the memo.
+    const cacheKey = JSON.stringify({ issuer, keys });
     if (this.signingAuthority?.cacheKey === cacheKey) return this.signingAuthority.authority;
 
-    const authority = createCapabilitySigningAuthorityFromSigningSecret({ issuer, keyId, signingSecret });
+    const authority = createCapabilitySigningAuthorityFromSigningKeys({ issuer, keys });
     this.signingAuthority = { authority, cacheKey };
     return authority;
   }
@@ -267,7 +278,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   // Authorization catalog plus signing authority: needs discovered capabilities and grants, so it
   // can fail while a target service is down. Only token issuance and brokering depend on it.
   private async issuerFor(context: Context<TEnv>, services?: ServiceEndpoint[]): Promise<CapabilityIssuer> {
-    const signingSecret = await this.options.signingSecret(context.env, context);
+    const keys = await this.options.signingKeys(context.env, context);
     const resolvedServices = services ?? (await this.options.services(context));
     const capabilities = await discoverServiceCapabilities(resolvedServices);
     const grantDefinition = {
@@ -277,19 +288,17 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       capabilities,
       grants: grantDefinition.grants,
       issuer: this.options.issuer ?? 'control-plane',
-      keyId: this.options.keyId ?? 'default',
-      signingSecret,
+      keys,
       ttlSeconds: this.options.ttlSeconds ?? null,
     });
     const existing = this.issuers.get(cacheKey);
     if (existing) return existing;
 
-    const issuer = createCapabilityIssuerFromSigningSecret({
+    const issuer = createCapabilityIssuerFromSigningKeys({
       capabilities,
       grants: grantDefinition,
-      signingSecret,
+      keys,
       ...(this.options.issuer ? { issuer: this.options.issuer } : {}),
-      ...(this.options.keyId ? { keyId: this.options.keyId } : {}),
       ...(this.options.ttlSeconds ? { ttlSeconds: this.options.ttlSeconds } : {}),
     });
     this.issuers.set(cacheKey, issuer);
