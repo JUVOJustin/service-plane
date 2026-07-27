@@ -133,9 +133,15 @@ Wait at least the sum of:
 | Term | Where it comes from |
 | --- | --- |
 | Maximum token TTL | `ttlSeconds` on the plane, capped by `MAX_CAPABILITY_TOKEN_TTL_SECONDS` |
-| JWKS HTTP `max-age` | the plane's `httpCache` option, plus any CDN or edge cache in front of it |
+| JWKS HTTP `max-age` | the plane's `httpCache` option (default `DEFAULT_HTTP_CACHE_MAX_AGE_SECONDS`), plus any CDN or edge cache in front of it |
+| JWKS HTTP `stale-while-revalidate` | the same option (default 300s). An edge honouring it keeps serving the **old** document for this long *after* `max-age` expires, while it refreshes in the background |
 | Service JWKS cache TTL | `cacheTtlSeconds` on `jwksFromUrl` / `jwksFromServiceBinding`, and any shared `cache` behind it |
 | Clock skew allowance | your fleet's worst-case clock drift |
+
+`stale-while-revalidate` is easy to leave out and it is the term most likely to bite: with short
+token and service-cache TTLs, an edge can still be serving a JWKS that has never seen the new key id
+for five minutes past `max-age`. Either include it in the wait, or set
+`httpCache: { staleWhileRevalidateSeconds: 0 }` for the duration of the rotation.
 
 Round generously. The cost of waiting is a longer rotation; the cost of not waiting is a service
 holding a JWKS that has never seen the new key id, which rejects every token with `Unknown
