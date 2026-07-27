@@ -14,7 +14,7 @@ import {
 } from 'service-plane/control-plane';
 
 export default new ServicePlaneControlPlane({
-  signingSecret: (env) => env.STS_SIGNING_SECRET,
+  signingKeys: (env) => [{ kid: '2026-07', secret: env.STS_SIGNING_SECRET }],
   authenticateCaller: (c) =>
     hmacServiceClientAuth({
       clients: [{ clientId: 'workflow-runner', secret: c.env.WORKFLOW_RUNNER_SECRET }],
@@ -44,7 +44,7 @@ To serve a documentation UI, mount a Hono renderer on `plane.app` against `/open
 
 ```mermaid
 flowchart TD
-  Secret["signingSecret"] --> Authority["Signing authority: issuer, key id, public JWKS"]
+  Secret["signingKeys"] --> Authority["Signing authority: issuer, key ids, public JWKS"]
   Authority --> JWKS["Serve /jwks.json"]
   Services["Configured services"] --> Discovery["Fetch service discovery"]
   Discovery --> Catalog["Build ability + scope catalog"]

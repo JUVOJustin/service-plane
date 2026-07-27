@@ -43,11 +43,30 @@ node --input-type=module -e "import { generateCapabilitySigningSecret } from 'se
 
 Store the output as `STS_SIGNING_SECRET` on the control plane only. Services and callers must not receive this secret.
 
+Configure it as a **key list**, newest first:
+
+```ts
+new ServicePlaneControlPlane({
+  signingKeys: (env) => [{ kid: '2026-07', secret: env.STS_SIGNING_SECRET }],
+  // ...
+});
+```
+
+`signingKeys[0]` signs every new token. Every entry is published in JWKS for verification. A single
+key is the steady state; a second entry is what makes rotation possible, and the ordering is the
+whole rotation protocol — see [Rotate The Signing Key](#rotate-the-signing-key).
+
+Key ids must be explicit and distinct. Two published keys sharing a `kid` are indistinguishable to a
+verifier, so the plane refuses that configuration with `Duplicate Service-Plane signing key id`
+rather than serving a JWKS that fails unpredictably. In particular, **never rotate the secret while
+keeping the key id**: a verifier holding a cached JWKS would select the stale key for that id and
+report a signature failure that looks nothing like a rotation problem.
+
 ## Signing Authority And Authorization Catalog
 
 The control plane keeps two responsibilities apart:
 
-- The **signing authority** owns the signing key, the issuer, the key id, and the public JWKS. It is derived from `signingSecret` alone.
+- The **signing authority** owns the signing keys, the issuer, the key ids, and the public JWKS. It is derived from `signingKeys` alone.
 - The **authorization catalog** owns the discovered services, capability scopes, and grants. Building it fetches every configured service's discovery document.
 
 `GET /.well-known/service-plane/jwks.json` answers from the signing authority only. It resolves neither
@@ -62,10 +81,98 @@ discovery — refuses tokens for **that** target only. Issuance, brokering, and 
 service keep working, and the affected target keeps returning its specific `Unknown Service-Plane
 capability scope`/`target` error rather than a silent "not granted".
 
-`createCapabilitySigningAuthorityFromSigningSecret({ signingSecret, issuer, keyId })` builds that half
+`createCapabilitySigningAuthorityFromSigningKeys({ keys, issuer })` builds that half
 directly if you publish JWKS from your own Hono app. `mountCapabilityJwksEndpoint` takes it, and
 `mountCapabilityEndpoints` requires an explicit `jwks` provider — passing the issuer there is legal but
 re-couples key publication to service discovery, so the choice is yours to make on purpose.
+
+## Rotate The Signing Key
+
+Rotation is safe because verification is driven by `kid`: a service picks its verification key by the
+id in the token header, so old and new keys coexist in one JWKS without ambiguity. Rotation is
+therefore a reordering of `signingKeys`, and each stage is a separate deploy.
+
+### 1. Prepare — publish the new key, keep signing with the old
+
+```ts
+signingKeys: (env) => [
+  { kid: '2026-01', secret: env.STS_SIGNING_SECRET },      // still signs
+  { kid: '2026-07', secret: env.STS_SIGNING_SECRET_NEXT }, // published only
+],
+```
+
+Wait for the full overlap window (below) before moving on. Every service must have had the chance to
+see a JWKS containing `2026-07` **before** any token is signed with it.
+
+### 2. Activate — put the new key first
+
+```ts
+signingKeys: (env) => [
+  { kid: '2026-07', secret: env.STS_SIGNING_SECRET_NEXT }, // signs
+  { kid: '2026-01', secret: env.STS_SIGNING_SECRET },      // published only
+],
+```
+
+During a rolling deploy some replicas are still on step 1 and some on step 2. That is safe and needs
+no coordination: both configurations publish both keys, so a token from either replica verifies
+against JWKS from either replica.
+
+### 3. Complete — drop the old key
+
+```ts
+signingKeys: (env) => [{ kid: '2026-07', secret: env.STS_SIGNING_SECRET_NEXT }],
+```
+
+Wait one more overlap window first. This is the step that actually invalidates tokens signed with
+`2026-01`; before it, they still verify.
+
+### The Overlap Window
+
+Wait at least the sum of:
+
+| Term | Where it comes from |
+| --- | --- |
+| Maximum token TTL | `ttlSeconds` on the plane, capped by `MAX_CAPABILITY_TOKEN_TTL_SECONDS` |
+| JWKS HTTP `max-age` | the plane's `httpCache` option, plus any CDN or edge cache in front of it |
+| Service JWKS cache TTL | `cacheTtlSeconds` on `jwksFromUrl` / `jwksFromServiceBinding`, and any shared `cache` behind it |
+| Clock skew allowance | your fleet's worst-case clock drift |
+
+Round generously. The cost of waiting is a longer rotation; the cost of not waiting is a service
+holding a JWKS that has never seen the new key id, which rejects every token with `Unknown
+Service-Plane capability key id` until its cache expires.
+
+If you must move faster than the cache allows, purge the `service-plane:jwks` cache tag at the edge
+and any shared `CapabilityJwksCache` entries, then treat the window as starting from the purge.
+
+### Rollback
+
+Rollback is step 2 in reverse — swap the order back:
+
+```ts
+signingKeys: (env) => [
+  { kid: '2026-01', secret: env.STS_SIGNING_SECRET },
+  { kid: '2026-07', secret: env.STS_SIGNING_SECRET_NEXT },
+],
+```
+
+Because both keys stay published, tokens minted during the failed rotation keep verifying while the
+fleet returns to the old signing key. Never roll back by *removing* the new key: that invalidates
+every token signed during the attempt.
+
+### Emergency Revocation
+
+Revoking a compromised key is deliberately not the same operation as rotating one. Rotation preserves
+outstanding tokens; revocation must not.
+
+1. Deploy `signingKeys` with the compromised key **absent** — not merely demoted. Tokens signed with
+   it stop verifying as soon as each service's JWKS cache expires.
+2. Purge the `service-plane:jwks` cache tag and any shared JWKS cache so that expiry is immediate
+   rather than up to the cache TTL away.
+3. Expect caller-visible failures. Every outstanding token signed with that key is now invalid; that
+   is the point of the operation, and the bound on the damage is the maximum token TTL.
+
+There is no revocation list. A capability token is valid until it expires or its signing key stops
+being published, which is why token TTLs are short and why the maximum is capped by the plane.
 
 ## Caller Authentication Options
 

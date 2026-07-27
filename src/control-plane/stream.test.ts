@@ -117,9 +117,8 @@ async function createFixture(options: FixtureOptions = {}) {
       grants: [{ caller: 'control-plane', scopes: ['hub.read'], target: 'hub' }],
     }),
     issuer: 'control-plane',
-    keyId: 'test-key',
     now: () => ISSUED_AT,
-    privateJwk: keys.privateJwk,
+    privateJwks: [keys.privateJwk],
   });
 
   const endpoint = deployed.endpoint;

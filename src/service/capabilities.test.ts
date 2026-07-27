@@ -37,9 +37,8 @@ describe('Cap’n Web service capabilities', () => {
         grants: [{ caller: 'moco', scopes: ['example.users.lookup', 'example.sync.run'], target: 'example' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
       now: () => ISSUED_AT,
-      privateJwk: keys.privateJwk,
+      privateJwks: [keys.privateJwk],
     });
 
     class ScopedExample extends RpcTarget {

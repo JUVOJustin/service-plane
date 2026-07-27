@@ -18,7 +18,7 @@ import { type CapabilityJwks, SERVICE_PLANE_CAPABILITY_JWKS_PATH } from '../shar
 import { jwkServiceClientAuth } from './caller-auth.js';
 import { ServicePlaneControlPlane } from './control-plane.js';
 import { cloudflareServiceBinding } from './endpoints.js';
-import { generateCapabilitySigningSecret } from './signing-secret.js';
+import { generateCapabilitySigningSecret } from './signing-keys.js';
 
 // A token bound to the caller's key (RFC 7800 `cnf`) is useless to anyone who only holds the bytes.
 // These tests exercise the direct caller -> service path, which is where a capability token leaves the
@@ -242,7 +242,7 @@ async function deployment(caller: Awaited<ReturnType<typeof callerKeys>>) {
         origin: 'https://example.internal',
       }),
     ],
-    signingSecret: () => signingSecret,
+    signingKeys: () => [{ kid: 'test-key', secret: signingSecret }],
   });
 
   const requestToken = controlPlaneJwkTokenRequester({

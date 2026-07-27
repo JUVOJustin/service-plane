@@ -204,7 +204,7 @@ await ctx.cache.purge({ tags: ['service-plane:service:asana'] });
 await ctx.cache.purge({ tags: ['service-plane:openapi'] });
 ```
 
-Keep JWKS key rotation overlapping: publish a new key alongside the old one for at least the edge `max-age` plus the services' JWKS cache TTL before signing with it, or purge `service-plane:jwks` on rotation.
+Keep JWKS key rotation overlapping: publish a new key alongside the old one for at least the edge `max-age` plus the services' JWKS cache TTL before signing with it, or purge `service-plane:jwks` on rotation. Full runbook, including the overlap-window terms and rollback: [Rotate The Signing Key](auth.md#rotate-the-signing-key).
 
 ## When To Use WebSockets
 

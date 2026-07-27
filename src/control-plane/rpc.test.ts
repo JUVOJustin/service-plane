@@ -18,8 +18,7 @@ describe('control-plane RPC token helpers', () => {
         grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
       }),
       issuer: 'control-plane',
-      keyId: 'test-key',
-      privateJwk,
+      privateJwks: [{ ...privateJwk, kid: 'test-key' }],
     });
 
     await expect(
