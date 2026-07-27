@@ -320,9 +320,21 @@ export function mountCapabilityJwksEndpoint(
   app.get(
     path,
     ...endpointFactory.createHandlers(async (context) => {
-      applyHttpCacheHeaders(cacheHeaders, (name, value) => context.header(name, value));
-      const provider = typeof jwks === 'function' ? await jwks(context) : jwks;
-      return context.json(await provider.jwks());
+      try {
+        const provider = typeof jwks === 'function' ? await jwks(context) : jwks;
+        const document = await provider.jwks();
+        // Applied only once the document exists: a shared cache told to keep a key-misconfiguration
+        // error for max-age + stale-while-revalidate would take key publication down for the whole
+        // window, during exactly the deploy that caused it.
+        applyHttpCacheHeaders(cacheHeaders, (name, value) => context.header(name, value));
+        return context.json(document);
+      } catch (error) {
+        if (error instanceof CapabilityAuthError) {
+          context.header('cache-control', 'no-store');
+          return context.json({ error: error.message }, error.status as 400 | 401 | 403 | 500);
+        }
+        throw error;
+      }
     }),
   );
 }

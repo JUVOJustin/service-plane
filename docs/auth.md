@@ -43,7 +43,7 @@ node --input-type=module -e "import { generateCapabilitySigningSecret } from 'se
 
 Store the output as `STS_SIGNING_SECRET` on the control plane only. Services and callers must not receive this secret.
 
-Configure it as a **key list**, newest first:
+Configure it as a **key list**, the signing key first:
 
 ```ts
 new ServicePlaneControlPlane({
@@ -54,7 +54,8 @@ new ServicePlaneControlPlane({
 
 `signingKeys[0]` signs every new token. Every entry is published in JWKS for verification. A single
 key is the steady state; a second entry is what makes rotation possible, and the ordering is the
-whole rotation protocol — see [Rotate The Signing Key](#rotate-the-signing-key).
+whole rotation protocol — position, not age, decides which key signs, so a newly introduced key goes
+**last** until you deliberately activate it. See [Rotate The Signing Key](#rotate-the-signing-key).
 
 Key ids must be explicit and distinct. Two published keys sharing a `kid` are indistinguishable to a
 verifier, so the plane refuses that configuration with `Duplicate Service-Plane signing key id`

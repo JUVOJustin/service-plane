@@ -186,7 +186,13 @@ export async function demoApp(options: DemoAppOptions): Promise<DemoApp> {
   // The load balancer in front of the fleet. Round-robin over the healthy replicas by default, so a
   // multi-replica test that does not pin still crosses replicas rather than testing one by accident.
   const balanced = (): ServicePlaneControlPlane => {
-    if (typeof routed === 'number') return planes[routed] as ServicePlaneControlPlane;
+    if (typeof routed === 'number') {
+      const pinned = planes[routed];
+      // A pinned replica is still a member of the fleet: taking it out has to be visible here, or a
+      // test could "prove" a dead replica still serves.
+      if (!pinned || !availability[routed]) throw new Error('No healthy demo control-plane replica');
+      return pinned;
+    }
     const healthy = planes.filter((_, index) => availability[index]);
     if (healthy.length === 0) throw new Error('No healthy demo control-plane replica');
     const chosen = healthy[nextReplica % healthy.length] as ServicePlaneControlPlane;
@@ -349,6 +355,9 @@ export async function demoApp(options: DemoAppOptions): Promise<DemoApp> {
     replicas,
 
     route(next) {
+      // Rejected at the call site rather than on the next request, so a typo reads as a bad index
+      // instead of an undefined plane failing somewhere inside a session.
+      if (typeof next === 'number' && !replicas[next]) throw new Error(`Unknown demo replica: ${next}`);
       routed = next;
       nextReplica = 0;
     },

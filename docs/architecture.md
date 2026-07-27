@@ -103,9 +103,16 @@ What that buys, and what it costs:
   lives on one replica: if that replica goes away the session fails and the caller must reconnect.
   There is no session failover, and none is planned — reconnect logic belongs to the caller.
 
-Misconfiguration fails closed rather than silently. A replica with a divergent issuer produces tokens
-every service rejects, and a replica signing with a key the fleet does not publish is refused with
-`Unknown Service-Plane capability key id`.
+Misconfiguration is refused rather than absorbed silently. A replica with a divergent issuer produces
+tokens every service rejects, and a replica signing with a key the fleet does not publish is refused
+with `Unknown Service-Plane capability key id`.
+
+That last guarantee is real only for services whose JWKS is stale relative to the divergent replica —
+a cached snapshot, or a refresh the balancer happened to route elsewhere. A divergent replica serves
+JWKS through the same balancer as its peers, so a service that refreshes *from it* learns its key and
+accepts its tokens. Key material is fleet-wide configuration, and nothing in the plane detects that
+one replica is holding a different set; keep the key list identical across replicas outside the
+deliberate overlap of a rotation.
 
 ## Discovery And Projections
 

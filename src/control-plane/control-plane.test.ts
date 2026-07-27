@@ -386,6 +386,26 @@ describe('ServicePlaneControlPlane', () => {
     expect(uncachedOpenapi.headers.get('cache-control')).toBeNull();
   });
 
+  it('refuses a misconfigured key set on JWKS without letting a shared cache keep the failure', async () => {
+    const secret = await generateCapabilitySigningSecret();
+    const plane = new ServicePlaneControlPlane({
+      httpCache: true,
+      services: () => [serviceEndpoint()],
+      signingKeys: () => [
+        { kid: 'test-key', secret },
+        { kid: 'test-key', secret },
+      ],
+    });
+
+    const jwks = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_CAPABILITY_JWKS_PATH}`));
+    expect(jwks.status).toBe(500);
+    await expect(jwks.json()).resolves.toEqual({ error: 'Duplicate Service-Plane signing key id: test-key' });
+    // The failure lasts exactly as long as the misconfiguration: an edge holding this for max-age
+    // plus stale-while-revalidate would keep key publication down after the fix deploys.
+    expect(jwks.headers.get('cache-control')).toBe('no-store');
+    expect(jwks.headers.get('cache-tag')).toBeNull();
+  });
+
   it('serves the OpenAPI document without a bundled UI', async () => {
     const plane = new ServicePlaneControlPlane({
       services: () => [serviceEndpoint()],

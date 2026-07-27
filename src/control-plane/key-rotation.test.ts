@@ -5,6 +5,7 @@ import { decodeServicePlaneJwkToken } from '../shared/jwk-auth.js';
 import {
   DEMO_SIGNING_KEY_ID,
   type DemoApp,
+  type DemoReplica,
   type DemoServiceSpec,
   demoApp,
   demoEnvironments,
@@ -69,9 +70,13 @@ describe.each(demoEnvironments())('signing-key rotation over $name', (env) => {
     expect(await signingKeyIdOf(plane, 1)).toBe(OLD_KEY_ID);
 
     // Whichever replica signs, whichever replica's JWKS the service happens to read, the call works.
-    for (const replica of [0, 1]) {
-      plane.route(replica);
-      await expect(call(plane)).resolves.toMatchObject({ caller: 'control-plane', value: 'ping' });
+    // The signer is pinned by dialing its own origin; the JWKS refresh follows the balancer, so the
+    // mismatched pairs are the ones that actually cross replicas.
+    for (const signer of [0, 1]) {
+      for (const jwksSource of [0, 1]) {
+        plane.route(jwksSource);
+        await expect(callVia(plane.replica(signer))).resolves.toMatchObject({ caller: 'control-plane', value: 'ping' });
+      }
     }
   });
 
@@ -173,6 +178,7 @@ async function signingKeyId(app: DemoApp): Promise<string> {
 
 async function signingKeyIdOf(app: DemoApp, replica: number): Promise<string> {
   const response = await app.replica(replica).token({ scopes: ['demo.echo'], targetServiceId: 'demo' });
+  if (!response.ok) throw new Error(`token request failed on replica ${replica}: ${response.status}`);
   const issued = ((await response.json()) as { token: string }).token;
   return (decodeServicePlaneJwkToken(issued, 'unreadable').header as { kid: string }).kid;
 }
@@ -180,6 +186,12 @@ async function signingKeyIdOf(app: DemoApp, replica: number): Promise<string> {
 // Brokered, so the token the plane just minted is the one the service verifies on this call.
 function call(app: DemoApp) {
   return app.brokerRoot<EchoApiShape>().ability('demo', 'demo.echo').connect(['demo.echo']).echo({ value: 'ping' });
+}
+
+// The same brokered call against one named replica, bypassing the balancer. Which replica signs and
+// which replica's JWKS the service reads are then independent.
+function callVia(replica: DemoReplica) {
+  return replica.brokerRoot<EchoApiShape>().ability('demo', 'demo.echo').connect(['demo.echo']).echo({ value: 'ping' });
 }
 
 // The direct caller leg driven by a token captured earlier — the only way to present a token minted
