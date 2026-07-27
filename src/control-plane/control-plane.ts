@@ -99,9 +99,12 @@ export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
   requestId?: ServicePlaneRequestIdOptions;
   services: (context: Context<TEnv>) => ServiceEndpoint[] | Promise<ServiceEndpoint[]>;
   // `keys[0]` signs every new token; the rest are published in JWKS for verification only. Rotating
-  // is prepending the new key, and the old one stays listed until the overlap window in
-  // `docs/auth.md` has passed. Resolved per request so a replica picks up a rotation without a
-  // redeploy, and so replicas mid-rollout can disagree about the active key without downtime.
+  // is two deploys, not one: append the new key so every verifier can see it, wait the overlap
+  // window in `docs/auth.md`, and only then move it to the front. Prepending a key straight away
+  // signs with a `kid` services holding an older JWKS cannot resolve. The old key stays listed for
+  // one more window before it is dropped. Resolved per request so a replica picks up a rotation
+  // without a redeploy, and so replicas mid-rollout can disagree about the active key without
+  // downtime.
   signingKeys: (bindings: TEnv['Bindings'], context: Context<TEnv>) => CapabilitySigningKey[] | Promise<CapabilitySigningKey[]>;
   ttlSeconds?: number;
 };

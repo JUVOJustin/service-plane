@@ -95,6 +95,17 @@ describe('control-plane signing keys', () => {
     expect((header as { kid: string }).kid).toBe('2026-07');
   });
 
+  it('hands out a key list a caller cannot edit the authority through', async () => {
+    const authority = createCapabilitySigningAuthorityFromSigningKeys({ keys: [await signingKey('2026-07')] });
+
+    // Aggregating several planes' JWKS into one document is an ordinary thing to do, and it must not
+    // leave this authority publishing a key it was never configured with.
+    const aggregated = await authority.jwks();
+    aggregated.keys.push({ kid: 'not-ours', kty: 'EC' });
+
+    await expect(authority.jwks()).resolves.toEqual({ keys: [expect.objectContaining({ kid: '2026-07' })] });
+  });
+
   it('keeps tokens signed with a retired key verifiable while it is still published', async () => {
     const oldKey = await signingKey('2026-01');
     const newKey = await signingKey('2026-07');

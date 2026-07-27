@@ -95,8 +95,11 @@ What that buys, and what it costs:
 - **Replicas may disagree about the active signing key.** That is the normal state during a rolling
   key rotation and needs no coordination, because both configurations publish both keys. See
   [Rotate The Signing Key](auth.md#rotate-the-signing-key).
-- **Replay protection needs no shared store.** Sender-constrained tokens make a captured request
-  unusable without the caller's key, so there is deliberately nothing for replicas to agree on. See
+- **Replay protection needs no shared store.** What bounds a replayed token request is per-request
+  signing plus a short timestamp window, and both are stateless — so there is deliberately nothing
+  for replicas to agree on. JWK callers narrow it further: issuance sender-constrains their token to
+  the key that authenticated, so the bytes alone are not enough to use it. HMAC callers get an
+  ordinary bearer token, and their residual risk is the duplicate-token window described in
   [Replay Protection](auth.md#replay-protection).
 - **Sessions are bound to the replica that serves them.** HTTP-batch carries no cross-request state,
   which is what makes the fleet safe to load-balance. A long-lived WebSocket session, by contrast,

@@ -144,8 +144,10 @@ export function createCapabilitySigningAuthority(options: CreateCapabilitySignin
   return {
     issuer: options.issuer,
     async jwks() {
+      // A fresh array per call: the authority holds this key set for its whole lifetime, and a
+      // caller aggregating or sorting the result would otherwise edit every later document.
       return {
-        keys: publicJwks,
+        keys: [...publicJwks],
       };
     },
     keyId: keyIds[0] as string,
