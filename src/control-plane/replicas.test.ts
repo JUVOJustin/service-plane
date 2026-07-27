@@ -188,7 +188,7 @@ describe.each(demoEnvironments())('control-plane replicas over $name', (env) => 
     // Bearer tokens remain usable by design; what matters is that the decision is identical on both
     // replicas and reached without either consulting shared state.
     await expect(session.echo({ value: 'ping' })).resolves.toMatchObject({ caller: 'workflow-runner' });
-    const tampered = `${captured.slice(0, -2)}xy`;
+    const tampered = tamperSignature(captured);
     await expect(
       plane
         .sessionWith<EchoApiShape>({ abilityId: 'demo.echo', scopes: ['demo.echo'], serviceId: 'demo', token: tampered })
@@ -203,6 +203,17 @@ async function tokenFrom(app: DemoApp, replica: number): Promise<string> {
   const response = await app.replica(replica).token({ scopes: ['demo.echo'], targetServiceId: 'demo' });
   if (!response.ok) throw new Error(`token request failed: ${response.status}`);
   return ((await response.json()) as { token: string }).token;
+}
+
+// Corrupts the signature so verification must fail. Rewriting the *tail* is not enough: a 64-byte
+// ES256 signature is 86 base64url characters (516 bits carrying 512), so the final character owns
+// only two significant bits and the decoder discards the rest — a rewritten tail decoded back to
+// the identical signature roughly 1 run in 230, which is what made this test flaky. The first
+// character owns six full bits of the first byte, so changing it always changes the signature.
+function tamperSignature(token: string): string {
+  const lastDot = token.lastIndexOf('.');
+  const signature = token.slice(lastDot + 1);
+  return `${token.slice(0, lastDot + 1)}${signature[0] === 'A' ? 'B' : 'A'}${signature.slice(1)}`;
 }
 
 function brokered(app: DemoApp) {
