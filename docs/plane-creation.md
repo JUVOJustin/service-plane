@@ -167,7 +167,7 @@ The plane memoizes one thing, and it needs no configuration: the signing materia
 
 The capability issuer itself is rebuilt on every request. Assembling one around already-derived material costs 0.03 ms at 20 services and 0.35 ms at 200, which is not worth a cache with a bound, an eviction policy and an expiry to get right. Two consequences worth knowing:
 
-- **A changed catalog or grant takes effect immediately.** There is no issuer cache to invalidate, so withdrawing a grant refuses the next request.
+- **A changed grant takes effect immediately.** Grants are plane-side configuration and are re-read on every request, so withdrawing one refuses the next request — there is no issuer cache holding the old answer. A changed *catalog* is different: it converges within the [discovery cache](#discovery-cache) TTL, because that is where the service's own view of itself is held.
 - **Cost scales with catalog size**, not with how many distinct configurations you resolve. A plane that hands different callers different grants pays nothing extra.
 
 The memo is per instance, in memory. On Cloudflare that means per isolate: a plane constructed at module scope (as above) keeps it for the isolate's lifetime and across the many requests it serves, but nothing is shared between isolates and each warms up independently. Constructing the plane *inside* the fetch handler would instead re-derive the signing material on every request — that is the one arrangement worth avoiding.
