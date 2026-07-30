@@ -77,6 +77,10 @@ export type DiscoveryCacheRoute = (typeof DISCOVERY_CACHE_ROUTES)[number];
 // `default` covers every route not named. A route set to `false` resolves the catalog fresh.
 export type ServicePlaneDiscoveryCaches = Partial<Record<DiscoveryCacheRoute | 'default', false | RegistryCache>>;
 
+function snapshotSigningKeys(keys: CapabilitySigningKey[]): CapabilitySigningKey[] {
+  return keys.map((key) => ({ kid: key.kid, secret: key.secret }));
+}
+
 function isRegistryCache(value: RegistryCache | ServicePlaneDiscoveryCaches): value is RegistryCache {
   return typeof (value as RegistryCache).get === 'function';
 }
@@ -317,7 +321,10 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       caller,
       // Normalized at the boundary so the plane never forwards a value the service would reject.
       connInfo: normalizeConnInfo(mountOptions.connInfo?.(context)),
-      issuer: await this.issuerFor(context, services),
+      // Same route for both: a brokered call needs an issuer and a registry, and reading them from
+      // two different stores would mean one request warming two caches and combining snapshots that
+      // do not have to agree.
+      issuer: await this.issuerFor(context, services, route),
       registry: createServiceRegistry({ ...(cache ? { cache } : {}), services }),
       requestId: brokerRequestId(context),
     };
@@ -334,7 +341,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     if (memo && memo.issuer === issuer && sameCapabilitySigningKeys(memo.keys, keys)) return memo.authority;
 
     const authority = createCapabilitySigningAuthority({ issuer, privateJwks: await this.signingMaterialFor(keys) });
-    this.signingAuthority = { authority, issuer, keys };
+    this.signingAuthority = { authority, issuer, keys: snapshotSigningKeys(keys) };
     return authority;
   }
 
@@ -345,7 +352,11 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     if (memo && sameCapabilitySigningKeys(memo.keys, keys)) return memo.privateJwks;
 
     const privateJwks = validatedPrivateJwksFromSigningKeys(keys);
-    this.signingMaterial = { keys, privateJwks };
+    // Copied, not referenced: a resolver that hands back the same array — or the same key objects —
+    // and rotates by mutating them in place would otherwise be comparing the new values against
+    // themselves. That reads as a hit, and the plane would keep signing with the retired material
+    // for the life of the process, which is exactly the case rotation exists to avoid.
+    this.signingMaterial = { keys: snapshotSigningKeys(keys), privateJwks };
     // Invalid key material must not memoize as permanent: the next request retries and fails again
     // on its own merits rather than being refused by a cached rejection.
     privateJwks.catch(() => {
@@ -356,13 +367,17 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
 
   // Authorization catalog plus signing authority: needs discovered capabilities and grants, so it
   // can fail while a target service is down. Only token issuance and brokering depend on it.
-  private async issuerFor(context: Context<TEnv>, services?: ServiceEndpoint[]): Promise<CapabilityIssuer> {
+  private async issuerFor(
+    context: Context<TEnv>,
+    services?: ServiceEndpoint[],
+    route: DiscoveryCacheRoute = 'token',
+  ): Promise<CapabilityIssuer> {
     const keys = await this.options.signingKeys(context.env, context);
     // Resolved before the memo lookup so a miss only has to assemble the catalog, which is
     // microseconds — the key work is already done and shared across every configuration.
     const privateJwks = await this.signingMaterialFor(keys);
     const resolvedServices = services ?? (await this.options.services(context));
-    const capabilities = await discoverServiceCapabilities(resolvedServices, this.discoveryCaches.token);
+    const capabilities = await discoverServiceCapabilities(resolvedServices, this.discoveryCaches[route]);
     const grantDefinition = {
       grants: serviceGrantsFromEndpoints(resolvedServices),
     };

@@ -183,4 +183,37 @@ describe('signing material memo', () => {
     expect((await plane.fetch(tokenRequest())).status).toBe(403);
     expect(derivations.count).toBe(1);
   });
+
+  it('re-derives when a rotation mutates the key set in place', async () => {
+    const secret = await generateCapabilitySigningSecret();
+    const rotated = await generateCapabilitySigningSecret();
+    // A resolver that hands back the same array every time and rotates by writing into it. Storing
+    // that array by reference would mean comparing the new secret against itself on the next
+    // request — a hit — and the plane would keep signing with the retired key indefinitely.
+    const keys = [{ kid: 'test-key', secret }];
+    const plane = new ServicePlaneControlPlane({
+      authenticateCaller: () => 'worker-a',
+      log: false,
+      services: () => [
+        cloudflareServiceBinding({
+          binding: { fetch: async () => Response.json(discovery) },
+          grants: [{ caller: 'worker-a', scopes: ['example.sync.run'] }],
+          id: 'example',
+        }),
+      ],
+      signingKeys: () => keys,
+    });
+
+    expect((await plane.fetch(tokenRequest())).status).toBe(200);
+    expect(derivations.count).toBe(1);
+
+    keys[0] = { kid: 'test-key', secret: rotated };
+    expect((await plane.fetch(tokenRequest())).status).toBe(200);
+    expect(derivations.count).toBe(2);
+
+    // And mutating the key object itself, which is the sharper version of the same mistake.
+    (keys[0] as { secret: string }).secret = secret;
+    expect((await plane.fetch(tokenRequest())).status).toBe(200);
+    expect(derivations.count).toBe(3);
+  });
 });

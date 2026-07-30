@@ -277,4 +277,47 @@ describe('discovery cache on the token path', () => {
     expect((await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`))).status).toBe(200);
     expect(fetches).toBe(1);
   });
+
+  it('resolves a brokered request from one store rather than two', async () => {
+    const secret = await generateCapabilitySigningSecret();
+    const brokerCache = memoryRegistryCache();
+    let fetches = 0;
+    const plane = new ServicePlaneControlPlane({
+      authenticateCaller: () => 'worker-a',
+      broker: { caller: () => ({ id: 'gateway', kind: 'user' }) },
+      // Token issuance is explicitly uncached; the broker route has its own store. A brokered call
+      // needs both an issuer and a registry, and it must take both from the route it is on.
+      discoveryCache: { broker: brokerCache, token: false },
+      log: false,
+      services: () => [
+        cloudflareServiceBinding({
+          binding: {
+            fetch: async (request: Request) => {
+              if (new URL(request.url).pathname.endsWith('service.json')) fetches += 1;
+              return Response.json(discovery('svc0'));
+            },
+          },
+          grants: [{ caller: 'gateway', scopes: ['svc0.use'] }],
+          id: 'svc0',
+        }),
+      ],
+      signingKeys: () => [{ kid: 'test-key', secret }],
+    });
+
+    const brokerRequest = () =>
+      new Request('https://plane.internal/rpc/broker', {
+        body: JSON.stringify([]),
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
+      });
+
+    await plane.fetch(brokerRequest());
+    const afterFirst = fetches;
+    expect(afterFirst).toBeGreaterThan(0);
+
+    // Second call is fully served by the broker cache. If the issuer still read through the `token`
+    // route it would fan out again on every brokered request despite this route being cached.
+    await plane.fetch(brokerRequest());
+    expect(fetches).toBe(afterFirst);
+  });
 });
