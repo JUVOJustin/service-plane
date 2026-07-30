@@ -79,8 +79,12 @@ export type DiscoveryCacheRoute = (typeof DISCOVERY_CACHE_ROUTES)[number];
 // `default` covers every route not named. A route set to `false` resolves the catalog fresh.
 export type ServicePlaneDiscoveryCaches = Partial<Record<DiscoveryCacheRoute | 'default', false | RegistryCache>>;
 
+// Listing the members explicitly rather than spreading keeps the copy free of anything a caller
+// hung off the object, and `satisfies Required<...>` makes a member added to CapabilitySigningKey a
+// build error here instead of one that silently drops out of both the copy and the comparison
+// below — which would leave a rotation changing only that member looking like no change at all.
 function snapshotSigningKeys(keys: CapabilitySigningKey[]): CapabilitySigningKey[] {
-  return keys.map((key) => ({ kid: key.kid, secret: key.secret }));
+  return keys.map((key) => ({ kid: key.kid, secret: key.secret }) satisfies Required<CapabilitySigningKey>);
 }
 
 function isRegistryCache(value: RegistryCache | ServicePlaneDiscoveryCaches): value is RegistryCache {
@@ -315,8 +319,6 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     const caller = await resolveBrokerCaller(context, mountOptions.caller);
     if (caller instanceof Response) return caller;
     const services = await this.options.services(context);
-    // The mount's own cache wins; otherwise this shares the plane-wide one, so a brokered call and
-    // the token it needs resolve the catalog once between them instead of fanning out twice.
     // Both halves from one store: a brokered call needs an issuer and a registry, and reading them
     // from two caches would mean one request warming both and combining snapshots that need not
     // agree. Brokering is the call path, so it shares `token`.

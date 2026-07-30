@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { SERVICE_DISCOVERY_PATH, type ServiceDiscoveryDocument } from '../shared/types.js';
 import { cloudflareServiceBinding, httpsService, serviceDiscoveryRequest } from './endpoints.js';
-import { createServiceRegistry, memoryRegistryCache } from './registry.js';
+import { createServiceRegistry, memoryRegistryCache, serviceRegistryCacheKey } from './registry.js';
 
 describe('service registry', () => {
   const document: ServiceDiscoveryDocument = {
@@ -163,5 +163,40 @@ describe('service registry', () => {
   it('builds discovery requests against the configured origin', () => {
     const endpoint = httpsService({ baseUrl: 'https://example.internal', id: 'example' });
     expect(serviceDiscoveryRequest(endpoint).url).toBe(`https://example.internal${SERVICE_DISCOVERY_PATH}`);
+  });
+
+  it('bounds the default cache when the resolved service list varies', async () => {
+    const cache = memoryRegistryCache();
+    const document = (id: string) => ({
+      abilities: [],
+      capabilities: { scopes: [], serviceId: id },
+      id,
+      title: id,
+      version: '0.1.0',
+    });
+
+    // The cache key is derived from the resolved service list, so a plane that hands different
+    // callers different services produces a distinct entry per list. Each entry holds every
+    // document in that catalog, so without a bound this grows for the life of the process.
+    for (let tenant = 0; tenant < 200; tenant += 1) {
+      const services = [
+        cloudflareServiceBinding({
+          binding: { fetch: async () => Response.json(document(`svc-${tenant}`)) },
+          id: `svc-${tenant}`,
+        }),
+      ];
+      await createServiceRegistry({ cache, services }).discover();
+    }
+
+    const entries = await Promise.all(
+      Array.from({ length: 200 }, (_, tenant) =>
+        cache.get(
+          serviceRegistryCacheKey([cloudflareServiceBinding({ binding: { fetch: async () => new Response(null) }, id: `svc-${tenant}` })]),
+        ),
+      ),
+    );
+    expect(entries.filter(Boolean).length).toBeLessThanOrEqual(32);
+    // The most recent tenant is still resident: eviction takes the coldest, not the newest.
+    expect(entries[199]).toBeDefined();
   });
 });

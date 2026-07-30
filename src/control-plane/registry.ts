@@ -244,6 +244,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
+const MAX_REGISTRY_CACHE_ENTRIES = 32;
+
 // The default discovery cache, and the one a plane uses unless it is given another. Process-local by
 // nature: on Cloudflare that means per isolate, on Node per process. That is the bulk of the win —
 // it turns a catalog fan-out per request into one per process per TTL — while a shared store (KV,
@@ -255,6 +257,10 @@ export function memoryRegistryCache(now: () => number = () => Date.now()): Regis
     async get(key) {
       const entry = entries.get(key);
       if (!entry || entry.expiresAt <= now()) return undefined;
+      // Re-inserted so the hit moves to the most-recently-used end, which is what the bound in
+      // `set` evicts from.
+      entries.delete(key);
+      entries.set(key, entry);
       return entry.value;
     },
     // Kept past expiry on purpose: an expired entry is still the right thing to revalidate against
@@ -263,7 +269,17 @@ export function memoryRegistryCache(now: () => number = () => Date.now()): Regis
       return entries.get(key)?.value;
     },
     async set(key, value, ttlSeconds) {
+      entries.delete(key);
       entries.set(key, { expiresAt: now() + ttlSeconds * 1000, value });
+      // A backstop, not a tuning knob. One entry is the normal case, because the key is derived from
+      // the resolved service list — but a plane that hands different callers different services has
+      // one entry per distinct list, and each holds every document in that catalog. Without a bound
+      // that grows for the life of the process.
+      while (entries.size > MAX_REGISTRY_CACHE_ENTRIES) {
+        const oldest = entries.keys().next();
+        if (oldest.done) break;
+        entries.delete(oldest.value);
+      }
     },
   };
 }

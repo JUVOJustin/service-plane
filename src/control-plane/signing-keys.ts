@@ -59,7 +59,17 @@ export async function generateCapabilitySigningSecret(): Promise<string> {
 // any derived value that would then need its own handling.
 export function sameCapabilitySigningKeys(left: CapabilitySigningKey[], right: CapabilitySigningKey[]): boolean {
   if (left.length !== right.length) return false;
-  return left.every((key, index) => key.kid === right[index]?.kid && key.secret === right[index]?.secret);
+  return left.every((key, index) => {
+    const other = right[index];
+    if (!other) return false;
+    // Same guard as the snapshot this pairs with: a member added to CapabilitySigningKey has to be
+    // compared here too, or two key sets differing only in it would look identical to the memo.
+    const compared = { kid: key.kid === other.kid, secret: key.secret === other.secret } satisfies Record<
+      keyof Required<CapabilitySigningKey>,
+      boolean
+    >;
+    return compared.kid && compared.secret;
+  });
 }
 
 // Rebuilds the ES256 private JWK from the stored P-256 scalar and library defaults.
