@@ -1,3 +1,4 @@
+import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
 import { CapabilityAuthError } from '../shared/errors.js';
 import { type CapabilityCatalog, DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS, type ServiceGrantDefinition } from '../shared/types.js';
 import {
@@ -7,6 +8,7 @@ import {
   type CreateCapabilityIssuerFromPrivateJwkOptions,
   createCapabilityIssuerFromPrivateJwk,
   createCapabilitySigningAuthority,
+  validateEs256KeyPair,
 } from './capabilities.js';
 
 const DEFAULT_CAPABILITY_ISSUER = 'control-plane';
@@ -49,6 +51,15 @@ export async function generateCapabilitySigningSecret(): Promise<string> {
   const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
   if (typeof privateJwk.d !== 'string') throw new CapabilityAuthError('Unable to export Service-Plane signing secret', 500);
   return privateJwk.d;
+}
+
+// Identity check for a caller memoizing per key set. Order matters as much as content: `keys[0]`
+// signs, so a reorder after a rollback is a different key set even with the same members. A direct
+// compare rather than a digest keeps the memo's hit path synchronous and keeps the secrets out of
+// any derived value that would then need its own handling.
+export function sameCapabilitySigningKeys(left: CapabilitySigningKey[], right: CapabilitySigningKey[]): boolean {
+  if (left.length !== right.length) return false;
+  return left.every((key, index) => key.kid === right[index]?.kid && key.secret === right[index]?.secret);
 }
 
 // Rebuilds the ES256 private JWK from the stored P-256 scalar and library defaults.
@@ -97,6 +108,20 @@ export async function createCapabilityIssuerFromSigningKeys(
     ...(options.now ? { now: options.now } : {}),
   };
   return createCapabilityIssuerFromPrivateJwk(input);
+}
+
+// Everything about an issuer that is expensive lives here, and none of it depends on the service
+// catalog or the grants: deriving each private JWK is a P-256 scalar multiplication (~8.7ms) and
+// proving the active key signs and verifies is a further round-trip (~3.5ms), while assembling the
+// issuer around them costs microseconds. Split out so a caller can memoize this per key set — one
+// entry for the life of a rotation — instead of paying it again for every configuration.
+export async function validatedPrivateJwksFromSigningKeys(keys: CapabilitySigningKey[]): Promise<CapabilitySigningJwk[]> {
+  const privateJwks = privateJwksFromSigningKeys(keys);
+  // Only the active key is round-tripped: retired entries are allowed to be public-only, so there
+  // is no private half left to check against them. Same rule as createCapabilityIssuerFromPrivateJwk.
+  const signingJwk = privateJwks[0] as CapabilitySigningJwk;
+  await validateEs256KeyPair(signingJwk, publicJwkFromPrivateJwk(signingJwk, signingJwk.kid), signingJwk.kid);
+  return privateJwks;
 }
 
 function privateJwksFromSigningKeys(keys: CapabilitySigningKey[]): CapabilitySigningJwk[] {
