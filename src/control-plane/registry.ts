@@ -244,23 +244,28 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
-const MAX_REGISTRY_CACHE_ENTRIES = 32;
-
 // The default discovery cache, and the one a plane uses unless it is given another. Process-local by
 // nature: on Cloudflare that means per isolate, on Node per process. That is the bulk of the win —
 // it turns a catalog fan-out per request into one per process per TTL — while a shared store (KV,
 // Redis) additionally collapses it to one for the whole fleet. Both are worth having; only this one
 // needs no infrastructure, which is why it is the default rather than an opt-in.
+//
+// Deliberately unbounded. The entry count follows the number of distinct *service sets* the plane
+// resolves — `serviceRegistryCacheKey` covers only ids and origins, so per-caller grants do not
+// create entries and the ordinary plane holds exactly one. The two dimensions also trade against
+// each other: a plane with a 200-service catalog has one entry (~800 KB), while a plane with many
+// distinct sets has small ones (~4 KB each), so the product stays modest in any real shape.
+//
+// A capacity bound was tried and removed. A miss here is a network fan-out over every service, so
+// any cap low enough to fire turns into the eviction thrashing that made the issuer cache's bound
+// not worth carrying — and worse, because that miss cost microseconds and this one costs round
+// trips. Bound the retention with the TTL instead; that is what it is for.
 export function memoryRegistryCache(now: () => number = () => Date.now()): RegistryCache {
   const entries = new Map<string, { expiresAt: number; value: ServiceDiscoverySnapshot }>();
   return {
     async get(key) {
       const entry = entries.get(key);
       if (!entry || entry.expiresAt <= now()) return undefined;
-      // Re-inserted so the hit moves to the most-recently-used end, which is what the bound in
-      // `set` evicts from.
-      entries.delete(key);
-      entries.set(key, entry);
       return entry.value;
     },
     // Kept past expiry on purpose: an expired entry is still the right thing to revalidate against
@@ -269,17 +274,7 @@ export function memoryRegistryCache(now: () => number = () => Date.now()): Regis
       return entries.get(key)?.value;
     },
     async set(key, value, ttlSeconds) {
-      entries.delete(key);
       entries.set(key, { expiresAt: now() + ttlSeconds * 1000, value });
-      // A backstop, not a tuning knob. One entry is the normal case, because the key is derived from
-      // the resolved service list — but a plane that hands different callers different services has
-      // one entry per distinct list, and each holds every document in that catalog. Without a bound
-      // that grows for the life of the process.
-      while (entries.size > MAX_REGISTRY_CACHE_ENTRIES) {
-        const oldest = entries.keys().next();
-        if (oldest.done) break;
-        entries.delete(oldest.value);
-      }
     },
   };
 }

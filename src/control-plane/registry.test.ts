@@ -165,38 +165,32 @@ describe('service registry', () => {
     expect(serviceDiscoveryRequest(endpoint).url).toBe(`https://example.internal${SERVICE_DISCOVERY_PATH}`);
   });
 
-  it('bounds the default cache when the resolved service list varies', async () => {
+  it('keys the cache by the service set, not by per-caller grants', async () => {
     const cache = memoryRegistryCache();
-    const document = (id: string) => ({
-      abilities: [],
-      capabilities: { scopes: [], serviceId: id },
-      id,
-      title: id,
-      version: '0.1.0',
-    });
+    let fetches = 0;
+    const document = { abilities: [], capabilities: { scopes: [], serviceId: 'svc' }, id: 'svc', title: 'svc', version: '0.1.0' };
+    const services = (caller: string) => [
+      cloudflareServiceBinding({
+        binding: {
+          fetch: async () => {
+            fetches += 1;
+            return Response.json(document);
+          },
+        },
+        grants: [{ caller, scopes: ['svc.use'] }],
+        id: 'svc',
+      }),
+    ];
 
-    // The cache key is derived from the resolved service list, so a plane that hands different
-    // callers different services produces a distinct entry per list. Each entry holds every
-    // document in that catalog, so without a bound this grows for the life of the process.
-    for (let tenant = 0; tenant < 200; tenant += 1) {
-      const services = [
-        cloudflareServiceBinding({
-          binding: { fetch: async () => Response.json(document(`svc-${tenant}`)) },
-          id: `svc-${tenant}`,
-        }),
-      ];
-      await createServiceRegistry({ cache, services }).discover();
+    // This is what keeps the unbounded cache safe: a plane that hands each caller different grants
+    // resolves to one entry, because the key covers ids and origins only. Growth would need
+    // genuinely different *service sets*, which is a configuration dimension rather than a
+    // per-request one.
+    for (let caller = 0; caller < 50; caller += 1) {
+      await createServiceRegistry({ cache, services: services(`tenant-${caller}`) }).discover();
     }
 
-    const entries = await Promise.all(
-      Array.from({ length: 200 }, (_, tenant) =>
-        cache.get(
-          serviceRegistryCacheKey([cloudflareServiceBinding({ binding: { fetch: async () => new Response(null) }, id: `svc-${tenant}` })]),
-        ),
-      ),
-    );
-    expect(entries.filter(Boolean).length).toBeLessThanOrEqual(32);
-    // The most recent tenant is still resident: eviction takes the coldest, not the newest.
-    expect(entries[199]).toBeDefined();
+    expect(fetches).toBe(1);
+    expect(await cache.get(serviceRegistryCacheKey(services('anyone')))).toBeDefined();
   });
 });
