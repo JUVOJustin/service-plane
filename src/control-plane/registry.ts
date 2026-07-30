@@ -47,13 +47,17 @@ export function createServiceRegistry(options: CreateServiceRegistryOptions): Se
       if (cached) return withAbilities(cached, options.services);
 
       const stale = await options.cache?.getStale?.(cacheKey);
-      const { etags, services } = await discoverServices(options.services, discoveryPath, stale);
+      const { complete, etags, services } = await discoverServices(options.services, discoveryPath, stale);
       const snapshot: ServiceDiscoverySnapshot = {
         discoveredAt: new Date().toISOString(),
         ...(Object.keys(etags).length > 0 ? { etags } : {}),
         services,
       };
-      await options.cache?.set(cacheKey, snapshot, cacheTtlSeconds);
+      // A service that was unreachable is simply missing from this snapshot, and storing that would
+      // turn a momentary outage into a catalog gap that outlives it by the full TTL — the service
+      // comes back and the plane keeps refusing it until the entry expires. An incomplete discovery
+      // is therefore used for this request and not written; the next request retries.
+      if (complete) await options.cache?.set(cacheKey, snapshot, cacheTtlSeconds);
       return withAbilities(snapshot, options.services);
     },
 
@@ -86,7 +90,7 @@ async function discoverServices(
   endpoints: ServiceEndpoint[],
   discoveryPath: string,
   previous?: ServiceDiscoverySnapshot,
-): Promise<{ etags: Record<string, string>; services: ServiceDiscoveryDocument[] }> {
+): Promise<{ complete: boolean; etags: Record<string, string>; services: ServiceDiscoveryDocument[] }> {
   const previousServices = new Map(previous?.services.map((service) => [service.id, service]));
   const discovered = await Promise.all(
     endpoints.map(async (endpoint) => {
@@ -119,6 +123,7 @@ async function discoverServices(
 
   const documents = discovered.filter((entry): entry is DiscoveredDocument => !!entry);
   return {
+    complete: documents.length === endpoints.length,
     etags: documents.reduce<Record<string, string>>((metadata, entry) => {
       if (entry.etag) metadata[entry.endpointId] = entry.etag;
       return metadata;
@@ -237,4 +242,28 @@ function isHttpMethod(value: unknown): value is ServiceHttpMethod {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+// The default discovery cache, and the one a plane uses unless it is given another. Process-local by
+// nature: on Cloudflare that means per isolate, on Node per process. That is the bulk of the win —
+// it turns a catalog fan-out per request into one per process per TTL — while a shared store (KV,
+// Redis) additionally collapses it to one for the whole fleet. Both are worth having; only this one
+// needs no infrastructure, which is why it is the default rather than an opt-in.
+export function memoryRegistryCache(now: () => number = () => Date.now()): RegistryCache {
+  const entries = new Map<string, { expiresAt: number; value: ServiceDiscoverySnapshot }>();
+  return {
+    async get(key) {
+      const entry = entries.get(key);
+      if (!entry || entry.expiresAt <= now()) return undefined;
+      return entry.value;
+    },
+    // Kept past expiry on purpose: an expired entry is still the right thing to revalidate against
+    // with `if-none-match`, which is what turns a refresh into a 304 instead of a full document.
+    async getStale(key) {
+      return entries.get(key)?.value;
+    },
+    async set(key, value, ttlSeconds) {
+      entries.set(key, { expiresAt: now() + ttlSeconds * 1000, value });
+    },
+  };
 }

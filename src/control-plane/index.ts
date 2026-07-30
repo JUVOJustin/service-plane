@@ -118,8 +118,10 @@ export {
 export {
   type BrokerCallerResolver,
   type ConnInfoResolver,
+  type DiscoveryCacheRoute,
   ServicePlaneControlPlane,
   type ServicePlaneControlPlaneOptions,
+  type ServicePlaneDiscoveryCaches,
 } from './control-plane.js';
 export {
   cloudflareServiceBinding,
@@ -144,6 +146,7 @@ export {
 export {
   type CreateServiceRegistryOptions,
   createServiceRegistry,
+  memoryRegistryCache,
 } from './registry.js';
 export {
   type IssueCapabilityTokenForCallerInput,

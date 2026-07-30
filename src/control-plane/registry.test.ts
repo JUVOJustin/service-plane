@@ -1,8 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { SERVICE_DISCOVERY_PATH, type ServiceDiscoveryDocument } from '../shared/types.js';
-import { memoryRegistryCache } from '../testing/index.js';
 import { cloudflareServiceBinding, httpsService, serviceDiscoveryRequest } from './endpoints.js';
-import { createServiceRegistry } from './registry.js';
+import { createServiceRegistry, memoryRegistryCache } from './registry.js';
 
 describe('service registry', () => {
   const document: ServiceDiscoveryDocument = {
