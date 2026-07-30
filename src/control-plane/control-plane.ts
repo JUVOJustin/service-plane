@@ -68,9 +68,11 @@ type BrokeredRequest = {
   requestId: string | undefined;
 };
 
-// The routes that resolve the service catalog. Named rather than positional so a deployment can say
-// "OpenAPI reads from KV, issuance from a Durable Object" without ordering mattering.
-const DISCOVERY_CACHE_ROUTES = ['broker', 'mcp', 'openapi', 'token'] as const;
+// The two ways the catalog gets used, which is the only split worth configuring. `token` covers the
+// whole call path — issuing a token, brokering, MCP — because a brokered call *is* an issuance plus
+// a registry lookup and both must come from one snapshot. `openapi` is the projection path: cold,
+// infrequent, and happy on a store whose reads are slow.
+const DISCOVERY_CACHE_ROUTES = ['openapi', 'token'] as const;
 
 export type DiscoveryCacheRoute = (typeof DISCOVERY_CACHE_ROUTES)[number];
 
@@ -119,11 +121,11 @@ export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
   // service — and every route that needs the catalog pays that fan-out without a cache: token
   // issuance on every request, the broker and MCP on every call, OpenAPI on every document build.
   //
-  // One cache backs all four. Pass an object instead to give a route its own store, which is worth
-  // doing when they differ in what they need rather than as a matter of course: token issuance is
-  // hot and latency-sensitive, OpenAPI is cold and tolerates a slow read. Note that separate stores
-  // warm separately — the same catalog is then fetched and held once per store, so splitting trades
-  // fan-out for control.
+  // One cache backs all of them. Pass an object instead to split the call path (`token`, which also
+  // covers brokering and MCP) from the projection path (`openapi`) — the one split that reflects a
+  // real difference: issuance is hot and latency-sensitive, OpenAPI is cold and tolerates a slow
+  // read. Note that separate stores warm separately: the same catalog is then fetched and held once
+  // per store, so splitting trades fan-out for control.
   //
   // Staleness is a convergence question, not a correctness one: a token minted from a stale catalog
   // is still checked by the service against its current definition, so the failure mode is a newly
@@ -226,7 +228,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   private mountBroker(brokerOptions: Exclude<ServicePlaneControlPlaneOptions<TEnv>['broker'], false | undefined>): void {
     const path = brokerOptions.path ?? '/rpc/broker';
     this.app.all(path, async (context) => {
-      const resolved = await this.resolveBrokeredRequest(context as Context<TEnv>, brokerOptions, 'broker');
+      const resolved = await this.resolveBrokeredRequest(context as Context<TEnv>, brokerOptions);
       if (resolved instanceof Response) return resolved;
       const log = this.log;
       const broker = createControlPlaneRpcBroker({
@@ -259,7 +261,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       if (context.req.method !== 'POST') {
         return new Response('Method Not Allowed', { headers: { allow: 'POST' }, status: 405 });
       }
-      const resolved = await this.resolveBrokeredRequest(context as Context<TEnv>, mcpOptions, 'mcp');
+      const resolved = await this.resolveBrokeredRequest(context as Context<TEnv>, mcpOptions);
       if (resolved instanceof Response) return resolved;
       const log = this.log;
       return handleControlPlaneMcpRequest(context.req.raw, {
@@ -309,22 +311,21 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   private async resolveBrokeredRequest(
     context: Context<TEnv>,
     mountOptions: { caller?: BrokerCallerResolver<TEnv>; connInfo?: ConnInfoResolver<TEnv> },
-    route: DiscoveryCacheRoute,
   ): Promise<Response | BrokeredRequest> {
     const caller = await resolveBrokerCaller(context, mountOptions.caller);
     if (caller instanceof Response) return caller;
     const services = await this.options.services(context);
     // The mount's own cache wins; otherwise this shares the plane-wide one, so a brokered call and
     // the token it needs resolve the catalog once between them instead of fanning out twice.
-    const cache = this.discoveryCaches[route];
+    // Both halves from one store: a brokered call needs an issuer and a registry, and reading them
+    // from two caches would mean one request warming both and combining snapshots that need not
+    // agree. Brokering is the call path, so it shares `token`.
+    const cache = this.discoveryCaches.token;
     return {
       caller,
       // Normalized at the boundary so the plane never forwards a value the service would reject.
       connInfo: normalizeConnInfo(mountOptions.connInfo?.(context)),
-      // Same route for both: a brokered call needs an issuer and a registry, and reading them from
-      // two different stores would mean one request warming two caches and combining snapshots that
-      // do not have to agree.
-      issuer: await this.issuerFor(context, services, route),
+      issuer: await this.issuerFor(context, services),
       registry: createServiceRegistry({ ...(cache ? { cache } : {}), services }),
       requestId: brokerRequestId(context),
     };
@@ -367,17 +368,13 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
 
   // Authorization catalog plus signing authority: needs discovered capabilities and grants, so it
   // can fail while a target service is down. Only token issuance and brokering depend on it.
-  private async issuerFor(
-    context: Context<TEnv>,
-    services?: ServiceEndpoint[],
-    route: DiscoveryCacheRoute = 'token',
-  ): Promise<CapabilityIssuer> {
+  private async issuerFor(context: Context<TEnv>, services?: ServiceEndpoint[]): Promise<CapabilityIssuer> {
     const keys = await this.options.signingKeys(context.env, context);
     // Resolved before the memo lookup so a miss only has to assemble the catalog, which is
     // microseconds — the key work is already done and shared across every configuration.
     const privateJwks = await this.signingMaterialFor(keys);
     const resolvedServices = services ?? (await this.options.services(context));
-    const capabilities = await discoverServiceCapabilities(resolvedServices, this.discoveryCaches[route]);
+    const capabilities = await discoverServiceCapabilities(resolvedServices, this.discoveryCaches.token);
     const grantDefinition = {
       grants: serviceGrantsFromEndpoints(resolvedServices),
     };

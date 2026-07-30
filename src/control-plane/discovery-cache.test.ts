@@ -278,16 +278,12 @@ describe('discovery cache on the token path', () => {
     expect(fetches).toBe(1);
   });
 
-  it('resolves a brokered request from one store rather than two', async () => {
+  it('resolves a brokered request once, not once per half', async () => {
     const secret = await generateCapabilitySigningSecret();
-    const brokerCache = memoryRegistryCache();
     let fetches = 0;
     const plane = new ServicePlaneControlPlane({
       authenticateCaller: () => 'worker-a',
       broker: { caller: () => ({ id: 'gateway', kind: 'user' }) },
-      // Token issuance is explicitly uncached; the broker route has its own store. A brokered call
-      // needs both an issuer and a registry, and it must take both from the route it is on.
-      discoveryCache: { broker: brokerCache, token: false },
       log: false,
       services: () => [
         cloudflareServiceBinding({
@@ -311,13 +307,12 @@ describe('discovery cache on the token path', () => {
         method: 'POST',
       });
 
+    // A brokered call needs an issuer *and* a registry. Both are the call path, so both read the
+    // same store: one resolution for the request, not one per half.
     await plane.fetch(brokerRequest());
-    const afterFirst = fetches;
-    expect(afterFirst).toBeGreaterThan(0);
+    expect(fetches).toBe(1);
 
-    // Second call is fully served by the broker cache. If the issuer still read through the `token`
-    // route it would fan out again on every brokered request despite this route being cached.
     await plane.fetch(brokerRequest());
-    expect(fetches).toBe(afterFirst);
+    expect(fetches).toBe(1);
   });
 });

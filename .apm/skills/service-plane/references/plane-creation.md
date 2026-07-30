@@ -112,20 +112,23 @@ const plane = new ServicePlaneControlPlane({
 
 Or turn it off with `discoveryCache: false` when the plane must see every catalog change immediately and would rather pay the fan-out.
 
-Four routes resolve the catalog — `token`, `broker`, `mcp`, `openapi` — and one cache backs all of them. Pass an object to give a route its own store:
+There are two ways the catalog gets used, and you can give each its own store:
 
 ```ts
 const plane = new ServicePlaneControlPlane({
   discoveryCache: {
-    default: env.SERVICE_DISCOVERY_KV,
-    openapi: env.SERVICE_DISCOVERY_KV,
-    token: redisRegistryCache(),  // hot path, latency-sensitive
+    token: redisRegistryCache(),        // issuing tokens, brokering, MCP
+    openapi: env.SERVICE_DISCOVERY_KV,  // building the OpenAPI document
   },
   // ...
 });
 ```
 
-`default` covers every route not named, and any route can be set to `false` on its own. Worth doing when the routes genuinely differ in what they need — issuance is hot and latency-sensitive, OpenAPI is cold and tolerates a slow read — but note the cost: **separate stores warm separately**, so the same catalog is fetched and held once per store. One shared cache is the cheaper default for a reason.
+`token` covers the whole call path. Brokering and MCP are not separate: a brokered call *is* a token issuance plus a registry lookup, and both halves have to come from one snapshot. `openapi` is the projection path — cold, infrequent, and happy on a store whose reads are slow.
+
+`default` covers whichever of the two you do not name, and either can be set to `false` on its own. Splitting is worth it when the two genuinely differ in what they need, but note the cost: **separate stores warm separately**, so the same catalog is fetched and held once per store. One shared cache is the cheaper default for a reason.
+
+On Cloudflare, see [layering a shared store behind the in-memory one](cloudflare.md#sharing-the-discovery-cache-across-isolates) before reaching for KV or a Durable Object.
 
 The registry derives distinct cache keys from the configured service ids and origins, so one instance is safe to share across routes and replicas. This is separate from `openapi.cache`, which caches the generated document rather than the catalog behind it.
 

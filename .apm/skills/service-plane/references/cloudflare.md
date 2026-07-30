@@ -160,6 +160,89 @@ Behind that binding:
 
 This keeps workflow code simple and keeps credentials outside user-authored workflow code. Service Plane secures the plane-to-service call and can delegate it to an end-user subject per RFC 8693; the implementor owns any further user and tenant context in the validated input.
 
+## Sharing The Discovery Cache Across Isolates
+
+The plane caches the discovered service catalog by default, in memory. On Cloudflare that means **per isolate**: each one resolves the catalog once and then serves it for the TTL, but nothing is shared between isolates and each warms up on its own.
+
+That is already most of the benefit — it turns a fan-out on every request into one per isolate per TTL. A shared store only adds the last step: isolates stop warming up independently.
+
+### Layering a shared store behind the in-memory one
+
+The mistake to avoid is putting the shared store *in front*. A KV or Durable Object read is a network hop; doing it on every request replaces a cheap local lookup with a remote one. Put it **behind** the in-memory cache instead, so the hop happens only when the local copy is missing:
+
+```ts
+import { memoryRegistryCache, type RegistryCache } from 'service-plane/control-plane';
+
+function tieredRegistryCache(local: RegistryCache, shared: RegistryCache, localTtlSeconds = 30): RegistryCache {
+  return {
+    async get(key) {
+      const near = await local.get(key);
+      if (near) return near;            // almost always ends here
+      const far = await shared.get(key);
+      if (far) await local.set(key, far, localTtlSeconds);
+      return far;
+    },
+    getStale: (key) => shared.getStale?.(key),
+    async set(key, value, ttlSeconds) {
+      await Promise.all([local.set(key, value, ttlSeconds), shared.set(key, value, ttlSeconds)]);
+    },
+  };
+}
+```
+
+A warm isolate answers from memory in microseconds. A cold one reads the shared snapshot instead of asking every service. Only the first isolate to miss both pays the fan-out.
+
+### A Durable Object as the shared store
+
+```ts
+import { DurableObject } from 'cloudflare:workers';
+import type { RegistryCache, ServiceDiscoverySnapshot } from 'service-plane/control-plane';
+
+type Entry = { expiresAt: number; value: ServiceDiscoverySnapshot };
+
+export class DiscoveryCacheObject extends DurableObject {
+  async read(key: string, allowStale: boolean): Promise<ServiceDiscoverySnapshot | undefined> {
+    const entry = await this.ctx.storage.get<Entry>(key);
+    if (!entry) return undefined;
+    // Expired entries stay readable as stale: that is what lets the registry revalidate with
+    // `if-none-match` and get 304s back instead of full documents.
+    return allowStale || Date.now() < entry.expiresAt ? entry.value : undefined;
+  }
+
+  async write(key: string, value: ServiceDiscoverySnapshot, ttlSeconds: number): Promise<void> {
+    await this.ctx.storage.put<Entry>(key, { expiresAt: Date.now() + ttlSeconds * 1000, value });
+  }
+}
+
+export function durableObjectRegistryCache(
+  namespace: DurableObjectNamespace<DiscoveryCacheObject>,
+  name = 'discovery',
+): RegistryCache {
+  const stub = () => namespace.get(namespace.idFromName(name));
+  return {
+    get: (key) => stub().read(key, false),
+    getStale: (key) => stub().read(key, true),
+    set: (key, value, ttlSeconds) => stub().write(key, value, ttlSeconds),
+  };
+}
+```
+
+The snapshot is plain JSON, so it crosses the Durable Object RPC boundary unchanged. Durable Object storage has no TTL of its own, which is why the entry carries its own `expiresAt`.
+
+**Use a Durable Object here only behind the in-memory layer.** One object serializes every access and sits in one location, so making it the first stop for a hot route builds a global bottleneck exactly where throughput matters. KV is the easier shared store for this — reads are edge-cached and eventual consistency is harmless for a catalog snapshot, since staleness can only delay a new ability becoming grantable.
+
+```ts
+new ServicePlaneControlPlane({
+  discoveryCache: {
+    // The call path — issuance, broker, MCP — wants the fast local layer in front.
+    token: tieredRegistryCache(memoryRegistryCache(), durableObjectRegistryCache(env.DISCOVERY_CACHE)),
+    // OpenAPI is cold and infrequent; a plain shared store is fine.
+    openapi: kvRegistryCache(env.SERVICE_DISCOVERY_KV),
+  },
+  // ...
+});
+```
+
 ## Caching Metadata At The Edge
 
 Cloudflare [Workers Cache](https://blog.cloudflare.com/workers-cache/) puts the cache in front of the Worker: on a hit the Worker does not execute at all. Service Plane's metadata GET routes are the natural fit — the service discovery document, the aggregated `/openapi.json`, and the JWKS document. Ability RPC (POST), the broker, and MCP sessions are never cache-eligible.
