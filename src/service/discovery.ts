@@ -176,7 +176,7 @@ export function defineAbilityService<TEnv extends Env = Env>(
 ): ServiceDefinition<TEnv> {
   const serviceId = normalizeValue(input.id, 'service id');
   const service: ServiceDefinition<TEnv> = {
-    abilities: normalizeAbilities(input.abilities, input.capabilities, options.requireAbilityScopes ?? true),
+    abilities: normalizeAbilities(serviceId, input.abilities, input.capabilities, options.requireAbilityScopes ?? true),
     ...(input.callerAuth ? { callerAuth: input.callerAuth } : {}),
     ...(input.capabilities ? { capabilities: input.capabilities } : {}),
     id: serviceId,
@@ -468,6 +468,7 @@ function abilityStreamPuller(source: unknown, methodName: string): AbilityStream
 export { SERVICE_DISCOVERY_PATH };
 
 function normalizeAbilities<TEnv extends Env>(
+  serviceId: string,
   abilities: Array<AnyServiceAbilityDefinition<TEnv>>,
   capabilities: CapabilityCatalog | undefined,
   requireAbilityScopes: boolean,
@@ -494,7 +495,7 @@ function normalizeAbilities<TEnv extends Env>(
     }
     validateKnownScopes(scopes, knownScopes, capabilities, `Service-Plane ability requires unknown scope`);
 
-    const methods = normalizeMethods(id, ability.methods, scopes, knownScopes, capabilities, requireAbilityScopes);
+    const methods = normalizeMethods(serviceId, id, ability.methods, scopes, knownScopes, capabilities, requireAbilityScopes);
     const path = normalizePath(ability.rpc?.path ?? defaultAbilityRpcPath(id), id);
     if (seenPaths.has(path)) throw new CapabilityAuthError(`Duplicate Service-Plane ability RPC path: ${path}`, 500);
     seenPaths.add(path);
@@ -537,6 +538,7 @@ function isReservedMethodName(methodName: string): boolean {
 }
 
 function normalizeMethods(
+  serviceId: string,
   abilityId: string,
   methods: AbilityMethodDefinitions,
   abilityScopes: string[],
@@ -587,11 +589,21 @@ function normalizeMethods(
         name,
         {
           ...method,
-          inputSchema: abilityJsonSchema(method.input, 'input', `${abilityId}/${name}`),
+          inputSchema: abilityJsonSchema(
+            method.input,
+            'input',
+            `${abilityId}/${name}`,
+            schemaResourceId(serviceId, abilityId, name, 'input'),
+          ),
           ...(mcp ? { mcp } : {}),
           ...(mcpPrompt ? { mcpPrompt } : {}),
           ...(mcpResource ? { mcpResource } : {}),
-          outputSchema: abilityJsonSchema(method.output, 'output', `${abilityId}/${name}`),
+          outputSchema: abilityJsonSchema(
+            method.output,
+            'output',
+            `${abilityId}/${name}`,
+            schemaResourceId(serviceId, abilityId, name, 'output'),
+          ),
           ...(rest ? { rest } : {}),
           scopes,
           ...(method.stream ? { stream: true as const } : {}),
@@ -847,7 +859,7 @@ function assertAbilitySchemaContract(
   return typed as StandardSchemaV1.Props<unknown, unknown> & StandardJSONSchemaV1.Props;
 }
 
-function abilityJsonSchema(schema: AbilitySchema, io: 'input' | 'output', source: string): OpenApiObject {
+function abilityJsonSchema(schema: AbilitySchema, io: 'input' | 'output', source: string, resourceId: string): OpenApiObject {
   const converter = assertAbilitySchemaContract(schema, source).jsonSchema;
   let rendered: unknown;
   try {
@@ -867,7 +879,33 @@ function abilityJsonSchema(schema: AbilitySchema, io: 'input' | 'output', source
       500,
     );
   }
-  return rendered as OpenApiObject;
+  return withSchemaResourceId(rendered as OpenApiObject, resourceId);
+}
+
+// JSON Schema 2020-12 resource identity: a schema whose fragment `$ref`s point at itself
+// (`#`, `#/$defs/...`, `#anchor`) resolves those pointers against the nearest enclosing
+// resource. Standalone that is the schema itself, but embedded into a larger document — the
+// generated OpenAPI, an MCP tool listing — the pointers would re-anchor to the embedding
+// document and dangle. Declaring `$id` makes the schema its own resource wherever it travels,
+// so vendor output needs no rewriting. Schemas without local refs are left byte-identical.
+function schemaResourceId(serviceId: string, abilityId: string, methodName: string, io: 'input' | 'output'): string {
+  const segment = (value: string) => encodeURIComponent(value);
+  return `urn:service-plane:${segment(serviceId)}/${segment(abilityId)}/${segment(methodName)}/${io}`;
+}
+
+function withSchemaResourceId(schema: OpenApiObject, resourceId: string): OpenApiObject {
+  // A vendor-declared `$id` already anchors the schema's own refs; overriding it would break them.
+  if (typeof schema.$id === 'string' && schema.$id.length > 0) return schema;
+  if (!containsLocalRef(schema)) return schema;
+  return { $id: resourceId, ...schema };
+}
+
+function containsLocalRef(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(containsLocalRef);
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  if (typeof record.$ref === 'string' && record.$ref.startsWith('#')) return true;
+  return Object.values(record).some(containsLocalRef);
 }
 
 function errorMessage(error: unknown): string {

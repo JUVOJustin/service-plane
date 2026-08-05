@@ -101,7 +101,9 @@ export function generateMcpDiscovery(snapshot: ServiceRegistrySnapshot): McpDisc
         tools.push({
           _meta: meta,
           ...(method.mcp.description ? { description: method.mcp.description } : {}),
-          inputSchema: method.inputSchema,
+          // Root inlined so clients that read `type`/`properties` without a resolver see the
+          // object shape even when the vendor rooted the schema at a `$ref`.
+          inputSchema: inlineSchemaRoot(method.inputSchema),
           name: method.mcp.name,
           ...(outputSchema ? { outputSchema } : {}),
         });
@@ -475,7 +477,49 @@ function mcpToolOutputSchema(method: DiscoveredServiceAbility['methods'][string]
   // MCP structuredContent is always a JSON object. Streaming results are explicitly wrapped in
   // `{ items }`; unary primitive and array schemas remain available through text content only.
   if (method.stream) return streamToolOutputSchema(method.outputSchema);
-  return method.outputSchema.type === 'object' ? method.outputSchema : undefined;
+  const schema = inlineSchemaRoot(method.outputSchema);
+  return schema.type === 'object' ? schema : undefined;
+}
+
+// Some validation libraries root their JSON Schema at a local `$ref` into `$defs` instead of an
+// inlined object. The refs are valid — MCP clients treat each tool schema as its own document —
+// but a `$ref` root hides `type` and `properties` from anything that reads the schema without a
+// full resolver, including this file's own object-sniffing and prompt-argument derivation. Copy
+// the referenced content up to the root; `$defs` stays, so internal refs keep resolving.
+function inlineSchemaRoot(schema: OpenApiObject): OpenApiObject {
+  const target = resolveLocalRefTarget(schema);
+  if (!target) return schema;
+  const { $ref, ...rootExtras } = schema;
+  return { ...target, ...rootExtras };
+}
+
+function resolveLocalRefTarget(schema: OpenApiObject): OpenApiObject | undefined {
+  const seen = new Set<string>();
+  let current: OpenApiObject = schema;
+  while (typeof current.$ref === 'string' && current.$ref.startsWith('#/')) {
+    if (seen.has(current.$ref)) return undefined;
+    seen.add(current.$ref);
+    const resolved = resolveJsonPointer(schema, current.$ref.slice(2));
+    if (!isRecord(resolved)) return undefined;
+    current = resolved as OpenApiObject;
+  }
+  return current === schema ? undefined : current;
+}
+
+function resolveJsonPointer(document: OpenApiObject, pointer: string): unknown {
+  let current: unknown = document;
+  for (const rawSegment of pointer.split('/')) {
+    // JSON Pointer unescaping per RFC 6901, after URI fragment decoding.
+    const segment = decodeURIComponent(rawSegment).replaceAll('~1', '/').replaceAll('~0', '~');
+    if (Array.isArray(current)) {
+      current = current[Number(segment)];
+    } else if (isRecord(current)) {
+      current = current[segment];
+    } else {
+      return undefined;
+    }
+  }
+  return current;
 }
 
 function streamToolOutputSchema(itemSchema: OpenApiObject): OpenApiObject {
@@ -720,9 +764,10 @@ function promptResult(result: unknown, description: string | undefined) {
 }
 
 function derivePromptArguments(inputSchema: OpenApiObject): ServiceAbilityMcpPromptArgument[] | undefined {
-  const properties = isRecord(inputSchema.properties) ? Object.keys(inputSchema.properties) : [];
+  const schema = inlineSchemaRoot(inputSchema);
+  const properties = isRecord(schema.properties) ? Object.keys(schema.properties) : [];
   if (properties.length === 0) return undefined;
-  const required = new Set(Array.isArray(inputSchema.required) ? inputSchema.required : []);
+  const required = new Set(Array.isArray(schema.required) ? schema.required : []);
   return properties.map((name) => ({ name, ...(required.has(name) ? { required: true } : {}) }));
 }
 
