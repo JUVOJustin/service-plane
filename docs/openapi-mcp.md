@@ -44,7 +44,7 @@ OpenAPI includes methods when both are true:
 - the ability has `exposure: 'published'`
 - the method has `rest` metadata
 
-The request and response schemas come from the method's Zod input and output schemas through generated JSON Schema. The control plane only produces the document — it does not bundle a documentation UI.
+The request and response schemas come from the method's input and output schemas, rendered as JSON Schema at service setup through [Standard JSON Schema](https://standardschema.dev/json-schema). Service Plane always requests the `draft-2020-12` target, so every service publishes the same dialect; the exact keywords are still the converter's own — Zod, for example, adds `additionalProperties: false` on the output side. The control plane only produces the document — it does not bundle a documentation UI.
 
 Streaming methods (`stream: true`) cannot declare `rest` metadata — the generated OpenAPI documents request/response operations only.
 
@@ -85,7 +85,7 @@ Because the UI is not baked into the library, there is no bundled CDN dependency
 
 ## Edge Validation
 
-The service remains the authoritative validator. Every RPC call still goes through Zod validation in the ability wrapper.
+The service remains the authoritative validator. Every RPC call still goes through schema validation in the ability wrapper.
 
 The control plane can also use the discovered JSON Schemas for HTTP edge validation on REST facades:
 
@@ -95,10 +95,23 @@ flowchart LR
   Edge --> Validate["JSON Schema validation"]
   Validate --> Token["Mint scoped token"]
   Token --> RPC["Call asana.tasks.createTask"]
-  RPC --> Service["Service-side Zod validation"]
+  RPC --> Service["Service-side schema validation"]
 ```
 
 Edge validation is a user-facing guardrail. It should not replace service-side validation.
+
+`service-plane` does not mount that facade for you, and it does not ship request-validation middleware. `ServicePlaneControlPlane` exposes `plane.app` (and `ServicePlaneService` exposes `service.app`) as ordinary Hono apps, so mount whatever you already use — for example [`@hono/standard-validator`](https://github.com/honojs/middleware/tree/main/packages/standard-validator), which takes the same Standard Schema values your abilities use:
+
+```ts
+import { sValidator } from '@hono/standard-validator';
+
+plane.app.post('/asana/tasks', sValidator('json', CreateTaskInput), async (context) => {
+  const input = context.req.valid('json');
+  // mint a scoped token, then call the ability
+});
+```
+
+Service Plane's own HTTP routes are protocol endpoints — the Cap'n Web batch at `/rpc/<abilityId>`, the MCP JSON-RPC mount, STS — not schema-shaped REST bodies, so no request validator is applied to them. Caller-auth routes deliberately read the raw request bytes, because HMAC and JWK signatures cover the exact bytes rather than a re-serialized parse.
 
 ## MCP
 
@@ -114,7 +127,7 @@ Every projected entry carries its Service Plane routing metadata (service, abili
 
 ### Tools
 
-`mcp: { name, description? }` projects a method as a tool. The input schema comes from the method's Zod input schema. Object-shaped outputs also advertise `outputSchema` and return the validated object as `structuredContent`, with serialized JSON in a `text` block for compatibility. Primitive and array outputs omit `outputSchema` and return serialized text only. Handler failures are reported in-band with `isError: true`; unknown tools and authorization failures are JSON-RPC errors.
+`mcp: { name, description? }` projects a method as a tool. The tool's input schema comes from the method's input schema. Object-shaped outputs also advertise `outputSchema` and return the validated object as `structuredContent`, with serialized JSON in a `text` block for compatibility. Primitive and array outputs omit `outputSchema` and return serialized text only. Handler failures are reported in-band with `isError: true`; unknown tools and authorization failures are JSON-RPC errors.
 
 Streaming methods (`stream: true`) can project tools too. Because SSE is the only shape such a call can answer in, the request must accept it: an explicit `Accept` header that excludes `text/event-stream` (and `text/*`/`*/*`) gets `406` before any ability session is opened, while a missing `Accept` is treated as accepting anything. Unary tools, resources, and prompts stay usable for JSON-only clients. The plane opens the backing ability over a session transport (the endpoint's native ability RPC binding, then WebSocket) and answers `tools/call` over SSE per MCP streamable HTTP: while items arrive, it emits `notifications/progress` events (when the client sent `_meta.progressToken`), and the final response aggregates the items as `structuredContent: { items }` — MCP defines exactly one response per request, so the tool schema advertises the aggregated `{ items }` shape and `_meta.servicePlane.stream` marks the tool. Unbuffered transfer of very large streams belongs on a direct or brokered Cap'n Web session, not on MCP: the plane aggregates at most 10,000 items / 1 MiB of serialized items per streaming tool call (configurable via `mcp.streamLimits`) and fails the call in-band beyond that. `maxBytes` also gives optional progress notifications an independent cumulative byte budget; because every notification consumes that budget, it bounds how many can be emitted during a call. When that progress budget is exhausted, the plane stops sending notifications but continues building the separately bounded final result. Streaming methods cannot project resources or prompts (single-response surfaces); the service rejects such definitions at setup. See [Streaming](streaming.md).
 

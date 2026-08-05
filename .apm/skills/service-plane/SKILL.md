@@ -19,10 +19,18 @@ files, ad hoc auth checks, and separate AI-tool metadata with one source of
 truth: the **ability**.
 
 An ability is a schema-backed RPC surface owned by a service. Each method
-declares one Zod input schema, one Zod output schema, required scopes, and
-optional REST and MCP metadata. Those schemas drive runtime validation,
-service discovery, OpenAPI generation, and MCP tool metadata — define once,
-project everywhere.
+declares one input schema, one output schema, required scopes, and optional
+REST and MCP metadata. Those schemas drive runtime validation, service
+discovery, OpenAPI generation, and MCP tool metadata — define once, project
+everywhere.
+
+Schemas are Standard Schema values (https://standardschema.dev), so the
+validation library belongs to the service, not to `service-plane`. A schema
+must implement both `~standard.validate` and `~standard.jsonSchema`
+(https://standardschema.dev/json-schema): ArkType 2.1.28+, Valibot 1.2+
+wrapped in `toStandardJsonSchema()`, VineJS 4.3+, Zod 4.2+, or any other
+implementation. Read the schemas the repo already uses rather than assuming
+Zod; the choice is per schema, not per service.
 
 ## Mental model
 
@@ -69,8 +77,10 @@ them:
 
 ## Dos
 
-- **Do** define Zod schemas once and let them drive validation, discovery,
+- **Do** define schemas once and let them drive validation, discovery,
   OpenAPI, and MCP. Never hand-maintain a parallel JSON Schema or OpenAPI file.
+- **Do** use whichever Standard Schema library the service already depends on.
+  Do not add one to `service-plane` itself — it has no validation dependency.
 - **Do** declare every scope in `defineCapabilities` first; the service fails
   at setup if an ability or method references an unknown scope — that is a
   feature, not a bug to route around.
