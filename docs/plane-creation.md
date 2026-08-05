@@ -97,23 +97,55 @@ Grants are checked per target service. If one service's grant goes stale — it 
 
 ## Discovery Cache
 
-The broker and MCP surfaces can each cache service discovery documents. Pass the same cache to both when they share the same service catalog; the registry creates distinct cache keys from the configured service ids and origins.
+Resolving the catalog is a fan-out: the plane fetches `/.well-known/service-plane/service.json` from **every** configured service. It needs the catalog to issue a token — that is how it knows which scopes a service actually has — so without a cache a plane with 50 services makes 50 requests to mint one token.
+
+**This is cached by default.** A plane you configure with nothing extra keeps a process-local snapshot for 30 seconds, which is per isolate on Cloudflare and per process on Node. Nothing to install and no infrastructure required.
+
+Pass `discoveryCache` to replace it with a shared store — KV, Redis — so a whole fleet resolves the catalog once instead of once per replica:
 
 ```ts
 const plane = new ServicePlaneControlPlane({
-  broker: {
-    cache: env.SERVICE_DISCOVERY_CACHE,
-    caller: resolveCaller,
-  },
-  mcp: {
-    cache: env.SERVICE_DISCOVERY_CACHE,
-    caller: resolveCaller,
+  discoveryCache: env.SERVICE_DISCOVERY_CACHE,
+  // ...
+});
+```
+
+Or turn it off with `discoveryCache: false` when the plane must see every catalog change immediately and would rather pay the fan-out.
+
+There are two ways the catalog gets used, and you can give each its own store:
+
+```ts
+const plane = new ServicePlaneControlPlane({
+  discoveryCache: {
+    token: redisRegistryCache(),        // issuing tokens, brokering, MCP
+    openapi: env.SERVICE_DISCOVERY_KV,  // building the OpenAPI document
   },
   // ...
 });
 ```
 
-Use discovery caching to avoid repeatedly fetching `/.well-known/service-plane/service.json` from every service. Cache discovery separately from generated OpenAPI; broker and MCP discovery entries use the built-in registry TTL.
+`token` covers the whole call path. Brokering and MCP are not separate: a brokered call *is* a token issuance plus a registry lookup, and both halves have to come from one snapshot. `openapi` is the projection path — cold, infrequent, and happy on a store whose reads are slow.
+
+`default` covers whichever of the two you do not name, and either can be set to `false` on its own. Splitting is worth it when the two genuinely differ in what they need, but note the cost: **separate stores warm separately**, so the same catalog is fetched and held once per store. One shared cache is the cheaper default for a reason.
+
+On Cloudflare, see [layering a shared store behind the in-memory one](cloudflare.md#sharing-the-discovery-cache-across-isolates) before reaching for KV or a Durable Object.
+
+The registry derives distinct cache keys from the configured service ids and origins, so one instance is safe to share across routes and replicas. This is separate from `openapi.cache`, which caches the generated document rather than the catalog behind it.
+
+A discovery that could not reach every service is never cached — an unreachable service is simply absent from the snapshot, and storing that would keep the plane refusing it for the rest of the TTL after it recovers.
+
+Measured with `npm run bench` at one millisecond per service — roughly a Cloudflare service binding, and low for anything over the public internet:
+
+| Catalog | no cache | warm cache |
+| --- | --- | --- |
+| 20 services | 1.7 ms | 0.006 ms |
+| 200 services | 22.7 ms | 0.065 ms |
+
+ETag revalidation helps less than it looks: a 304 skips parsing and validating the document, but it is still one round trip per service. At 20 services over a 10 ms link it saves under a millisecond.
+
+Staleness here is mostly a convergence question. A token minted from a stale catalog is still checked by the service against its current definition, so a scope the service no longer declares is refused at the service regardless of what the plane cached. Grants are plane-side configuration and are re-read on every request, so revoking one takes effect immediately.
+
+**One catalog change is not covered by that.** `access` is enforced by the broker, from the catalog, and the service does not re-check it. Tightening an ability from `access: 'plane'` to `access: 'service'` therefore takes effect only once the cache refreshes: until then a non-service caller that already holds a grant for the scope can still reach it. Revoke the grant for immediate effect, or set `discoveryCache: false` on a plane where `access` changes must land at once. Tracked in [#32](https://github.com/JUVOJustin/service-plane/issues/32).
 
 ## OpenAPI Cache
 
@@ -130,6 +162,19 @@ const plane = new ServicePlaneControlPlane({
 ```
 
 The document is derived from published ability metadata. Individual services do not serve OpenAPI files.
+
+## Signing Material
+
+The plane memoizes one thing, and it needs no configuration: the signing material derived from your secret. Deriving a private JWK is a P-256 scalar multiplication and proving the key pair is a sign/verify round-trip — together about 9.5 ms — and neither depends on your service catalog or grants, so the result is reused until the key set changes.
+
+The capability issuer itself is rebuilt on every request. Assembling one around already-derived material costs 0.03 ms at 20 services and 0.35 ms at 200, which is not worth a cache with a bound, an eviction policy and an expiry to get right. Two consequences worth knowing:
+
+- **A changed grant takes effect immediately.** Grants are plane-side configuration and are re-read on every request, so withdrawing one refuses the next request — there is no issuer cache holding the old answer. A changed *catalog* is different: it converges within the [discovery cache](#discovery-cache) TTL, because that is where the service's own view of itself is held.
+- **Cost scales with catalog size**, not with how many distinct configurations you resolve. A plane that hands different callers different grants pays nothing extra.
+
+The memo is per instance, in memory. On Cloudflare that means per isolate: a plane constructed at module scope (as above) keeps it for the isolate's lifetime and across the many requests it serves, but nothing is shared between isolates and each warms up independently. Constructing the plane *inside* the fetch handler would instead re-derive the signing material on every request — that is the one arrangement worth avoiding.
+
+`npm run bench` tracks the ratio these numbers rest on.
 
 ## Optional Broker
 

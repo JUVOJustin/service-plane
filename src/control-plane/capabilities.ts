@@ -498,7 +498,9 @@ function normalizeSigningJwks(privateJwks: CapabilitySigningJwk[]): CapabilitySi
   });
 }
 
-async function validateEs256KeyPair(privateJwk: JsonWebKey, publicJwk: JsonWebKey, keyId: string): Promise<void> {
+// Exported so a caller that memoizes derived key material can pay this round-trip once per key set
+// rather than once per issuer. Deliberately not re-exported from `index.ts`.
+export async function validateEs256KeyPair(privateJwk: JsonWebKey, publicJwk: JsonWebKey, keyId: string): Promise<void> {
   try {
     const issued = await signCapabilityToken({
       claims: {

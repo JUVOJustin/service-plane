@@ -161,7 +161,7 @@ outage. The capability-token, broker, and MCP routes additionally need the autho
 
 `httpCache` is optional and mirrors the service option: when set, the OpenAPI and JWKS routes emit `Cache-Control` and `Cache-Tag` headers. The capability-token endpoint always responds with `Cache-Control: no-store` and `Pragma: no-cache`. Broker and MCP RPC responses are never cache-eligible.
 
-`broker.cache` and `mcp.cache` cache the discovery snapshots used by those surfaces. `openapi.cache` caches the generated document; set its TTL with `openapi.cacheTtlSeconds`. Keep discovery and OpenAPI caches separate.
+`discoveryCache` caches the discovered service catalog for every route that needs it — token issuance, broker, MCP, and OpenAPI. It defaults to a process-local cache; pass a `RegistryCache` to share one across a fleet, `false` to resolve fresh every time, or an object keyed by `token` (issuance, broker and MCP), `openapi`, and `default` to give either path its own store. `openapi.cache` is separate and caches the generated document rather than the catalog behind it; set its TTL with `openapi.cacheTtlSeconds`.
 
 `broker.caller` and `mcp.caller` use `BrokerCallerResolver`. The resolver may return a
 `BrokerCaller`, an application-owned `Response`, or `undefined`. A returned response passes through

@@ -10,6 +10,7 @@ import {
   type CapabilityCatalog,
   type CapabilityJwks,
   type RegistryCache,
+  SERVICE_DISCOVERY_PATH,
   SERVICE_PLANE_CAPABILITY_JWKS_PATH,
   SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
   SERVICE_PLANE_MCP_PATH,
@@ -55,6 +56,9 @@ export type DemoServiceSpec = {
 export type DemoReplicaSpec = {
   issuer?: string;
   openapi?: ControlPlaneOpenApiOptions;
+  // Backs every route that resolves the catalog on this replica: token issuance, broker and MCP.
+  // Per replica by construction — an in-memory cache is exactly what each isolate or process gets
+  // on its own, and passing one instance to several replicas is what a shared KV/Redis looks like.
   registryCache?: RegistryCache;
   signingKeys?: CapabilitySigningKey[];
 };
@@ -103,6 +107,9 @@ export type DemoReplica = {
 export type DemoApp = {
   brokerRoot<TApi>(): DemoBrokerRoot<TApi>;
   close(): void;
+  // Discovery requests the services have answered since the last reset. Discovery is a fan-out —
+  // one request per configured service — so this counts what a cache is there to avoid.
+  discoveryFetches(): number;
   events: ServicePlaneLoggableEvent[];
   mcp(body: unknown, headers?: Record<string, string>): Promise<Response>;
   // Replica 0. Every single-replica test addresses the fleet through this.
@@ -216,6 +223,9 @@ export async function demoApp(options: DemoAppOptions): Promise<DemoApp> {
   };
 
   const deployments = new Map<string, Deployment>();
+  // Counted at the service host so it reflects requests that actually reached a service, not what
+  // the plane intended to ask for.
+  const discoveryFetches = { count: 0 };
   const deploy = (spec: DemoServiceSpec, carried?: Pick<Deployment, 'available' | 'grants'>) => {
     deployments.set(spec.id, {
       available: carried?.available ?? true,
@@ -232,8 +242,10 @@ export async function demoApp(options: DemoAppOptions): Promise<DemoApp> {
       if (!deployment.available) throw new Error(`Service is unavailable: ${deployment.spec.id}`);
       return deployment.service.connectAbility(input);
     },
-    fetch: async (request: Request) =>
-      deployment.available ? deployment.service.fetch(request) : new Response('Service Unavailable', { status: 503 }),
+    fetch: async (request: Request) => {
+      if (new URL(request.url).pathname === SERVICE_DISCOVERY_PATH) discoveryFetches.count += 1;
+      return deployment.available ? deployment.service.fetch(request) : new Response('Service Unavailable', { status: 503 });
+    },
   });
 
   const endpoints = (): ServiceEndpoint[] =>
@@ -257,13 +269,14 @@ export async function demoApp(options: DemoAppOptions): Promise<DemoApp> {
         authenticateCaller: () => callerServiceId,
         broker: {
           caller: () => options.brokerCaller ?? { id: 'gateway', kind: 'user' },
-          ...(spec.registryCache ? { cache: spec.registryCache } : {}),
         },
+        // Explicit either way: a fixture that silently cached discovery would make `redeploy()`
+        // and grant changes land a TTL later, which is the opposite of what most tests are about.
+        discoveryCache: spec.registryCache ?? false,
         issuer: spec.issuer ?? issuer,
         log: options.log ?? ((event) => events.push(event as ServicePlaneLoggableEvent)),
         mcp: {
           caller: () => options.brokerCaller ?? { id: 'gateway', kind: 'user' },
-          ...(spec.registryCache ? { cache: spec.registryCache } : {}),
           ...(options.mcp?.serverInfo ? { serverInfo: options.mcp.serverInfo } : {}),
         },
         ...(spec.openapi ? { openapi: spec.openapi } : {}),
@@ -333,6 +346,8 @@ export async function demoApp(options: DemoAppOptions): Promise<DemoApp> {
     },
 
     close,
+
+    discoveryFetches: () => discoveryFetches.count,
 
     events,
 

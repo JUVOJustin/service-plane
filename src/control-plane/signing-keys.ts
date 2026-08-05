@@ -1,3 +1,4 @@
+import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
 import { CapabilityAuthError } from '../shared/errors.js';
 import { type CapabilityCatalog, DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS, type ServiceGrantDefinition } from '../shared/types.js';
 import {
@@ -7,6 +8,7 @@ import {
   type CreateCapabilityIssuerFromPrivateJwkOptions,
   createCapabilityIssuerFromPrivateJwk,
   createCapabilitySigningAuthority,
+  validateEs256KeyPair,
 } from './capabilities.js';
 
 const DEFAULT_CAPABILITY_ISSUER = 'control-plane';
@@ -49,6 +51,34 @@ export async function generateCapabilitySigningSecret(): Promise<string> {
   const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
   if (typeof privateJwk.d !== 'string') throw new CapabilityAuthError('Unable to export Service-Plane signing secret', 500);
   return privateJwk.d;
+}
+
+// The copy half of the memo contract below: listing the members explicitly rather than spreading
+// keeps the copy free of anything a caller hung off the object, and `satisfies Required<...>` makes
+// a member added to CapabilitySigningKey a build error here instead of one that silently drops out
+// of both the copy and the comparison — which would leave a rotation changing only that member
+// looking like no change at all. Exported for the plane's memos, deliberately not from `index.ts`.
+export function snapshotSigningKeys(keys: CapabilitySigningKey[]): CapabilitySigningKey[] {
+  return keys.map((key) => ({ kid: key.kid, secret: key.secret }) satisfies Required<CapabilitySigningKey>);
+}
+
+// Identity check for a caller memoizing per key set. Order matters as much as content: `keys[0]`
+// signs, so a reorder after a rollback is a different key set even with the same members. A direct
+// compare rather than a digest keeps the memo's hit path synchronous and keeps the secrets out of
+// any derived value that would then need its own handling.
+export function sameCapabilitySigningKeys(left: CapabilitySigningKey[], right: CapabilitySigningKey[]): boolean {
+  if (left.length !== right.length) return false;
+  return left.every((key, index) => {
+    const other = right[index];
+    if (!other) return false;
+    // Same guard as the snapshot this pairs with: a member added to CapabilitySigningKey has to be
+    // compared here too, or two key sets differing only in it would look identical to the memo.
+    const compared = { kid: key.kid === other.kid, secret: key.secret === other.secret } satisfies Record<
+      keyof Required<CapabilitySigningKey>,
+      boolean
+    >;
+    return compared.kid && compared.secret;
+  });
 }
 
 // Rebuilds the ES256 private JWK from the stored P-256 scalar and library defaults.
@@ -97,6 +127,20 @@ export async function createCapabilityIssuerFromSigningKeys(
     ...(options.now ? { now: options.now } : {}),
   };
   return createCapabilityIssuerFromPrivateJwk(input);
+}
+
+// Everything about an issuer that is expensive lives here, and none of it depends on the service
+// catalog or the grants: deriving each private JWK is a P-256 scalar multiplication (~8.7ms) and
+// proving the active key signs and verifies is a further round-trip (~3.5ms), while assembling the
+// issuer around them costs microseconds. Split out so a caller can memoize this per key set — one
+// entry for the life of a rotation — instead of paying it again for every configuration.
+export async function validatedPrivateJwksFromSigningKeys(keys: CapabilitySigningKey[]): Promise<CapabilitySigningJwk[]> {
+  const privateJwks = privateJwksFromSigningKeys(keys);
+  // Only the active key is round-tripped: retired entries are allowed to be public-only, so there
+  // is no private half left to check against them. Same rule as createCapabilityIssuerFromPrivateJwk.
+  const signingJwk = privateJwks[0] as CapabilitySigningJwk;
+  await validateEs256KeyPair(signingJwk, publicJwkFromPrivateJwk(signingJwk, signingJwk.kid), signingJwk.kid);
+  return privateJwks;
 }
 
 function privateJwksFromSigningKeys(keys: CapabilitySigningKey[]): CapabilitySigningJwk[] {

@@ -1,8 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { SERVICE_DISCOVERY_PATH, type ServiceDiscoveryDocument } from '../shared/types.js';
-import { memoryRegistryCache } from '../testing/index.js';
 import { cloudflareServiceBinding, httpsService, serviceDiscoveryRequest } from './endpoints.js';
-import { createServiceRegistry } from './registry.js';
+import { createServiceRegistry, memoryRegistryCache, serviceRegistryCacheKey } from './registry.js';
 
 describe('service registry', () => {
   const document: ServiceDiscoveryDocument = {
@@ -164,5 +163,34 @@ describe('service registry', () => {
   it('builds discovery requests against the configured origin', () => {
     const endpoint = httpsService({ baseUrl: 'https://example.internal', id: 'example' });
     expect(serviceDiscoveryRequest(endpoint).url).toBe(`https://example.internal${SERVICE_DISCOVERY_PATH}`);
+  });
+
+  it('keys the cache by the service set, not by per-caller grants', async () => {
+    const cache = memoryRegistryCache();
+    let fetches = 0;
+    const document = { abilities: [], capabilities: { scopes: [], serviceId: 'svc' }, id: 'svc', title: 'svc', version: '0.1.0' };
+    const services = (caller: string) => [
+      cloudflareServiceBinding({
+        binding: {
+          fetch: async () => {
+            fetches += 1;
+            return Response.json(document);
+          },
+        },
+        grants: [{ caller, scopes: ['svc.use'] }],
+        id: 'svc',
+      }),
+    ];
+
+    // This is what keeps the unbounded cache safe: a plane that hands each caller different grants
+    // resolves to one entry, because the key covers ids and origins only. Growth would need
+    // genuinely different *service sets*, which is a configuration dimension rather than a
+    // per-request one.
+    for (let caller = 0; caller < 50; caller += 1) {
+      await createServiceRegistry({ cache, services: services(`tenant-${caller}`) }).discover();
+    }
+
+    expect(fetches).toBe(1);
+    expect(await cache.get(serviceRegistryCacheKey(services('anyone')))).toBeDefined();
   });
 });

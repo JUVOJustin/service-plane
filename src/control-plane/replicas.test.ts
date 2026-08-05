@@ -9,7 +9,7 @@ import {
   demoEnvironments,
   demoSigningKey,
 } from '../test-support/index.js';
-import { memoryRegistryCache } from '../testing/memory-cache.js';
+import { memoryRegistryCache } from './registry.js';
 
 // The horizontal-scaling contract (#21): two independent control-plane replicas serving one
 // deployment. Every replica here is its own `ServicePlaneControlPlane` with its own issuer object,
@@ -111,6 +111,75 @@ describe.each(demoEnvironments())('control-plane replicas over $name', (env) => 
       expect(denied.status).toBe(403);
       await expect(denied.json()).resolves.toEqual({ error: 'Service-Plane capability grant denied' });
     }
+  });
+
+  // What an in-memory discovery cache actually buys across a fleet. Resolving the catalog is a
+  // fan-out — one request per configured service, on every token issuance and every brokered call —
+  // so the question is not whether a process-local cache works, but how far its effect reaches.
+  it('resolves the catalog once per replica when each holds its own in-memory cache', async () => {
+    // One cache instance per replica: what every isolate or process gets on its own.
+    app = await demoApp({
+      env,
+      replicas: [{ registryCache: memoryRegistryCache() }, { registryCache: memoryRegistryCache() }],
+      services: [echoService()],
+    });
+    const plane = app;
+
+    plane.route(0);
+    await expect(brokered(plane)).resolves.toMatchObject({ value: 'ping' });
+    await expect(brokered(plane)).resolves.toMatchObject({ value: 'ping' });
+    const afterFirstReplica = plane.discoveryFetches();
+
+    // The second call on the same replica cost nothing: within one process the cache is fully
+    // effective, which is the part that does not depend on sharing anything.
+    plane.route(0);
+    await expect(brokered(plane)).resolves.toMatchObject({ value: 'ping' });
+    expect(plane.discoveryFetches()).toBe(afterFirstReplica);
+
+    // The peer replica gains nothing from it and warms independently. That is the ceiling on a
+    // process-local cache: the fan-out drops from per-request to once per replica per TTL, not to
+    // once for the fleet.
+    plane.route(1);
+    await expect(brokered(plane)).resolves.toMatchObject({ value: 'ping' });
+    expect(plane.discoveryFetches()).toBeGreaterThan(afterFirstReplica);
+  });
+
+  it('resolves the catalog once for the whole fleet when the cache is shared', async () => {
+    // The same instance handed to both replicas — what a KV or Redis registry cache looks like from
+    // inside the fleet, minus the network.
+    const shared = memoryRegistryCache();
+    app = await demoApp({
+      env,
+      replicas: [{ registryCache: shared }, { registryCache: shared }],
+      services: [echoService()],
+    });
+    const plane = app;
+
+    plane.route(0);
+    await expect(brokered(plane)).resolves.toMatchObject({ value: 'ping' });
+    const afterWarmup = plane.discoveryFetches();
+    expect(afterWarmup).toBeGreaterThan(0);
+
+    // Replica 1 was never asked to discover anything: it reads the snapshot replica 0 wrote.
+    plane.route(1);
+    await expect(brokered(plane)).resolves.toMatchObject({ value: 'ping' });
+    expect(plane.discoveryFetches()).toBe(afterWarmup);
+  });
+
+  it('re-resolves the catalog on every request when no replica caches it', async () => {
+    app = await demoApp({ env, replicas: 2, services: [echoService()] });
+    const plane = app;
+
+    plane.route(0);
+    await expect(brokered(plane)).resolves.toMatchObject({ value: 'ping' });
+    const afterFirst = plane.discoveryFetches();
+
+    // The unconfigured default, stated so it cannot drift silently: every brokered call and every
+    // token issuance asks the services again. Correct, and the reason a fleet with a large catalog
+    // wants a cache even though nothing is wrong without one.
+    plane.route(0);
+    await expect(brokered(plane)).resolves.toMatchObject({ value: 'ping' });
+    expect(plane.discoveryFetches()).toBeGreaterThan(afterFirst);
   });
 
   it('refuses a replica whose issuer disagrees with the fleet', async () => {
