@@ -53,16 +53,20 @@ type ServicePlaneControlPlaneEnv<TEnv extends Env> = TEnv & {
 
 type ServicePlaneRequestIdOptions = NonNullable<Parameters<typeof requestId>[0]>;
 
-// Resolves the authenticated broker/MCP caller from a request. A resolver-owned Response lets the
-// application preserve its authentication scheme's exact challenge and body. Returning undefined
-// refuses the request with 403; omitting the resolver entirely fails closed with 500.
+/**
+ * Resolves the authenticated broker/MCP caller from a request. A resolver-owned Response lets the
+ * application preserve its authentication scheme's exact challenge and body. Returning undefined
+ * refuses the request with 403; omitting the resolver entirely fails closed with 500.
+ */
 export type BrokerCallerResolver<TEnv extends Env = Env> = (
   context: Context<TEnv>,
 ) => BrokerCaller | Promise<BrokerCaller | Response | undefined> | Response | undefined;
 
-// Supplies the original client's connection info for forwarding to services. `getConnInfo` is
-// runtime-specific in Hono (`hono/cloudflare-workers`, `@hono/node-server/conninfo`, ...), so the
-// application picks the right one: `connInfo: (c) => getConnInfo(c)`.
+/**
+ * Supplies the original client's connection info for forwarding to services. `getConnInfo` is
+ * runtime-specific in Hono (`hono/cloudflare-workers`, `@hono/node-server/conninfo`, ...), so the
+ * application picks the right one: `connInfo: (c) => getConnInfo(c)`.
+ */
 export type ConnInfoResolver<TEnv extends Env = Env> = (context: Context<TEnv>) => ConnInfo | undefined;
 
 type BrokeredRequest = {
@@ -81,7 +85,9 @@ const DISCOVERY_CACHE_ROUTES = ['openapi', 'token'] as const;
 
 export type DiscoveryCacheRoute = (typeof DISCOVERY_CACHE_ROUTES)[number];
 
-// `default` covers every route not named. A route set to `false` resolves the catalog fresh.
+/**
+ * `default` covers every route not named. A route set to `false` resolves the catalog fresh.
+ */
 export type ServicePlaneDiscoveryCaches = Partial<Record<DiscoveryCacheRoute | 'default', false | RegistryCache>>;
 
 function isRegistryCache(value: RegistryCache | ServicePlaneDiscoveryCaches): value is RegistryCache {
@@ -123,30 +129,34 @@ export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
         upgradeWebSocket?: UpgradeWebSocket;
       };
   controlPlaneServiceId?: string;
-  // Caches the discovered service catalog. Resolving it is a fan-out — one request per configured
-  // service — and every route that needs the catalog pays that fan-out without a cache: token
-  // issuance on every request, the broker and MCP on every call, OpenAPI on every document build.
-  //
-  // One cache backs all of them. Pass an object instead to split the call path (`token`, which also
-  // covers brokering and MCP) from the projection path (`openapi`) — the one split that reflects a
-  // real difference: issuance is hot and latency-sensitive, OpenAPI is cold and tolerates a slow
-  // read. Note that separate stores warm separately: the same catalog is then fetched and held once
-  // per store, so splitting trades fan-out for control.
-  //
-  // Staleness is a convergence question, not a correctness one: a token minted from a stale catalog
-  // is still checked by the service against its current definition, so the failure mode is a newly
-  // published ability taking up to the TTL to become grantable, never a stale one staying usable.
-  // That is why this defaults to a process-local `memoryRegistryCache()` rather than to nothing —
-  // the fan-out is real on every request and the risk it trades against is bounded. Pass `false`,
-  // here or per route, to resolve the catalog every time instead.
+  /**
+   * Caches the discovered service catalog. Resolving it is a fan-out — one request per configured
+   * service — and every route that needs the catalog pays that fan-out without a cache: token
+   * issuance on every request, the broker and MCP on every call, OpenAPI on every document build.
+   *
+   * One cache backs all of them. Pass an object instead to split the call path (`token`, which also
+   * covers brokering and MCP) from the projection path (`openapi`) — the one split that reflects a
+   * real difference: issuance is hot and latency-sensitive, OpenAPI is cold and tolerates a slow
+   * read. Note that separate stores warm separately: the same catalog is then fetched and held once
+   * per store, so splitting trades fan-out for control.
+   *
+   * Staleness is a convergence question, not a correctness one: a token minted from a stale catalog
+   * is still checked by the service against its current definition, so the failure mode is a newly
+   * published ability taking up to the TTL to become grantable, never a stale one staying usable.
+   * That is why this defaults to a process-local `memoryRegistryCache()` rather than to nothing —
+   * the fan-out is real on every request and the risk it trades against is bounded. Pass `false`,
+   * here or per route, to resolve the catalog every time instead.
+   */
   discoveryCache?: false | RegistryCache | ServicePlaneDiscoveryCaches;
-  // Discriminates cache entries when one plane resolves different catalogs under the same service
-  // ids. `serviceRegistryCacheKey` covers ids and origins only, and `cloudflareServiceBinding`
-  // defaults the origin to `https://<id>.service-plane.internal`, so a plane handing each tenant its
-  // own binding under the id `asana` produces one key for all of them — and the first tenant's
-  // catalog is then served to the rest for the TTL. Return something that identifies the catalog
-  // (a tenant id) and it is folded into the key. Only needed for that shape; a plane whose service
-  // set is the same for every caller needs nothing here.
+  /**
+   * Discriminates cache entries when one plane resolves different catalogs under the same service
+   * ids. `serviceRegistryCacheKey` covers ids and origins only, and `cloudflareServiceBinding`
+   * defaults the origin to `https://<id>.service-plane.internal`, so a plane handing each tenant its
+   * own binding under the id `asana` produces one key for all of them — and the first tenant's
+   * catalog is then served to the rest for the TTL. Return something that identifies the catalog
+   * (a tenant id) and it is folded into the key. Only needed for that shape; a plane whose service
+   * set is the same for every caller needs nothing here.
+   */
   discoveryCacheKey?: (context: Context<TEnv>) => string | undefined;
   httpCache?: ServicePlaneHttpCacheOption;
   issuer?: string;
@@ -164,18 +174,22 @@ export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
   openapi?: false | ControlPlaneOpenApiOptions;
   requestId?: ServicePlaneRequestIdOptions;
   services: (context: Context<TEnv>) => ServiceEndpoint[] | Promise<ServiceEndpoint[]>;
-  // `keys[0]` signs every new token; the rest are published in JWKS for verification only. Rotating
-  // is two deploys, not one: append the new key so every verifier can see it, wait the overlap
-  // window in `docs/auth.md`, and only then move it to the front. Prepending a key straight away
-  // signs with a `kid` services holding an older JWKS cannot resolve. The old key stays listed for
-  // one more window before it is dropped. Resolved per request so a replica picks up a rotation
-  // without a redeploy, and so replicas mid-rollout can disagree about the active key without
-  // downtime.
+  /**
+   * `keys[0]` signs every new token; the rest are published in JWKS for verification only. Rotating
+   * is two deploys, not one: append the new key so every verifier can see it, wait the overlap
+   * window in `docs/auth.md`, and only then move it to the front. Prepending a key straight away
+   * signs with a `kid` services holding an older JWKS cannot resolve. The old key stays listed for
+   * one more window before it is dropped. Resolved per request so a replica picks up a rotation
+   * without a redeploy, and so replicas mid-rollout can disagree about the active key without
+   * downtime.
+   */
   signingKeys: (bindings: TEnv['Bindings'], context: Context<TEnv>) => CapabilitySigningKey[] | Promise<CapabilitySigningKey[]>;
   ttlSeconds?: number;
 };
 
-// ServicePlaneControlPlane is now only STS/JWKS plus an optional Cap'n Web broker.
+/**
+ * ServicePlaneControlPlane is now only STS/JWKS plus an optional Cap'n Web broker.
+ */
 export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   readonly app: Hono<ServicePlaneControlPlaneEnv<TEnv>>;
   // Resolved once so the default instance is per plane — which is per isolate on Cloudflare and per

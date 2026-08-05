@@ -73,6 +73,11 @@ Before changing public API:
 
 - Match existing TypeScript style and Biome formatting.
 - Keep code comments short and explain why a boundary exists, not what each line does.
+- Use JSDoc (`/** */`) on exported declarations and on properties inside exported types: only JSDoc
+  reaches `.d.ts` and a consumer's editor hover, so a `//` comment there is invisible to the people
+  it was written for. Keep `//` for everything else — notes inside function bodies and on internal
+  declarations are for whoever edits the file, and promoting them would put implementation reasoning
+  into the published API surface.
 - Prefer small, explicit helpers near the code that owns the behavior.
 - Use schemas as the source of truth for ability input and output. Ability schemas are Standard Schema values (`~standard.validate` plus `~standard.jsonSchema`), so no validation library is a dependency of this package. Tests use Zod; library code must not import it.
 - Use structured token claims, discovery fields, and typed options instead of ad hoc request parsing.

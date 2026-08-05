@@ -15,17 +15,21 @@ export type BrokerCaller = {
   orgId?: string;
 };
 
-// User callers become the RFC 8693 delegated subject (`sub` = user, `act` = brokering service) so
-// target services see verified end-user attribution; service callers already ride in `sub` alone.
-// A blank orgId from the resolver is dropped rather than failing the call; a blank id still fails
-// closed, but here at the boundary with a clear error instead of deep inside token minting.
+/**
+ * User callers become the RFC 8693 delegated subject (`sub` = user, `act` = brokering service) so
+ * target services see verified end-user attribution; service callers already ride in `sub` alone.
+ * A blank orgId from the resolver is dropped rather than failing the call; a blank id still fails
+ * closed, but here at the boundary with a clear error instead of deep inside token minting.
+ */
 export function brokerCallerSubject(caller: BrokerCaller | undefined): CapabilitySubject | undefined {
   if (caller?.kind !== 'user') return undefined;
   const orgId = caller.orgId?.trim();
   return normalizeCapabilitySubject({ id: caller.id, ...(orgId ? { orgId } : {}) });
 }
 
-// One projection for caller audit fields so broker and MCP log events cannot drift.
+/**
+ * One projection for caller audit fields so broker and MCP log events cannot drift.
+ */
 export function brokerCallerLogFields(caller: BrokerCaller | undefined): {
   callerId?: string;
   callerKind?: BrokerCaller['kind'];
@@ -36,8 +40,10 @@ export function brokerCallerLogFields(caller: BrokerCaller | undefined): {
 }
 
 export type CreateControlPlaneRpcBrokerOptions = {
-  // Advisory connection info about the original client, forwarded to the target service. Services
-  // surface it to handlers only for brokered calls with ingress enabled.
+  /**
+   * Advisory connection info about the original client, forwarded to the target service. Services
+   * surface it to handlers only for brokered calls with ingress enabled.
+   */
   connInfo?: ConnInfo;
   controlPlaneServiceId: string;
   issuer: CapabilityIssuer;
@@ -48,9 +54,11 @@ export type CreateControlPlaneRpcBrokerOptions = {
 };
 
 export type RootCapabilityOptions = {
-  // Enable only when the caller's own leg to the broker is a session transport that can carry a
-  // returned stream. The default is false so custom shells cannot accidentally return dangling
-  // stream stubs over HTTP-batch.
+  /**
+   * Enable only when the caller's own leg to the broker is a session transport that can carry a
+   * returned stream. The default is false so custom shells cannot accidentally return dangling
+   * stream stubs over HTTP-batch.
+   */
   allowStreaming?: boolean;
 };
 
@@ -226,9 +234,11 @@ function authorizeAbility(ability: DiscoveredServiceAbility, caller: BrokerCalle
   throw new CapabilityAuthError('Service-Plane broker ability requires service access', 403);
 }
 
-// Shared transport selection for broker and MCP so the two cannot drift. The broker opens the
-// whole ability and uses its default all-methods view; single-method projections such as MCP can
-// request a session transport only for the method that needs one.
+/**
+ * Shared transport selection for broker and MCP so the two cannot drift. The broker opens the
+ * whole ability and uses its default all-methods view; single-method projections such as MCP can
+ * request a session transport only for the method that needs one.
+ */
 export function transportForAbility(ability: DiscoveredServiceAbility, options: { requiresStreaming?: boolean } = {}) {
   const requiresStreaming = options.requiresStreaming ?? Object.values(ability.methods).some((method) => method.stream);
   // Native Workers RPC is session-shaped without holding a WebSocket and is the cheapest

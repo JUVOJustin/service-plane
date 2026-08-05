@@ -22,9 +22,11 @@ const P256_G = {
 
 type Point = { x: bigint; y: bigint } | undefined;
 
-// One stored secret plus the key id verifiers select it by. Ordering carries the rotation state:
-// `keys[0]` signs, and every later entry stays published so tokens minted before the rotation — and
-// by control-plane replicas that have not restarted yet — keep verifying.
+/**
+ * One stored secret plus the key id verifiers select it by. Ordering carries the rotation state:
+ * `keys[0]` signs, and every later entry stays published so tokens minted before the rotation — and
+ * by control-plane replicas that have not restarted yet — keep verifying.
+ */
 export type CapabilitySigningKey = {
   kid: string;
   secret: string;
@@ -45,7 +47,9 @@ export type CreateCapabilitySigningAuthorityFromSigningKeysOptions = {
   keys: CapabilitySigningKey[];
 };
 
-// Generates the only value that needs to be stored as the control-plane secret.
+/**
+ * Generates the only value that needs to be stored as the control-plane secret.
+ */
 export async function generateCapabilitySigningSecret(): Promise<string> {
   const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
   const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
@@ -53,19 +57,23 @@ export async function generateCapabilitySigningSecret(): Promise<string> {
   return privateJwk.d;
 }
 
-// The copy half of the memo contract below: listing the members explicitly rather than spreading
-// keeps the copy free of anything a caller hung off the object, and `satisfies Required<...>` makes
-// a member added to CapabilitySigningKey a build error here instead of one that silently drops out
-// of both the copy and the comparison — which would leave a rotation changing only that member
-// looking like no change at all. Exported for the plane's memos, deliberately not from `index.ts`.
+/**
+ * The copy half of the memo contract below: listing the members explicitly rather than spreading
+ * keeps the copy free of anything a caller hung off the object, and `satisfies Required<...>` makes
+ * a member added to CapabilitySigningKey a build error here instead of one that silently drops out
+ * of both the copy and the comparison — which would leave a rotation changing only that member
+ * looking like no change at all. Exported for the plane's memos, deliberately not from `index.ts`.
+ */
 export function snapshotSigningKeys(keys: CapabilitySigningKey[]): CapabilitySigningKey[] {
   return keys.map((key) => ({ kid: key.kid, secret: key.secret }) satisfies Required<CapabilitySigningKey>);
 }
 
-// Identity check for a caller memoizing per key set. Order matters as much as content: `keys[0]`
-// signs, so a reorder after a rollback is a different key set even with the same members. A direct
-// compare rather than a digest keeps the memo's hit path synchronous and keeps the secrets out of
-// any derived value that would then need its own handling.
+/**
+ * Identity check for a caller memoizing per key set. Order matters as much as content: `keys[0]`
+ * signs, so a reorder after a rollback is a different key set even with the same members. A direct
+ * compare rather than a digest keeps the memo's hit path synchronous and keeps the secrets out of
+ * any derived value that would then need its own handling.
+ */
 export function sameCapabilitySigningKeys(left: CapabilitySigningKey[], right: CapabilitySigningKey[]): boolean {
   if (left.length !== right.length) return false;
   return left.every((key, index) => {
@@ -81,7 +89,9 @@ export function sameCapabilitySigningKeys(left: CapabilitySigningKey[], right: C
   });
 }
 
-// Rebuilds the ES256 private JWK from the stored P-256 scalar and library defaults.
+/**
+ * Rebuilds the ES256 private JWK from the stored P-256 scalar and library defaults.
+ */
 export function privateJwkFromCapabilitySigningSecret(signingSecret: string, keyId: string): CapabilitySigningJwk {
   const d = normalizeSigningSecret(signingSecret);
   const scalar = base64UrlToBigInt(d);
@@ -102,8 +112,10 @@ export function privateJwkFromCapabilitySigningSecret(signingSecret: string, key
   };
 }
 
-// Builds only the signing authority from the stored scalars. Publishing JWKS needs nothing else, so
-// this path never touches the service catalog.
+/**
+ * Builds only the signing authority from the stored scalars. Publishing JWKS needs nothing else, so
+ * this path never touches the service catalog.
+ */
 export function createCapabilitySigningAuthorityFromSigningKeys(
   options: CreateCapabilitySigningAuthorityFromSigningKeysOptions,
 ): CapabilitySigningAuthority {
@@ -113,7 +125,9 @@ export function createCapabilitySigningAuthorityFromSigningKeys(
   });
 }
 
-// Builds a full issuer from the stored scalars plus strong Service-Plane defaults.
+/**
+ * Builds a full issuer from the stored scalars plus strong Service-Plane defaults.
+ */
 export async function createCapabilityIssuerFromSigningKeys(
   options: CreateCapabilityIssuerFromSigningKeysOptions,
 ): Promise<CapabilityIssuer> {
@@ -129,11 +143,13 @@ export async function createCapabilityIssuerFromSigningKeys(
   return createCapabilityIssuerFromPrivateJwk(input);
 }
 
-// Everything about an issuer that is expensive lives here, and none of it depends on the service
-// catalog or the grants: deriving each private JWK is a P-256 scalar multiplication (~8.7ms) and
-// proving the active key signs and verifies is a further round-trip (~3.5ms), while assembling the
-// issuer around them costs microseconds. Split out so a caller can memoize this per key set — one
-// entry for the life of a rotation — instead of paying it again for every configuration.
+/**
+ * Everything about an issuer that is expensive lives here, and none of it depends on the service
+ * catalog or the grants: deriving each private JWK is a P-256 scalar multiplication (~8.7ms) and
+ * proving the active key signs and verifies is a further round-trip (~3.5ms), while assembling the
+ * issuer around them costs microseconds. Split out so a caller can memoize this per key set — one
+ * entry for the life of a rotation — instead of paying it again for every configuration.
+ */
 export async function validatedPrivateJwksFromSigningKeys(keys: CapabilitySigningKey[]): Promise<CapabilitySigningJwk[]> {
   const privateJwks = privateJwksFromSigningKeys(keys);
   // Only the active key is round-tripped: retired entries are allowed to be public-only, so there

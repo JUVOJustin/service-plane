@@ -27,9 +27,11 @@ import { issuedCapabilityTokenRpcResponse, rejectCallerAssertedSubject } from '.
 
 const endpointFactory = createFactory();
 
-// Rotation makes the key id load-bearing rather than cosmetic: a verifier picks its verification key
-// by `kid` alone, so a published key without one — or two sharing one — is unusable. The type makes
-// that a compile error instead of a runtime surprise during a rollout.
+/**
+ * Rotation makes the key id load-bearing rather than cosmetic: a verifier picks its verification key
+ * by `kid` alone, so a published key without one — or two sharing one — is unusable. The type makes
+ * that a compile error instead of a runtime surprise during a rollout.
+ */
 export type CapabilitySigningJwk = JsonWebKey & { kid: string };
 
 export type CapabilityIssuer = {
@@ -38,28 +40,36 @@ export type CapabilityIssuer = {
   jwks(): Promise<CapabilityJwks>;
 };
 
-// The signing authority owns key material only: issuer, key ids, and public JWKS. It is deliberately
-// separate from the authorization catalog (services, scopes, grants) so publishing JWKS never
-// depends on downstream service discovery — verifiers must be able to refresh keys during an outage.
+/**
+ * The signing authority owns key material only: issuer, key ids, and public JWKS. It is deliberately
+ * separate from the authorization catalog (services, scopes, grants) so publishing JWKS never
+ * depends on downstream service discovery — verifiers must be able to refresh keys during an outage.
+ */
 export type CapabilitySigningAuthority = {
   issuer: string;
   jwks(): Promise<CapabilityJwks>;
-  // The key new tokens are signed with. `jwks()` also publishes every retired key still inside the
-  // rotation overlap window, so this is not the full set a verifier may legitimately see.
+  /**
+   * The key new tokens are signed with. `jwks()` also publishes every retired key still inside the
+   * rotation overlap window, so this is not the full set a verifier may legitimately see.
+   */
   keyId: string;
   keyIds: string[];
 };
 
-// Anything that can publish JWKS. A full CapabilityIssuer satisfies it, so JWKS mounts accept either.
+/**
+ * Anything that can publish JWKS. A full CapabilityIssuer satisfies it, so JWKS mounts accept either.
+ */
 export type CapabilityJwksProvider = Pick<CapabilityIssuer, 'jwks'>;
 
 export type CapabilityJwksProviderResolver =
   | CapabilityJwksProvider
   | ((context: Context) => Promise<CapabilityJwksProvider> | CapabilityJwksProvider);
 
-// `privateJwks[0]` signs; every entry is published for verification. Retired entries may be public
-// JWKs — the private members are stripped before publication either way — so old private material can
-// be destroyed the moment the active key changes.
+/**
+ * `privateJwks[0]` signs; every entry is published for verification. Retired entries may be public
+ * JWKs — the private members are stripped before publication either way — so old private material can
+ * be destroyed the moment the active key changes.
+ */
 export type CreateCapabilitySigningAuthorityOptions = {
   issuer: string;
   privateJwks: CapabilitySigningJwk[];
@@ -82,9 +92,11 @@ export type GenerateCapabilitySigningJwkOptions = {
   keyId: string;
 };
 
-// A caller-auth result. The bare string form says "authenticated, no key to bind" — which is all HMAC
-// and service-binding callers can offer. The object form reports the key that actually authenticated,
-// so issuance can sender-constrain the token to it.
+/**
+ * A caller-auth result. The bare string form says "authenticated, no key to bind" — which is all HMAC
+ * and service-binding callers can offer. The object form reports the key that actually authenticated,
+ * so issuance can sender-constrain the token to it.
+ */
 export type CallerAuthResult = {
   confirmation?: CapabilityConfirmation;
   serviceId: string;
@@ -109,9 +121,11 @@ export type MountCapabilityJwksEndpointOptions = {
 export type MountCapabilityEndpointsOptions = {
   authenticateCaller: CallerAuthenticator;
   httpCache?: ServicePlaneHttpCacheOption;
-  // Required, and separate from the issuer on purpose: passing the issuer here couples key
-  // publication to the authorization catalog, so a service-discovery outage takes JWKS down with it.
-  // Pass a signing authority unless you have a reason to accept that coupling.
+  /**
+   * Required, and separate from the issuer on purpose: passing the issuer here couples key
+   * publication to the authorization catalog, so a service-discovery outage takes JWKS down with it.
+   * Pass a signing authority unless you have a reason to accept that coupling.
+   */
   jwks: CapabilityJwksProviderResolver;
   jwksPath?: string;
   tokenPath?: string;
@@ -135,7 +149,9 @@ export function defineServiceGrants(definition: ServiceGrantDefinition): Service
   };
 }
 
-// Derives the public JWKS from private key material alone. No catalog, no discovery, no I/O.
+/**
+ * Derives the public JWKS from private key material alone. No catalog, no discovery, no I/O.
+ */
 export function createCapabilitySigningAuthority(options: CreateCapabilitySigningAuthorityOptions): CapabilitySigningAuthority {
   const privateJwks = normalizeSigningJwks(options.privateJwks);
   const publicJwks = privateJwks.map((privateJwk) => publicJwkFromPrivateJwk(privateJwk, privateJwk.kid));
@@ -498,8 +514,10 @@ function normalizeSigningJwks(privateJwks: CapabilitySigningJwk[]): CapabilitySi
   });
 }
 
-// Exported so a caller that memoizes derived key material can pay this round-trip once per key set
-// rather than once per issuer. Deliberately not re-exported from `index.ts`.
+/**
+ * Exported so a caller that memoizes derived key material can pay this round-trip once per key set
+ * rather than once per issuer. Deliberately not re-exported from `index.ts`.
+ */
 export async function validateEs256KeyPair(privateJwk: JsonWebKey, publicJwk: JsonWebKey, keyId: string): Promise<void> {
   try {
     const issued = await signCapabilityToken({

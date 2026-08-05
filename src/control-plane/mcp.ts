@@ -26,11 +26,15 @@ export type ControlPlaneMcpServerInfo = {
 };
 
 export type ControlPlaneMcpHandlerOptions = {
-  // Browser requests must come from the MCP endpoint's own origin by default. Deployments
-  // intentionally serving browser clients from another origin can allow exact origins here.
+  /**
+   * Browser requests must come from the MCP endpoint's own origin by default. Deployments
+   * intentionally serving browser clients from another origin can allow exact origins here.
+   */
   allowedOrigins?: string[];
   caller?: BrokerCaller;
-  // Advisory connection info about the original client, forwarded to the target service.
+  /**
+   * Advisory connection info about the original client, forwarded to the target service.
+   */
   connInfo?: ConnInfo;
   controlPlaneServiceId: string;
   issuer: CapabilityIssuer;
@@ -38,9 +42,11 @@ export type ControlPlaneMcpHandlerOptions = {
   registry: ServiceRegistry;
   requestId?: string;
   serverInfo?: Partial<ControlPlaneMcpServerInfo>;
-  // Streaming tools must aggregate into one MCP result, so unbounded sources would grow
-  // control-plane memory without limit; calls exceeding these caps fail in-band. maxBytes also
-  // independently caps optional progress-notification bytes so an opaque token is not amplified.
+  /**
+   * Streaming tools must aggregate into one MCP result, so unbounded sources would grow
+   * control-plane memory without limit; calls exceeding these caps fail in-band. maxBytes also
+   * independently caps optional progress-notification bytes so an opaque token is not amplified.
+   */
   streamLimits?: { maxBytes?: number; maxItems?: number };
 };
 
@@ -49,8 +55,10 @@ const DEFAULT_MCP_STREAM_MAX_BYTES = 1_048_576;
 
 export const DEFAULT_MCP_PATH = SERVICE_PLANE_MCP_PATH;
 
-// Latest protocol revision this endpoint implements; preceding Streamable HTTP revisions are
-// accepted for stateless requests and can be negotiated during initialization.
+/**
+ * Latest protocol revision this endpoint implements; preceding Streamable HTTP revisions are
+ * accepted for stateless requests and can be negotiated during initialization.
+ */
 export const MCP_PROTOCOL_VERSION = '2025-11-25';
 const SUPPORTED_MCP_PROTOCOL_VERSIONS = [MCP_PROTOCOL_VERSION, '2025-06-18', '2025-03-26'];
 
@@ -140,8 +148,10 @@ export function generateMcpDiscovery(snapshot: ServiceRegistrySnapshot): McpDisc
   return { prompts, resourceTemplates, resources, tools };
 }
 
-// Stateless MCP Streamable HTTP endpoint: each POST carries one JSON-RPC message, responses are
-// JSON except streaming tool calls over SSE, and no session id is issued.
+/**
+ * Stateless MCP Streamable HTTP endpoint: each POST carries one JSON-RPC message, responses are
+ * JSON except streaming tool calls over SSE, and no session id is issued.
+ */
 export async function handleControlPlaneMcpRequest(request: Request, options: ControlPlaneMcpHandlerOptions): Promise<Response> {
   const transportError = validateControlPlaneMcpTransportRequest(request, options.allowedOrigins);
   if (transportError) return transportError;

@@ -60,9 +60,11 @@ export async function signCapabilityProof(options: SignCapabilityProofOptions): 
   );
 }
 
-// Order matters: the embedded key is thumbprinted and matched against `cnf.jkt` *before* the signature
-// is checked against it. A proof signed by any other key therefore fails at the thumbprint, and can
-// never be verified using its own public half.
+/**
+ * Order matters: the embedded key is thumbprinted and matched against `cnf.jkt` *before* the signature
+ * is checked against it. A proof signed by any other key therefore fails at the thumbprint, and can
+ * never be verified using its own public half.
+ */
 export async function verifyCapabilityProof(proof: string, options: VerifyCapabilityProofOptions): Promise<void> {
   if (typeof proof !== 'string' || !proof || proof.length > MAX_PROOF_LENGTH) {
     throw new CapabilityAuthError('Invalid Service-Plane proof of possession', 401);

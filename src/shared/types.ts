@@ -13,15 +13,19 @@ export const DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS = 300;
 
 export const SERVICE_PLANE_AUTHORIZATION_SCHEME = 'ServicePlane';
 export const SERVICE_PLANE_REQUEST_ID_HEADER = 'X-Request-Id';
-// WebSocket upgrades cannot carry custom headers portably, so request ids ride a query parameter there.
+/**
+ * WebSocket upgrades cannot carry custom headers portably, so request ids ride a query parameter there.
+ */
 export const SERVICE_PLANE_REQUEST_ID_QUERY_PARAM = 'request_id';
 
 export type AbilityAccess = 'plane' | 'service';
 export type AbilityExposure = 'private' | 'published';
 export type AbilityTransport = 'cloudflare-binding-rpc' | 'http-batch' | 'websocket';
-// `query` is the HTTP QUERY method (RFC 10008): a safe, idempotent request that carries its
-// parameters in a body. OpenAPI 3.2 gives it a fixed `query` field on the Path Item Object,
-// and Hono 4.13+ routes it first-class (`app.query()`), which is why hono >=4.13 is the peer floor.
+/**
+ * `query` is the HTTP QUERY method (RFC 10008): a safe, idempotent request that carries its
+ * parameters in a body. OpenAPI 3.2 gives it a fixed `query` field on the Path Item Object,
+ * and Hono 4.13+ routes it first-class (`app.query()`), which is why hono >=4.13 is the peer floor.
+ */
 export type ServiceHttpMethod = 'delete' | 'get' | 'patch' | 'post' | 'put' | 'query';
 
 export type CapabilityScopeDefinition = {
@@ -56,7 +60,9 @@ export type ServiceAbilityMcpProjection = {
   name: string;
 };
 
-// A `{var}` URI declares a resource template; template variables become the method input.
+/**
+ * A `{var}` URI declares a resource template; template variables become the method input.
+ */
 export type ServiceAbilityMcpResourceProjection = {
   description?: string;
   mimeType?: string;
@@ -71,7 +77,9 @@ export type ServiceAbilityMcpPromptArgument = {
   required?: boolean;
 };
 
-// Prompt arguments default to the method input schema's top-level properties when omitted.
+/**
+ * Prompt arguments default to the method input schema's top-level properties when omitted.
+ */
 export type ServiceAbilityMcpPromptProjection = {
   arguments?: ServiceAbilityMcpPromptArgument[];
   description?: string;
@@ -87,8 +95,10 @@ export type ServiceAbilityMethodDiscovery = {
   outputSchema: OpenApiObject;
   rest?: ServiceAbilityRestProjection;
   scopes: string[];
-  // Streaming methods return a ReadableStream of output items over a Cap'n Web session
-  // transport; `outputSchema` then describes one streamed item, not the whole response.
+  /**
+   * Streaming methods return a ReadableStream of output items over a Cap'n Web session
+   * transport; `outputSchema` then describes one streamed item, not the whole response.
+   */
   stream?: true;
 };
 
@@ -135,9 +145,11 @@ export type ServiceGrantDefinition = {
   grants: ServiceGrant[];
 };
 
-// Native ability RPC surface a service can expose next to `fetch` (e.g. a Cloudflare
-// WorkerEntrypoint forwarding to ServicePlaneService.connectAbility). Session-shaped, so
-// streaming method returns flow through it natively.
+/**
+ * Native ability RPC surface a service can expose next to `fetch` (e.g. a Cloudflare
+ * WorkerEntrypoint forwarding to ServicePlaneService.connectAbility). Session-shaped, so
+ * streaming method returns flow through it natively.
+ */
 export type ServiceAbilityNativeRpcBinding = {
   connectAbility(input: { abilityId: string; connInfo?: ConnInfo; requestId?: string; token: string }): Promise<object> | object;
 };
@@ -206,14 +218,18 @@ export type OpenApiDocumentCache = {
   set(key: string, value: OpenApiDocument, ttlSeconds: number): Promise<void>;
 };
 
-// Spec-shaped MCP projections: only `_meta` carries Service-Plane routing data so stock clients see standard objects.
+/**
+ * Spec-shaped MCP projections: only `_meta` carries Service-Plane routing data so stock clients see standard objects.
+ */
 export type McpServicePlaneMeta = {
   servicePlane: {
     abilityId: string;
     method: string;
     scopes: string[];
     serviceId: string;
-    // The projected method streams; tools/call answers over SSE per MCP Streamable HTTP.
+    /**
+     * The projected method streams; tools/call answers over SSE per MCP Streamable HTTP.
+     */
     stream?: true;
   };
 };
@@ -223,8 +239,10 @@ export type McpToolDiscovery = {
   description?: string;
   inputSchema: OpenApiObject;
   name: string;
-  // MCP structured tool output is object-shaped. Primitive/array ability outputs are returned as
-  // text content and intentionally do not advertise an incompatible output schema.
+  /**
+   * MCP structured tool output is object-shaped. Primitive/array ability outputs are returned as
+   * text content and intentionally do not advertise an incompatible output schema.
+   */
   outputSchema?: OpenApiObject;
 };
 
@@ -261,10 +279,12 @@ export type McpDiscoveryDocument = {
   tools: McpToolDiscovery[];
 };
 
-// Control-plane-verified end-user delegation following RFC 8693: on delegated tokens `sub` is the
-// end user the call is made on behalf of, `act` names the acting service, and `spo` carries the
-// subject's org. Attribution for audit and per-user decisions; never a substitute for scope or
-// grant authorization.
+/**
+ * Control-plane-verified end-user delegation following RFC 8693: on delegated tokens `sub` is the
+ * end user the call is made on behalf of, `act` names the acting service, and `spo` carries the
+ * subject's org. Attribution for audit and per-user decisions; never a substitute for scope or
+ * grant authorization.
+ */
 export type CapabilitySubject = {
   id: string;
   orgId?: string;
@@ -274,10 +294,12 @@ export type CapabilityActorClaim = {
   sub: string;
 };
 
-// RFC 7800 `cnf` (confirmation) claim: the issuer states which key the presenter must prove it holds.
-// RFC 7800 itself defines jwk/jwe/jku/kid; `jkt` is the JWK SHA-256 thumbprint (RFC 7638) registered
-// as a confirmation method by RFC 9449 (DPoP). Only `jkt` is supported here — it is 32 bytes and the
-// proof carries the public key, so a service needs no key distribution to verify one.
+/**
+ * RFC 7800 `cnf` (confirmation) claim: the issuer states which key the presenter must prove it holds.
+ * RFC 7800 itself defines jwk/jwe/jku/kid; `jkt` is the JWK SHA-256 thumbprint (RFC 7638) registered
+ * as a confirmation method by RFC 9449 (DPoP). Only `jkt` is supported here — it is 32 bytes and the
+ * proof carries the public key, so a service needs no key distribution to verify one.
+ */
 export type CapabilityConfirmation = {
   jkt: string;
 };
@@ -300,8 +322,10 @@ export type CapabilityClaims = {
 export type CapabilityIdentity = {
   audience: string;
   brokerServiceId?: string;
-  // Present when the token is sender-constrained. A verified identity only ever carries this after a
-  // matching proof of possession was checked, so handlers can treat it as proof the caller was present.
+  /**
+   * Present when the token is sender-constrained. A verified identity only ever carries this after a
+   * matching proof of possession was checked, so handlers can treat it as proof the caller was present.
+   */
   confirmation?: CapabilityConfirmation;
   expiresAt: Date;
   issuer: string;
@@ -328,8 +352,10 @@ export type CapabilityJwksCache = {
 };
 
 export type VerifyCapabilityTokenOptions = {
-  // Required to check a proof of possession, because a proof is bound to the ability whose session it
-  // opens. A sender-constrained token presented without both of these is rejected.
+  /**
+   * Required to check a proof of possession, because a proof is bound to the ability whose session it
+   * opens. A sender-constrained token presented without both of these is rejected.
+   */
   abilityId?: string;
   expectedAudience: string;
   issuer?: string;
@@ -343,8 +369,10 @@ export type CapabilityVerifierOptions = Omit<VerifyCapabilityTokenOptions, 'requ
 
 export type IssueCapabilityTokenInput = {
   callerServiceId: string;
-  // Binds the issued token to a caller key. Set by the plane from the key that actually authenticated
-  // the request, never by the caller — a caller-chosen confirmation would bind a key of its choosing.
+  /**
+   * Binds the issued token to a caller key. Set by the plane from the key that actually authenticated
+   * the request, never by the caller — a caller-chosen confirmation would bind a key of its choosing.
+   */
   confirmation?: CapabilityConfirmation;
   scopes: string[];
   subject?: CapabilitySubject;

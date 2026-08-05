@@ -24,9 +24,11 @@ function hasStrippablePathChar(path: string): boolean {
   return false;
 }
 
-// A route advertised by a service must stay on that service's origin when resolved with
-// `new URL(path, origin)`. Network-path references (`//host`) and backslashes can replace the
-// host under WHATWG URL parsing, while query/fragment components are not route paths.
+/**
+ * A route advertised by a service must stay on that service's origin when resolved with
+ * `new URL(path, origin)`. Network-path references (`//host`) and backslashes can replace the
+ * host under WHATWG URL parsing, while query/fragment components are not route paths.
+ */
 export function isOriginRelativePath(path: string): boolean {
   if (hasStrippablePathChar(path)) return false;
   return path.startsWith('/') && !path.startsWith('//') && !path.includes('\\') && !path.includes('?') && !path.includes('#');

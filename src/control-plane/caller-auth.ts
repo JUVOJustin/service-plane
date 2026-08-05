@@ -106,14 +106,18 @@ export type JwkServiceClientAuthOptions = {
   services?: ServiceEndpoint[] | ((context: Context) => Promise<ServiceEndpoint[]> | ServiceEndpoint[]);
 };
 
-// Generates the caller-side HMAC secret for authenticating to the control-plane token endpoint.
+/**
+ * Generates the caller-side HMAC secret for authenticating to the control-plane token endpoint.
+ */
 export function generateHmacClientSecret(): string {
   const bytes = new Uint8Array(HMAC_CLIENT_SECRET_BYTES);
   crypto.getRandomValues(bytes);
   return bytesToBase64Url(bytes);
 }
 
-// Authenticates token requests with an HMAC signature bound to method, path, body, timestamp, client id, and request id.
+/**
+ * Authenticates token requests with an HMAC signature bound to method, path, body, timestamp, client id, and request id.
+ */
 export function hmacServiceClientAuth(options: HmacServiceClientAuthOptions) {
   const clientIdHeader = options.clientIdHeader ?? SERVICE_PLANE_HMAC_CLIENT_HEADER;
   const timestampHeader = options.timestampHeader ?? SERVICE_PLANE_HMAC_TIMESTAMP_HEADER;
@@ -180,9 +184,11 @@ export function hmacServiceClientAuth(options: HmacServiceClientAuthOptions) {
   };
 }
 
-// Authenticates token requests with a short-lived asymmetric JWT assertion. Signature
-// verification uses Hono's verifyWithJwks helper directly because its JWK middleware only
-// accepts the Bearer scheme, while these request-bound assertions have their own scheme.
+/**
+ * Authenticates token requests with a short-lived asymmetric JWT assertion. Signature
+ * verification uses Hono's verifyWithJwks helper directly because its JWK middleware only
+ * accepts the Bearer scheme, while these request-bound assertions have their own scheme.
+ */
 export function jwkServiceClientAuth(options: JwkServiceClientAuthOptions) {
   const clientIdHeader = options.clientIdHeader ?? SERVICE_PLANE_JWK_CLIENT_HEADER;
   const keyIdHeader = options.keyIdHeader ?? SERVICE_PLANE_JWK_KEY_ID_HEADER;
