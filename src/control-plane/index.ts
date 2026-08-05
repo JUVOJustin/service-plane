@@ -147,6 +147,7 @@ export {
   type CreateServiceRegistryOptions,
   createServiceRegistry,
   memoryRegistryCache,
+  serviceRegistryCacheKey,
 } from './registry.js';
 export {
   type IssueCapabilityTokenForCallerInput,

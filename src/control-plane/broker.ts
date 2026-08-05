@@ -213,6 +213,13 @@ function brokerConnectFailedEvent(
   };
 }
 
+// Decided from the discovered catalog, which the plane caches. That makes `access` the one catalog
+// field whose staleness *loosens* enforcement rather than delaying availability: the service checks
+// scopes and ingress but never re-checks `access`, so tightening an ability from 'plane' to
+// 'service' only takes effect once the plane's discovery cache refreshes. Until then a non-service
+// caller that already holds a grant for the scope still gets through. Revoking the grant is the
+// immediate lever; closing it properly needs the caller kind inside the token so the service can
+// enforce this itself. Tracked in #32.
 function authorizeAbility(ability: DiscoveredServiceAbility, caller: BrokerCaller | undefined): void {
   if (ability.access === 'plane') return;
   if (ability.access === 'service' && caller?.kind === 'service') return;

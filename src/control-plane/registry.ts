@@ -46,8 +46,17 @@ export function createServiceRegistry(options: CreateServiceRegistryOptions): Se
       const cached = await options.cache?.get(cacheKey);
       if (cached) return withAbilities(cached, options.services);
 
-      const stale = await options.cache?.getStale?.(cacheKey);
-      const { complete, etags, services } = await discoverServices(options.services, discoveryPath, stale);
+      // Coalesced per cache key: without this, every request that arrives before the first one
+      // finishes writing observes the same miss and fans out independently, so a cold start or a
+      // TTL boundary costs services × concurrent requests rather than one fan-out. That is the load
+      // this cache exists to prevent, at exactly the moment it is highest. The fetched documents are
+      // a function of the services and the discovery path — which is what the key covers — so
+      // sharing one resolution between callers is sound even when their caches differ; each still
+      // writes its own entry below.
+      const { complete, etags, services } = await coalescedDiscovery(cacheKey, async () => {
+        const stale = await options.cache?.getStale?.(cacheKey);
+        return discoverServices(options.services, discoveryPath, stale);
+      });
       const snapshot: ServiceDiscoverySnapshot = {
         discoveredAt: new Date().toISOString(),
         ...(Object.keys(etags).length > 0 ? { etags } : {}),
@@ -100,11 +109,32 @@ type DiscoveredDocument = {
   etag?: string;
 };
 
+// Process-local, and only ever holds a resolution that is still running: the entry is dropped as
+// soon as it settles, so this is a stampede guard rather than a second cache.
+const inFlightDiscovery = new Map<string, Promise<DiscoveryResult>>();
+
+function coalescedDiscovery(cacheKey: string, resolve: () => Promise<DiscoveryResult>): Promise<DiscoveryResult> {
+  const running = inFlightDiscovery.get(cacheKey);
+  if (running) return running;
+
+  const pending = resolve();
+  inFlightDiscovery.set(cacheKey, pending);
+  const settle = () => {
+    if (inFlightDiscovery.get(cacheKey) === pending) inFlightDiscovery.delete(cacheKey);
+  };
+  // Both handlers, so a rejection clears the entry without becoming an unhandled rejection here —
+  // the callers awaiting `pending` are the ones that see it.
+  pending.then(settle, settle);
+  return pending;
+}
+
+type DiscoveryResult = { complete: boolean; etags: Record<string, string>; services: ServiceDiscoveryDocument[] };
+
 async function discoverServices(
   endpoints: ServiceEndpoint[],
   discoveryPath: string,
   previous?: ServiceDiscoverySnapshot,
-): Promise<{ complete: boolean; etags: Record<string, string>; services: ServiceDiscoveryDocument[] }> {
+): Promise<DiscoveryResult> {
   const previousServices = new Map(previous?.services.map((service) => [service.id, service]));
   const discovered = await Promise.all(
     endpoints.map(async (endpoint) => {

@@ -315,4 +315,92 @@ describe('discovery cache on the token path', () => {
     await plane.fetch(brokerRequest());
     expect(fetches).toBe(1);
   });
+
+  it('coalesces concurrent fills instead of fanning out per request', async () => {
+    const secret = await generateCapabilitySigningSecret();
+    let inFlight = 0;
+    let peak = 0;
+    let fetches = 0;
+    const plane = new ServicePlaneControlPlane({
+      authenticateCaller: () => 'worker-a',
+      log: false,
+      services: () => [
+        cloudflareServiceBinding({
+          binding: {
+            fetch: async () => {
+              fetches += 1;
+              inFlight += 1;
+              peak = Math.max(peak, inFlight);
+              await new Promise((resolve) => setTimeout(resolve, 5));
+              inFlight -= 1;
+              return Response.json(discovery('svc0'));
+            },
+          },
+          grants: [{ caller: 'worker-a', scopes: ['svc0.use'] }],
+          id: 'svc0',
+        }),
+      ],
+      signingKeys: () => [{ kid: 'test-key', secret }],
+    });
+
+    // Twelve requests hit a cold plane together. Without coalescing every one of them observes the
+    // same miss and resolves the catalog itself, so the services this cache exists to protect see
+    // the load at exactly the moment it is highest.
+    const responses = await Promise.all(Array.from({ length: 12 }, () => plane.fetch(tokenRequest())));
+
+    expect(responses.every((response) => response.status === 200)).toBe(true);
+    expect(fetches).toBe(1);
+    expect(peak).toBe(1);
+  });
+
+  it('separates cached catalogs per tenant when ids and origins collide', async () => {
+    const secret = await generateCapabilitySigningSecret();
+    // Both tenants configure the service under the same id, so `cloudflareServiceBinding` gives them
+    // the same default origin and the derived key is identical — yet the catalogs differ.
+    const catalogFor = (tenant: string) => ({
+      ...discovery('svc0'),
+      abilities: [
+        {
+          access: 'plane' as const,
+          exposure: 'published' as const,
+          id: 'svc0.run',
+          methods: { go: { inputSchema: { type: 'object' }, outputSchema: { type: 'object' }, scopes: [`svc0.${tenant}`] } },
+          rpc: { path: '/rpc/svc0.run', transports: ['http-batch' as const] },
+          scopes: [`svc0.${tenant}`],
+        },
+      ],
+      capabilities: { scopes: [{ id: `svc0.${tenant}` }], serviceId: 'svc0' },
+    });
+
+    let tenant = 'alpha';
+    const plane = new ServicePlaneControlPlane({
+      authenticateCaller: () => 'worker-a',
+      discoveryCacheKey: () => tenant,
+      log: false,
+      services: () => [
+        cloudflareServiceBinding({
+          binding: { fetch: async () => Response.json(catalogFor(tenant)) },
+          grants: [{ caller: 'worker-a', scopes: [`svc0.${tenant}`] }],
+          id: 'svc0',
+        }),
+      ],
+      signingKeys: () => [{ kid: 'test-key', secret }],
+    });
+
+    const tokenFor = (scope: string) =>
+      plane.fetch(
+        new Request(`https://plane.internal${SERVICE_PLANE_CAPABILITY_TOKEN_PATH}`, {
+          body: JSON.stringify({ scopes: [scope], targetServiceId: 'svc0' }),
+          headers: { 'content-type': 'application/json' },
+          method: 'POST',
+        }),
+      );
+
+    expect((await tokenFor('svc0.alpha')).status).toBe(200);
+
+    // Without the discriminator this would read alpha's snapshot and refuse beta's own scope as
+    // unknown — one tenant's catalog answering for another's for the length of the TTL.
+    tenant = 'beta';
+    expect((await tokenFor('svc0.beta')).status).toBe(200);
+  });
 });

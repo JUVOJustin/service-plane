@@ -38,7 +38,7 @@ import {
   DEFAULT_OPENAPI_CACHE_TTL_SECONDS,
   generateControlPlaneOpenApi,
 } from './openapi.js';
-import { createServiceRegistry, memoryRegistryCache } from './registry.js';
+import { createServiceRegistry, memoryRegistryCache, serviceRegistryCacheKey } from './registry.js';
 import { type IssueCapabilityTokenForCallerInput, issueCapabilityTokenForCaller, type RpcIssuedCapabilityToken } from './rpc.js';
 import { type CapabilitySigningKey, sameCapabilitySigningKeys, validatedPrivateJwksFromSigningKeys } from './signing-keys.js';
 
@@ -138,6 +138,14 @@ export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
   // the fan-out is real on every request and the risk it trades against is bounded. Pass `false`,
   // here or per route, to resolve the catalog every time instead.
   discoveryCache?: false | RegistryCache | ServicePlaneDiscoveryCaches;
+  // Discriminates cache entries when one plane resolves different catalogs under the same service
+  // ids. `serviceRegistryCacheKey` covers ids and origins only, and `cloudflareServiceBinding`
+  // defaults the origin to `https://<id>.service-plane.internal`, so a plane handing each tenant its
+  // own binding under the id `asana` produces one key for all of them — and the first tenant's
+  // catalog is then served to the rest for the TTL. Return something that identifies the catalog
+  // (a tenant id) and it is folded into the key. Only needed for that shape; a plane whose service
+  // set is the same for every caller needs nothing here.
+  discoveryCacheKey?: (context: Context<TEnv>) => string | undefined;
   httpCache?: ServicePlaneHttpCacheOption;
   issuer?: string;
   log?: false | ServicePlaneLogSink;
@@ -295,7 +303,11 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       if (cached) return context.json(cached);
 
       const openApiCache = this.discoveryCaches.openapi;
-      const snapshot = await createServiceRegistry({ ...(openApiCache ? { cache: openApiCache } : {}), services }).discover();
+      const snapshot = await createServiceRegistry({
+        ...(openApiCache ? { cache: openApiCache } : {}),
+        ...this.discoveryCacheKeyFor(context as Context<TEnv>, services),
+        services,
+      }).discover();
       const document = generateControlPlaneOpenApi({
         ...(openApiOptions.description ? { description: openApiOptions.description } : {}),
         ...(openApiOptions.servers ? { servers: openApiOptions.servers } : {}),
@@ -328,7 +340,11 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       // Normalized at the boundary so the plane never forwards a value the service would reject.
       connInfo: normalizeConnInfo(mountOptions.connInfo?.(context)),
       issuer: await this.issuerFor(context, services),
-      registry: createServiceRegistry({ ...(cache ? { cache } : {}), services }),
+      registry: createServiceRegistry({
+        ...(cache ? { cache } : {}),
+        ...this.discoveryCacheKeyFor(context, services),
+        services,
+      }),
       requestId: brokerRequestId(context),
     };
   }
@@ -340,12 +356,27 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     // The whole ordered key set is the identity: rotating the active key, retiring an old one, and
     // reordering after a rollback must each invalidate the memo. Compared directly rather than
     // through a digest, because this is the JWKS hit path and a compare keeps it synchronous.
+    // Snapshotted before anything is awaited, and the same snapshot feeds the derivation and the
+    // memo. Copying after the await would record whatever the resolver's array holds by then: a
+    // rotation landing inside that window would leave the memo describing the new key set while the
+    // authority still holds the old material, so JWKS would publish the retired key indefinitely
+    // while issuance had already moved on — and every token minted after the move would fail
+    // verification against the published set.
+    const resolved = snapshotSigningKeys(keys);
     const memo = this.signingAuthority;
-    if (memo && memo.issuer === issuer && sameCapabilitySigningKeys(memo.keys, keys)) return memo.authority;
+    if (memo && memo.issuer === issuer && sameCapabilitySigningKeys(memo.keys, resolved)) return memo.authority;
 
-    const authority = createCapabilitySigningAuthority({ issuer, privateJwks: await this.signingMaterialFor(keys) });
-    this.signingAuthority = { authority, issuer, keys: snapshotSigningKeys(keys) };
+    const authority = createCapabilitySigningAuthority({ issuer, privateJwks: await this.signingMaterialFor(resolved) });
+    this.signingAuthority = { authority, issuer, keys: resolved };
     return authority;
+  }
+
+  // Folds the caller-supplied discriminator into the derived key, or leaves the derived one alone
+  // when there is none. Returned as a spreadable so every call site stays exact-optional-safe.
+  private discoveryCacheKeyFor(context: Context<TEnv>, services: ServiceEndpoint[]): { cacheKey?: string } {
+    const discriminator = this.options.discoveryCacheKey?.(context);
+    if (!discriminator) return {};
+    return { cacheKey: `${serviceRegistryCacheKey(services)}|${discriminator}` };
   }
 
   // Memoized by direct key comparison rather than a digest: the caller already holds the key set, so
@@ -376,7 +407,11 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     // microseconds — the key work is already done and shared across every configuration.
     const privateJwks = await this.signingMaterialFor(keys);
     const resolvedServices = services ?? (await this.options.services(context));
-    const capabilities = await discoverServiceCapabilities(resolvedServices, this.discoveryCaches.token);
+    const capabilities = await discoverServiceCapabilities(
+      resolvedServices,
+      this.discoveryCaches.token,
+      this.discoveryCacheKeyFor(context, resolvedServices).cacheKey,
+    );
     const grantDefinition = {
       grants: serviceGrantsFromEndpoints(resolvedServices),
     };
@@ -467,8 +502,8 @@ function requestIdFromContext(context: Context): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
 
-async function discoverServiceCapabilities(services: ServiceEndpoint[], cache?: RegistryCache) {
-  const registry = createServiceRegistry({ ...(cache ? { cache } : {}), services });
+async function discoverServiceCapabilities(services: ServiceEndpoint[], cache?: RegistryCache, cacheKey?: string) {
+  const registry = createServiceRegistry({ ...(cache ? { cache } : {}), ...(cacheKey ? { cacheKey } : {}), services });
   const snapshot = await registry.discover();
   return snapshot.services.flatMap((service) => (service.capabilities ? [service.capabilities] : []));
 }

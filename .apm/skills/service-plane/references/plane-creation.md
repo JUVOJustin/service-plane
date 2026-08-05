@@ -143,7 +143,9 @@ Measured with `npm run bench` at one millisecond per service — roughly a Cloud
 
 ETag revalidation helps less than it looks: a 304 skips parsing and validating the document, but it is still one round trip per service. At 20 services over a 10 ms link it saves under a millisecond.
 
-Staleness here is a convergence question, not a correctness one. A token minted from a stale catalog is still checked by the service against its current definition, so the failure mode is a newly published ability taking up to the TTL to become grantable — never a withdrawn one staying usable. Grants are plane-side configuration and are re-read on every request, so revoking one takes effect immediately regardless of the cache.
+Staleness here is mostly a convergence question. A token minted from a stale catalog is still checked by the service against its current definition, so a scope the service no longer declares is refused at the service regardless of what the plane cached. Grants are plane-side configuration and are re-read on every request, so revoking one takes effect immediately.
+
+**One catalog change is not covered by that.** `access` is enforced by the broker, from the catalog, and the service does not re-check it. Tightening an ability from `access: 'plane'` to `access: 'service'` therefore takes effect only once the cache refreshes: until then a non-service caller that already holds a grant for the scope can still reach it. Revoke the grant for immediate effect, or set `discoveryCache: false` on a plane where `access` changes must land at once. Tracked in [#32](https://github.com/JUVOJustin/service-plane/issues/32).
 
 ## OpenAPI Cache
 

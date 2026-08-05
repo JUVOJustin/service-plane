@@ -173,13 +173,17 @@ The mistake to avoid is putting the shared store *in front*. A KV or Durable Obj
 ```ts
 import { memoryRegistryCache, type RegistryCache } from 'service-plane/control-plane';
 
-function tieredRegistryCache(local: RegistryCache, shared: RegistryCache, localTtlSeconds = 30): RegistryCache {
+function tieredRegistryCache(local: RegistryCache, shared: RegistryCache, promoteTtlSeconds = 5): RegistryCache {
   return {
     async get(key) {
       const near = await local.get(key);
       if (near) return near;            // almost always ends here
       const far = await shared.get(key);
-      if (far) await local.set(key, far, localTtlSeconds);
+      // Promoted for a short window, not a fresh full TTL. `RegistryCache.get` does not report how
+      // much life the shared entry had left, so giving the local copy the same TTL lets it outlive
+      // the entry it came from — with two 30s stores a catalog could stay stale for nearly 60s.
+      // A short promotion keeps the local layer doing its job without compounding staleness.
+      if (far) await local.set(key, far, promoteTtlSeconds);
       return far;
     },
     getStale: (key) => shared.getStale?.(key),
