@@ -524,9 +524,13 @@ function resolveJsonPointer(document: OpenApiObject, pointer: string): unknown {
 
 function streamToolOutputSchema(itemSchema: OpenApiObject): OpenApiObject {
   // Root-relative $refs ("#...") would re-anchor to the aggregate wrapper once the item schema
-  // is nested; hoist such schemas into $defs and rewrite their refs so recursive item schemas
-  // stay valid. Plain schemas are embedded directly to keep tools/list output simple.
-  if (!containsRootRef(itemSchema)) {
+  // is nested — unless the item declares `$id`, which keeps it a schema resource of its own
+  // wherever it travels, so it embeds directly with its refs intact. Service setup anchors every
+  // ref-carrying schema that way; the hoist-and-rewrite below remains for `$id`-less discovery
+  // documents from services on older versions. It must never see an `$id` schema: a nested
+  // resource would capture the rewritten wrapper-relative refs and dangle.
+  const anchored = typeof itemSchema.$id === 'string' && itemSchema.$id.length > 0;
+  if (anchored || !containsRootRef(itemSchema)) {
     return {
       properties: { items: { items: itemSchema, type: 'array' } },
       required: ['items'],

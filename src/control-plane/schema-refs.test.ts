@@ -76,8 +76,32 @@ const endpoint: ServiceEndpoint = {
   origin: 'https://example.internal',
 };
 
+function streamingServiceWith(output: AbilitySchema) {
+  return defineAbilityService({
+    abilities: [
+      defineAbility({
+        exposure: 'published',
+        id: 'example.stream',
+        methods: {
+          watch: abilityMethod({ input: plainSchema(), mcp: { name: 'example_watch' }, output, scopes: ['example.search'], stream: true }),
+        },
+        rpc: { transports: ['websocket'] },
+        scopes: ['example.search'],
+        handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
+      }),
+    ],
+    capabilities,
+    id: 'example',
+    title: 'Example',
+    version: '0.1.0',
+  });
+}
+
 function snapshotOf(input: AbilitySchema, output: AbilitySchema): ServiceRegistrySnapshot {
-  const ability = serviceWith(input, output).abilities[0];
+  return snapshotFromAbility(serviceWith(input, output).abilities[0]);
+}
+
+function snapshotFromAbility(ability: ReturnType<typeof serviceWith>['abilities'][number] | undefined): ServiceRegistrySnapshot {
   if (!ability) throw new Error('missing ability');
   const discovered: DiscoveredServiceAbility = {
     access: ability.access,
@@ -93,6 +117,7 @@ function snapshotOf(input: AbilitySchema, output: AbilitySchema): ServiceRegistr
           outputSchema: method.outputSchema,
           ...(method.rest ? { rest: method.rest } : {}),
           scopes: method.scopes,
+          ...(method.stream ? { stream: true as const } : {}),
         },
       ]),
     ),
@@ -210,6 +235,40 @@ describe('MCP projection of ref-rooted schemas', () => {
     const prompt = discovery.prompts.find((entry) => entry.name === 'example_search_prompt');
 
     expect(prompt?.arguments).toEqual([{ name: 'name', required: true }]);
+  });
+
+  it('embeds an $id-anchored streaming item schema without hoisting, refs intact', () => {
+    // The hoist-and-rewrite wrapper must not capture an $id-carrying item: the nested resource
+    // would re-anchor the rewritten wrapper-relative refs and they would dangle (Codex review
+    // finding on this PR). An anchored item embeds as-is; its $id keeps its refs resolving.
+    const discovery = generateMcpDiscovery(snapshotFromAbility(streamingServiceWith(refRootedSchema()).abilities[0]));
+    const tool = discovery.tools.find((entry) => entry.name === 'example_watch');
+    const outputSchema = tool?.outputSchema as OpenApiObject;
+    const item = (outputSchema.properties as { items: { items: OpenApiObject } }).items.items;
+
+    expect(item.$id).toBe('urn:service-plane:example/example.stream/watch/output');
+    expect(item.$ref).toBe('#/$defs/task');
+    expect(outputSchema.$defs).toBeUndefined();
+    assertLocalRefsResolve(outputSchema);
+  });
+
+  it('still hoists and rewrites $id-less streaming item schemas from older services', () => {
+    // Discovery documents produced before schemas carried $id reach the registry unchanged;
+    // their root-relative refs must keep being re-anchored to the wrapper.
+    const legacy = snapshotFromAbility(streamingServiceWith(refRootedSchema()).abilities[0]);
+    const method = legacy.abilities[0]?.methods.watch;
+    if (!method) throw new Error('missing method');
+    const { $id, ...withoutId } = method.outputSchema;
+    void $id;
+    method.outputSchema = withoutId;
+
+    const discovery = generateMcpDiscovery(legacy);
+    const outputSchema = discovery.tools.find((entry) => entry.name === 'example_watch')?.outputSchema as OpenApiObject;
+    const items = (outputSchema.properties as { items: { items: OpenApiObject } }).items.items;
+
+    expect(items.$ref).toBe('#/$defs/item');
+    expect((outputSchema.$defs as { item: OpenApiObject }).item.$ref).toBe('#/$defs/item/$defs/task');
+    assertLocalRefsResolve(outputSchema);
   });
 
   it('still omits outputSchema for genuinely non-object outputs', () => {
