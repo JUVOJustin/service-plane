@@ -14,13 +14,15 @@ Normal service APIs often split into REST routes, internal RPC, OpenAPI files, c
 
 An ability is a schema-backed RPC surface owned by a service. Each method declares:
 
-- one Zod input schema
-- one Zod output schema
+- one input schema
+- one output schema
 - required scopes
 - optional REST metadata
 - optional MCP metadata
 
 The schemas power runtime validation, service discovery, OpenAPI generation, and MCP tool metadata.
+
+Schemas are [Standard Schema](https://standardschema.dev) values, so the validation library is the service author's choice rather than this package's. The package depends on the two contracts, not on a vendor: `~standard.validate()` for runtime validation and [`~standard.jsonSchema`](https://standardschema.dev/json-schema) for the projections. Two services in the same plane can use different libraries and still produce a discovery document in the same JSON Schema dialect.
 
 ## Request Flow
 
@@ -59,10 +61,10 @@ flowchart TD
   Endpoint --> CapnWeb["Cap'n Web RPC"]
   CapnWeb --> Auth["authenticate(token)"]
   Auth --> Wrapper["Service Plane ability wrapper"]
-  Wrapper --> ZodIn["Zod input validation"]
-  ZodIn --> Scopes["Scope check"]
-  Scopes --> Handler["Handler method"]
-  Handler --> ZodOut["Zod output validation"]
+  Wrapper --> Scopes["Method scope check"]
+  Scopes --> SchemaIn["Input schema validation"]
+  SchemaIn --> Handler["Handler method"]
+  Handler --> SchemaOut["Output schema validation"]
 ```
 
 Hono middleware sees the HTTP or WebSocket request. Cap'n Web sees the logical method call. That is why method auth and validation live in the Service Plane RPC wrapper, not in Hono middleware.

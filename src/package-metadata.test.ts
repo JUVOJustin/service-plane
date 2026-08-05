@@ -8,6 +8,7 @@ describe('package metadata', () => {
     };
 
     expect(packageJson.peerDependencies?.hono).toBe('>=4.10.3 <5.0.0');
-    expect(packageJson.peerDependencies?.zod).toBe('>=4.0.0 <5.0.0');
+    // Validation is Standard Schema based, so no validation library is a peer dependency.
+    expect(packageJson.peerDependencies?.zod).toBeUndefined();
   });
 });

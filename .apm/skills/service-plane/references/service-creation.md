@@ -21,7 +21,7 @@ If an ability or method references an unknown scope, the service fails during se
 
 ## 2. Define Schemas
 
-Use Zod as the source of truth for input and output.
+Schemas are the source of truth for input and output. Pick any validation library that implements [Standard Schema](https://standardschema.dev) and its [Standard JSON Schema](https://standardschema.dev/json-schema) companion — see [Choosing A Validation Library](#choosing-a-validation-library) below. The snippets here use Zod to stay concrete; every one of them works the same written in ArkType, Valibot, or VineJS.
 
 ```ts
 import * as z from 'zod';
@@ -41,6 +41,44 @@ export const CreateTaskOutput = z.object({
 The same schemas are used for RPC validation, discovery, OpenAPI, and MCP metadata.
 
 Besides `mcp` (an MCP tool), a published method can declare `mcpResource` (a static or `{variable}`-templated MCP resource) and `mcpPrompt` (an MCP prompt). See [OpenAPI and MCP](openapi-mcp.md#mcp) for how the control plane projects and serves them.
+
+### Choosing A Validation Library
+
+`service-plane` has no validation library of its own and no validation peer dependency. An `input` or `output` schema is anything that implements two companion specs:
+
+- [Standard Schema](https://standardschema.dev) — the `~standard.validate()` contract used to validate one RPC call's input, one return value, or one streamed item.
+- [Standard JSON Schema](https://standardschema.dev/json-schema) — the `~standard.jsonSchema` contract used to render the discovery document, OpenAPI, and MCP tool metadata.
+
+Both halves are required, because every ability method appears in the discovery document. Service Plane always asks for the `draft-2020-12` target, so every service publishes the same JSON Schema dialect no matter which library produced it.
+
+Known implementations, alphabetically — none is preferred by this package, and the list is not exhaustive:
+
+| Library | Supported from | Note |
+| --- | --- | --- |
+| [ArkType](https://arktype.io) | 2.1.28 | Works directly. |
+| [Valibot](https://valibot.dev) | 1.2 | Wrap with `toStandardJsonSchema()` from `@valibot/to-json-schema` 1.5+. |
+| [VineJS](https://vinejs.dev) | 4.3 | Works directly. |
+| [Zod](https://zod.dev) | 4.2 | Works directly. |
+
+There is nothing to configure. You do not register a library, pass an adapter, or set an option — you import the library you want and pass its schemas as `input` and `output`. Service Plane reads the contract off each schema it is handed.
+
+That means the choice is per schema, not per service. Two services in one plane can use different libraries, one ability can mix them across methods, and a single method can take its `input` from one library and its `output` from another. Each schema is projected on its own, so mixing is invisible to callers.
+
+```ts
+// Valibot schemas carry validation, but JSON Schema comes from the wrapper.
+import { toStandardJsonSchema } from '@valibot/to-json-schema';
+import * as v from 'valibot';
+
+export const CreateTaskInput = toStandardJsonSchema(
+  v.object({
+    connectionId: v.string(),
+    name: v.pipe(v.string(), v.minLength(1)),
+    projectId: v.string(),
+  }),
+);
+```
+
+Both halves of the contract are checked when the service is defined, not on the first call: a schema missing `~standard.validate` or `~standard.jsonSchema`, or one JSON Schema cannot represent — a Zod `.transform()` on the output side, for example — fails while the service boots, with the offending ability and method named. Because there is no validation peer dependency, an outdated library installs cleanly and only fails here, so the error names the version floor.
 
 ## 3. Define An Ability
 
