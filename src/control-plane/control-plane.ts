@@ -40,7 +40,12 @@ import {
 } from './openapi.js';
 import { createServiceRegistry, memoryRegistryCache, serviceRegistryCacheKey } from './registry.js';
 import { type IssueCapabilityTokenForCallerInput, issueCapabilityTokenForCaller, type RpcIssuedCapabilityToken } from './rpc.js';
-import { type CapabilitySigningKey, sameCapabilitySigningKeys, validatedPrivateJwksFromSigningKeys } from './signing-keys.js';
+import {
+  type CapabilitySigningKey,
+  sameCapabilitySigningKeys,
+  snapshotSigningKeys,
+  validatedPrivateJwksFromSigningKeys,
+} from './signing-keys.js';
 
 type ServicePlaneControlPlaneEnv<TEnv extends Env> = TEnv & {
   Variables: RequestIdVariables;
@@ -79,14 +84,6 @@ export type DiscoveryCacheRoute = (typeof DISCOVERY_CACHE_ROUTES)[number];
 // `default` covers every route not named. A route set to `false` resolves the catalog fresh.
 export type ServicePlaneDiscoveryCaches = Partial<Record<DiscoveryCacheRoute | 'default', false | RegistryCache>>;
 
-// Listing the members explicitly rather than spreading keeps the copy free of anything a caller
-// hung off the object, and `satisfies Required<...>` makes a member added to CapabilitySigningKey a
-// build error here instead of one that silently drops out of both the copy and the comparison
-// below — which would leave a rotation changing only that member looking like no change at all.
-function snapshotSigningKeys(keys: CapabilitySigningKey[]): CapabilitySigningKey[] {
-  return keys.map((key) => ({ kid: key.kid, secret: key.secret }) satisfies Required<CapabilitySigningKey>);
-}
-
 function isRegistryCache(value: RegistryCache | ServicePlaneDiscoveryCaches): value is RegistryCache {
   return typeof (value as RegistryCache).get === 'function';
 }
@@ -94,17 +91,22 @@ function isRegistryCache(value: RegistryCache | ServicePlaneDiscoveryCaches): va
 function discoveryCachesFor(
   option: false | RegistryCache | ServicePlaneDiscoveryCaches | undefined,
 ): Record<DiscoveryCacheRoute, RegistryCache | undefined> {
-  // One instance, so routes left on the default share a single warm snapshot instead of each
-  // fetching the catalog into its own copy.
-  const perRoute: ServicePlaneDiscoveryCaches = option === undefined || option === false || isRegistryCache(option) ? {} : option;
-  const fallback: false | RegistryCache =
-    option === false ? false : option !== undefined && isRegistryCache(option) ? option : (perRoute.default ?? memoryRegistryCache());
+  // One instance for every route, so routes left on the default share a single warm snapshot
+  // instead of each fetching the catalog into its own copy.
+  const sharedByAllRoutes = (cache: RegistryCache | undefined) =>
+    Object.fromEntries(DISCOVERY_CACHE_ROUTES.map((route) => [route, cache])) as Record<DiscoveryCacheRoute, RegistryCache | undefined>;
 
+  if (option === undefined) return sharedByAllRoutes(memoryRegistryCache());
+  if (option === false) return sharedByAllRoutes(undefined);
+  if (isRegistryCache(option)) return sharedByAllRoutes(option);
+
+  // Per-route object: `default` covers the routes not named, and a route set to `false` opts out
+  // on its own.
+  const fallback = option.default ?? memoryRegistryCache();
   return Object.fromEntries(
     DISCOVERY_CACHE_ROUTES.map((route) => {
-      const configured = perRoute[route];
-      const resolved = configured === undefined ? fallback : configured;
-      return [route, resolved === false ? undefined : resolved];
+      const configured = option[route] ?? fallback;
+      return [route, configured === false ? undefined : configured];
     }),
   ) as Record<DiscoveryCacheRoute, RegistryCache | undefined>;
 }

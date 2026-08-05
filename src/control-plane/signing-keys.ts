@@ -53,6 +53,15 @@ export async function generateCapabilitySigningSecret(): Promise<string> {
   return privateJwk.d;
 }
 
+// The copy half of the memo contract below: listing the members explicitly rather than spreading
+// keeps the copy free of anything a caller hung off the object, and `satisfies Required<...>` makes
+// a member added to CapabilitySigningKey a build error here instead of one that silently drops out
+// of both the copy and the comparison — which would leave a rotation changing only that member
+// looking like no change at all. Exported for the plane's memos, deliberately not from `index.ts`.
+export function snapshotSigningKeys(keys: CapabilitySigningKey[]): CapabilitySigningKey[] {
+  return keys.map((key) => ({ kid: key.kid, secret: key.secret }) satisfies Required<CapabilitySigningKey>);
+}
+
 // Identity check for a caller memoizing per key set. Order matters as much as content: `keys[0]`
 // signs, so a reorder after a rollback is a different key set even with the same members. A direct
 // compare rather than a digest keeps the memo's hit path synchronous and keeps the secrets out of

@@ -109,6 +109,8 @@ type DiscoveredDocument = {
   etag?: string;
 };
 
+type DiscoveryResult = { complete: boolean; etags: Record<string, string>; services: ServiceDiscoveryDocument[] };
+
 // Scoped per cache instance, never module-wide: two planes in one process can share endpoint ids
 // and origins (the default origin is derived from the id) while resolving genuinely different
 // catalogs behind them, and a global map would hand the second plane the first one's result — and
@@ -121,11 +123,11 @@ const inFlightDiscovery = new WeakMap<RegistryCache, Map<string, Promise<Discove
 function coalescedDiscovery(
   cache: RegistryCache | undefined,
   cacheKey: string,
-  resolve: () => Promise<DiscoveryResult>,
+  discover: () => Promise<DiscoveryResult>,
 ): Promise<DiscoveryResult> {
   // No cache, no coalescing: without an instance there is nothing safe to group callers by, and a
   // plane configured with `discoveryCache: false` has chosen freshness over shared work anyway.
-  if (!cache) return resolve();
+  if (!cache) return discover();
 
   let inFlight = inFlightDiscovery.get(cache);
   if (!inFlight) {
@@ -135,7 +137,7 @@ function coalescedDiscovery(
   const running = inFlight.get(cacheKey);
   if (running) return running;
 
-  const pending = resolve();
+  const pending = discover();
   inFlight.set(cacheKey, pending);
   const settle = () => {
     if (inFlight.get(cacheKey) === pending) inFlight.delete(cacheKey);
@@ -145,8 +147,6 @@ function coalescedDiscovery(
   pending.then(settle, settle);
   return pending;
 }
-
-type DiscoveryResult = { complete: boolean; etags: Record<string, string>; services: ServiceDiscoveryDocument[] };
 
 async function discoverServices(
   endpoints: ServiceEndpoint[],
