@@ -2,17 +2,21 @@ import type { Context } from 'hono';
 
 export type ServicePlaneLogLevel = 'info' | 'warn' | 'error';
 
-// Minimal shape every Service-Plane log event satisfies; sinks that only need
-// event name, level, and correlation id can accept this instead of a concrete union.
+/**
+ * Minimal shape every Service-Plane log event satisfies; sinks that only need
+ * event name, level, and correlation id can accept this instead of a concrete union.
+ */
 export type ServicePlaneLoggableEvent = {
   event: string;
   level: ServicePlaneLogLevel;
   requestId?: string;
 };
 
-// Sinks receive the Hono context when the event was emitted inside a request so
-// integrations can reach request-scoped loggers; broker events emitted outside a
-// Hono handler omit it.
+/**
+ * Sinks receive the Hono context when the event was emitted inside a request so
+ * integrations can reach request-scoped loggers; broker events emitted outside a
+ * Hono handler omit it.
+ */
 export type ServicePlaneLogSink<TEvent extends ServicePlaneLoggableEvent = ServicePlaneLoggableEvent> = (
   event: TEvent,
   context?: Context,

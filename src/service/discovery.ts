@@ -24,9 +24,11 @@ import {
 } from '../shared/types.js';
 import { bindCapabilityIdentity, capabilityIdentity, requireScopes } from './capabilities.js';
 
-// Abilities accept any Standard Schema value, so services pick their own validation library.
-// The JSON Schema half of the spec is required rather than optional: every ability method is
-// projected into the discovery document, and OpenAPI/MCP projections read those schemas.
+/**
+ * Abilities accept any Standard Schema value, so services pick their own validation library.
+ * The JSON Schema half of the spec is required rather than optional: every ability method is
+ * projected into the discovery document, and OpenAPI/MCP projections read those schemas.
+ */
 export type AbilitySchema = StandardSchemaV1 & StandardJSONSchemaV1;
 
 // Discovery documents have always carried draft-2020-12 JSON Schema; naming the target keeps
@@ -44,8 +46,10 @@ export type AbilityMethodDefinition<TInput extends AbilitySchema = AbilitySchema
   output: TOutput;
   rest?: ServiceAbilityRestProjection;
   scopes?: string[];
-  // Streaming methods return a ReadableStream of `output`-shaped items over the ordinary
-  // Cap'n Web session instead of one value; `output` validates each item.
+  /**
+   * Streaming methods return a ReadableStream of `output`-shaped items over the ordinary
+   * Cap'n Web session instead of one value; `output` validates each item.
+   */
   stream?: true;
 };
 
@@ -53,16 +57,20 @@ export type AbilityMethodDefinitions = Record<string, AbilityMethodDefinition>;
 
 export type ServiceAbilityHandlerFactoryInput<TEnv extends Env = Env> = {
   abilityId: string;
-  // Advisory connection info about the original client, forwarded by the control plane. Present
-  // only for brokered calls into an ingress-protected service; unlike `identity` it is not
-  // signature-verified, so use it for audit and logging, never for authorization.
+  /**
+   * Advisory connection info about the original client, forwarded by the control plane. Present
+   * only for brokered calls into an ingress-protected service; unlike `identity` it is not
+   * signature-verified, so use it for audit and logging, never for authorization.
+   */
   connInfo?: ConnInfo;
   context: Context<TEnv>;
   identity: CapabilityIdentity;
 };
 
-// `Iterable & object` keeps plain strings out: a string is Iterable<string>, but handing one
-// back from a streaming method is almost certainly a bug, and the runtime rejects it.
+/**
+ * `Iterable & object` keeps plain strings out: a string is Iterable<string>, but handing one
+ * back from a streaming method is almost certainly a bug, and the runtime rejects it.
+ */
 export type AbilityStreamSource<TItem> = AsyncIterable<TItem> | (Iterable<TItem> & object) | ReadableStream<TItem>;
 
 // Streamed items are re-validated against `output`, so handlers must yield the schema's INPUT
@@ -85,8 +93,10 @@ export type AbilityImplementation<TAbility extends ServiceAbilityDefinition> = {
         | AbilitySchemaOutput<TAbility['methods'][TMethod]['output']>;
 };
 
-// Streaming methods resolve to a native Cap'n Web ReadableStream of validated items; they
-// require a session transport (WebSocket, native binding, custom bidirectional).
+/**
+ * Streaming methods resolve to a native Cap'n Web ReadableStream of validated items; they
+ * require a session transport (WebSocket, native binding, custom bidirectional).
+ */
 export type AbilityRpc<TAbility extends ServiceAbilityDefinition> = {
   [TMethod in keyof TAbility['methods']]: TAbility['methods'][TMethod] extends { stream: true }
     ? (
@@ -158,8 +168,10 @@ export type DefineServiceOptions = {
   requireAbilityScopes?: boolean;
 };
 
-// Returns the definition's own type (not the widened AbilityMethodDefinition) so the
-// `stream: true` discriminator survives into AbilityRpc and AbilityImplementation.
+/**
+ * Returns the definition's own type (not the widened AbilityMethodDefinition) so the
+ * `stream: true` discriminator survives into AbilityRpc and AbilityImplementation.
+ */
 export function abilityMethod<TDefinition extends AbilityMethodDefinition>(definition: TDefinition): TDefinition {
   return definition;
 }
@@ -203,9 +215,11 @@ export function defaultAbilityRpcPath(abilityId: string): string {
 }
 
 export type CreateValidatingAbilityHandlerOptions = {
-  // Cap'n Web streams need an ongoing session. Defaults to false (fail-closed): a caller must
-  // opt in only for a session transport (WebSocket upgrade, native binding). Over HTTP-batch,
-  // streaming methods then fail with a clear 405 instead of a dangling stub after the batch ends.
+  /**
+   * Cap'n Web streams need an ongoing session. Defaults to false (fail-closed): a caller must
+   * opt in only for a session transport (WebSocket upgrade, native binding). Over HTTP-batch,
+   * streaming methods then fail with a clear 405 instead of a dangling stub after the batch ends.
+   */
   allowStreaming?: boolean;
 };
 

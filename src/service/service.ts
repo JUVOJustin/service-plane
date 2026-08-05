@@ -66,7 +66,9 @@ export type ServicePlaneServiceOptions<TEnv extends Env = Env> = DefineServiceIn
     };
   };
 
-// ServicePlaneService provides the Hono shell while Cap'n Web owns the service API.
+/**
+ * ServicePlaneService provides the Hono shell while Cap'n Web owns the service API.
+ */
 export class ServicePlaneService<TEnv extends Env = Env> {
   readonly app: Hono<ServicePlaneServiceEnv<TEnv>>;
   readonly definition: ServiceDefinition<TEnv>;

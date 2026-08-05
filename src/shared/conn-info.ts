@@ -1,14 +1,20 @@
 import type { ConnInfo } from 'hono/conninfo';
 
-// `hono/conninfo` ships types only — every runtime's `getConnInfo` lives in its own adapter
-// (`hono/cloudflare-workers`, `hono/deno`, `hono/bun`, `@hono/node-server/conninfo`) — so this
-// type import adds no runtime code and keeps the package portable. Consumers supply the getter.
+/**
+ * `hono/conninfo` ships types only — every runtime's `getConnInfo` lives in its own adapter
+ * (`hono/cloudflare-workers`, `hono/deno`, `hono/bun`, `@hono/node-server/conninfo`) — so this
+ * type import adds no runtime code and keeps the package portable. Consumers supply the getter.
+ */
 export type { ConnInfo };
 
-// Forwarded connection info is an unsigned assertion by the plane about a connection the service
-// never saw. It is advisory: use it for audit and logging, never as an authorization input.
+/**
+ * Forwarded connection info is an unsigned assertion by the plane about a connection the service
+ * never saw. It is advisory: use it for audit and logging, never as an authorization input.
+ */
 export const SERVICE_PLANE_CONN_INFO_HEADER = 'X-Service-Plane-Conn-Info';
-// WebSocket upgrades cannot carry custom headers portably, mirroring the request id.
+/**
+ * WebSocket upgrades cannot carry custom headers portably, mirroring the request id.
+ */
 export const SERVICE_PLANE_CONN_INFO_QUERY_PARAM = 'conn_info';
 
 // Bounded so a hostile or buggy value cannot smuggle header separators, blow up a log line, or
@@ -17,8 +23,10 @@ export const SERVICE_PLANE_CONN_INFO_QUERY_PARAM = 'conn_info';
 const ADDRESS_PATTERN = /^[A-Za-z0-9.:_\-[\]%]{1,255}$/u;
 const MAX_SERIALIZED_BYTES = 512;
 
-// Applied on both send and receive: the plane must not emit a value the service would reject, and
-// the service must not trust a value merely because it arrived from the plane.
+/**
+ * Applied on both send and receive: the plane must not emit a value the service would reject, and
+ * the service must not trust a value merely because it arrived from the plane.
+ */
 export function normalizeConnInfo(connInfo: ConnInfo | undefined): ConnInfo | undefined {
   const remote = connInfo?.remote;
   if (!remote) return undefined;

@@ -1,6 +1,8 @@
 import type { RpcTransport } from 'capnweb';
 
-// In-memory Cap'n Web transport used by tests that should not bind real sockets.
+/**
+ * In-memory Cap'n Web transport used by tests that should not bind real sockets.
+ */
 export function memoryRpcTransportPair(): { left: RpcTransport; right: RpcTransport } {
   const leftToRight = createQueue();
   const rightToLeft = createQueue();

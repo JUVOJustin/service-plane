@@ -150,8 +150,10 @@ export type CloudflareAbilityRpcBinding = {
 };
 
 export type WebSocketRpcOptions = {
-  // Inject a standards-compatible client on runtimes without a global WebSocket. A factory lets
-  // Service Plane add its request id to the URL before the connection is created.
+  /**
+   * Inject a standards-compatible client on runtimes without a global WebSocket. A factory lets
+   * Service Plane add its request id to the URL before the connection is created.
+   */
   createWebSocket?: (url: string) => WebSocket;
 };
 
@@ -159,13 +161,17 @@ export interface AuthenticatedRoot<Scoped> {
   authenticate(token: string, proof?: string): Scoped;
 }
 
-// Signs a proof of possession for a sender-constrained token. Supplied by the caller because only the
-// caller holds the private key its tokens are bound to.
+/**
+ * Signs a proof of possession for a sender-constrained token. Supplied by the caller because only the
+ * caller holds the private key its tokens are bound to.
+ */
 export type CapabilityProofSigner = (input: { abilityId: string; targetServiceId: string; token: string }) => Promise<string> | string;
 
-// A token requester, optionally carrying the prover for the key it authenticates with. Callers that use
-// a shipped requester therefore need no extra wiring for sender-constrained tokens: the key is already
-// configured once, in one place.
+/**
+ * A token requester, optionally carrying the prover for the key it authenticates with. Callers that use
+ * a shipped requester therefore need no extra wiring for sender-constrained tokens: the key is already
+ * configured once, in one place.
+ */
 export type CapabilityTokenRequester = CreateCapabilityTokenProviderOptions['requestToken'] & {
   proveTokenPossession?: CapabilityProofSigner;
 };
@@ -206,9 +212,11 @@ export type AbilitySessionOptions<Scoped> = CapabilityRpcSessionOptions<Scoped> 
   abilityId: string;
 };
 
-// A persistent Cap'n Web session follows the platform Disposable contract. Intersecting the
-// caller's ability shape keeps method inference intact while making `using` and explicit cleanup
-// discoverable to consumers.
+/**
+ * A persistent Cap'n Web session follows the platform Disposable contract. Intersecting the
+ * caller's ability shape keeps method inference intact while making `using` and explicit cleanup
+ * discoverable to consumers.
+ */
 export type AbilitySession<Scoped> = Scoped & Disposable;
 
 export function defineCapabilities(catalog: CapabilityCatalog): CapabilityCatalog {
@@ -382,10 +390,12 @@ export function capabilityTokenCacheKey(input: {
   return `service-plane:capability-token:${encodeURIComponent(JSON.stringify(parts))}`;
 }
 
-// The session proxy is deliberately NOT typed as a capnweb RpcStub: it is our own
-// promise-returning proxy at runtime, and capnweb's RpcCompatible machinery cannot represent
-// typed item streams (its types only bless ReadableStream<Uint8Array>), which would send the
-// compiler into unbounded recursion for abilities with streaming methods.
+/**
+ * The session proxy is deliberately NOT typed as a capnweb RpcStub: it is our own
+ * promise-returning proxy at runtime, and capnweb's RpcCompatible machinery cannot represent
+ * typed item streams (its types only bless ReadableStream<Uint8Array>), which would send the
+ * compiler into unbounded recursion for abilities with streaming methods.
+ */
 export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSessionOptions<Scoped>): Promise<AbilitySession<Scoped>> {
   const tokenProvider = options.tokenProvider ?? createCapabilityTokenProvider(options as CreateCapabilityTokenProviderOptions);
   const authenticate = options.authenticate ?? defaultAuthenticate<Scoped>;
@@ -557,9 +567,11 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
   }) as unknown as AbilitySession<Scoped>;
 }
 
-// Closes a persistent Cap'n Web session opened by `abilitySession`/`capabilityRpcSession`,
-// releasing its transport socket or disposable native binding target. Safe (and a no-op) for
-// per-call HTTP-batch sessions, which hold nothing to close.
+/**
+ * Closes a persistent Cap'n Web session opened by `abilitySession`/`capabilityRpcSession`,
+ * releasing its transport socket or disposable native binding target. Safe (and a no-op) for
+ * per-call HTTP-batch sessions, which hold nothing to close.
+ */
 export async function disposeAbilitySession(session: unknown): Promise<void> {
   const disposable = session as Record<symbol, (() => unknown) | undefined>;
   const asyncDispose = disposable?.[ASYNC_DISPOSE_SYMBOL];
@@ -651,8 +663,10 @@ export type JwkCapabilityProofSignerOptions = {
   ttlSeconds?: number;
 };
 
-// Signs proofs with the same private key the caller authenticates to the control plane with, so a
-// sender-constrained token can be used without registering or distributing anything further.
+/**
+ * Signs proofs with the same private key the caller authenticates to the control plane with, so a
+ * sender-constrained token can be used without registering or distributing anything further.
+ */
 export function jwkCapabilityProofSigner(options: JwkCapabilityProofSignerOptions): CapabilityProofSigner {
   return async (input) => {
     const privateJwk = await resolvePrivateJwk(options.privateJwk);

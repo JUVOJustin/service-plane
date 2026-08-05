@@ -28,8 +28,10 @@ export class AbilityValidationError extends ServicePlaneError {
   }
 }
 
-// Structurally the Standard Schema issue shape, restated so consumers reading `issues` do not
-// need the spec package and so a malformed vendor issue cannot widen the type.
+/**
+ * Structurally the Standard Schema issue shape, restated so consumers reading `issues` do not
+ * need the spec package and so a malformed vendor issue cannot widen the type.
+ */
 export type AbilityValidationIssue = {
   readonly message: string;
   readonly path?: ReadonlyArray<PropertyKey> | undefined;

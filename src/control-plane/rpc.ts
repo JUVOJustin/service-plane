@@ -12,15 +12,19 @@ export type RpcIssuedCapabilityToken = {
   tokenType: 'ServicePlane';
 };
 
-// Subject delegation is asserted by control-plane code (broker caller resolver or direct issuer
-// calls), never by an authenticated caller. One guard for every caller-facing token surface so the
-// rule and its wire-facing error cannot drift between endpoints.
+/**
+ * Subject delegation is asserted by control-plane code (broker caller resolver or direct issuer
+ * calls), never by an authenticated caller. One guard for every caller-facing token surface so the
+ * rule and its wire-facing error cannot drift between endpoints.
+ */
 export function rejectCallerAssertedSubject(subject: unknown): void {
   if (subject === undefined) return;
   throw new CapabilityAuthError('Service-Plane capability token subject cannot be asserted by callers', 403);
 }
 
-// Supports private platform RPC entrypoints where deployment config establishes the caller.
+/**
+ * Supports private platform RPC entrypoints where deployment config establishes the caller.
+ */
 export async function issueCapabilityTokenForCaller(
   issuer: CapabilityIssuer,
   callerServiceId: string,

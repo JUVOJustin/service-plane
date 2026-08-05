@@ -33,8 +33,10 @@ export type ServicePlaneLogEvent = {
   };
 };
 
-// Hono context variables the logger maintains so app middleware mounted outside it
-// can read the emitted events after `await next()`.
+/**
+ * Hono context variables the logger maintains so app middleware mounted outside it
+ * can read the emitted events after `await next()`.
+ */
 export type ServicePlaneLogVariables = {
   servicePlaneLogEvents?: ServicePlaneLogEvent[];
 };
@@ -45,7 +47,9 @@ export type ServicePlaneLoggerOptions = {
   requestId?: (context: Context) => string | undefined;
 };
 
-// Emits structured, token-safe logs for service requests without owning the app logger.
+/**
+ * Emits structured, token-safe logs for service requests without owning the app logger.
+ */
 export function servicePlaneLogger(service: ServiceDefinition, options: ServicePlaneLoggerOptions = {}) {
   const discovery = serviceDiscoveryDocument(service);
   const write = options.log ?? defaultServicePlaneLogSink;

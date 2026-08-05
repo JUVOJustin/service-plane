@@ -306,29 +306,31 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
-// The default discovery cache, and the one a plane uses unless it is given another. Process-local by
-// nature: on Cloudflare that means per isolate, on Node per process. That is the bulk of the win —
-// it turns a catalog fan-out per request into one per process per TTL — while a shared store (KV,
-// Redis) additionally collapses it to one for the whole fleet. Both are worth having; only this one
-// needs no infrastructure, which is why it is the default rather than an opt-in.
-//
-// Deliberately unbounded, and the TTL is not what bounds it: expiry only makes `get` miss, while the
-// entry itself stays for `getStale` to revalidate against. Nothing here ever deletes, so an entry
-// written once is retained for the life of the process. The TTL bounds freshness, not memory.
-//
-// What bounds memory is the number of distinct *service sets* resolved, which is a configuration
-// dimension rather than a per-request one: `serviceRegistryCacheKey` covers ids and origins only, so
-// per-caller grants resolve to a single entry and the ordinary plane holds exactly one. The two
-// dimensions also trade against each other — a 200-service catalog is one entry at ~800 KB, while a
-// plane with many distinct sets has small ones at ~4 KB each — so the product stays modest in any
-// shape that corresponds to a real deployment.
-//
-// A capacity bound was tried and removed. A miss here is a network fan-out over every configured
-// service, so any cap low enough to fire produces the eviction thrashing that made the issuer
-// cache's bound not worth carrying, and worse: that miss cost microseconds, this one costs round
-// trips. A cap set high enough never to fire would be a memory backstop rather than a cache policy —
-// defensible, but it guards a shape we could not construct without inventing hundreds of distinct
-// large catalogs.
+/**
+ * The default discovery cache, and the one a plane uses unless it is given another. Process-local by
+ * nature: on Cloudflare that means per isolate, on Node per process. That is the bulk of the win —
+ * it turns a catalog fan-out per request into one per process per TTL — while a shared store (KV,
+ * Redis) additionally collapses it to one for the whole fleet. Both are worth having; only this one
+ * needs no infrastructure, which is why it is the default rather than an opt-in.
+ *
+ * Deliberately unbounded, and the TTL is not what bounds it: expiry only makes `get` miss, while the
+ * entry itself stays for `getStale` to revalidate against. Nothing here ever deletes, so an entry
+ * written once is retained for the life of the process. The TTL bounds freshness, not memory.
+ *
+ * What bounds memory is the number of distinct *service sets* resolved, which is a configuration
+ * dimension rather than a per-request one: `serviceRegistryCacheKey` covers ids and origins only, so
+ * per-caller grants resolve to a single entry and the ordinary plane holds exactly one. The two
+ * dimensions also trade against each other — a 200-service catalog is one entry at ~800 KB, while a
+ * plane with many distinct sets has small ones at ~4 KB each — so the product stays modest in any
+ * shape that corresponds to a real deployment.
+ *
+ * A capacity bound was tried and removed. A miss here is a network fan-out over every configured
+ * service, so any cap low enough to fire produces the eviction thrashing that made the issuer
+ * cache's bound not worth carrying, and worse: that miss cost microseconds, this one costs round
+ * trips. A cap set high enough never to fire would be a memory backstop rather than a cache policy —
+ * defensible, but it guards a shape we could not construct without inventing hundreds of distinct
+ * large catalogs.
+ */
 export function memoryRegistryCache(now: () => number = () => Date.now()): RegistryCache {
   const entries = new Map<string, { expiresAt: number; value: ServiceDiscoverySnapshot }>();
   return {
