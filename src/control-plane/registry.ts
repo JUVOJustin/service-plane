@@ -53,7 +53,7 @@ export function createServiceRegistry(options: CreateServiceRegistryOptions): Se
       // a function of the services and the discovery path — which is what the key covers — so
       // sharing one resolution between callers is sound even when their caches differ; each still
       // writes its own entry below.
-      const { complete, etags, services } = await coalescedDiscovery(cacheKey, async () => {
+      const { complete, etags, services } = await coalescedDiscovery(options.cache, cacheKey, async () => {
         const stale = await options.cache?.getStale?.(cacheKey);
         return discoverServices(options.services, discoveryPath, stale);
       });
@@ -109,18 +109,36 @@ type DiscoveredDocument = {
   etag?: string;
 };
 
-// Process-local, and only ever holds a resolution that is still running: the entry is dropped as
-// soon as it settles, so this is a stampede guard rather than a second cache.
-const inFlightDiscovery = new Map<string, Promise<DiscoveryResult>>();
+// Scoped per cache instance, never module-wide: two planes in one process can share endpoint ids
+// and origins (the default origin is derived from the id) while resolving genuinely different
+// catalogs behind them, and a global map would hand the second plane the first one's result — and
+// write it into the second plane's cache, bypassing exactly the isolation separate caches exist
+// for. Sharing a fill is only sound between callers that already share the entry it fills, and the
+// cache instance is what defines that group. Entries only ever hold a resolution that is still
+// running — dropped as soon as it settles — so this is a stampede guard, not a second cache.
+const inFlightDiscovery = new WeakMap<RegistryCache, Map<string, Promise<DiscoveryResult>>>();
 
-function coalescedDiscovery(cacheKey: string, resolve: () => Promise<DiscoveryResult>): Promise<DiscoveryResult> {
-  const running = inFlightDiscovery.get(cacheKey);
+function coalescedDiscovery(
+  cache: RegistryCache | undefined,
+  cacheKey: string,
+  resolve: () => Promise<DiscoveryResult>,
+): Promise<DiscoveryResult> {
+  // No cache, no coalescing: without an instance there is nothing safe to group callers by, and a
+  // plane configured with `discoveryCache: false` has chosen freshness over shared work anyway.
+  if (!cache) return resolve();
+
+  let inFlight = inFlightDiscovery.get(cache);
+  if (!inFlight) {
+    inFlight = new Map();
+    inFlightDiscovery.set(cache, inFlight);
+  }
+  const running = inFlight.get(cacheKey);
   if (running) return running;
 
   const pending = resolve();
-  inFlightDiscovery.set(cacheKey, pending);
+  inFlight.set(cacheKey, pending);
   const settle = () => {
-    if (inFlightDiscovery.get(cacheKey) === pending) inFlightDiscovery.delete(cacheKey);
+    if (inFlight.get(cacheKey) === pending) inFlight.delete(cacheKey);
   };
   // Both handlers, so a rejection clears the entry without becoming an unhandled rejection here —
   // the callers awaiting `pending` are the ones that see it.

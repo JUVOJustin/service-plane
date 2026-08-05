@@ -194,7 +194,7 @@ function tieredRegistryCache(local: RegistryCache, shared: RegistryCache, promot
 }
 ```
 
-A warm isolate answers from memory in microseconds. A cold one reads the shared snapshot instead of asking every service. Only the first isolate to miss both pays the fan-out.
+A warm isolate answers from memory in microseconds. A cold one reads the shared snapshot instead of asking every service. The fan-out is paid by whichever isolates miss both layers — the plane coalesces concurrent fills *within* a process, but there is no distributed lock across isolates, so several cold isolates racing an empty shared store can each resolve once before the first write lands. That is a bounded burst at cold start, not the steady state; a distributed single-flight would need an atomic reservation in the shared store and is not worth its complexity here.
 
 ### A Durable Object as the shared store
 
@@ -233,7 +233,7 @@ export function durableObjectRegistryCache(
 
 The snapshot is plain JSON, so it crosses the Durable Object RPC boundary unchanged. Durable Object storage has no TTL of its own, which is why the entry carries its own `expiresAt`.
 
-**Use a Durable Object here only behind the in-memory layer.** One object serializes every access and sits in one location, so making it the first stop for a hot route builds a global bottleneck exactly where throughput matters. KV is the easier shared store for this — reads are edge-cached and eventual consistency is harmless for a catalog snapshot, since staleness can only delay a new ability becoming grantable.
+**Use a Durable Object here only behind the in-memory layer.** One object serializes every access and sits in one location, so making it the first stop for a hot route builds a global bottleneck exactly where throughput matters. KV is the easier shared store for this — reads are edge-cached, and for most of the catalog its eventual consistency only delays a new ability becoming grantable. The exception is the same one the [discovery-cache guide](plane-creation.md#discovery-cache) documents: `access` is enforced by the broker from the catalog, so KV's propagation delay *extends* the window in which an ability tightened from `plane` to `service` stays reachable. Where `access` changes must land promptly, keep the call path on a store with read-after-write semantics (the Durable Object above) and leave KV to the projection path.
 
 ```ts
 new ServicePlaneControlPlane({

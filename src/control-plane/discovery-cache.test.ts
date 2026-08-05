@@ -403,4 +403,152 @@ describe('discovery cache on the token path', () => {
     tenant = 'beta';
     expect((await tokenFor('svc0.beta')).status).toBe(200);
   });
+
+  it('never shares an in-flight fill between planes with separate caches', async () => {
+    const secret = await generateCapabilitySigningSecret();
+    // Two planes in one process, same service id — and therefore the same default origin and the
+    // same derived cache key — but genuinely different catalogs behind the binding. Their caches
+    // are separate on purpose; the single-flight guard must not become a side channel between them.
+    const planeFor = (tenant: string, gate: () => Promise<void>) =>
+      new ServicePlaneControlPlane({
+        authenticateCaller: () => 'worker-a',
+        discoveryCache: memoryRegistryCache(),
+        log: false,
+        services: () => [
+          cloudflareServiceBinding({
+            binding: {
+              fetch: async () => {
+                await gate();
+                return Response.json({
+                  ...discovery('svc0'),
+                  capabilities: { scopes: [{ id: `svc0.${tenant}` }], serviceId: 'svc0' },
+                  abilities: [
+                    {
+                      access: 'plane' as const,
+                      exposure: 'published' as const,
+                      id: 'svc0.run',
+                      methods: {
+                        go: { inputSchema: { type: 'object' }, outputSchema: { type: 'object' }, scopes: [`svc0.${tenant}`] },
+                      },
+                      rpc: { path: '/rpc/svc0.run', transports: ['http-batch' as const] },
+                      scopes: [`svc0.${tenant}`],
+                    },
+                  ],
+                });
+              },
+            },
+            grants: [{ caller: 'worker-a', scopes: [`svc0.${tenant}`] }],
+            id: 'svc0',
+          }),
+        ],
+        signingKeys: () => [{ kid: 'test-key', secret }],
+      });
+
+    // Both discoveries are held open until both planes are mid-flight, which is the window in which
+    // a module-global guard would hand plane B plane A's result — and write it into B's cache. The
+    // release waits for both fetches to have *started* (with a generous fallback, because under the
+    // regression the second fetch never starts at all — it is parked on the first plane's fill), so
+    // the overlap is guaranteed rather than raced: a fixed delay was measured to fire before the
+    // second plane finished its signing-material derivation, leaving the fills sequential and the
+    // test vacuously green.
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let started = 0;
+    let signalSecondStart = () => {};
+    const secondStarted = new Promise<void>((resolve) => {
+      signalSecondStart = resolve;
+    });
+    const trackedGate = async () => {
+      started += 1;
+      if (started >= 2) signalSecondStart();
+      await gate;
+    };
+    const alpha = planeFor('alpha', trackedGate);
+    const beta = planeFor('beta', trackedGate);
+
+    const tokenFor = (plane: ServicePlaneControlPlane, scope: string) =>
+      plane.fetch(
+        new Request(`https://plane.internal${SERVICE_PLANE_CAPABILITY_TOKEN_PATH}`, {
+          body: JSON.stringify({ scopes: [scope], targetServiceId: 'svc0' }),
+          headers: { 'content-type': 'application/json' },
+          method: 'POST',
+        }),
+      );
+
+    const pending = Promise.all([tokenFor(alpha, 'svc0.alpha'), tokenFor(beta, 'svc0.beta')]);
+    await Promise.race([secondStarted, new Promise((resolve) => setTimeout(resolve, 250))]);
+    release();
+    const [alphaResponse, betaResponse] = await pending;
+
+    // Each plane must see its own catalog. Sharing the fill would refuse one of the two scopes as
+    // unknown, because the other tenant's snapshot answered for both.
+    expect(alphaResponse.status).toBe(200);
+    expect(betaResponse.status).toBe(200);
+  });
+
+  it('scopes cached OpenAPI documents by the tenant discriminator', async () => {
+    const secret = await generateCapabilitySigningSecret();
+    const documents = new Map<string, unknown>();
+    let tenant = 'alpha';
+    const plane = new ServicePlaneControlPlane({
+      authenticateCaller: () => 'worker-a',
+      discoveryCacheKey: () => tenant,
+      log: false,
+      openapi: {
+        cache: {
+          get: async (key) => documents.get(key) as never,
+          set: async (key, value) => {
+            documents.set(key, value);
+          },
+        },
+      },
+      services: () => [
+        cloudflareServiceBinding({
+          binding: {
+            fetch: async () =>
+              Response.json({
+                ...discovery('svc0'),
+                abilities: [
+                  {
+                    access: 'plane' as const,
+                    exposure: 'published' as const,
+                    id: 'svc0.run',
+                    methods: {
+                      go: {
+                        inputSchema: { type: 'object' },
+                        outputSchema: { type: 'object' },
+                        rest: { method: 'post' as const, operationId: `run-${tenant}`, path: `/${tenant}/run` },
+                        scopes: ['svc0.use'],
+                      },
+                    },
+                    rpc: { path: '/rpc/svc0.run', transports: ['http-batch' as const] },
+                    scopes: ['svc0.use'],
+                  },
+                ],
+              }),
+          },
+          id: 'svc0',
+        }),
+      ],
+      signingKeys: () => [{ kid: 'test-key', secret }],
+    });
+
+    const documentFor = async () => {
+      const response = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`));
+      expect(response.status).toBe(200);
+      return JSON.stringify(await response.json());
+    };
+
+    const alphaDocument = await documentFor();
+    expect(alphaDocument).toContain('/alpha/run');
+
+    // The registry cache is discriminator-scoped; the *document* cache above it has to be as well,
+    // or tenant B reads tenant A's published REST surface until the document TTL expires.
+    tenant = 'beta';
+    const betaDocument = await documentFor();
+    expect(betaDocument).toContain('/beta/run');
+    expect(betaDocument).not.toContain('/alpha/run');
+  });
 });

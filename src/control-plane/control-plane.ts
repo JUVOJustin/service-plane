@@ -298,7 +298,13 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     this.app.get(path, async (context) => {
       applyHttpCacheHeaders(cacheHeaders, (name, value) => context.header(name, value));
       const services = await this.options.services(context as Context<TEnv>);
-      const cacheKey = openApiOptions.cacheKey ?? controlPlaneOpenApiCacheKey(services, openApiOptions);
+      // The generated document inherits the same tenant discriminator as the catalog behind it: a
+      // per-tenant plane that caches documents would otherwise serve tenant A's published REST
+      // surface to tenant B until the document TTL expires — the registry key was scoped, the
+      // document key not. An explicit `openapi.cacheKey` keeps full responsibility instead.
+      const discriminator = this.options.discoveryCacheKey?.(context as Context<TEnv>);
+      const cacheKey =
+        openApiOptions.cacheKey ?? `${controlPlaneOpenApiCacheKey(services, openApiOptions)}${discriminator ? `|${discriminator}` : ''}`;
       const cached = await openApiOptions.cache?.get(cacheKey);
       if (cached) return context.json(cached);
 
