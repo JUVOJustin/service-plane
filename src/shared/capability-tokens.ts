@@ -256,7 +256,9 @@ function isBoundedClaimString(value: string): boolean {
 // Deviation from the ready-made hono helper, on purpose: hono/jwt's verifyWithJwks re-imports
 // the CryptoKey from the JWK on EVERY call, which measured 206us/op vs 100us/op with a cached
 // key on Node — capability tokens are verified per request on HTTP-batch transports, so that
-// doubling matters. The JWS signature check itself still uses hono's own low-level `verifying`
+// doubling matters. Re-verified against hono 4.13.0: still no key cache in its jws/jwt path
+// (211us/op vs 81us/op cached, 2.6x), so this stays until hono caches imported keys.
+// The JWS signature check itself still uses hono's own low-level `verifying`
 // primitive (hono/utils/jwt/jws); only kid-matching and key caching are ours. Everything here
 // is web-standard (crypto.subtle, atob, TextEncoder), so it behaves identically on Node 20+,
 // Bun, workerd, and Deno — the same matrix hono itself targets.

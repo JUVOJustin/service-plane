@@ -7,7 +7,9 @@ describe('package metadata', () => {
       peerDependencies?: Record<string, string>;
     };
 
-    expect(packageJson.peerDependencies?.hono).toBe('>=4.10.3 <5.0.0');
+    // 4.13 is the first release with first-class HTTP QUERY routing, which `rest.method: 'query'`
+    // projections rely on; it also carries all current security patches.
+    expect(packageJson.peerDependencies?.hono).toBe('>=4.13.0 <5.0.0');
     // Validation is Standard Schema based, so no validation library is a peer dependency.
     expect(packageJson.peerDependencies?.zod).toBeUndefined();
   });

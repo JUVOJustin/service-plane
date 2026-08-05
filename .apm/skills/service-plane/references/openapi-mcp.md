@@ -39,10 +39,12 @@ The control plane serves the generated document:
 GET /openapi.json
 ```
 
-OpenAPI includes methods when both are true:
+The document is OpenAPI **3.2.0**. It includes methods when both are true:
 
 - the ability has `exposure: 'published'`
 - the method has `rest` metadata
+
+`rest.method` accepts `get`, `post`, `put`, `patch`, `delete`, and `query`. QUERY (RFC 10008) is the safe, idempotent method whose parameters travel in the request body — the natural fit for search-shaped abilities whose input is too structured for a query string. OpenAPI 3.2 models it as a fixed `query` field on the path item, and Hono 4.13+ (the peer floor) routes it first-class via `app.query()` when you mount a REST facade.
 
 The request and response schemas come from the method's input and output schemas, rendered as JSON Schema at service setup through [Standard JSON Schema](https://standardschema.dev/json-schema). Service Plane always requests the `draft-2020-12` target, so every service publishes the same dialect; the exact keywords are still the converter's own — Zod, for example, adds `additionalProperties: false` on the output side. The control plane only produces the document — it does not bundle a documentation UI.
 
@@ -53,6 +55,8 @@ Streaming methods (`stream: true`) cannot declare `rest` metadata — the genera
 ## Docs UI
 
 `service-plane` produces the OpenAPI document but does not render it. The control plane exposes its Hono app as `plane.app`, so you mount whichever OpenAPI viewer you prefer against `/openapi.json`. Two ready-made Hono extensions cover the common choices — neither is a dependency of `service-plane`, so install the one you want.
+
+Both accept the 3.2 document, with one gap each (verified against `@hono/swagger-ui` 0.6.1 and `@scalar/hono-api-reference` 0.11.12): Swagger UI renders `query` operations fully but its resolver does not implement embedded `$id` resources, so a recursive or `$defs`-referencing schema shows a non-blocking "resolver error" banner while the rest of the page keeps working. Scalar resolves `$id`-anchored schemas correctly but does not yet display `query` operations at all — they are silently absent from the sidebar. If your API uses both features, prefer Swagger UI until Scalar adds QUERY support.
 
 ### Swagger UI
 

@@ -330,7 +330,7 @@ describe('ServicePlaneControlPlane', () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
       info: { title: 'Control Plane APIs', version: '2026.05.23' },
-      openapi: '3.1.0',
+      openapi: '3.2.0',
       paths: {
         '/examples/search': {
           post: {
@@ -414,7 +414,7 @@ describe('ServicePlaneControlPlane', () => {
 
     const openapi = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`));
     expect(openapi.status).toBe(200);
-    await expect(openapi.json()).resolves.toMatchObject({ openapi: '3.1.0' });
+    await expect(openapi.json()).resolves.toMatchObject({ openapi: '3.2.0' });
 
     // The plane only projects the OpenAPI document; a docs UI (e.g. @hono/swagger-ui or
     // @scalar/hono-api-reference) is mounted by the consumer on plane.app.

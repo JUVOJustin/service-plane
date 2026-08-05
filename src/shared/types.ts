@@ -19,7 +19,10 @@ export const SERVICE_PLANE_REQUEST_ID_QUERY_PARAM = 'request_id';
 export type AbilityAccess = 'plane' | 'service';
 export type AbilityExposure = 'private' | 'published';
 export type AbilityTransport = 'cloudflare-binding-rpc' | 'http-batch' | 'websocket';
-export type ServiceHttpMethod = 'delete' | 'get' | 'patch' | 'post' | 'put';
+// `query` is the HTTP QUERY method (RFC 10008): a safe, idempotent request that carries its
+// parameters in a body. OpenAPI 3.2 gives it a fixed `query` field on the Path Item Object,
+// and Hono 4.13+ routes it first-class (`app.query()`), which is why hono >=4.13 is the peer floor.
+export type ServiceHttpMethod = 'delete' | 'get' | 'patch' | 'post' | 'put' | 'query';
 
 export type CapabilityScopeDefinition = {
   description?: string;
@@ -192,7 +195,7 @@ export type OpenApiDocument = {
     title: string;
     version: string;
   };
-  openapi: '3.1.0';
+  openapi: '3.2.0';
   paths: Record<string, Record<string, OpenApiObject>>;
   servers?: OpenApiObject[];
   tags?: Array<{ description?: string; name: string }>;

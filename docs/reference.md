@@ -56,6 +56,8 @@ Each method accepts one input object and returns one output value. The wrapper v
 
 Validation failures raise `AbilityValidationError` carrying the issues the schema library reported. See [Errors](#errors).
 
+Optional `rest` metadata projects the method into the generated OpenAPI 3.2 document; `rest.method` accepts `get`, `post`, `put`, `patch`, `delete`, and `query` (HTTP QUERY per RFC 10008 — request parameters in the body, safe and idempotent). See [OpenAPI and MCP](openapi-mcp.md#openapi).
+
 ## Streaming Methods
 
 Some methods produce many results over time — large file transfers, long exports. Declare them with `stream: true`; the `output` schema then validates **each streamed item**, and the handler returns an async iterable (usually an async generator), a sync iterable, or a `ReadableStream`:
