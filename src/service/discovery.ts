@@ -1,8 +1,8 @@
+import type { StandardJSONSchemaV1, StandardSchemaV1 } from '@standard-schema/spec';
 import { RpcPromise, RpcTarget } from 'capnweb';
 import type { Context, Env } from 'hono';
-import * as z from 'zod';
 import type { ConnInfo } from '../shared/conn-info.js';
-import { AbilityValidationError, CapabilityAuthError } from '../shared/errors.js';
+import { AbilityValidationError, type AbilityValidationIssue, CapabilityAuthError } from '../shared/errors.js';
 import { isOriginRelativePath } from '../shared/paths.js';
 import {
   type AbilityAccess,
@@ -24,7 +24,17 @@ import {
 } from '../shared/types.js';
 import { bindCapabilityIdentity, capabilityIdentity, requireScopes } from './capabilities.js';
 
-export type AbilitySchema = z.ZodType;
+// Abilities accept any Standard Schema value, so services pick their own validation library.
+// The JSON Schema half of the spec is required rather than optional: every ability method is
+// projected into the discovery document, and OpenAPI/MCP projections read those schemas.
+export type AbilitySchema = StandardSchemaV1 & StandardJSONSchemaV1;
+
+// Discovery documents have always carried draft-2020-12 JSON Schema; naming the target keeps
+// that stable across validation libraries instead of inheriting each vendor's default.
+const ABILITY_JSON_SCHEMA_TARGET: StandardJSONSchemaV1.Target = 'draft-2020-12';
+
+type AbilitySchemaInput<TSchema extends AbilitySchema> = StandardSchemaV1.InferInput<TSchema>;
+type AbilitySchemaOutput<TSchema extends AbilitySchema> = StandardSchemaV1.InferOutput<TSchema>;
 
 export type AbilityMethodDefinition<TInput extends AbilitySchema = AbilitySchema, TOutput extends AbilitySchema = AbilitySchema> = {
   input: TInput;
@@ -55,32 +65,36 @@ export type ServiceAbilityHandlerFactoryInput<TEnv extends Env = Env> = {
 // back from a streaming method is almost certainly a bug, and the runtime rejects it.
 export type AbilityStreamSource<TItem> = AsyncIterable<TItem> | (Iterable<TItem> & object) | ReadableStream<TItem>;
 
-// Streamed items are re-validated by `output.parseAsync`, so handlers must yield the schema's
-// INPUT shape: for transforming schemas (pipes, coercions) the transformed output would fail
-// re-parsing, so unlike unary methods the output side is not accepted here.
-type AbilityMethodItem<TMethod extends AbilityMethodDefinition> = z.input<TMethod['output']>;
+// Streamed items are re-validated against `output`, so handlers must yield the schema's INPUT
+// shape: for transforming schemas (pipes, coercions) the transformed output would fail
+// re-validation, so unlike unary methods the output side is not accepted here.
+type AbilityMethodItem<TMethod extends AbilityMethodDefinition> = AbilitySchemaInput<TMethod['output']>;
 
 export type AbilityImplementation<TAbility extends ServiceAbilityDefinition> = {
   [TMethod in keyof TAbility['methods']]: TAbility['methods'][TMethod] extends { stream: true }
     ? (
-        input: z.output<TAbility['methods'][TMethod]['input']>,
+        input: AbilitySchemaOutput<TAbility['methods'][TMethod]['input']>,
       ) =>
         | AbilityStreamSource<AbilityMethodItem<TAbility['methods'][TMethod]>>
         | Promise<AbilityStreamSource<AbilityMethodItem<TAbility['methods'][TMethod]>>>
     : (
-        input: z.output<TAbility['methods'][TMethod]['input']>,
+        input: AbilitySchemaOutput<TAbility['methods'][TMethod]['input']>,
       ) =>
-        | Promise<z.input<TAbility['methods'][TMethod]['output']> | z.output<TAbility['methods'][TMethod]['output']>>
-        | z.input<TAbility['methods'][TMethod]['output']>
-        | z.output<TAbility['methods'][TMethod]['output']>;
+        | Promise<AbilitySchemaInput<TAbility['methods'][TMethod]['output']> | AbilitySchemaOutput<TAbility['methods'][TMethod]['output']>>
+        | AbilitySchemaInput<TAbility['methods'][TMethod]['output']>
+        | AbilitySchemaOutput<TAbility['methods'][TMethod]['output']>;
 };
 
 // Streaming methods resolve to a native Cap'n Web ReadableStream of validated items; they
 // require a session transport (WebSocket, native binding, custom bidirectional).
 export type AbilityRpc<TAbility extends ServiceAbilityDefinition> = {
   [TMethod in keyof TAbility['methods']]: TAbility['methods'][TMethod] extends { stream: true }
-    ? (input: z.input<TAbility['methods'][TMethod]['input']>) => Promise<ReadableStream<z.output<TAbility['methods'][TMethod]['output']>>>
-    : (input: z.input<TAbility['methods'][TMethod]['input']>) => Promise<z.output<TAbility['methods'][TMethod]['output']>>;
+    ? (
+        input: AbilitySchemaInput<TAbility['methods'][TMethod]['input']>,
+      ) => Promise<ReadableStream<AbilitySchemaOutput<TAbility['methods'][TMethod]['output']>>>
+    : (
+        input: AbilitySchemaInput<TAbility['methods'][TMethod]['input']>,
+      ) => Promise<AbilitySchemaOutput<TAbility['methods'][TMethod]['output']>>;
 };
 
 export type ServiceAbilityHandlerFactory<TEnv extends Env = Env> = (
@@ -162,7 +176,7 @@ export function defineAbilityService<TEnv extends Env = Env>(
 ): ServiceDefinition<TEnv> {
   const serviceId = normalizeValue(input.id, 'service id');
   const service: ServiceDefinition<TEnv> = {
-    abilities: normalizeAbilities(input.abilities, input.capabilities, options.requireAbilityScopes ?? true),
+    abilities: normalizeAbilities(serviceId, input.abilities, input.capabilities, options.requireAbilityScopes ?? true),
     ...(input.callerAuth ? { callerAuth: input.callerAuth } : {}),
     ...(input.capabilities ? { capabilities: input.capabilities } : {}),
     id: serviceId,
@@ -280,13 +294,73 @@ async function invokeValidatingAbilityMethod(target: RpcTarget, methodName: stri
     throw new AbilityValidationError(`Service-Plane ability handler does not implement method: ${methodName}`, 500);
   }
 
-  const input = await method.input.parseAsync(args[0]);
+  const input = await validateAbilityValue(method.input, args[0], `input for ${methodName}`, 422);
   activeValidatingAbilityHandlerState(target);
   const output = await implementation.call(state.handler, input);
   // Streaming methods return their items as a native Cap'n Web ReadableStream, validated
   // one item at a time as the consumer pulls.
   if (method.stream) return validatedAbilityItemStream(method, methodName, output);
-  return method.output.parseAsync(output);
+  return validateAbilityValue(method.output, output, `output for ${methodName}`, 500);
+}
+
+// Standard Schema reports failures as issues rather than by throwing, so the boundary that owns
+// the caller/handler distinction turns them into an error: a bad input is the caller's fault
+// (422), a bad output means the handler broke its own contract (500). Schemas come from a
+// library this package never sees, so every deviation from the contract must fail closed here:
+// an unrecognized result would otherwise hand the handler unvalidated data.
+async function validateAbilityValue(schema: AbilitySchema, value: unknown, source: string, status: number): Promise<unknown> {
+  let result: StandardSchemaV1.Result<unknown>;
+  try {
+    result = await schema['~standard'].validate(value);
+  } catch (error) {
+    // A validator that throws instead of returning issues still means "this value is invalid";
+    // reporting it as an unclassified error would hide whose fault the call was.
+    throw new AbilityValidationError(`Service-Plane ability ${source}: ${errorMessage(error)}`, status);
+  }
+  if (result?.issues) {
+    throw new AbilityValidationError(
+      `Service-Plane ability ${source}: ${formatSchemaIssues(result.issues)}`,
+      status,
+      normalizeSchemaIssues(result.issues),
+    );
+  }
+  if (!result || !('value' in result)) {
+    throw new AbilityValidationError(`Service-Plane ability ${source}: schema returned no validated value`, status);
+  }
+  return result.value;
+}
+
+// Flattens the vendor's issues into the package's own shape so consumers can read them without
+// depending on the spec package, and so a malformed issue cannot escape into a caught error.
+function normalizeSchemaIssues(issues: ReadonlyArray<StandardSchemaV1.Issue>): AbilityValidationIssue[] {
+  if (!Array.isArray(issues)) return [];
+  return issues.map((issue) => {
+    const segments = issue?.path;
+    const path = Array.isArray(segments) ? segments.map(schemaIssuePathKey) : undefined;
+    return { message: issue?.message ?? 'invalid value', ...(path ? { path } : {}) };
+  });
+}
+
+function schemaIssuePathKey(segment: unknown): PropertyKey {
+  const key = segment && typeof segment === 'object' ? (segment as { key?: unknown }).key : segment;
+  return typeof key === 'string' || typeof key === 'number' || typeof key === 'symbol' ? key : String(key);
+}
+
+function formatSchemaIssues(issues: ReadonlyArray<StandardSchemaV1.Issue>): string {
+  if (!Array.isArray(issues) || issues.length === 0) return 'schema reported no issue detail';
+  return issues.map(formatSchemaIssue).join('; ');
+}
+
+function formatSchemaIssue(issue: StandardSchemaV1.Issue | undefined): string {
+  const message = issue?.message ?? 'invalid value';
+  const segments = issue?.path;
+  if (!Array.isArray(segments) || segments.length === 0) return message;
+  const path = segments.map(formatSchemaIssuePathSegment).join('.');
+  return path ? `${path}: ${message}` : message;
+}
+
+function formatSchemaIssuePathSegment(segment: unknown): string {
+  return String(schemaIssuePathKey(segment));
 }
 
 function activeValidatingAbilityHandlerState(target: RpcTarget): ValidatingAbilityHandlerState {
@@ -314,6 +388,9 @@ function validatedAbilityItemStream(
   source: unknown,
 ): ReadableStream<unknown> {
   const puller = abilityStreamPuller(source, methodName);
+  // Constant for the whole stream; building it per item would allocate once per pull for a
+  // message that is only read when an item fails validation.
+  const itemSource = `stream item for ${methodName}`;
   return new ReadableStream<unknown>({
     cancel(reason) {
       // Cancel the underlying source directly and without awaiting: an async generator's
@@ -328,7 +405,7 @@ function validatedAbilityItemStream(
           controller.close();
           return;
         }
-        controller.enqueue(await method.output.parseAsync(next.value));
+        controller.enqueue(await validateAbilityValue(method.output, next.value, itemSource, 500));
       } catch (error) {
         // A failed pull or invalid item errors the stream, which can no longer be cancelled by
         // the consumer. Release the handler's source here so iterator return/finally cleanup and
@@ -391,6 +468,7 @@ function abilityStreamPuller(source: unknown, methodName: string): AbilityStream
 export { SERVICE_DISCOVERY_PATH };
 
 function normalizeAbilities<TEnv extends Env>(
+  serviceId: string,
   abilities: Array<AnyServiceAbilityDefinition<TEnv>>,
   capabilities: CapabilityCatalog | undefined,
   requireAbilityScopes: boolean,
@@ -417,7 +495,7 @@ function normalizeAbilities<TEnv extends Env>(
     }
     validateKnownScopes(scopes, knownScopes, capabilities, `Service-Plane ability requires unknown scope`);
 
-    const methods = normalizeMethods(id, ability.methods, scopes, knownScopes, capabilities, requireAbilityScopes);
+    const methods = normalizeMethods(serviceId, id, ability.methods, scopes, knownScopes, capabilities, requireAbilityScopes);
     const path = normalizePath(ability.rpc?.path ?? defaultAbilityRpcPath(id), id);
     if (seenPaths.has(path)) throw new CapabilityAuthError(`Duplicate Service-Plane ability RPC path: ${path}`, 500);
     seenPaths.add(path);
@@ -460,6 +538,7 @@ function isReservedMethodName(methodName: string): boolean {
 }
 
 function normalizeMethods(
+  serviceId: string,
   abilityId: string,
   methods: AbilityMethodDefinitions,
   abilityScopes: string[],
@@ -470,12 +549,20 @@ function normalizeMethods(
   const names = Object.keys(methods);
   if (names.length === 0) throw new CapabilityAuthError(`Service-Plane ability must define at least one method: ${abilityId}`, 500);
 
+  // Names are trimmed below, so two distinct keys can collapse into one. Without this guard the
+  // later definition silently wins and the earlier method's scopes stop being enforced.
+  const seenNames = new Set<string>();
+
   return Object.fromEntries(
     names.map((methodName) => {
       const name = normalizeValue(methodName, `method name for ${abilityId}`);
       if (isReservedMethodName(name)) {
         throw new CapabilityAuthError(`Service-Plane ability method name is reserved: ${abilityId}/${name}`, 500);
       }
+      if (seenNames.has(name)) {
+        throw new CapabilityAuthError(`Service-Plane ability method name is duplicated: ${abilityId}/${name}`, 500);
+      }
+      seenNames.add(name);
       const method = methods[methodName];
       if (!method) throw new CapabilityAuthError(`Service-Plane ability method is missing: ${abilityId}/${methodName}`, 500);
       const scopes = normalizeScopes(method.scopes ?? []);
@@ -502,11 +589,21 @@ function normalizeMethods(
         name,
         {
           ...method,
-          inputSchema: zodToJsonSchema(method.input, 'input', `${abilityId}/${name}`),
+          inputSchema: abilityJsonSchema(
+            method.input,
+            'input',
+            `${abilityId}/${name}`,
+            schemaResourceId(serviceId, abilityId, name, 'input'),
+          ),
           ...(mcp ? { mcp } : {}),
           ...(mcpPrompt ? { mcpPrompt } : {}),
           ...(mcpResource ? { mcpResource } : {}),
-          outputSchema: zodToJsonSchema(method.output, 'output', `${abilityId}/${name}`),
+          outputSchema: abilityJsonSchema(
+            method.output,
+            'output',
+            `${abilityId}/${name}`,
+            schemaResourceId(serviceId, abilityId, name, 'output'),
+          ),
           ...(rest ? { rest } : {}),
           scopes,
           ...(method.stream ? { stream: true as const } : {}),
@@ -673,7 +770,14 @@ function normalizePath(path: string, source: string): string {
 function normalizeHttpMethod(method: ServiceHttpMethod): ServiceHttpMethod {
   if (typeof method !== 'string') throw new CapabilityAuthError('Service-Plane REST method cannot be empty', 500);
   const normalized = method.toLowerCase() as ServiceHttpMethod;
-  if (normalized !== 'delete' && normalized !== 'get' && normalized !== 'patch' && normalized !== 'post' && normalized !== 'put') {
+  if (
+    normalized !== 'delete' &&
+    normalized !== 'get' &&
+    normalized !== 'patch' &&
+    normalized !== 'post' &&
+    normalized !== 'put' &&
+    normalized !== 'query'
+  ) {
     throw new CapabilityAuthError(`Unknown Service-Plane REST method: ${method as string}`, 500);
   }
   return normalized;
@@ -730,13 +834,87 @@ function normalizeValue(value: string, field: string): string {
   return normalized;
 }
 
-function zodToJsonSchema(schema: AbilitySchema, io: 'input' | 'output', source: string): OpenApiObject {
-  try {
-    return z.toJSONSchema(schema, { io }) as OpenApiObject;
-  } catch (error) {
+// Both halves of the Standard Schema contract are checked here, at setup, so a schema that
+// cannot validate fails while the service is being defined rather than on a caller's first
+// request. `AbilitySchema` is structural, and JS consumers get no compile-time check at all,
+// so anything may arrive in an `input`/`output` slot.
+function assertAbilitySchemaContract(
+  schema: AbilitySchema,
+  source: string,
+): StandardSchemaV1.Props<unknown, unknown> & StandardJSONSchemaV1.Props {
+  const props = (schema as { '~standard'?: unknown } | null | undefined)?.['~standard'];
+  if (!props || typeof props !== 'object') {
+    throw new CapabilityAuthError(`Service-Plane ability schema is not a Standard Schema (https://standardschema.dev) for ${source}`, 500);
+  }
+  const typed = props as Partial<StandardSchemaV1.Props<unknown, unknown> & StandardJSONSchemaV1.Props>;
+  const vendor = typeof typed.vendor === 'string' ? typed.vendor : 'unknown vendor';
+  if (typeof typed.validate !== 'function') {
     throw new CapabilityAuthError(
-      `Service-Plane ability schema cannot be represented as JSON Schema for ${source}: ${error instanceof Error ? error.message : String(error)}`,
+      `Service-Plane ability schema does not implement Standard Schema validation (${vendor}) for ${source}`,
       500,
     );
   }
+  if (typeof typed.jsonSchema?.input !== 'function' || typeof typed.jsonSchema?.output !== 'function') {
+    // Naming the version floor matters: with no validation peer dependency, an outdated
+    // library installs cleanly and only fails here.
+    throw new CapabilityAuthError(
+      `Service-Plane ability schema does not implement Standard JSON Schema (https://standardschema.dev/json-schema) for ${source}: ` +
+        `${vendor} must expose \`~standard.jsonSchema\` (Zod 4.2+, ArkType 2.1.28+, VineJS 4.3+, or Valibot 1.2+ wrapped in \`toStandardJsonSchema()\`)`,
+      500,
+    );
+  }
+  return typed as StandardSchemaV1.Props<unknown, unknown> & StandardJSONSchemaV1.Props;
+}
+
+function abilityJsonSchema(schema: AbilitySchema, io: 'input' | 'output', source: string, resourceId: string): OpenApiObject {
+  const converter = assertAbilitySchemaContract(schema, source).jsonSchema;
+  let rendered: unknown;
+  try {
+    rendered = converter[io]({ target: ABILITY_JSON_SCHEMA_TARGET });
+  } catch (error) {
+    throw new CapabilityAuthError(
+      `Service-Plane ability schema cannot be represented as JSON Schema for ${source}: ${errorMessage(error)}`,
+      500,
+    );
+  }
+  // Boolean and null are legal JSON Schema documents but not projectable: the control plane
+  // drops a whole discovery document whose method schemas are not objects, so reject here
+  // where the offending ability and method can still be named.
+  if (!rendered || typeof rendered !== 'object' || Array.isArray(rendered)) {
+    throw new CapabilityAuthError(
+      `Service-Plane ability schema rendered a non-object JSON Schema for ${source}: ${JSON.stringify(rendered) ?? String(rendered)}`,
+      500,
+    );
+  }
+  return withSchemaResourceId(rendered as OpenApiObject, resourceId);
+}
+
+// JSON Schema 2020-12 resource identity: a schema whose fragment `$ref`s point at itself
+// (`#`, `#/$defs/...`, `#anchor`) resolves those pointers against the nearest enclosing
+// resource. Standalone that is the schema itself, but embedded into a larger document — the
+// generated OpenAPI, an MCP tool listing — the pointers would re-anchor to the embedding
+// document and dangle. Declaring `$id` makes the schema its own resource wherever it travels,
+// so vendor output needs no rewriting. Schemas without local refs are left byte-identical.
+function schemaResourceId(serviceId: string, abilityId: string, methodName: string, io: 'input' | 'output'): string {
+  const segment = (value: string) => encodeURIComponent(value);
+  return `urn:service-plane:${segment(serviceId)}/${segment(abilityId)}/${segment(methodName)}/${io}`;
+}
+
+function withSchemaResourceId(schema: OpenApiObject, resourceId: string): OpenApiObject {
+  // A vendor-declared `$id` already anchors the schema's own refs; overriding it would break them.
+  if (typeof schema.$id === 'string' && schema.$id.length > 0) return schema;
+  if (!containsLocalRef(schema)) return schema;
+  return { $id: resourceId, ...schema };
+}
+
+function containsLocalRef(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(containsLocalRef);
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  if (typeof record.$ref === 'string' && record.$ref.startsWith('#')) return true;
+  return Object.values(record).some(containsLocalRef);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

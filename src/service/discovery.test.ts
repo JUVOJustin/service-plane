@@ -91,6 +91,36 @@ describe('ability service discovery', () => {
     });
   });
 
+  it('accepts the QUERY method for REST projections and rejects unknown methods', () => {
+    const withMethod = (method: string) =>
+      defineAbilityService({
+        abilities: [
+          defineAbility({
+            exposure: 'published',
+            id: 'example.search',
+            methods: {
+              search: abilityMethod({
+                input: z.object({ query: z.string() }),
+                output: z.object({ results: z.array(z.string()) }),
+                rest: { method: method as never, path: '/examples/search' },
+                scopes: ['example.search'],
+              }),
+            },
+            scopes: ['example.search'],
+            handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
+          }),
+        ],
+        capabilities,
+        id: 'example',
+        title: 'Example',
+        version: '0.1.0',
+      });
+
+    // Uppercase input normalizes like the other verbs do.
+    expect(withMethod('QUERY').abilities[0]?.methods.search?.rest?.method).toBe('query');
+    expect(() => withMethod('propfind')).toThrow('Unknown Service-Plane REST method: propfind');
+  });
+
   it('publishes MCP resource and prompt projections in discovery', () => {
     const service = defineAbilityService({
       abilities: [

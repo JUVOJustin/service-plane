@@ -39,18 +39,24 @@ The control plane serves the generated document:
 GET /openapi.json
 ```
 
-OpenAPI includes methods when both are true:
+The document is OpenAPI **3.2.0**. It includes methods when both are true:
 
 - the ability has `exposure: 'published'`
 - the method has `rest` metadata
 
-The request and response schemas come from the method's Zod input and output schemas through generated JSON Schema. The control plane only produces the document — it does not bundle a documentation UI.
+`rest.method` accepts `get`, `post`, `put`, `patch`, `delete`, and `query`. QUERY (RFC 10008) is the safe, idempotent method whose parameters travel in the request body — the natural fit for search-shaped abilities whose input is too structured for a query string. OpenAPI 3.2 models it as a fixed `query` field on the path item, and Hono 4.13+ (the peer floor) routes it first-class via `app.query()` when you mount a REST facade.
+
+The request and response schemas come from the method's input and output schemas, rendered as JSON Schema at service setup through [Standard JSON Schema](https://standardschema.dev/json-schema). Service Plane always requests the `draft-2020-12` target, so every service publishes the same dialect; the exact keywords are still the converter's own — Zod, for example, adds `additionalProperties: false` on the output side. The control plane only produces the document — it does not bundle a documentation UI.
+
+Schemas containing local `$ref`s — recursive types, or converters that root at `$ref` into `$defs` the way ArkType and Valibot do — are anchored with a generated `$id` (`urn:service-plane:<service>/<ability>/<method>/<input|output>`) at service setup. Per JSON Schema 2020-12 that makes each schema its own resource, so its internal pointers keep resolving after the schema is embedded into the OpenAPI document, and vendor output never needs rewriting. Schemas without local refs are published byte-identical, and a vendor-declared `$id` is kept.
 
 Streaming methods (`stream: true`) cannot declare `rest` metadata — the generated OpenAPI documents request/response operations only.
 
 ## Docs UI
 
 `service-plane` produces the OpenAPI document but does not render it. The control plane exposes its Hono app as `plane.app`, so you mount whichever OpenAPI viewer you prefer against `/openapi.json`. Two ready-made Hono extensions cover the common choices — neither is a dependency of `service-plane`, so install the one you want.
+
+Both accept the 3.2 document, with one gap each (verified against `@hono/swagger-ui` 0.6.1 and `@scalar/hono-api-reference` 0.11.12): Swagger UI renders `query` operations fully but its resolver does not implement embedded `$id` resources, so a recursive or `$defs`-referencing schema shows a non-blocking "resolver error" banner while the rest of the page keeps working. Scalar resolves `$id`-anchored schemas correctly but does not yet display `query` operations at all — they are silently absent from the sidebar. If your API uses both features, prefer Swagger UI until Scalar adds QUERY support.
 
 ### Swagger UI
 
@@ -85,7 +91,7 @@ Because the UI is not baked into the library, there is no bundled CDN dependency
 
 ## Edge Validation
 
-The service remains the authoritative validator. Every RPC call still goes through Zod validation in the ability wrapper.
+The service remains the authoritative validator. Every RPC call still goes through schema validation in the ability wrapper.
 
 The control plane can also use the discovered JSON Schemas for HTTP edge validation on REST facades:
 
@@ -95,10 +101,23 @@ flowchart LR
   Edge --> Validate["JSON Schema validation"]
   Validate --> Token["Mint scoped token"]
   Token --> RPC["Call asana.tasks.createTask"]
-  RPC --> Service["Service-side Zod validation"]
+  RPC --> Service["Service-side schema validation"]
 ```
 
 Edge validation is a user-facing guardrail. It should not replace service-side validation.
+
+`service-plane` does not mount that facade for you, and it does not ship request-validation middleware. `ServicePlaneControlPlane` exposes `plane.app` (and `ServicePlaneService` exposes `service.app`) as ordinary Hono apps, so mount whatever you already use — for example [`@hono/standard-validator`](https://github.com/honojs/middleware/tree/main/packages/standard-validator), which takes the same Standard Schema values your abilities use:
+
+```ts
+import { sValidator } from '@hono/standard-validator';
+
+plane.app.post('/asana/tasks', sValidator('json', CreateTaskInput), async (context) => {
+  const input = context.req.valid('json');
+  // mint a scoped token, then call the ability
+});
+```
+
+Service Plane's own HTTP routes are protocol endpoints — the Cap'n Web batch at `/rpc/<abilityId>`, the MCP JSON-RPC mount, STS — not schema-shaped REST bodies, so no request validator is applied to them. Caller-auth routes deliberately read the raw request bytes, because HMAC and JWK signatures cover the exact bytes rather than a re-serialized parse.
 
 ## MCP
 
@@ -114,7 +133,7 @@ Every projected entry carries its Service Plane routing metadata (service, abili
 
 ### Tools
 
-`mcp: { name, description? }` projects a method as a tool. The input schema comes from the method's Zod input schema. Object-shaped outputs also advertise `outputSchema` and return the validated object as `structuredContent`, with serialized JSON in a `text` block for compatibility. Primitive and array outputs omit `outputSchema` and return serialized text only. Handler failures are reported in-band with `isError: true`; unknown tools and authorization failures are JSON-RPC errors.
+`mcp: { name, description? }` projects a method as a tool. The tool's input schema comes from the method's input schema; if the converter rooted it at a local `$ref` (ArkType and Valibot do this for referenced or recursive types), the referenced content is inlined at the root so clients that read `type` and `properties` without a resolver still see the object shape, with `$defs` kept for internal refs. Object-shaped outputs — including ref-rooted ones — also advertise `outputSchema` and return the validated object as `structuredContent`, with serialized JSON in a `text` block for compatibility. Primitive and array outputs omit `outputSchema` and return serialized text only. Handler failures are reported in-band with `isError: true`; unknown tools and authorization failures are JSON-RPC errors.
 
 Streaming methods (`stream: true`) can project tools too. Because SSE is the only shape such a call can answer in, the request must accept it: an explicit `Accept` header that excludes `text/event-stream` (and `text/*`/`*/*`) gets `406` before any ability session is opened, while a missing `Accept` is treated as accepting anything. Unary tools, resources, and prompts stay usable for JSON-only clients. The plane opens the backing ability over a session transport (the endpoint's native ability RPC binding, then WebSocket) and answers `tools/call` over SSE per MCP streamable HTTP: while items arrive, it emits `notifications/progress` events (when the client sent `_meta.progressToken`), and the final response aggregates the items as `structuredContent: { items }` — MCP defines exactly one response per request, so the tool schema advertises the aggregated `{ items }` shape and `_meta.servicePlane.stream` marks the tool. Unbuffered transfer of very large streams belongs on a direct or brokered Cap'n Web session, not on MCP: the plane aggregates at most 10,000 items / 1 MiB of serialized items per streaming tool call (configurable via `mcp.streamLimits`) and fails the call in-band beyond that. `maxBytes` also gives optional progress notifications an independent cumulative byte budget; because every notification consumes that budget, it bounds how many can be emitted during a call. When that progress budget is exhausted, the plane stops sending notifications but continues building the separately bounded final result. Streaming methods cannot project resources or prompts (single-response surfaces); the service rejects such definitions at setup. See [Streaming](streaming.md).
 

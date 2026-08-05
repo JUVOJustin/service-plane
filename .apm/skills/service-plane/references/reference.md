@@ -50,7 +50,13 @@ abilityMethod({
 });
 ```
 
-Each method accepts one input object and returns one output value. The wrapper validates both with Zod.
+Each method accepts one input object and returns one output value. The wrapper validates both.
+
+`input` and `output` accept any [Standard Schema](https://standardschema.dev) value that also implements [Standard JSON Schema](https://standardschema.dev/json-schema) — ArkType 2.1.28+, Valibot 1.2+ via `@valibot/to-json-schema`, VineJS 4.3+, Zod 4.2+, or anything else meeting both contracts. The choice is per schema: one method may take its `input` from one library and its `output` from another. See [Choosing A Validation Library](service-creation.md#choosing-a-validation-library).
+
+Validation failures raise `AbilityValidationError` carrying the issues the schema library reported. See [Errors](#errors).
+
+Optional `rest` metadata projects the method into the generated OpenAPI 3.2 document; `rest.method` accepts `get`, `post`, `put`, `patch`, `delete`, and `query` (HTTP QUERY per RFC 10008 — request parameters in the body, safe and idempotent). See [OpenAPI and MCP](openapi-mcp.md#openapi).
 
 ## Streaming Methods
 
@@ -322,6 +328,23 @@ Token cache keys include caller id, target service id, ability id, normalized sc
 - Missing or invalid token: `CapabilityAuthError` with 401-style status.
 - Missing scope: `CapabilityAuthError` with 403-style status.
 - Invalid caller input: `AbilityValidationError` with 422-style status.
-- Invalid service output: `AbilityValidationError` with 500-style status.
+- Invalid service output or streamed item: `AbilityValidationError` with 500-style status — the handler broke its own declared contract.
+
+`AbilityValidationError.issues` carries the schema library's issues as `{ message, path? }` entries, so a gateway can build a field-level response without parsing the joined message:
+
+```ts
+import { AbilityValidationError } from 'service-plane/service';
+
+try {
+  await asana.createTask(input);
+} catch (error) {
+  if (error instanceof AbilityValidationError) {
+    return Response.json({ errors: error.issues }, { status: error.status });
+  }
+  throw error;
+}
+```
+
+A schema that deviates from the Standard Schema contract fails closed: a validator that throws, or returns neither a value nor issues, raises `AbilityValidationError` rather than letting the value through. A schema missing `~standard.validate` or `~standard.jsonSchema` is rejected when the service is defined, not on the first call.
 
 Next: [auth](auth.md), [OpenAPI and MCP](openapi-mcp.md), and [Cloudflare](cloudflare.md).

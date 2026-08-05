@@ -36,14 +36,14 @@ function snapshotOf(abilities: DiscoveredServiceAbility[]): ServiceRegistrySnaps
 }
 
 describe('generateControlPlaneOpenApi', () => {
-  it('projects published REST methods from Zod-derived schemas into an OpenAPI 3.1 document', () => {
+  it('projects published REST methods from Zod-derived schemas into an OpenAPI 3.2 document', () => {
     const document = generateControlPlaneOpenApi({
       snapshot: snapshotOf([publishedAbility()]),
       title: 'Control Plane APIs',
       version: '2026.05.23',
     });
 
-    expect(document.openapi).toBe('3.1.0');
+    expect(document.openapi).toBe('3.2.0');
     expect(document.info).toMatchObject({ title: 'Control Plane APIs', version: '2026.05.23' });
 
     const operation = document.paths['/examples/search']?.post as Record<string, unknown> | undefined;
@@ -60,6 +60,31 @@ describe('generateControlPlaneOpenApi', () => {
     expect(document.components).toMatchObject({
       securitySchemes: { ServicePlane: { scheme: 'bearer', type: 'http' } },
     });
+  });
+
+  it('projects a QUERY method onto the 3.2 query field of the path item', () => {
+    const document = generateControlPlaneOpenApi({
+      snapshot: snapshotOf([
+        publishedAbility({
+          methods: {
+            search: {
+              inputSchema: { properties: { query: { type: 'string' } }, type: 'object' },
+              outputSchema: { type: 'object' },
+              // QUERY (RFC 10008): safe and idempotent, parameters travel in the request body —
+              // OpenAPI 3.2 models it as a fixed `query` field beside get/post/put.
+              rest: { method: 'query', path: '/examples/search', summary: 'Search examples' },
+              scopes: ['example.search'],
+            },
+          },
+        }),
+      ]),
+    });
+
+    const operation = document.paths['/examples/search']?.query as Record<string, unknown> | undefined;
+    expect(operation?.operationId).toBe('example.example.search.search');
+    const requestBody = operation?.requestBody as { content?: Record<string, { schema?: unknown }> } | undefined;
+    expect(requestBody?.content?.['application/json']?.schema).toMatchObject({ type: 'object' });
+    expect(document.paths['/examples/search']?.post).toBeUndefined();
   });
 
   it('excludes private abilities and methods without REST metadata', () => {

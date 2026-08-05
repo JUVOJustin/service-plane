@@ -77,7 +77,7 @@ cloudflareServiceBinding({ abilityRpc: env.ASANA, binding: env.ASANA, id: 'asana
 This is always explicit — a service-binding stub answers any property access with a callable RPC
 proxy, so the presence of `connectAbility` proves nothing about the target.
 
-Both transports use the same ability wrapper: token verification, Zod validation, method scopes, handler call, and output validation.
+Both transports use the same ability wrapper: token verification, method scopes, input validation, handler call, and output validation.
 
 Native binding calls do not traverse the Hono middleware chain, but the ability handler still
 receives a real Hono `Context` with the ability's POST path, supplied bindings, and propagated

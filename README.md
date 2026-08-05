@@ -7,7 +7,7 @@ Ability-first service APIs for TypeScript services.
 - Services define schema-backed abilities.
 - The control plane issues short-lived capability tokens.
 - Cap'n Web carries RPC method calls over HTTP-batch, WebSocket, or Cloudflare bindings.
-- Zod schemas validate inputs and outputs.
+- Schemas validate inputs and outputs, using the validation library you already use.
 - Published abilities can become OpenAPI or MCP tools from the control plane.
 - Request ids and structured JSON logs correlate plane and service calls out of the box.
 
@@ -16,8 +16,16 @@ Service authors define abilities. Hono stays the HTTP shell for middleware, disc
 ## Install
 
 ```sh
-npm install service-plane hono @hono/capnweb capnweb zod
+npm install service-plane hono @hono/capnweb capnweb
 ```
+
+Ability schemas come from a validation library you choose; `service-plane` does not bundle or require any particular one. Add whichever you already use — anything implementing [Standard Schema](https://standardschema.dev) and its [Standard JSON Schema](https://standardschema.dev/json-schema) companion:
+
+```sh
+npm install arktype     # or zod, or @vinejs/vine, or valibot + @valibot/to-json-schema
+```
+
+See [Choosing A Validation Library](docs/service-creation.md#choosing-a-validation-library) for versions and the one wrapper Valibot needs. Code samples in this README and the docs use Zod so they stay concrete — that is an arbitrary choice, not a default.
 
 ## Minimal Service
 

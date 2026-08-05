@@ -30,3 +30,4 @@ export {
   websocketEnv,
 } from './env.js';
 export { type TestKeys, testKeys } from './keys.js';
+export { drainStream } from './streams.js';

@@ -2,7 +2,7 @@
 
 Goal: return many results over time from one ability method — large file transfers, long exports, incremental tool output — without inventing a wire protocol.
 
-Service Plane uses Cap'n Web's native stream support: a streaming method resolves to a standard `ReadableStream`, transferred over the RPC session with built-in flow control. Service Plane adds only its usual layer on top — per-item Zod validation, scopes, discovery, and projections.
+Service Plane uses Cap'n Web's native stream support: a streaming method resolves to a standard `ReadableStream`, transferred over the RPC session with built-in flow control. Service Plane adds only its usual layer on top — per-item schema validation, scopes, discovery, and projections.
 
 ## Declare A Streaming Method
 

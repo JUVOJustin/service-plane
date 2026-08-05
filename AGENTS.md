@@ -4,7 +4,7 @@
 
 This package is `service-plane`: a TypeScript library for ability-first service APIs. It provides primitives for:
 
-- Service-owned ability definitions with Zod input and output schemas.
+- Service-owned ability definitions with Standard Schema input and output schemas.
 - Cap'n Web RPC sessions over HTTP-batch, WebSocket, Cloudflare service bindings, and custom transports.
 - Control-plane issued capability tokens and JWKS verification.
 - Service discovery documents.
@@ -74,7 +74,7 @@ Before changing public API:
 - Match existing TypeScript style and Biome formatting.
 - Keep code comments short and explain why a boundary exists, not what each line does.
 - Prefer small, explicit helpers near the code that owns the behavior.
-- Use Zod schemas as the source of truth for ability input and output.
+- Use schemas as the source of truth for ability input and output. Ability schemas are Standard Schema values (`~standard.validate` plus `~standard.jsonSchema`), so no validation library is a dependency of this package. Tests use Zod; library code must not import it.
 - Use structured token claims, discovery fields, and typed options instead of ad hoc request parsing.
 - Keep service logic separate from control-plane logic. The service should verify and enforce; the control plane should issue, discover, broker, and project.
 - Do not edit generated `dist/` output unless the user specifically asks for built artifacts to be committed.
