@@ -57,6 +57,20 @@ export function createServiceRegistry(options: CreateServiceRegistryOptions): Se
       // turn a momentary outage into a catalog gap that outlives it by the full TTL — the service
       // comes back and the plane keeps refusing it until the entry expires. An incomplete discovery
       // is therefore used for this request and not written; the next request retries.
+      //
+      // Two things this deliberately does not do yet, both tracked in #28:
+      //
+      // `complete` is consumed here and then discarded. `ServiceDiscoverySnapshot` carries a `stale`
+      // flag that nothing currently sets or reads, and it is the natural place to hand this to
+      // callers — one that knows the catalog is partial can say so instead of leaving an operator to
+      // infer it from a missing target. Combined with the bare `catch` in `discoverServices`, which
+      // swallows every per-endpoint failure, a degraded catalog is invisible: nothing reports which
+      // service dropped out, or that one did at all.
+      //
+      // And the retry has no ceiling. One service unreachable for good — decommissioned but still
+      // configured, or serving a document that stopped validating — keeps `complete` false forever,
+      // so nothing is ever cached again and every route fans out over the whole catalog on every
+      // request. Right for a blip, unbounded for a permanent failure, and silent either way.
       if (complete) await options.cache?.set(cacheKey, snapshot, cacheTtlSeconds);
       return withAbilities(snapshot, options.services);
     },
