@@ -770,7 +770,14 @@ function normalizePath(path: string, source: string): string {
 function normalizeHttpMethod(method: ServiceHttpMethod): ServiceHttpMethod {
   if (typeof method !== 'string') throw new CapabilityAuthError('Service-Plane REST method cannot be empty', 500);
   const normalized = method.toLowerCase() as ServiceHttpMethod;
-  if (normalized !== 'delete' && normalized !== 'get' && normalized !== 'patch' && normalized !== 'post' && normalized !== 'put') {
+  if (
+    normalized !== 'delete' &&
+    normalized !== 'get' &&
+    normalized !== 'patch' &&
+    normalized !== 'post' &&
+    normalized !== 'put' &&
+    normalized !== 'query'
+  ) {
     throw new CapabilityAuthError(`Unknown Service-Plane REST method: ${method as string}`, 500);
   }
   return normalized;

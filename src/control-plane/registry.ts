@@ -232,7 +232,7 @@ function isAbilityTransport(value: unknown): value is AbilityTransport {
 }
 
 function isHttpMethod(value: unknown): value is ServiceHttpMethod {
-  return value === 'delete' || value === 'get' || value === 'patch' || value === 'post' || value === 'put';
+  return value === 'delete' || value === 'get' || value === 'patch' || value === 'post' || value === 'put' || value === 'query';
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
