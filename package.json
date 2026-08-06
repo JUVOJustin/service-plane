@@ -47,6 +47,8 @@
     "sync:skill-docs": "cp docs/*.md .apm/skills/service-plane/references/",
     "bench": "vitest bench --run",
     "test": "vitest run",
+    "smoke:build": "node scripts/smoke.mjs build",
+    "smoke:workerd": "node scripts/smoke.mjs workerd",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
     "prepare": "npm run build",
     "test:coverage": "vitest run --coverage"
@@ -73,7 +75,9 @@
     "@biomejs/biome": "2.5.7",
     "@types/node": "^26.1.2",
     "@vitest/coverage-v8": "^4.1.10",
+    "esbuild": "^0.28.1",
     "hono": "^4.13.0",
+    "miniflare": "^5.20260801.0-alpha",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10",
     "zod": "^4.4.3"

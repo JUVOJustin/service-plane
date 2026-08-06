@@ -53,3 +53,77 @@ jobs:
 
       - name: Test
         run: npm test
+
+      # The same bundle the other runtimes execute; run it on Node too so a
+      # bundling-only regression cannot hide behind a green vitest suite.
+      - name: Smoke (bundled)
+        run: npm run smoke:build && node smoke-dist/cli.mjs
+
+  # The portability claim, exercised for real: the full suite stays Node-only, while a bundled
+  # smoke (HTTP-batch end to end, streaming over a session transport, token verify both ways)
+  # runs on real workerd, Deno, and Bun. workerd and Deno take the setTimeout(0) batch-flush
+  # fallback; Bun proves the setImmediate fast path outside Node.
+  smoke-workerd:
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Smoke on workerd (miniflare)
+        run: npm run smoke:workerd
+
+  smoke-deno:
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Smoke on Deno
+        run: npm run smoke:build && deno run smoke-dist/cli.mjs
+
+  smoke-bun:
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Smoke on Bun
+        run: npm run smoke:build && bun smoke-dist/cli.mjs

@@ -12,3 +12,4 @@ apm_modules/
 .claude/skills/
 .agents/
 tick.mjs
+smoke-dist
