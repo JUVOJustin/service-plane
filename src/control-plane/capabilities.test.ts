@@ -89,8 +89,9 @@ describe('capability issuer', () => {
       privateJwks: [keys.privateJwk],
     });
 
+    // A delegated subject is a caller the plane fronts, so its tokens are plane-class.
     const issued = await issuer.issueCapabilityToken({
-      callerAccess: 'service',
+      callerAccess: 'plane',
       callerServiceId: 'control-plane',
       scopes: ['fizzy.users.lookup'],
       subject: { id: 'user-7', orgId: 'org-42' },
@@ -104,17 +105,29 @@ describe('capability issuer', () => {
         jwks: await issuer.jwks(),
         now: new Date('2026-05-09T12:00:01.000Z'),
       }),
-    ).resolves.toMatchObject({ serviceId: 'control-plane', subject: { id: 'user-7', orgId: 'org-42' } });
+    ).resolves.toMatchObject({ callerAccess: 'plane', serviceId: 'control-plane', subject: { id: 'user-7', orgId: 'org-42' } });
 
     await expect(
       issuer.issueCapabilityToken({
-        callerAccess: 'service',
+        callerAccess: 'plane',
         callerServiceId: 'control-plane',
         scopes: ['fizzy.users.lookup'],
         subject: { id: '  ' },
         targetServiceId: 'fizzy',
       }),
     ).rejects.toThrow('Invalid Service-Plane capability subject');
+
+    // The contradiction no surface can produce: a delegated end user attested as a service
+    // caller would pass every service-only access check. Refused at mint.
+    await expect(
+      issuer.issueCapabilityToken({
+        callerAccess: 'service',
+        callerServiceId: 'control-plane',
+        scopes: ['fizzy.users.lookup'],
+        subject: { id: 'user-7' },
+        targetServiceId: 'fizzy',
+      }),
+    ).rejects.toThrow('Service-Plane delegated subject requires a plane-class caller');
   });
 
   it('rejects unknown scopes and unauthorized grants', async () => {

@@ -474,6 +474,44 @@ describe('ability handler safety', () => {
     ).toThrow(`Service-Plane ability method name is reserved: example.bad/${methodName}`);
   });
 
+  it('enforces service-only access in the validating wrapper, so custom shells inherit it', () => {
+    const definition = defineAbilityService({
+      abilities: [
+        defineAbility({
+          access: 'service',
+          id: 'example.search',
+          methods: {
+            search: abilityMethod({
+              input: z.object({ query: z.string() }),
+              output: z.object({ results: z.array(z.string()) }),
+              scopes: ['example.search'],
+            }),
+          },
+          scopes: ['example.search'],
+          handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
+        }),
+      ],
+      capabilities,
+      id: 'example',
+      title: 'Example',
+      version: '0.1.0',
+    });
+    const ability = definition.abilities[0];
+    if (!ability) throw new Error('missing ability');
+
+    // A shell built straight from the primitives — no ServicePlaneService in front — still may
+    // not hand a plane-class caller a service-only ability.
+    expect(() =>
+      createValidatingAbilityHandler(ability, new RpcTarget() as RpcTarget & Record<string, unknown>, {
+        ...identity('cap_plane'),
+        callerAccess: 'plane',
+      }),
+    ).toThrow('Service-Plane ability is callable by services only: example.search');
+    expect(
+      createValidatingAbilityHandler(ability, new RpcTarget() as RpcTarget & Record<string, unknown>, identity('cap_service')),
+    ).toBeDefined();
+  });
+
   it('rejects handler factories that return a shared instance across sessions', () => {
     const ability = searchService().abilities[0];
     if (!ability) throw new Error('missing ability');

@@ -30,6 +30,7 @@ import {
   type NormalizedServiceAbility,
   type ServiceDefinition,
   serviceDiscoveryDocument,
+  verifyAbilityAccess,
 } from './discovery.js';
 import { type ServicePlaneLoggerOptions, type ServicePlaneLogVariables, servicePlaneLogger } from './logger.js';
 
@@ -207,6 +208,9 @@ class AuthRoot<TEnv extends Env> extends RpcTarget {
       ...(proof === undefined ? {} : { proof }),
     });
     await verifyServiceIngress(this.auth, this.ingress, identity, this.context);
+    // From the ability's own definition, before the handler factory runs. The broker checks the
+    // same rule from its cached catalog; this is the authoritative end, so tightening an ability
+    // to `access: 'service'` takes effect the moment the service deploys.
     verifyAbilityAccess(this.ability, identity);
     // Connection info is an unsigned assertion about a connection this service never saw, so it is
     // only trustworthy once the peer is proven to be the broker: ingress restricts the service to
@@ -221,15 +225,6 @@ class AuthRoot<TEnv extends Env> extends RpcTarget {
     });
     return createValidatingAbilityHandler(this.ability, handler, identity, { allowStreaming: this.allowStreaming });
   }
-}
-
-// The broker decides this too, but from a catalog it caches. Here the ability's own definition is
-// the input, so tightening an ability to `access: 'service'` takes effect the moment the service
-// deploys instead of when the plane's cache expires. Checked before handler creation, next to
-// ingress, because both are questions about the peer rather than about the call.
-function verifyAbilityAccess<TEnv extends Env>(ability: NormalizedServiceAbility<TEnv>, identity: CapabilityIdentity): void {
-  if (ability.access !== 'service' || identity.callerAccess === 'service') return;
-  throw new CapabilityAuthError(`Service-Plane ability is callable by services only: ${ability.id}`, 403);
 }
 
 async function serviceVerifier<TEnv extends Env>(

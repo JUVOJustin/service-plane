@@ -19,6 +19,7 @@ import {
   type CapabilitySubject,
   DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
   type IssuedCapabilityToken,
+  isAbilityAccess,
   MAX_CAPABILITY_TOKEN_TTL_SECONDS,
   SERVICE_PLANE_AUTHORIZATION_SCHEME,
   type VerifyCapabilityTokenOptions,
@@ -185,7 +186,7 @@ function parseCapabilityClaims(value: unknown): CapabilityClaims {
     typeof sub !== 'string' ||
     // An unreadable access claim is refused rather than dropped: silently ignoring it would read the
     // token as plane-class and make a service caller's own call fail, which looks like a grant bug.
-    !(spa === undefined || spa === 'plane' || spa === 'service') ||
+    !(spa === undefined || isAbilityAccess(spa)) ||
     !(spb === undefined || typeof spb === 'string') ||
     !Array.isArray(scp) ||
     scp.length === 0 ||

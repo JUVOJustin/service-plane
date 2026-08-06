@@ -5,7 +5,15 @@ import type { ConnInfo } from '../shared/conn-info.js';
 import { CapabilityAuthError } from '../shared/errors.js';
 import type { ServicePlaneBrokerLogEvent } from '../shared/logging.js';
 import { isOriginRelativePath } from '../shared/paths.js';
-import type { AbilityAccess, CapabilitySubject, DiscoveredServiceAbility, ServiceEndpoint, ServiceRegistry } from '../shared/types.js';
+import type {
+  AbilityAccess,
+  CapabilitySubject,
+  DiscoveredServiceAbility,
+  IssueCapabilityTokenInput,
+  IssuedCapabilityToken,
+  ServiceEndpoint,
+  ServiceRegistry,
+} from '../shared/types.js';
 import type { CapabilityIssuer } from './capabilities.js';
 import { createServiceRegistry } from './registry.js';
 
@@ -35,6 +43,27 @@ export function brokerCallerSubject(caller: BrokerCaller | undefined): Capabilit
  */
 export function brokerCallerAccess(caller: BrokerCaller | undefined): AbilityAccess {
   return caller?.kind === 'service' ? 'service' : 'plane';
+}
+
+/**
+ * One token requester for broker and MCP so the brokered-vs-plain fork and the caller-class stamp
+ * cannot drift between the two mounts — the same anti-drift contract as `transportForAbility` and
+ * `brokerCallerLogFields`. Minting brokered tokens for ingress-required targets and stamping the
+ * resolver's caller class are both security-relevant, so they live in exactly one place.
+ */
+export function brokerRequestToken(options: {
+  ability: DiscoveredServiceAbility;
+  brokerServiceId: string;
+  caller: BrokerCaller | undefined;
+  issuer: CapabilityIssuer;
+}): (input: IssueCapabilityTokenInput) => Promise<IssuedCapabilityToken> {
+  const callerAccess = brokerCallerAccess(options.caller);
+  return (input) => {
+    const request = { ...input, callerAccess };
+    return options.ability.serviceIngress?.required
+      ? options.issuer.issueBrokeredCapabilityToken({ ...request, brokerServiceId: options.brokerServiceId })
+      : options.issuer.issueCapabilityToken(request);
+  };
 }
 
 /**
@@ -187,12 +216,12 @@ class BrokeredAbility extends RpcTarget {
         ...(subject ? { subject } : {}),
         ...(rejectStreamMethods && rejectStreamMethods.length > 0 ? { rejectStreamMethods } : {}),
         ...(this.input.requestId ? { requestId: this.input.requestId } : {}),
-        requestToken: (input) => {
-          const issued = { ...input, callerAccess: brokerCallerAccess(this.input.caller) };
-          return brokered
-            ? this.input.issuer.issueBrokeredCapabilityToken({ ...issued, brokerServiceId: this.input.brokerServiceId })
-            : this.input.issuer.issueCapabilityToken(issued);
-        },
+        requestToken: brokerRequestToken({
+          ability: this.input.ability,
+          brokerServiceId: this.input.brokerServiceId,
+          caller: this.input.caller,
+          issuer: this.input.issuer,
+        }),
         scopes: requested,
         targetServiceId: this.input.ability.serviceId,
         // Streaming methods are rejected outright when the caller's leg cannot carry a stream, so

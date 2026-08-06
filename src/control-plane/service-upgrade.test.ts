@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import * as z from 'zod';
 import { abilityMethod, defineAbility, RpcTarget, requireScopes } from '../service/index.js';
 import type { AbilityAccess } from '../shared/types.js';
-import { DEMO_CALLER_ID, type DemoApp, type DemoReplica, type DemoServiceSpec, demoApp } from '../test-support/index.js';
+import { DEMO_CALLER_ID, type DemoApp, type DemoServiceSpec, demoApp } from '../test-support/index.js';
 import { memoryRegistryCache } from './registry.js';
 
 // One plane, two independently deployed services. `beta` is redeployed mid-test with a renamed
@@ -114,7 +114,7 @@ describe('one service tightens its access', () => {
       services: [jobsService('alpha', 'alpha.run')],
     });
     const cached = app.replica(0);
-    await expect(runBrokeredOn(cached, 'alpha', 'alpha.run')).resolves.toMatchObject({ service: 'alpha' });
+    await expect(runBrokered(cached, 'alpha', 'alpha.run')).resolves.toMatchObject({ service: 'alpha' });
 
     // `alpha` redeploys as service-only. Replica 0 keeps serving the snapshot it cached.
     const tightened = jobsService('alpha', 'alpha.run', 'service');
@@ -122,10 +122,10 @@ describe('one service tightens its access', () => {
 
     // The broker still brokers it — its catalog says `plane` — and the service refuses the call it
     // was handed. Before this check the same call succeeded for the rest of the cache TTL.
-    await expect(runBrokeredOn(cached, 'alpha', 'alpha.run')).rejects.toThrow('callable by services only');
+    await expect(runBrokered(cached, 'alpha', 'alpha.run')).rejects.toThrow('callable by services only');
 
     // The replica that sees the new catalog refuses earlier, at the broker.
-    await expect(runBrokeredOn(app.replica(1), 'alpha', 'alpha.run')).rejects.toThrow('requires service access');
+    await expect(runBrokered(app.replica(1), 'alpha', 'alpha.run')).rejects.toThrow('requires service access');
   });
 
   it('keeps the tightened ability reachable for a service caller', async () => {
@@ -151,13 +151,9 @@ function runDirect(app: DemoApp, serviceId: string, scope: string) {
   return app.session<JobsApiShape>(serviceId, `${serviceId}.jobs`, [scope]).then((session) => session.run({ job: 'nightly' }));
 }
 
-function runBrokered(app: DemoApp, serviceId: string, scope: string) {
-  return app.brokerRoot<JobsApiShape>().ability(serviceId, `${serviceId}.jobs`).connect([scope]).run({ job: 'nightly' });
-}
-
-// The same call against one named replica, for tests whose subject is what that replica has cached.
-function runBrokeredOn(replica: DemoReplica, serviceId: string, scope: string) {
-  return replica.brokerRoot<JobsApiShape>().ability(serviceId, `${serviceId}.jobs`).connect([scope]).run({ job: 'nightly' });
+// Structural on brokerRoot so the whole app (its load balancer) and one pinned replica read the same.
+function runBrokered(on: Pick<DemoApp, 'brokerRoot'>, serviceId: string, scope: string) {
+  return on.brokerRoot<JobsApiShape>().ability(serviceId, `${serviceId}.jobs`).connect([scope]).run({ job: 'nightly' });
 }
 
 class JobsApi extends RpcTarget {

@@ -18,6 +18,7 @@ import {
   DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
   type IssueCapabilityTokenInput,
   type IssuedCapabilityToken,
+  isAbilityAccess,
   MAX_CAPABILITY_TOKEN_TTL_SECONDS,
   SERVICE_PLANE_CAPABILITY_JWKS_PATH,
   SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
@@ -244,6 +245,13 @@ function issueCapabilityToken(options: {
       ? options.maxTtlSeconds
       : Math.min(normalizeTtlSeconds(options.input.ttlSeconds, 400), options.maxTtlSeconds);
   const subject = options.input.subject === undefined ? undefined : normalizeCapabilitySubject(options.input.subject);
+  // A delegated subject exists only for callers the plane fronts, so it can never ride a
+  // service-class token — the pair would hand an end user service-only reach at every service in
+  // the fleet. No shipped surface can produce it; refuse it here so a custom brokering path that
+  // stamps 'service' uniformly cannot mint the contradiction by accident.
+  if (subject && options.input.callerAccess === 'service') {
+    throw new CapabilityAuthError('Service-Plane delegated subject requires a plane-class caller', 500);
+  }
 
   // RFC 8693 delegation: with a subject, sub carries the end user and act names the acting service.
   // RFC 7800 `cnf`: present only when the caller authenticated with a key, sender-constraining the
@@ -378,11 +386,12 @@ export function mountCapabilityJwksEndpoint(
   );
 }
 
-// Refused rather than defaulted: a plane whose issuer is reached through an untyped edge (a service
-// binding, a hand-rolled RPC entrypoint) would otherwise mint tokens that silently claim the wrong
-// caller class, and the mistake would only surface as an unexplained 403 at some service.
+// Mirrors the verifier's claim check at mint time, like signCapabilityToken's spo/act guard: an
+// untyped edge (a service binding, a hand-rolled RPC entrypoint) that omits or garbles the class
+// would otherwise sign cleanly and fail later, at every verifying service, as a generic
+// invalid-claims 401 — refusing here names the actual mistake.
 function normalizeCallerAccess(callerAccess: AbilityAccess): AbilityAccess {
-  if (callerAccess !== 'plane' && callerAccess !== 'service') {
+  if (!isAbilityAccess(callerAccess)) {
     throw new CapabilityAuthError(`Unknown Service-Plane caller access: ${String(callerAccess)}`, 500);
   }
   return callerAccess;

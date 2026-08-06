@@ -1,10 +1,12 @@
 import { RpcSession } from 'capnweb';
 import { describe, expect, it } from 'vitest';
-import { createCapabilityIssuer, defineServiceGrants } from '../control-plane/capabilities.js';
+import { type CapabilityIssuer, createCapabilityIssuer, defineServiceGrants } from '../control-plane/capabilities.js';
 import { testKeys } from '../test-support/index.js';
 import { memoryCapabilityTokenCache, memoryRpcTransportPair } from '../testing/index.js';
 import {
   bindCapabilityIdentity,
+  type ControlPlaneRpcTokenBinding,
+  type CreateCapabilityTokenProviderOptions,
   capabilityIdentity,
   capabilityRpcSession,
   capabilityTokenCacheKey,
@@ -427,6 +429,19 @@ describe('Cap’n Web service capabilities', () => {
 
     await expect(api.ping()).resolves.toBe('pong');
     await disposeAbilitySession(api);
+  });
+
+  it('refuses a raw CapabilityIssuer at the requester seams at compile time', () => {
+    // Pins the property-function declarations on both seams: with method syntax TypeScript
+    // compares parameters bivariantly, so a raw issuer — whose input additionally requires
+    // callerAccess — would compile here and then throw a 500 on the first token request.
+    const issuer = { issueCapabilityToken: async () => ({ expiresAt: new Date(), token: 't' }) } as unknown as CapabilityIssuer;
+    // @ts-expect-error a raw issuer must not satisfy the RPC token binding seam
+    const binding: ControlPlaneRpcTokenBinding = issuer;
+    // @ts-expect-error a raw issuer method must not satisfy requestToken
+    const requestToken: CreateCapabilityTokenProviderOptions['requestToken'] = issuer.issueCapabilityToken;
+    expect(binding).toBe(issuer);
+    expect(requestToken).toBe(issuer.issueCapabilityToken);
   });
 });
 

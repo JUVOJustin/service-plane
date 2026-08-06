@@ -17,7 +17,14 @@ import {
   type ServiceRegistry,
   type ServiceRegistrySnapshot,
 } from '../shared/types.js';
-import { type BrokerCaller, brokerCallerAccess, brokerCallerLogFields, brokerCallerSubject, transportForAbility } from './broker.js';
+import {
+  type BrokerCaller,
+  brokerCallerAccess,
+  brokerCallerLogFields,
+  brokerCallerSubject,
+  brokerRequestToken,
+  transportForAbility,
+} from './broker.js';
 import type { CapabilityIssuer } from './capabilities.js';
 
 export type ControlPlaneMcpServerInfo = {
@@ -660,12 +667,12 @@ async function openMethodSession(
     ...(options.connInfo ? { connInfo: options.connInfo } : {}),
     ...(subject ? { subject } : {}),
     ...(options.requestId ? { requestId: options.requestId } : {}),
-    requestToken: (tokenInput) => {
-      const issued = { ...tokenInput, callerAccess: brokerCallerAccess(options.caller) };
-      return match.ability.serviceIngress?.required
-        ? options.issuer.issueBrokeredCapabilityToken({ ...issued, brokerServiceId: options.controlPlaneServiceId })
-        : options.issuer.issueCapabilityToken(issued);
-    },
+    requestToken: brokerRequestToken({
+      ability: match.ability,
+      brokerServiceId: options.controlPlaneServiceId,
+      caller: options.caller,
+      issuer: options.issuer,
+    }),
     scopes: match.scopes,
     targetServiceId: match.ability.serviceId,
     transport: transportForAbility(match.ability, {

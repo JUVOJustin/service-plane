@@ -1,10 +1,10 @@
 import { isOriginRelativePath } from '../shared/paths.js';
 import {
-  type AbilityAccess,
   type AbilityExposure,
   type AbilityTransport,
   DEFAULT_REGISTRY_CACHE_TTL_SECONDS,
   type DiscoveredServiceAbility,
+  isAbilityAccess,
   type RegistryCache,
   SERVICE_DISCOVERY_PATH,
   type ServiceAbilityDiscovery,
@@ -288,10 +288,6 @@ function isAbilityMethodDiscovery(value: unknown): value is ServiceAbilityMethod
 
 function isAbilityExposure(value: unknown): value is AbilityExposure {
   return value === 'private' || value === 'published';
-}
-
-function isAbilityAccess(value: unknown): value is AbilityAccess {
-  return value === 'plane' || value === 'service';
 }
 
 function isAbilityTransport(value: unknown): value is AbilityTransport {

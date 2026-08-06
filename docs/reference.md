@@ -263,7 +263,7 @@ Delegated (user-brokered) token:
 | `iss` | control-plane issuer → `identity.issuer` | same |
 | `aud` | target service id → `identity.audience` | same |
 | `scp` | granted scopes → `identity.scopes` | same |
-| `spa` | caller access class → `identity.callerAccess`; `'service'` here | `'plane'` — the plane fronts the caller |
+| `spa` | caller access class → `identity.callerAccess`; `'service'` in the example above, `'plane'` when the plane calls without a service caller (e.g. an anonymous broker) | always `'plane'` — a delegated subject is a fronted caller, and the issuer refuses the other pairing |
 | `spb` | broker service id on brokered (ingress) tokens → `identity.brokerServiceId` | same |
 | `cnf` | `{ jkt }` on tokens bound to a caller key (always, for JWK callers) → `identity.confirmation`, only after a matching proof verified | same |
 | `jti` | token id → `identity.tokenId` | same |
@@ -272,6 +272,8 @@ Delegated (user-brokered) token:
 The `act` delegation relationship comes from RFC 8693 and `cnf` from RFC 7800 (with the `jkt` confirmation method registered by RFC 9449). `scp`, `spa`, `spo`, and `spb` are Service Plane-specific claims, and `/.well-known/service-plane/capability-token` is the package's JSON capability endpoint, not an RFC 8693 token-exchange endpoint.
 
 `spa` is the access class the control plane authenticated for the caller. It is `service` for a caller the plane proved to be another service — the capability-token endpoint, `issueCapabilityTokenForCaller`, and a broker or MCP caller resolver returning `kind: 'service'` — and `plane` for every caller the plane fronts itself: users, API keys, anonymous traffic. Services compare it against the ability's own `access` and reject a mismatch with 403 before the handler is created. A token carrying no `spa` reads as `plane`, so a control plane that predates the claim can only reach `access: 'plane'` abilities.
+
+That default dictates the rollout order: **upgrade the control plane before any service declares `access: 'service'`.** A service on this version behind an older plane refuses every caller of its service-only abilities — legitimate service callers included — until the plane mints the claim. The reverse mix is the transitional gap, not a hole in the new guarantee: a *service* still on an older package version never checks `spa`, so for that service tightening `access` keeps depending on the plane's catalog refresh until the service upgrades.
 
 Delegated subjects are minted only by control-plane code — the broker/MCP caller resolver (a `BrokerCaller` with `kind: 'user'` and optional `orgId`) or a direct `issueCapabilityToken({ subject, ... })` call. The capability-token endpoint and `issueCapabilityTokenForCaller` reject caller-supplied subjects with 403, and the shipped token requesters fail fast locally instead of transmitting one. Direct issue mints a non-brokered token, so ingress-required targets must be reached through the broker, which selects `issueBrokeredCapabilityToken` automatically. See [auth](auth.md#subject-delegation).
 
