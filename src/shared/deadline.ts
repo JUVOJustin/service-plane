@@ -18,6 +18,53 @@ export const SERVICE_PLANE_TIMEOUT_QUERY_PARAM = 'timeout';
 export const MAX_SERVICE_PLANE_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
+ * How long one unary ability method may run when nobody configured anything.
+ *
+ * A deadline nobody sets is a deadline nobody has: gRPC and Connect leave this to the caller, and
+ * gRPC's own guidance is the standing reminder to "always set a deadline" — a rule that exists
+ * because the unset case is unbounded. Systems that own a default instead do not need the reminder:
+ * Envoy routes time out at 15s, Armeria's server request timeout is 10s. 10s matches the closest
+ * analogue, a server bounding its own request handling.
+ *
+ * Per call and per method, never per session, for the reason Envoy documents about its route
+ * timeout: a bound that suits a request is wrong for a stream. Streaming methods are exempt, and
+ * session lifetime is untouched.
+ */
+export const DEFAULT_ABILITY_TIMEOUT_MS = 10_000;
+
+/**
+ * Added to a caller's own local wait, on top of the budget it forwards.
+ *
+ * Armeria defaults its client response timeout (15s) above its server request timeout (10s) so a
+ * server-side timeout produces a real response instead of the client giving up first. Same idea: the
+ * service's own enforcement should win, so the caller sees a `timeout` error the service actually
+ * raised rather than a local abort that tells it nothing about what happened downstream.
+ */
+export const SERVICE_PLANE_TIMEOUT_GRACE_MS = 250;
+
+/**
+ * Policy for turning a requested budget into an effective one: a default when nothing was asked
+ * for, and a ceiling on what may be asked.
+ */
+export type ServicePlaneTimeoutPolicy = {
+  /**
+   * Applied when the caller sent no budget of its own.
+   */
+  defaultMs?: number;
+  /**
+   * Clamps a caller-supplied budget. Clamped rather than refused, like the package-wide ceiling.
+   */
+  maxMs?: number;
+};
+
+export function resolveTimeoutMs(requested: number | undefined, policy: ServicePlaneTimeoutPolicy | undefined): number | undefined {
+  const asked = normalizeTimeoutMs(requested) ?? normalizeTimeoutMs(policy?.defaultMs);
+  if (asked === undefined) return undefined;
+  const max = normalizeTimeoutMs(policy?.maxMs);
+  return max === undefined ? asked : Math.min(asked, max);
+}
+
+/**
  * Applied on both send and receive, like conn info: the plane must not emit a value the service
  * would reject, and the service must not trust a value merely because it arrived from the plane.
  * Returns undefined for anything that is not a usable positive budget.

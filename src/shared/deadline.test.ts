@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { MAX_SERVICE_PLANE_TIMEOUT_MS, normalizeTimeoutMs, parseTimeoutMs, remainingTimeoutMs, serializeTimeoutMs } from './deadline.js';
+import {
+  MAX_SERVICE_PLANE_TIMEOUT_MS,
+  normalizeTimeoutMs,
+  parseTimeoutMs,
+  remainingTimeoutMs,
+  resolveTimeoutMs,
+  serializeTimeoutMs,
+} from './deadline.js';
 
 describe('normalizeTimeoutMs', () => {
   it('keeps a usable budget and clamps one above the ceiling', () => {
@@ -54,5 +61,26 @@ describe('remainingTimeoutMs', () => {
   it('ignores a nonsensical elapsed reading instead of inventing budget', () => {
     expect(remainingTimeoutMs(1_000, -50)).toBe(1_000);
     expect(remainingTimeoutMs(1_000, Number.NaN)).toBe(1_000);
+  });
+});
+
+describe('resolveTimeoutMs', () => {
+  it('supplies a default only when the caller asked for nothing', () => {
+    expect(resolveTimeoutMs(undefined, { defaultMs: 10_000 })).toBe(10_000);
+    expect(resolveTimeoutMs(2_000, { defaultMs: 10_000 })).toBe(2_000);
+  });
+
+  it('clamps what a caller may ask for rather than refusing it', () => {
+    expect(resolveTimeoutMs(90_000, { maxMs: 30_000 })).toBe(30_000);
+    expect(resolveTimeoutMs(5_000, { maxMs: 30_000 })).toBe(5_000);
+  });
+
+  it('applies the ceiling to the default too', () => {
+    expect(resolveTimeoutMs(undefined, { defaultMs: 60_000, maxMs: 30_000 })).toBe(30_000);
+  });
+
+  it('stays unbounded when no policy and no request say otherwise', () => {
+    expect(resolveTimeoutMs(undefined, undefined)).toBeUndefined();
+    expect(resolveTimeoutMs(undefined, {})).toBeUndefined();
   });
 });

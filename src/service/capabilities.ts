@@ -23,6 +23,7 @@ import {
 } from '../shared/conn-info.js';
 import {
   normalizeTimeoutMs,
+  SERVICE_PLANE_TIMEOUT_GRACE_MS,
   SERVICE_PLANE_TIMEOUT_HEADER,
   SERVICE_PLANE_TIMEOUT_QUERY_PARAM,
   serializeTimeoutMs,
@@ -590,7 +591,9 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
         // The remote peer keeps working after a local timeout — Cap'n Web has no cancel message, so
         // this frees the caller rather than the callee. The same budget travels to the service,
         // which is what actually stops the handler.
-        return timeoutMs === undefined ? call : withCallDeadline(call, timeoutMs, property);
+        // Grace on top of the forwarded budget so the service's own deadline fires first and the
+        // caller gets the error the service actually raised, not a bare local abort.
+        return timeoutMs === undefined ? call : withCallDeadline(call, timeoutMs + SERVICE_PLANE_TIMEOUT_GRACE_MS, property);
       };
     },
     // Cap'n Web only retains and remotely disposes an RpcTarget when Symbol.dispose is visible

@@ -4,7 +4,14 @@ import { etag } from 'hono/etag';
 import { type RequestIdVariables, requestId } from 'hono/request-id';
 import type { UpgradeWebSocket } from 'hono/ws';
 import { type ConnInfo, normalizeConnInfo } from '../shared/conn-info.js';
-import { parseTimeoutMs, remainingTimeoutMs, SERVICE_PLANE_TIMEOUT_HEADER, SERVICE_PLANE_TIMEOUT_QUERY_PARAM } from '../shared/deadline.js';
+import {
+  parseTimeoutMs,
+  remainingTimeoutMs,
+  resolveTimeoutMs,
+  SERVICE_PLANE_TIMEOUT_HEADER,
+  SERVICE_PLANE_TIMEOUT_QUERY_PARAM,
+  type ServicePlaneTimeoutPolicy,
+} from '../shared/deadline.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
 import {
   normalizeIdempotencyKey,
@@ -192,6 +199,16 @@ export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
    * downtime.
    */
   signingKeys: (bindings: TEnv['Bindings'], context: Context<TEnv>) => CapabilitySigningKey[] | Promise<CapabilitySigningKey[]>;
+  /**
+   * Policy for the deadline the plane forwards. `defaultMs` bounds callers that send none of their
+   * own; `maxMs` clamps one that asks for more than this plane is willing to hold a connection for.
+   *
+   * There is no built-in default here on purpose. The plane forwards a budget rather than doing the
+   * work, so the bound that must always exist belongs at the service, where
+   * `DEFAULT_ABILITY_TIMEOUT_MS` already applies it per method. Set `defaultMs` when the plane
+   * itself should be the policy point — the role Envoy's route timeout plays.
+   */
+  timeout?: ServicePlaneTimeoutPolicy;
   ttlSeconds?: number;
 };
 
@@ -393,7 +410,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       }),
       idempotencyKey: brokerIdempotencyKey(context),
       requestId: brokerRequestId(context),
-      timeoutMs: brokerTimeoutMs(context),
+      timeoutMs: resolveTimeoutMs(brokerTimeoutMs(context), this.options.timeout),
     };
   }
 

@@ -11,9 +11,9 @@ import {
   SERVICE_PLANE_CONN_INFO_QUERY_PARAM,
 } from '../shared/conn-info.js';
 import {
-  normalizeTimeoutMs,
   parseTimeoutMs,
   remainingTimeoutMs,
+  resolveTimeoutMs,
   SERVICE_PLANE_TIMEOUT_HEADER,
   SERVICE_PLANE_TIMEOUT_QUERY_PARAM,
 } from '../shared/deadline.js';
@@ -76,6 +76,22 @@ export type ServicePlaneServiceOptions<TEnv extends Env = Env> = DefineServiceIn
     rpc?: {
       upgradeWebSocket?: UpgradeWebSocket;
     };
+    /**
+     * Bounds how long work runs here, so a service is not left unbounded by callers that send no
+     * deadline of their own.
+     *
+     * `methodMs` is a per-call ceiling on every unary method, defaulting to
+     * `DEFAULT_ABILITY_TIMEOUT_MS` (10s, matching Armeria's server request timeout). Override one
+     * slow method with `timeoutMs` on the method rather than raising this for everything, and use
+     * `false` to opt the whole service out. Streaming methods are never bounded this way.
+     *
+     * `maxMs` clamps a budget a caller forwarded; `defaultMs` supplies one when a caller sent none.
+     */
+    timeout?: {
+      defaultMs?: number;
+      maxMs?: number;
+      methodMs?: false | number;
+    };
   };
 
 /**
@@ -88,7 +104,10 @@ export class ServicePlaneService<TEnv extends Env = Env> {
 
   constructor(private readonly options: ServicePlaneServiceOptions<TEnv>) {
     this.app = (options.app ?? new Hono<ServicePlaneServiceEnv<TEnv>>()) as Hono<ServicePlaneServiceEnv<TEnv>>;
-    this.definition = defineAbilityService(options, { requireAbilityScopes: options.requireAbilityScopes ?? true });
+    this.definition = defineAbilityService(options, {
+      ...(options.timeout?.methodMs === undefined ? {} : { defaultMethodTimeoutMs: options.timeout.methodMs }),
+      requireAbilityScopes: options.requireAbilityScopes ?? true,
+    });
     this.discoveryPath = options.discoveryPath ?? SERVICE_DISCOVERY_PATH;
 
     // @hono/capnweb answers upgrades with 400 unless an upgradeWebSocket helper is wired in,
@@ -159,7 +178,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
       context,
       true,
       input.connInfo,
-      normalizeTimeoutMs(input.timeoutMs),
+      resolveTimeoutMs(input.timeoutMs, this.options.timeout),
       normalizeIdempotencyKey(input.idempotencyKey),
     );
     return root.authenticate(input.token, input.proof);
@@ -207,7 +226,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
           context as unknown as Context<TEnv>,
           upgrade,
           forwardedConnInfo(context),
-          forwardedTimeoutMs(context),
+          resolveTimeoutMs(forwardedTimeoutMs(context), this.options.timeout),
           forwardedIdempotencyKey(context),
         ),
         this.options.rpc,

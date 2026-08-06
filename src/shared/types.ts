@@ -106,6 +106,12 @@ export type ServiceAbilityMethodDiscovery = {
    * transport; `outputSchema` then describes one streamed item, not the whole response.
    */
   stream?: true;
+  /**
+   * How long this method may run, in milliseconds, independent of any caller budget. Advertised so
+   * a gateway can size its own wait against it. Absent on streaming methods, which are not bounded
+   * this way.
+   */
+  timeoutMs?: number;
 };
 
 export type ServiceAbilityDiscovery = {

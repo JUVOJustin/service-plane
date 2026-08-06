@@ -2,6 +2,7 @@ import type { StandardJSONSchemaV1, StandardSchemaV1 } from '@standard-schema/sp
 import { RpcPromise, RpcTarget } from 'capnweb';
 import type { Context, Env } from 'hono';
 import type { ConnInfo } from '../shared/conn-info.js';
+import { DEFAULT_ABILITY_TIMEOUT_MS, normalizeTimeoutMs } from '../shared/deadline.js';
 import {
   AbilityValidationError,
   type AbilityValidationIssue,
@@ -64,6 +65,12 @@ export type AbilityMethodDefinition<TInput extends AbilitySchema = AbilitySchema
    * Cap'n Web session instead of one value; `output` validates each item.
    */
   stream?: true;
+  /**
+   * How long this method may run, overriding the service-wide ceiling. Set it on the one export
+   * that legitimately takes minutes rather than raising the ceiling for everything. Ignored on
+   * streaming methods. `0` removes the ceiling for this method.
+   */
+  timeoutMs?: number;
 };
 
 export type AbilityMethodDefinitions = Record<string, AbilityMethodDefinition>;
@@ -207,6 +214,10 @@ export type DefineServiceInput<TEnv extends Env = Env> = Omit<ServiceDefinition<
 };
 
 export type DefineServiceOptions = {
+  /**
+   * Ceiling applied to every unary method that does not set its own `timeoutMs`. `false` removes it.
+   */
+  defaultMethodTimeoutMs?: false | number;
   requireAbilityScopes?: boolean;
 };
 
@@ -230,7 +241,13 @@ export function defineAbilityService<TEnv extends Env = Env>(
 ): ServiceDefinition<TEnv> {
   const serviceId = normalizeValue(input.id, 'service id');
   const service: ServiceDefinition<TEnv> = {
-    abilities: normalizeAbilities(serviceId, input.abilities, input.capabilities, options.requireAbilityScopes ?? true),
+    abilities: normalizeAbilities(
+      serviceId,
+      input.abilities,
+      input.capabilities,
+      options.requireAbilityScopes ?? true,
+      options.defaultMethodTimeoutMs === undefined ? DEFAULT_ABILITY_TIMEOUT_MS : options.defaultMethodTimeoutMs,
+    ),
     ...(input.callerAuth ? { callerAuth: input.callerAuth } : {}),
     ...(input.capabilities ? { capabilities: input.capabilities } : {}),
     id: serviceId,
@@ -365,7 +382,15 @@ async function invokeValidatingAbilityMethod(target: RpcTarget, methodName: stri
   assertDeadlineNotExceeded(state.signal, methodName);
   let output: unknown;
   try {
-    output = await abortableAbilityCall(implementation.call(state.handler, input), state.signal, methodName);
+    // Two independent bounds, whichever fires first: the caller's session budget and this method's
+    // own ceiling. Layered the way Envoy layers a route timeout under a client's, so a service stays
+    // bounded even when nobody upstream set anything.
+    output = await abortableAbilityCall(
+      implementation.call(state.handler, input),
+      state.signal,
+      methodName,
+      method.stream ? undefined : method.timeoutMs,
+    );
   } catch (error) {
     throw abilityHandlerFailure(error, methodName);
   }
@@ -403,20 +428,36 @@ function assertDeadlineNotExceeded(signal: AbortSignal | undefined, methodName: 
 // honours its `signal` stops on its own. What this guarantees is the contract the caller was given:
 // the method never resolves after the budget is gone. The losing outcome stays handled so a late
 // rejection cannot surface as an unhandled one.
-function abortableAbilityCall(call: unknown, signal: AbortSignal | undefined, methodName: string): Promise<unknown> {
+function abortableAbilityCall(
+  call: unknown,
+  signal: AbortSignal | undefined,
+  methodName: string,
+  ceilingMs: number | undefined,
+): Promise<unknown> {
   const settled = Promise.resolve(call);
-  if (!signal) return settled;
+  if (!signal && ceilingMs === undefined) return settled;
   return new Promise<unknown>((resolve, reject) => {
     const onAbort = () =>
       reject(new ServicePlaneTimeoutError(`Service-Plane ability method exceeded its caller's deadline: ${methodName}`));
-    signal.addEventListener('abort', onAbort, { once: true });
+    signal?.addEventListener('abort', onAbort, { once: true });
+    const timer =
+      ceilingMs === undefined
+        ? undefined
+        : setTimeout(
+            () => reject(new ServicePlaneTimeoutError(`Service-Plane ability method exceeded its ${ceilingMs}ms limit: ${methodName}`)),
+            ceilingMs,
+          );
+    const release = () => {
+      signal?.removeEventListener('abort', onAbort);
+      if (timer !== undefined) clearTimeout(timer);
+    };
     settled.then(
       (value) => {
-        signal.removeEventListener('abort', onAbort);
+        release();
         resolve(value);
       },
       (error: unknown) => {
-        signal.removeEventListener('abort', onAbort);
+        release();
         reject(error as Error);
       },
     );
@@ -593,6 +634,7 @@ function normalizeAbilities<TEnv extends Env>(
   abilities: Array<AnyServiceAbilityDefinition<TEnv>>,
   capabilities: CapabilityCatalog | undefined,
   requireAbilityScopes: boolean,
+  defaultMethodTimeoutMs: false | number,
 ): NormalizedServiceAbility<TEnv>[] {
   if (abilities.length === 0) {
     throw new CapabilityAuthError('Service-Plane service must define at least one ability', 500);
@@ -616,7 +658,16 @@ function normalizeAbilities<TEnv extends Env>(
     }
     validateKnownScopes(scopes, knownScopes, capabilities, `Service-Plane ability requires unknown scope`);
 
-    const methods = normalizeMethods(serviceId, id, ability.methods, scopes, knownScopes, capabilities, requireAbilityScopes);
+    const methods = normalizeMethods(
+      serviceId,
+      id,
+      ability.methods,
+      scopes,
+      knownScopes,
+      capabilities,
+      requireAbilityScopes,
+      defaultMethodTimeoutMs,
+    );
     const path = normalizePath(ability.rpc?.path ?? defaultAbilityRpcPath(id), id);
     if (seenPaths.has(path)) throw new CapabilityAuthError(`Duplicate Service-Plane ability RPC path: ${path}`, 500);
     seenPaths.add(path);
@@ -666,6 +717,7 @@ function normalizeMethods(
   knownScopes: Set<string>,
   capabilities: CapabilityCatalog | undefined,
   requireAbilityScopes: boolean,
+  defaultMethodTimeoutMs: false | number,
 ): Record<string, NormalizedAbilityMethodDefinition> {
   const names = Object.keys(methods);
   if (names.length === 0) throw new CapabilityAuthError(`Service-Plane ability must define at least one method: ${abilityId}`, 500);
@@ -702,6 +754,14 @@ function normalizeMethods(
         // no REST serving semantics here.
         throw new CapabilityAuthError(`Service-Plane streaming method cannot project a REST operation: ${abilityId}/${name}`, 500);
       }
+      // Resolved once here rather than per call: a streaming method is exempt (the bound that suits
+      // a request is wrong for a stream), an explicit 0 opts out, and anything else falls back to
+      // the service-wide ceiling.
+      const timeoutMs = method.stream
+        ? undefined
+        : method.timeoutMs === undefined
+          ? (normalizeTimeoutMs(defaultMethodTimeoutMs === false ? undefined : defaultMethodTimeoutMs) ?? undefined)
+          : normalizeTimeoutMs(method.timeoutMs);
       const rest = method.rest ? normalizeRestProjection(abilityId, name, method.rest) : undefined;
       const mcp = method.mcp ? normalizeMcpProjection(abilityId, name, method.mcp) : undefined;
       const mcpPrompt = method.mcpPrompt ? normalizeMcpPromptProjection(abilityId, name, method.mcpPrompt) : undefined;
@@ -728,6 +788,7 @@ function normalizeMethods(
           ...(rest ? { rest } : {}),
           scopes,
           ...(method.stream ? { stream: true as const } : {}),
+          ...(timeoutMs === undefined ? {} : { timeoutMs }),
         },
       ];
     }),
@@ -769,6 +830,7 @@ function abilityDiscovery<TEnv extends Env>(ability: NormalizedServiceAbility<TE
           ...(method.rest ? { rest: method.rest } : {}),
           scopes: method.scopes,
           ...(method.stream ? { stream: true as const } : {}),
+          ...(method.timeoutMs === undefined ? {} : { timeoutMs: method.timeoutMs }),
         } satisfies ServiceAbilityMethodDiscovery,
       ]),
     ),

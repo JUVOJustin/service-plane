@@ -1,8 +1,11 @@
 export { type ConnInfo, SERVICE_PLANE_CONN_INFO_HEADER, SERVICE_PLANE_CONN_INFO_QUERY_PARAM } from '../shared/conn-info.js';
 export {
+  DEFAULT_ABILITY_TIMEOUT_MS,
   MAX_SERVICE_PLANE_TIMEOUT_MS,
+  SERVICE_PLANE_TIMEOUT_GRACE_MS,
   SERVICE_PLANE_TIMEOUT_HEADER,
   SERVICE_PLANE_TIMEOUT_QUERY_PARAM,
+  type ServicePlaneTimeoutPolicy,
 } from '../shared/deadline.js';
 export {
   AbilityHandlerError,

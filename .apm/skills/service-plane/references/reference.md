@@ -282,6 +282,30 @@ Connection info about the original client rides the same three channels when `br
 
 ## Deadlines
 
+Two bounds, layered. A **service-side ceiling** that always exists, and an **end-to-end budget** a caller may set on top of it. Whichever expires first wins.
+
+### The ceiling you get for free
+
+Every unary ability method is bounded at `DEFAULT_ABILITY_TIMEOUT_MS` — 10 seconds — without anyone configuring anything.
+
+That default is deliberate. gRPC and [Connect](https://connectrpc.com/docs/node/timeouts/) leave deadlines entirely to the caller, and the standing advice in [gRPC's own guidance](https://grpc.io/blog/deadlines/) is to *"always set a deadline"* — a rule that only needs stating because the unset case is unbounded. Systems that own a default do not need the reminder: [Envoy routes time out at 15s](https://www.envoyproxy.io/docs/envoy/latest/faq/configuration/timeouts), and [Armeria's server request timeout is 10s](https://armeria.dev/docs/server/timeouts/). 10s matches the closest analogue — a server bounding its own request handling.
+
+Tune it where it belongs:
+
+```ts
+new ServicePlaneService({
+  timeout: { methodMs: 2_500 },     // service-wide ceiling; `false` removes it
+});
+
+bigExport: abilityMethod({ timeoutMs: 120_000, ... });  // the one slow method
+```
+
+Raise the exception, not the ceiling. **Streaming methods are never bounded this way** — for the reason Envoy documents about its own route timeout, a bound that suits a request is wrong for a stream. Session lifetime is untouched either way.
+
+The effective ceiling is advertised per method in the discovery document, so a gateway can size its own wait against it.
+
+### The budget a caller sets
+
 A caller states how long it is willing to wait; every hop spends from that budget rather than granting a new one.
 
 ```ts
@@ -343,7 +367,30 @@ Two caveats worth stating:
 - The runtime matrix in [#11](https://github.com/JUVOJustin/service-plane/issues/11) does not run yet, so the above reflects documented workerd behavior, not a test result on workerd.
 - If Cap'n Web ever gains WebSocket Hibernation ([capnweb#36](https://github.com/cloudflare/capnweb/issues/36)), a hibernating Durable Object would lose the in-memory `AbortSignal.timeout` behind a session-scoped deadline, and it would silently never fire on wake. Today Cap'n Web sessions cannot hibernate, so this is not reachable — but a deadline set before hibernation is not something to assume survives it.
 
-Values are clamped to `MAX_SERVICE_PLANE_TIMEOUT_MS` (10 minutes) and anything that is not a positive integer count of milliseconds is ignored, so a caller sending nothing keeps today's behavior: no deadline.
+Values are clamped to `MAX_SERVICE_PLANE_TIMEOUT_MS` (10 minutes) and anything that is not a positive integer count of milliseconds is ignored. A caller that sends nothing forwards nothing — the service-side ceiling above is what still bounds the call.
+
+Both shells take a policy for what they will accept:
+
+```ts
+new ServicePlaneControlPlane({ timeout: { defaultMs: 10_000, maxMs: 60_000 } });
+new ServicePlaneService({ timeout: { defaultMs: 5_000, maxMs: 30_000 } });
+```
+
+`defaultMs` supplies a budget when the caller sent none; `maxMs` clamps one that asks for more than you are willing to hold a connection for. The plane has no built-in default on purpose — it forwards a budget rather than doing the work, so the bound that must always exist lives at the service. Set `defaultMs` when you want the plane to be the policy point, the role Envoy's route timeout plays.
+
+A caller's own local wait is set slightly **above** the budget it forwards (`SERVICE_PLANE_TIMEOUT_GRACE_MS`, 250ms). [Armeria does the same thing](https://armeria.dev/docs/advanced/understanding-timeouts/) — its client response timeout of 15s sits above its 10s server request timeout — so that the service's own enforcement fires first and the caller gets the error the service actually raised instead of a bare local abort that says nothing about what happened downstream.
+
+### When a deadline fires
+
+| | This package | gRPC | Envoy | Armeria |
+| --- | --- | --- | --- | --- |
+| Caller sees | `ServicePlaneTimeoutError`, `code: 'timeout'`, status 504 | `DEADLINE_EXCEEDED` (maps to 504) | 504 Gateway Timeout | `ResponseTimeoutException` |
+| Service sees | The method rejects; `signal` is aborted | Context cancelled (`CANCELLED`) | Upstream stream reset | `RequestTimeoutException`, work cancelled |
+| Peer is told | **No** | Yes | Yes | Yes (RST_STREAM / close) |
+
+The last row is the honest gap: Cap'n Web has no cancel message, so a caller giving up cannot tell the service. That is why the budget is forwarded rather than relied on locally — the service's own copy is what stops the work. Everyone else in that table can signal the peer; we compensate by making the service-side bound the one that always exists.
+
+`retryable` is `true` for a timeout, matching Envoy's treatment of 504 as a `gateway-error` worth retrying — but only retry when the method is also `idempotent`. See [Idempotency](#idempotency).
 
 Unlike forwarded connection info, a deadline is honoured from **any** caller without requiring ingress. It is not an authorization input: a caller shortening its own budget can only cut itself off, and a long one is clamped.
 
