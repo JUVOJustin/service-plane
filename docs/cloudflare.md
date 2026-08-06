@@ -233,7 +233,7 @@ export function durableObjectRegistryCache(
 
 The snapshot is plain JSON, so it crosses the Durable Object RPC boundary unchanged. Durable Object storage has no TTL of its own, which is why the entry carries its own `expiresAt`.
 
-**Use a Durable Object here only behind the in-memory layer.** One object serializes every access and sits in one location, so making it the first stop for a hot route builds a global bottleneck exactly where throughput matters. KV is the easier shared store for this — reads are edge-cached, and for most of the catalog its eventual consistency only delays a new ability becoming grantable. The exception is the same one the [discovery-cache guide](plane-creation.md#discovery-cache) documents: `access` is enforced by the broker from the catalog, so KV's propagation delay *extends* the window in which an ability tightened from `plane` to `service` stays reachable. Where `access` changes must land promptly, keep the call path on a store with read-after-write semantics (the Durable Object above) and leave KV to the projection path.
+**Use a Durable Object here only behind the in-memory layer.** One object serializes every access and sits in one location, so making it the first stop for a hot route builds a global bottleneck exactly where throughput matters. KV is the easier shared store for this — reads are edge-cached, and its eventual consistency only delays a new ability becoming grantable. Nothing it can delay *loosens* enforcement, `access` included: the caller's access class rides the token and the service checks it against its own definition, so an ability tightened to `access: 'service'` refuses a plane-class caller from the moment it deploys, however far behind the cached catalog is. (The service does the refusing, so this holds once the service runs a package version with the check — see the [rollout-order note](reference.md#capability-token-claims).)
 
 ```ts
 new ServicePlaneControlPlane({
@@ -278,7 +278,7 @@ Two caches now sit between a deployed service and what callers see: the plane's 
 
 During that window, staleness fails closed, not open:
 
-- The service verifies every token against its **current** definition. A token minted from a stale snapshot with a removed or renamed scope is rejected with 403; a call brokered to a removed RPC path gets a 404. Nothing stale grants access.
+- The service verifies every token against its **current** definition. A token minted from a stale snapshot with a removed or renamed scope is rejected with 403; a call brokered to a removed RPC path gets a 404; an ability the deploy tightened to `access: 'service'` refuses a plane-class caller even while the plane still brokers it. Nothing stale grants access.
 - A removed published ability can linger in a cached `/openapi.json`; callers get errors until the caches converge. A newly added ability is simply invisible until then.
 - A grant that still names a scope the deployed service renamed or dropped refuses tokens for that service alone. The rest of the plane keeps issuing and brokering, and the refusal stays the specific `Unknown Service-Plane capability scope` error so it reads as configuration drift, not a permissions bug.
 

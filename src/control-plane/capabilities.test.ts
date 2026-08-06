@@ -29,6 +29,7 @@ describe('capability issuer', () => {
     });
 
     const issued = await issuer.issueCapabilityToken({
+      callerAccess: 'service',
       callerServiceId: 'moco',
       scopes: ['fizzy.users.lookup'],
       targetServiceId: 'fizzy',
@@ -60,6 +61,7 @@ describe('capability issuer', () => {
 
     const issued = await issuer.issueBrokeredCapabilityToken({
       brokerServiceId: 'control-plane',
+      callerAccess: 'service',
       callerServiceId: 'moco',
       scopes: ['fizzy.users.lookup'],
       targetServiceId: 'fizzy',
@@ -87,7 +89,9 @@ describe('capability issuer', () => {
       privateJwks: [keys.privateJwk],
     });
 
+    // A delegated subject is a caller the plane fronts, so its tokens are plane-class.
     const issued = await issuer.issueCapabilityToken({
+      callerAccess: 'plane',
       callerServiceId: 'control-plane',
       scopes: ['fizzy.users.lookup'],
       subject: { id: 'user-7', orgId: 'org-42' },
@@ -101,16 +105,29 @@ describe('capability issuer', () => {
         jwks: await issuer.jwks(),
         now: new Date('2026-05-09T12:00:01.000Z'),
       }),
-    ).resolves.toMatchObject({ serviceId: 'control-plane', subject: { id: 'user-7', orgId: 'org-42' } });
+    ).resolves.toMatchObject({ callerAccess: 'plane', serviceId: 'control-plane', subject: { id: 'user-7', orgId: 'org-42' } });
 
     await expect(
       issuer.issueCapabilityToken({
+        callerAccess: 'plane',
         callerServiceId: 'control-plane',
         scopes: ['fizzy.users.lookup'],
         subject: { id: '  ' },
         targetServiceId: 'fizzy',
       }),
     ).rejects.toThrow('Invalid Service-Plane capability subject');
+
+    // The contradiction no surface can produce: a delegated end user attested as a service
+    // caller would pass every service-only access check. Refused at mint.
+    await expect(
+      issuer.issueCapabilityToken({
+        callerAccess: 'service',
+        callerServiceId: 'control-plane',
+        scopes: ['fizzy.users.lookup'],
+        subject: { id: 'user-7' },
+        targetServiceId: 'fizzy',
+      }),
+    ).rejects.toThrow('Service-Plane delegated subject requires a plane-class caller');
   });
 
   it('rejects unknown scopes and unauthorized grants', async () => {
@@ -127,6 +144,7 @@ describe('capability issuer', () => {
 
     await expect(
       unknownScope.issueCapabilityToken({
+        callerAccess: 'service',
         callerServiceId: 'moco',
         scopes: ['fizzy.users.lookup'],
         targetServiceId: 'fizzy',
@@ -144,6 +162,7 @@ describe('capability issuer', () => {
 
     await expect(
       issuer.issueCapabilityToken({
+        callerAccess: 'service',
         callerServiceId: 'moco',
         scopes: ['fizzy.boards.sync'],
         targetServiceId: 'fizzy',
@@ -168,20 +187,40 @@ describe('capability issuer', () => {
     });
 
     await expect(
-      issuer.issueCapabilityToken({ callerServiceId: 'moco', scopes: ['whizzy.jobs.run'], targetServiceId: 'whizzy' }),
+      issuer.issueCapabilityToken({
+        callerAccess: 'service',
+        callerServiceId: 'moco',
+        scopes: ['whizzy.jobs.run'],
+        targetServiceId: 'whizzy',
+      }),
     ).resolves.toMatchObject({ token: expect.any(String) });
 
     await expect(
-      issuer.issueCapabilityToken({ callerServiceId: 'moco', scopes: ['fizzy.users.lookup'], targetServiceId: 'fizzy' }),
+      issuer.issueCapabilityToken({
+        callerAccess: 'service',
+        callerServiceId: 'moco',
+        scopes: ['fizzy.users.lookup'],
+        targetServiceId: 'fizzy',
+      }),
     ).rejects.toThrow('Unknown Service-Plane capability scope: fizzy.renamed');
 
     await expect(
-      issuer.issueCapabilityToken({ callerServiceId: 'moco', scopes: ['buzzy.jobs.run'], targetServiceId: 'buzzy' }),
+      issuer.issueCapabilityToken({
+        callerAccess: 'service',
+        callerServiceId: 'moco',
+        scopes: ['buzzy.jobs.run'],
+        targetServiceId: 'buzzy',
+      }),
     ).rejects.toThrow('Unknown Service-Plane capability target: buzzy');
 
     // A target nobody granted stays an ordinary authorization refusal, not a misconfiguration.
     await expect(
-      issuer.issueCapabilityToken({ callerServiceId: 'moco', scopes: ['whizzy.jobs.run'], targetServiceId: 'unlisted' }),
+      issuer.issueCapabilityToken({
+        callerAccess: 'service',
+        callerServiceId: 'moco',
+        scopes: ['whizzy.jobs.run'],
+        targetServiceId: 'unlisted',
+      }),
     ).rejects.toThrow('Service-Plane capability grant denied');
   });
 
@@ -198,6 +237,7 @@ describe('capability issuer', () => {
 
     await expect(
       issuer.issueCapabilityToken({
+        callerAccess: 'service',
         callerServiceId: 'moco',
         scopes: [],
         targetServiceId: 'fizzy',
@@ -219,6 +259,7 @@ describe('capability issuer', () => {
     });
 
     const issued = await issuer.issueCapabilityToken({
+      callerAccess: 'service',
       callerServiceId: 'moco',
       scopes: ['fizzy.users.lookup'],
       targetServiceId: 'fizzy',
@@ -228,6 +269,7 @@ describe('capability issuer', () => {
 
     await expect(
       issuer.issueCapabilityToken({
+        callerAccess: 'service',
         callerServiceId: 'moco',
         scopes: ['fizzy.users.lookup'],
         targetServiceId: 'fizzy',
@@ -237,6 +279,7 @@ describe('capability issuer', () => {
 
     await expect(
       issuer.issueCapabilityToken({
+        callerAccess: 'service',
         callerServiceId: 'moco',
         scopes: ['fizzy.users.lookup'],
         targetServiceId: 'fizzy',
@@ -246,6 +289,7 @@ describe('capability issuer', () => {
 
     await expect(
       issuer.issueCapabilityToken({
+        callerAccess: 'service',
         callerServiceId: 'moco',
         scopes: ['fizzy.users.lookup'],
         targetServiceId: 'fizzy',
@@ -433,6 +477,7 @@ describe('capability issuer', () => {
     expect(jwks.keys[0]).not.toHaveProperty('d');
 
     const issued = await issuer.issueCapabilityToken({
+      callerAccess: 'service',
       callerServiceId: 'moco',
       scopes: ['fizzy.users.lookup'],
       targetServiceId: 'fizzy',

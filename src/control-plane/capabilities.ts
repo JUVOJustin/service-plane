@@ -11,12 +11,14 @@ import { CapabilityAuthError } from '../shared/errors.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
 import { generateServicePlaneJwkSigningKey } from '../shared/jwk-auth.js';
 import {
+  type AbilityAccess,
   type CapabilityCatalog,
   type CapabilityConfirmation,
   type CapabilityJwks,
   DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
   type IssueCapabilityTokenInput,
   type IssuedCapabilityToken,
+  isAbilityAccess,
   MAX_CAPABILITY_TOKEN_TTL_SECONDS,
   SERVICE_PLANE_CAPABILITY_JWKS_PATH,
   SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
@@ -34,9 +36,24 @@ const endpointFactory = createFactory();
  */
 export type CapabilitySigningJwk = JsonWebKey & { kid: string };
 
+/**
+ * What the issuer needs: the token request plus the plane's own finding about who is asking.
+ * `callerAccess` is deliberately not part of `IssueCapabilityTokenInput` — that type is also the wire
+ * shape a service posts to the token endpoint, and a caller that could name its own access class
+ * would be authorizing itself.
+ */
+export type CapabilityIssuerInput = IssueCapabilityTokenInput & {
+  /**
+   * `service` only for a caller the plane authenticated as another service. Everything the plane
+   * fronts itself — end users, API keys, anonymous traffic — is `plane`. Services compare this
+   * against their ability's own `access`, so it decides whether service-only abilities are reachable.
+   */
+  callerAccess: AbilityAccess;
+};
+
 export type CapabilityIssuer = {
-  issueBrokeredCapabilityToken(input: IssueCapabilityTokenInput & { brokerServiceId: string }): Promise<IssuedCapabilityToken>;
-  issueCapabilityToken(input: IssueCapabilityTokenInput): Promise<IssuedCapabilityToken>;
+  issueBrokeredCapabilityToken(input: CapabilityIssuerInput & { brokerServiceId: string }): Promise<IssuedCapabilityToken>;
+  issueCapabilityToken(input: CapabilityIssuerInput): Promise<IssuedCapabilityToken>;
   jwks(): Promise<CapabilityJwks>;
 };
 
@@ -211,7 +228,7 @@ export function createCapabilityIssuer(options: CreateCapabilityIssuerOptions): 
 function issueCapabilityToken(options: {
   brokerServiceId?: string;
   grantsByTarget: Map<string, ValidatedTargetGrants>;
-  input: IssueCapabilityTokenInput;
+  input: CapabilityIssuerInput;
   issuer: string;
   keyId: string;
   maxTtlSeconds: number;
@@ -228,6 +245,13 @@ function issueCapabilityToken(options: {
       ? options.maxTtlSeconds
       : Math.min(normalizeTtlSeconds(options.input.ttlSeconds, 400), options.maxTtlSeconds);
   const subject = options.input.subject === undefined ? undefined : normalizeCapabilitySubject(options.input.subject);
+  // A delegated subject exists only for callers the plane fronts, so it can never ride a
+  // service-class token — the pair would hand an end user service-only reach at every service in
+  // the fleet. No shipped surface can produce it; refuse it here so a custom brokering path that
+  // stamps 'service' uniformly cannot mint the contradiction by accident.
+  if (subject && options.input.callerAccess === 'service') {
+    throw new CapabilityAuthError('Service-Plane delegated subject requires a plane-class caller', 500);
+  }
 
   // RFC 8693 delegation: with a subject, sub carries the end user and act names the acting service.
   // RFC 7800 `cnf`: present only when the caller authenticated with a key, sender-constraining the
@@ -239,6 +263,7 @@ function issueCapabilityToken(options: {
       ...(options.input.confirmation ? { cnf: normalizeConfirmation(options.input.confirmation) } : {}),
       iss: options.issuer,
       scp: requestedScopes,
+      spa: normalizeCallerAccess(options.input.callerAccess),
       ...(options.brokerServiceId ? { spb: options.brokerServiceId } : {}),
       ...(subject?.orgId ? { spo: subject.orgId } : {}),
       sub: subject ? subject.id : options.input.callerServiceId,
@@ -292,6 +317,10 @@ export function mountCapabilityTokenEndpoint(
           return context.json({ error: 'Caller service mismatch' }, 403);
         }
         const issued = await resolvedIssuer.issueCapabilityToken({
+          // This endpoint exists for service-to-service calls: `authenticateCaller` proves a service
+          // identity, and grants are configured against it. A plane that fronts end users brokers
+          // them instead, and the broker mints their tokens as plane-class.
+          callerAccess: 'service',
           callerServiceId: caller.serviceId,
           // Comes from the authenticator, never from the request body: a caller-supplied confirmation
           // would let it bind a key of its choosing and defeat the point.
@@ -355,6 +384,17 @@ export function mountCapabilityJwksEndpoint(
       }
     }),
   );
+}
+
+// Mirrors the verifier's claim check at mint time, like signCapabilityToken's spo/act guard: an
+// untyped edge (a service binding, a hand-rolled RPC entrypoint) that omits or garbles the class
+// would otherwise sign cleanly and fail later, at every verifying service, as a generic
+// invalid-claims 401 — refusing here names the actual mistake.
+function normalizeCallerAccess(callerAccess: AbilityAccess): AbilityAccess {
+  if (!isAbilityAccess(callerAccess)) {
+    throw new CapabilityAuthError(`Unknown Service-Plane caller access: ${String(callerAccess)}`, 500);
+  }
+  return callerAccess;
 }
 
 function normalizeConfirmation(confirmation: CapabilityConfirmation): CapabilityConfirmation {
