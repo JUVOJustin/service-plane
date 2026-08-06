@@ -178,7 +178,7 @@ describe('standard schema streaming', () => {
   // high-water-mark choice), so the exact pulled-count pin holds only on Node. Laziness itself is
   // still covered there — the eager-drain failure mode this guards against would pull all items,
   // and the badItem/cancel tests above run on both runtimes.
-  it.skipIf(navigator.userAgent === 'Cloudflare-Workers')(
+  it.skipIf(typeof navigator !== 'undefined' && navigator.userAgent === 'Cloudflare-Workers')(
     'validates lazily so consumer backpressure still reaches the handler',
     async () => {
       const source = new StreamHandler();
