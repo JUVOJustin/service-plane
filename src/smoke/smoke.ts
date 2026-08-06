@@ -8,16 +8,21 @@ import {
   defineAbility,
   defineCapabilities,
   disposeAbilitySession,
+  jwkCapabilityProofSigner,
   RpcTarget,
   requireScopes,
   ServicePlaneService,
 } from '../service/index.js';
+// Thumbprinting is not on a public entrypoint — a plane computes `cnf` from the key its caller
+// authenticated with, so consumers never call it themselves. The smoke plays both roles.
+import { publicJwkFromPrivateJwk, servicePlaneJwkThumbprint } from '../shared/jwk-auth.js';
+import { signCapabilityProof } from '../shared/proof-of-possession.js';
 
 // The portability smoke: one self-contained pass over the paths whose behavior differs by runtime,
 // written against web-standard globals only so the same bundle runs on Node, workerd, Deno, and Bun.
 // It exercises what the CI matrix exists to prove — the HTTP-batch flush (`nextMacrotask` falls back
 // to setTimeout(0) where setImmediate is missing: workerd, Deno), the WebCrypto verify path with its
-// cached key import, and streaming over a session transport — using the public API only. Kept out of
+// cached key import, streaming over a session transport, and sender-constrained proofs. Kept out of
 // the published build; see tsconfig.json's exclude and scripts/smoke.mjs.
 
 type SmokeApi = {
@@ -139,6 +144,59 @@ export async function runSmoke(): Promise<string[]> {
     `tampered token was not rejected: ${String(forged)}`,
   );
   step('tampered token rejected');
+
+  // Sender-constrained tokens: the caller signs a proof with the key its token is bound to. This is
+  // the path a runtime JWK-shape difference already broke once — workerd's exportKey('jwk')
+  // materializes `alg` where Node omits it — so every runtime has to prove it end to end, in both
+  // directions: the bound key accepted, an unbound one refused at the confirmation check.
+  const callerKeyPair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+  const callerPrivateJwk = await crypto.subtle.exportKey('jwk', callerKeyPair.privateKey);
+  const jkt = await servicePlaneJwkThumbprint(publicJwkFromPrivateJwk(callerPrivateJwk, 'smoke-caller-key'));
+  const boundToken = () =>
+    issuer.issueCapabilityToken({
+      callerAccess: 'service',
+      callerServiceId: 'smoke-caller',
+      confirmation: { jkt },
+      scopes: ['smoke.run'],
+      targetServiceId: 'smoke',
+    });
+
+  const bound = await abilitySession<Pick<SmokeApi, 'run'>>({
+    abilityId: 'smoke.jobs',
+    callerServiceId: 'smoke-caller',
+    proveTokenPossession: jwkCapabilityProofSigner({ privateJwk: callerPrivateJwk }),
+    requestToken: boundToken,
+    scopes: ['smoke.run'],
+    targetServiceId: 'smoke',
+    transport: cloudflareServiceBindingRpc({ fetch: async (request) => service.fetch(request) }, undefined, 'https://smoke.internal'),
+  });
+  const proven = await bound.run({ name: 'bound' });
+  assert(proven.name === 'bound', `sender-constrained call failed: ${JSON.stringify(proven)}`);
+
+  // The negative direction has to reach the service: the shipped signer refuses a mismatched key
+  // locally, so signing directly is what puts the thumbprint check itself under test — and it
+  // exercises a second runtime-exported key through the same signing path.
+  const otherKeyPair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+  const otherPrivateJwk = await crypto.subtle.exportKey('jwk', otherKeyPair.privateKey);
+  const wrongKey = await abilitySession<Pick<SmokeApi, 'run'>>({
+    abilityId: 'smoke.jobs',
+    callerServiceId: 'smoke-caller',
+    proveTokenPossession: (input) => signCapabilityProof({ ...input, privateJwk: otherPrivateJwk }),
+    requestToken: boundToken,
+    scopes: ['smoke.run'],
+    targetServiceId: 'smoke',
+    transport: cloudflareServiceBindingRpc({ fetch: async (request) => service.fetch(request) }, undefined, 'https://smoke.internal'),
+  })
+    .then((api) => api.run({ name: 'unbound' }))
+    .then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+  assert(
+    wrongKey instanceof Error && wrongKey.message.includes('does not match the token confirmation'),
+    `a proof signed by an unbound key was accepted: ${String(wrongKey)}`,
+  );
+  step('sender-constrained token proved and refused');
 
   // Scope enforcement inside the wrapper: a token without the method's scope must not reach it.
   const narrow = await abilitySession<SmokeApi>({

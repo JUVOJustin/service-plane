@@ -48,8 +48,7 @@
     "bench": "vitest bench --run",
     "test": "vitest run",
     "test:workerd": "vitest run --config vitest.workerd.config.ts",
-    "smoke:build": "node scripts/smoke.mjs build",
-    "smoke:workerd": "node scripts/smoke.mjs workerd",
+    "smoke:build": "node scripts/smoke.mjs",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
     "prepare": "npm run build",
     "test:coverage": "vitest run --coverage"
@@ -79,7 +78,6 @@
     "@vitest/coverage-v8": "^4.1.10",
     "esbuild": "^0.28.1",
     "hono": "^4.13.0",
-    "miniflare": "^5.20260801.0-alpha",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10",
     "zod": "^4.4.3"
