@@ -176,8 +176,8 @@ function objectSchema(field: string, kind: 'number' | 'string'): AbilitySchema {
       jsonSchema: { input: jsonSchema, output: jsonSchema },
       validate: (value: unknown) => {
         const candidate = (value as Record<string, unknown> | null)?.[field];
-        // biome-ignore lint/suspicious/useValidTypeof: `kind` is a literal union of valid typeof results
-        if (typeof candidate !== kind) return { issues: [{ message: `expected ${kind}`, path: [field] }] };
+        const valid = kind === 'number' ? typeof candidate === 'number' : typeof candidate === 'string';
+        if (!valid) return { issues: [{ message: `expected ${kind}`, path: [field] }] };
         return { value: { [field]: candidate } };
       },
       vendor: 'smoke',
