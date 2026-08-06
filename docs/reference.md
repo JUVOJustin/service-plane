@@ -384,13 +384,15 @@ A caller's own local wait is set slightly **above** the budget it forwards (`SER
 
 | | This package | gRPC | Envoy | Armeria |
 | --- | --- | --- | --- | --- |
-| Caller sees | `ServicePlaneTimeoutError`, `code: 'timeout'`, status 504 | `DEADLINE_EXCEEDED` (maps to 504) | 504 Gateway Timeout | `ResponseTimeoutException` |
+| Caller sees | `code: 'timeout'`, `status: 504` **inside the RPC payload** — the HTTP response is 200 | `DEADLINE_EXCEEDED` (maps to 504) | 504 Gateway Timeout | `ResponseTimeoutException` |
 | Service sees | The method rejects; `signal` is aborted | Context cancelled (`CANCELLED`) | Upstream stream reset | `RequestTimeoutException`, work cancelled |
 | Peer is told | **No** | Yes | Yes | Yes (RST_STREAM / close) |
 
 The last row is the honest gap: Cap'n Web has no cancel message, so a caller giving up cannot tell the service. That is why the budget is forwarded rather than relied on locally — the service's own copy is what stops the work. Everyone else in that table can signal the peer; we compensate by making the service-side bound the one that always exists.
 
 `retryable` is `true` for a timeout, matching Envoy's treatment of 504 as a `gateway-error` worth retrying — but only retry when the method is also `idempotent`. See [Idempotency](#idempotency).
+
+**`status` is a classification, not an HTTP status code.** A method's failure is a value inside the Cap'n Web batch, so the HTTP response is `200` and the error travels in its body. Read the classification with `servicePlaneErrorInfo`; do not expect to see 504 on the wire. The number matters when a gateway maps the failure onto its own response — and it is the number the shells do use where they answer HTTP directly, such as the plane refusing an MCP call whose budget is already spent.
 
 Unlike forwarded connection info, a deadline is honoured from **any** caller without requiring ingress. It is not an authorization input: a caller shortening its own budget can only cut itself off, and a long one is clamped.
 

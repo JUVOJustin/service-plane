@@ -10,7 +10,7 @@ import {
   servicePlaneErrorInfo,
 } from '../shared/errors.js';
 import { testKeys } from '../test-support/index.js';
-import { abilitySession, cloudflareNativeRpc, defineCapabilities, RpcTarget } from './capabilities.js';
+import { abilitySession, cloudflareNativeRpc, cloudflareServiceBindingRpc, defineCapabilities, RpcTarget } from './capabilities.js';
 import { type AbilityRpc, abilityMethod, defineAbility } from './discovery.js';
 import { ServicePlaneService } from './service.js';
 
@@ -163,5 +163,60 @@ describe('servicePlaneErrorInfo', () => {
     // A hostile peer must not be able to make a refusal look retryable.
     expect(servicePlaneErrorInfo({ code: 'capability_auth', retryable: 'yes', status: 403 })).toBeUndefined();
     expect(servicePlaneErrorInfo({ code: 'capability_auth', retryable: true, status: '403' })).toBeUndefined();
+  });
+});
+
+describe('how a taxonomy error reaches the wire', () => {
+  it('rides inside the RPC payload — `status` is a classification, not the HTTP status', async () => {
+    const keys = await testKeys();
+    const issuer = createCapabilityIssuer({
+      capabilities: [capabilities],
+      grants: defineServiceGrants({ grants: [{ caller: 'worker-a', scopes: ['example.work.run'], target: 'example' }] }),
+      issuer: 'control-plane',
+      now: () => ISSUED_AT,
+      privateJwks: [keys.privateJwk],
+    });
+    const service = new ServicePlaneService({
+      abilities: [workAbility],
+      auth: { issuer: 'control-plane', jwks: { keys: [keys.publicJwk] }, now: () => VERIFIED_AT },
+      capabilities,
+      id: 'example',
+      title: 'Example',
+      version: '0.1.0',
+    });
+    const issued = await issuer.issueCapabilityToken({
+      callerServiceId: 'worker-a',
+      scopes: ['example.work.run'],
+      targetServiceId: 'example',
+    });
+
+    let httpStatus: number | undefined;
+    const api = await abilitySession<AbilityRpc<typeof workAbility>>({
+      abilityId: 'example.work',
+      callerServiceId: 'worker-a',
+      requestToken: async () => issued,
+      scopes: ['example.work.run'],
+      targetServiceId: 'example',
+      transport: cloudflareServiceBindingRpc(
+        {
+          fetch: async (request: Request) => {
+            const response = await service.fetch(request);
+            httpStatus = response.status;
+            return response;
+          },
+        },
+        undefined,
+        'https://example.internal',
+      ),
+    });
+
+    const caught = await api.shaped({}).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+
+    // The transport succeeded; the failure is a value inside the batch, not an HTTP condition.
+    expect(httpStatus).toBe(200);
+    expect(servicePlaneErrorInfo(caught)?.status).toBe(429);
   });
 });
