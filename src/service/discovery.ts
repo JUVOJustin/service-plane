@@ -2,7 +2,14 @@ import type { StandardJSONSchemaV1, StandardSchemaV1 } from '@standard-schema/sp
 import { RpcPromise, RpcTarget } from 'capnweb';
 import type { Context, Env } from 'hono';
 import type { ConnInfo } from '../shared/conn-info.js';
-import { AbilityValidationError, type AbilityValidationIssue, CapabilityAuthError, ServicePlaneTimeoutError } from '../shared/errors.js';
+import {
+  AbilityValidationError,
+  type AbilityValidationIssue,
+  CapabilityAuthError,
+  rememberHandlerFailureCause,
+  ServicePlaneError,
+  ServicePlaneTimeoutError,
+} from '../shared/errors.js';
 import { isOriginRelativePath } from '../shared/paths.js';
 import {
   type AbilityAccess,
@@ -329,11 +336,34 @@ async function invokeValidatingAbilityMethod(target: RpcTarget, methodName: stri
   // Checked after validation rather than before: a budget already gone means the caller stopped
   // waiting, so there is nothing to gain by running the handler.
   assertDeadlineNotExceeded(state.signal, methodName);
-  const output = await abortableAbilityCall(implementation.call(state.handler, input), state.signal, methodName);
+  let output: unknown;
+  try {
+    output = await abortableAbilityCall(implementation.call(state.handler, input), state.signal, methodName);
+  } catch (error) {
+    throw abilityHandlerFailure(error, methodName);
+  }
   // Streaming methods return their items as a native Cap'n Web ReadableStream, validated
   // one item at a time as the consumer pulls.
   if (method.stream) return validatedAbilityItemStream(method, methodName, output);
   return validateAbilityValue(method.output, output, `output for ${methodName}`, 500);
+}
+
+/**
+ * The one place a handler's failure becomes what the caller sees.
+ *
+ * Errors this package raised are deliberate — a scope refusal, a schema failure, a deadline — and
+ * already say only what a caller should know, so they pass through. `AbilityHandlerError` is a
+ * service author making the same choice explicitly. Everything else is whatever the handler's
+ * dependencies threw: those messages and properties were written for an operator, not a caller, and
+ * routinely carry connection strings, internal hostnames, SQL, or row data. Only the fact of the
+ * failure crosses the boundary; the original stays reachable in-process through
+ * `handlerFailureCause` for logging.
+ */
+function abilityHandlerFailure(error: unknown, methodName: string): unknown {
+  if (error instanceof ServicePlaneError) return error;
+  const opaque = new ServicePlaneError(`Service-Plane ability handler failed: ${methodName}`, 500);
+  rememberHandlerFailureCause(opaque, error);
+  return opaque;
 }
 
 function assertDeadlineNotExceeded(signal: AbortSignal | undefined, methodName: string): void {
@@ -472,9 +502,10 @@ function validatedAbilityItemStream(
       } catch (error) {
         // A failed pull or invalid item errors the stream, which can no longer be cancelled by
         // the consumer. Release the handler's source here so iterator return/finally cleanup and
-        // reader locks are not stranded.
+        // reader locks are not stranded. Cancel with the original — the source's own cleanup is
+        // in-process — but surface the same replacement a unary failure would get.
         puller.cancel(error);
-        throw error;
+        throw abilityHandlerFailure(error, methodName);
       }
     },
   });

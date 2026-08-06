@@ -375,6 +375,54 @@ try {
 }
 ```
 
+### Reading An Error A Caller Received
+
+`instanceof` works in-process, but **not** on an error that arrived over RPC. Cap'n Web rebuilds a received error as a plain `Error`: its class table holds only built-in error types, and the sent class name is used to choose from that table rather than restored onto the result. Own enumerable properties do survive, which is why the taxonomy lives in `code`, `status`, and `retryable`. Read them with `servicePlaneErrorInfo`, which works for both a local instance and a received one:
+
+```ts
+import { servicePlaneErrorInfo } from 'service-plane/service';
+
+const info = servicePlaneErrorInfo(error);
+if (info?.retryable) return retryLater();
+if (info?.code === 'capability_auth') return refreshTokenAndRetry();
+```
+
+| `code` | Meaning |
+| --- | --- |
+| `capability_auth` | Token, scope, ingress, or proof-of-possession check refused the call |
+| `ability_validation` | Input or output did not satisfy the method's schema |
+| `timeout` | The caller's deadline elapsed |
+| `handler` | The handler failed deliberately and chose what the caller sees |
+| `internal` | Anything else, including a handler failure the service did not shape |
+
+`retryable` means the failure is transient — the same call may succeed later. It does **not** mean retrying is safe: for a non-idempotent method a retry can still double an effect. It defaults from the status (408, 429, 502, 503, 504) and can be set explicitly. A 500 is deliberately not retryable by default: a handler that broke once usually breaks again, and saying otherwise invites a retry storm against a service already failing.
+
+Every field is re-validated when read, so a hostile or buggy peer cannot make a refusal look retryable.
+
+### What An Ability Handler May Throw
+
+Errors this package raises are already shaped for callers and pass through untouched. Everything else a handler throws is **replaced** with an opaque 500 before it leaves the service:
+
+```
+Service-Plane ability handler failed: <methodName>
+```
+
+That is deliberate. A database driver error or a `TypeError` was written for an operator, not a caller, and routinely carries connection strings, internal hostnames, SQL, or row data. The same replacement applies to a streaming method that fails mid-stream.
+
+To choose what the caller sees, throw `AbilityHandlerError`:
+
+```ts
+import { AbilityHandlerError } from 'service-plane/service';
+
+throw new AbilityHandlerError('Monthly export quota is used up', {
+  reason: 'quota_exhausted', // your own discriminator, carried alongside code: 'handler'
+  retryable: false,
+  status: 429,
+});
+```
+
+The original failure is not lost — it is held beside the replacement, reachable in-process with `handlerFailureCause(error)` so a service can log it. It is deliberately not attached as `cause`: Cap'n Web serializes `cause` unconditionally, which would defeat the replacement.
+
 A schema that deviates from the Standard Schema contract fails closed: a validator that throws, or returns neither a value nor issues, raises `AbilityValidationError` rather than letting the value through. A schema missing `~standard.validate` or `~standard.jsonSchema` is rejected when the service is defined, not on the first call.
 
 Next: [auth](auth.md), [OpenAPI and MCP](openapi-mcp.md), and [Cloudflare](cloudflare.md).

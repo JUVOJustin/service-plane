@@ -5,11 +5,18 @@ export {
   SERVICE_PLANE_TIMEOUT_QUERY_PARAM,
 } from '../shared/deadline.js';
 export {
+  AbilityHandlerError,
+  type AbilityHandlerErrorOptions,
   AbilityValidationError,
   type AbilityValidationIssue,
   CapabilityAuthError,
+  handlerFailureCause,
   ServicePlaneError,
+  type ServicePlaneErrorCode,
+  type ServicePlaneErrorInfo,
+  type ServicePlaneErrorOptions,
   ServicePlaneTimeoutError,
+  servicePlaneErrorInfo,
 } from '../shared/errors.js';
 export {
   DEFAULT_HTTP_CACHE_MAX_AGE_SECONDS,

@@ -437,7 +437,10 @@ describe('control-plane MCP endpoint', () => {
       result: { content: Array<{ text: string }>; isError: boolean };
     };
     expect(failed.result.isError).toBe(true);
-    expect(failed.result.content[0]?.text).toContain('exploded');
+    // The handler threw a bare Error, so the service replaced it: the caller learns the call failed
+    // and which method, never the handler's own message.
+    expect(failed.result.content[0]?.text).toContain('Service-Plane ability handler failed');
+    expect(failed.result.content[0]?.text).not.toContain('exploded');
     expect(events).toContainEqual(expect.objectContaining({ event: 'service_plane.mcp.tool.failed', tool: 'example_fail' }));
 
     // Missing arguments fail service-side Zod validation, which is an execution failure, not a protocol error.
