@@ -2,6 +2,7 @@ import { RpcSession } from 'capnweb';
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import * as z from 'zod';
 import { createCapabilityIssuer, defineServiceGrants } from '../control-plane/capabilities.js';
+import type { CapabilityIdentity } from '../shared/types.js';
 import { demoService, nativeRpcEnv, testKeys } from '../test-support/index.js';
 import { memoryRpcTransportPair } from '../testing/memory-transport.js';
 import {
@@ -176,6 +177,7 @@ async function createFixture(options: { ingress?: boolean } = {}) {
     privateJwks: [keys.privateJwk],
   });
   const issued = await issuer.issueCapabilityToken({
+    callerAccess: 'service',
     callerServiceId: 'worker-a',
     scopes: ['example.read'],
     targetServiceId: 'example',
@@ -498,8 +500,9 @@ describe('streaming ability methods', () => {
     });
     const ability = definition.abilities[0];
     if (!ability) throw new Error('missing ability');
-    const identity = {
+    const identity: CapabilityIdentity = {
       audience: 'example',
+      callerAccess: 'service',
       expiresAt: new Date(VERIFIED_AT.getTime() + 60_000),
       issuer: 'control-plane',
       scopes: ['example.read'],

@@ -38,7 +38,7 @@ Defaults:
 - `rpc.path: /rpc/<abilityId>`
 - `rpc.transports: ['http-batch']`
 
-`access: 'plane'` means the control plane or gateway owns any upstream product auth decision before calling the service. `access: 'service'` restricts broker access to authenticated service callers.
+`access: 'plane'` means the control plane or gateway owns any upstream product auth decision before calling the service. `access: 'service'` restricts the ability to authenticated service callers, and is enforced at both ends: the broker refuses it for a non-service caller from the discovered catalog, and the service refuses it from its own definition using the token's [`spa` claim](#capability-token-claims). Tightening an ability therefore takes effect when the service deploys, not when the plane's [discovery cache](plane-creation.md#discovery-cache) catches up.
 
 ## Ability Method
 
@@ -242,7 +242,7 @@ Tokens come in two shapes, and `sub` always answers the same question: who is th
 Plain service token:
 
 ```json
-{ "iss": "control-plane", "sub": "workflow-runner", "aud": "asana", "scp": ["asana.tasks.write"] }
+{ "iss": "control-plane", "sub": "workflow-runner", "aud": "asana", "scp": ["asana.tasks.write"], "spa": "service" }
 ```
 
 → `identity.serviceId = 'workflow-runner'`, no `identity.subject`.
@@ -250,7 +250,7 @@ Plain service token:
 Delegated (user-brokered) token:
 
 ```json
-{ "iss": "control-plane", "sub": "user-7", "act": { "sub": "control-plane" }, "spo": "org-42", "aud": "asana", "scp": ["asana.tasks.write"] }
+{ "iss": "control-plane", "sub": "user-7", "act": { "sub": "control-plane" }, "spo": "org-42", "aud": "asana", "scp": ["asana.tasks.write"], "spa": "plane" }
 ```
 
 → `identity.serviceId = 'control-plane'` (from `act.sub`), `identity.subject = { id: 'user-7', orgId: 'org-42' }`.
@@ -263,12 +263,15 @@ Delegated (user-brokered) token:
 | `iss` | control-plane issuer → `identity.issuer` | same |
 | `aud` | target service id → `identity.audience` | same |
 | `scp` | granted scopes → `identity.scopes` | same |
+| `spa` | caller access class → `identity.callerAccess`; `'service'` here | `'plane'` — the plane fronts the caller |
 | `spb` | broker service id on brokered (ingress) tokens → `identity.brokerServiceId` | same |
 | `cnf` | `{ jkt }` on tokens bound to a caller key (always, for JWK callers) → `identity.confirmation`, only after a matching proof verified | same |
 | `jti` | token id → `identity.tokenId` | same |
 | `exp` | expiry → `identity.expiresAt`; `iat`/`nbf` are also enforced | same |
 
-The `act` delegation relationship comes from RFC 8693 and `cnf` from RFC 7800 (with the `jkt` confirmation method registered by RFC 9449). `scp`, `spo`, and `spb` are Service Plane-specific claims, and `/.well-known/service-plane/capability-token` is the package's JSON capability endpoint, not an RFC 8693 token-exchange endpoint.
+The `act` delegation relationship comes from RFC 8693 and `cnf` from RFC 7800 (with the `jkt` confirmation method registered by RFC 9449). `scp`, `spa`, `spo`, and `spb` are Service Plane-specific claims, and `/.well-known/service-plane/capability-token` is the package's JSON capability endpoint, not an RFC 8693 token-exchange endpoint.
+
+`spa` is the access class the control plane authenticated for the caller. It is `service` for a caller the plane proved to be another service — the capability-token endpoint, `issueCapabilityTokenForCaller`, and a broker or MCP caller resolver returning `kind: 'service'` — and `plane` for every caller the plane fronts itself: users, API keys, anonymous traffic. Services compare it against the ability's own `access` and reject a mismatch with 403 before the handler is created. A token carrying no `spa` reads as `plane`, so a control plane that predates the claim can only reach `access: 'plane'` abilities.
 
 Delegated subjects are minted only by control-plane code — the broker/MCP caller resolver (a `BrokerCaller` with `kind: 'user'` and optional `orgId`) or a direct `issueCapabilityToken({ subject, ... })` call. The capability-token endpoint and `issueCapabilityTokenForCaller` reject caller-supplied subjects with 403, and the shipped token requesters fail fast locally instead of transmitting one. Direct issue mints a non-brokered token, so ingress-required targets must be reached through the broker, which selects `issueBrokeredCapabilityToken` automatically. See [auth](auth.md#subject-delegation).
 

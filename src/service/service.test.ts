@@ -92,6 +92,7 @@ describe('ServicePlaneService', () => {
     });
 
     const issued = await issuer.issueCapabilityToken({
+      callerAccess: 'service',
       callerServiceId: 'worker-a',
       scopes: ['example.sync.run'],
       targetServiceId: 'example',
@@ -211,6 +212,7 @@ describe('ServicePlaneService', () => {
       version: '0.1.0',
     });
     const issued = await issuer.issueCapabilityToken({
+      callerAccess: 'service',
       callerServiceId: 'worker-a',
       scopes: ['example.sync.run'],
       targetServiceId: 'example',
@@ -264,6 +266,98 @@ describe('ServicePlaneService', () => {
     });
 
     await expect(nativeApi.runSync({ since: '2026-05-11T00:00:00.000Z' })).rejects.toThrow('brokered capability token is required');
+  });
+
+  // The service, not the plane's catalog, is the authority on its own `access`. A plane-class token
+  // is a perfectly valid token for this service — correct issuer, audience, and scope — and is still
+  // refused, which is what keeps a cached catalog from outliving a tightened ability.
+  it('refuses a service-only ability for a plane-class caller before creating the handler', async () => {
+    const keys = await testKeys();
+    const capabilities = defineCapabilities({
+      scopes: [{ id: 'example.sync.run' }],
+      serviceId: 'example',
+    });
+    const issuer = createCapabilityIssuer({
+      capabilities: [capabilities],
+      grants: defineServiceGrants({
+        grants: [
+          { caller: 'control-plane', scopes: ['example.sync.run'], target: 'example' },
+          { caller: 'worker-a', scopes: ['example.sync.run'], target: 'example' },
+        ],
+      }),
+      issuer: 'control-plane',
+      now: () => ISSUED_AT,
+      privateJwks: [keys.privateJwk],
+    });
+    let handlerCreations = 0;
+
+    const syncAbility = defineAbility({
+      access: 'service',
+      id: 'example.sync',
+      methods: {
+        runSync: abilityMethod({
+          input: z.object({ since: z.string().optional() }),
+          output: z.object({ caller: z.string(), ok: z.literal(true), since: z.string().nullable() }),
+          scopes: ['example.sync.run'],
+        }),
+      },
+      scopes: ['example.sync.run'],
+      handler: () => {
+        handlerCreations += 1;
+        return new ExampleApi() as ExampleApi & Record<string, unknown>;
+      },
+    });
+
+    const service = new ServicePlaneService({
+      abilities: [syncAbility],
+      auth: {
+        issuer: 'control-plane',
+        jwks: { keys: [keys.publicJwk] },
+        now: () => VERIFIED_AT,
+      },
+      capabilities,
+      id: 'example',
+      title: 'Example',
+      version: '0.1.0',
+    });
+    const binding = { fetch: async (request: Request) => service.fetch(request) };
+    const session = async (token: { expiresAt: Date; token: string }) =>
+      abilitySession<AbilityRpc<typeof syncAbility>>({
+        abilityId: 'example.sync',
+        callerServiceId: 'worker-a',
+        requestToken: async () => token,
+        scopes: ['example.sync.run'],
+        targetServiceId: 'example',
+        transport: cloudflareServiceBindingRpc(binding, undefined, 'https://example.internal'),
+      });
+
+    // What the broker mints for an end user it fronts: delegated subject, plane-class caller.
+    const forUser = await session(
+      await issuer.issueCapabilityToken({
+        callerAccess: 'plane',
+        callerServiceId: 'control-plane',
+        scopes: ['example.sync.run'],
+        subject: { id: 'user-7' },
+        targetServiceId: 'example',
+      }),
+    );
+    await expect(forUser.runSync({})).rejects.toThrow('callable by services only');
+    expect(handlerCreations).toBe(0);
+
+    const forService = await session(
+      await issuer.issueCapabilityToken({
+        callerAccess: 'service',
+        callerServiceId: 'worker-a',
+        scopes: ['example.sync.run'],
+        targetServiceId: 'example',
+      }),
+    );
+    await expect(forService.runSync({ since: '2026-05-09T00:00:00.000Z' })).resolves.toEqual({
+      caller: 'worker-a',
+      ok: true,
+      since: '2026-05-09T00:00:00.000Z',
+    });
+    expect(handlerCreations).toBe(1);
   });
 
   it('emits Cache-Control and Cache-Tag headers on discovery when httpCache is enabled', async () => {

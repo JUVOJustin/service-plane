@@ -366,9 +366,12 @@ context.env.CONTROL_PLANE
   audience: 'asana',
   scopes: ['asana.tasks.write'],
   tokenId: 'cap_123',
+  callerAccess: 'service',                    // 'plane' when the control plane fronts the caller
   subject: { id: 'user-7', orgId: 'org-42' }, // only on delegated (user-brokered) calls
 }
 ```
+
+`callerAccess` is the access class the control plane authenticated for the caller, and it is what enforces an ability's `access` at the service. `service` means the plane proved the caller is another service; `plane` covers every caller the plane fronts itself — end users, API keys, anonymous traffic. An ability declared `access: 'service'` refuses a `plane` caller with 403 before the handler is created, using the service's own definition rather than the plane's cached catalog. See [`spa`](reference.md#capability-token-claims).
 
 Keep identity small. It carries Service Plane caller and authorization claims, plus the delegated end-user subject on user-brokered calls. Any other product-level connection context is application-owned; pass it through validated method input if the service needs it. Store provider credentials in the service's own storage.
 
@@ -376,7 +379,7 @@ Keep identity small. It carries Service Plane caller and authorization claims, p
 
 When the control plane brokers a call for an authenticated end user, the token uses RFC 8693's `act` actor-claim semantics: `sub` carries the end user and `act.sub` names the acting service. The `spo` organization claim is Service Plane-specific. Services read the user as `identity.subject`, while `identity.serviceId` stays the acting service.
 
-Service Plane does not expose the RFC 8693 token-exchange protocol. `/.well-known/service-plane/capability-token` is a package-specific JSON capability endpoint, and `scp`, `spo`, and `spb` are Service Plane-specific claims. The established claim names stay the same; only `act` borrows RFC 8693's delegation relationship.
+Service Plane does not expose the RFC 8693 token-exchange protocol. `/.well-known/service-plane/capability-token` is a package-specific JSON capability endpoint, and `scp`, `spa`, `spo`, and `spb` are Service Plane-specific claims. The established claim names stay the same; only `act` borrows RFC 8693's delegation relationship.
 
 The flow with an application identity provider such as Supabase:
 

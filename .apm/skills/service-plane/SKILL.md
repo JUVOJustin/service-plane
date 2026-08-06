@@ -62,10 +62,12 @@ them:
 - **`exposure`** — discoverability in user-facing projections.
   `'private'` (default) keeps the ability out of OpenAPI/Swagger/MCP;
   `'published'` makes methods with `rest`/`mcp` metadata projectable.
-- **`access`** — who the broker serves. `'plane'` (default): the control
-  plane or gateway owns any product-level user/API-key/anonymous decision.
-  `'service'`: brokered only for authenticated service callers
-  (service-to-service). Never use it to model end-user authentication.
+- **`access`** — which class of caller may reach the ability. `'plane'`
+  (default): the control plane or gateway owns any product-level
+  user/API-key/anonymous decision. `'service'`: authenticated service callers
+  only (service-to-service), enforced by the broker from the catalog *and* by
+  the service from its own definition, using the caller-access claim on the
+  token. Never use it to model end-user authentication.
 - **`scopes`** — what a signed token may do once the service receives it.
   Declared in the service capability catalog (`defineCapabilities`),
   referenced at ability level (maximum surface) and method level (minimum for
@@ -113,7 +115,7 @@ them:
 - **Don't** share the STS signing secret beyond the control plane. Services
   verify via JWKS; callers only ever hold short-lived tokens.
 - **Don't** use `access: 'service'` to model end-user authentication — it
-  restricts the broker to service callers, nothing more.
+  restricts the ability to service callers, nothing more.
 - **Don't** weaken scope checks, grant checks, token validation, replay
   protection, or ingress protection to make tests pass. The security model is
   core package behavior.

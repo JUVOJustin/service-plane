@@ -29,6 +29,7 @@ describe('capability issuer', () => {
     });
 
     const issued = await issuer.issueCapabilityToken({
+      callerAccess: 'service',
       callerServiceId: 'moco',
       scopes: ['fizzy.users.lookup'],
       targetServiceId: 'fizzy',
@@ -60,6 +61,7 @@ describe('capability issuer', () => {
 
     const issued = await issuer.issueBrokeredCapabilityToken({
       brokerServiceId: 'control-plane',
+      callerAccess: 'service',
       callerServiceId: 'moco',
       scopes: ['fizzy.users.lookup'],
       targetServiceId: 'fizzy',
@@ -88,6 +90,7 @@ describe('capability issuer', () => {
     });
 
     const issued = await issuer.issueCapabilityToken({
+      callerAccess: 'service',
       callerServiceId: 'control-plane',
       scopes: ['fizzy.users.lookup'],
       subject: { id: 'user-7', orgId: 'org-42' },
@@ -105,6 +108,7 @@ describe('capability issuer', () => {
 
     await expect(
       issuer.issueCapabilityToken({
+        callerAccess: 'service',
         callerServiceId: 'control-plane',
         scopes: ['fizzy.users.lookup'],
         subject: { id: '  ' },
@@ -127,6 +131,7 @@ describe('capability issuer', () => {
 
     await expect(
       unknownScope.issueCapabilityToken({
+        callerAccess: 'service',
         callerServiceId: 'moco',
         scopes: ['fizzy.users.lookup'],
         targetServiceId: 'fizzy',
@@ -144,6 +149,7 @@ describe('capability issuer', () => {
 
     await expect(
       issuer.issueCapabilityToken({
+        callerAccess: 'service',
         callerServiceId: 'moco',
         scopes: ['fizzy.boards.sync'],
         targetServiceId: 'fizzy',
@@ -168,20 +174,40 @@ describe('capability issuer', () => {
     });
 
     await expect(
-      issuer.issueCapabilityToken({ callerServiceId: 'moco', scopes: ['whizzy.jobs.run'], targetServiceId: 'whizzy' }),
+      issuer.issueCapabilityToken({
+        callerAccess: 'service',
+        callerServiceId: 'moco',
+        scopes: ['whizzy.jobs.run'],
+        targetServiceId: 'whizzy',
+      }),
     ).resolves.toMatchObject({ token: expect.any(String) });
 
     await expect(
-      issuer.issueCapabilityToken({ callerServiceId: 'moco', scopes: ['fizzy.users.lookup'], targetServiceId: 'fizzy' }),
+      issuer.issueCapabilityToken({
+        callerAccess: 'service',
+        callerServiceId: 'moco',
+        scopes: ['fizzy.users.lookup'],
+        targetServiceId: 'fizzy',
+      }),
     ).rejects.toThrow('Unknown Service-Plane capability scope: fizzy.renamed');
 
     await expect(
-      issuer.issueCapabilityToken({ callerServiceId: 'moco', scopes: ['buzzy.jobs.run'], targetServiceId: 'buzzy' }),
+      issuer.issueCapabilityToken({
+        callerAccess: 'service',
+        callerServiceId: 'moco',
+        scopes: ['buzzy.jobs.run'],
+        targetServiceId: 'buzzy',
+      }),
     ).rejects.toThrow('Unknown Service-Plane capability target: buzzy');
 
     // A target nobody granted stays an ordinary authorization refusal, not a misconfiguration.
     await expect(
-      issuer.issueCapabilityToken({ callerServiceId: 'moco', scopes: ['whizzy.jobs.run'], targetServiceId: 'unlisted' }),
+      issuer.issueCapabilityToken({
+        callerAccess: 'service',
+        callerServiceId: 'moco',
+        scopes: ['whizzy.jobs.run'],
+        targetServiceId: 'unlisted',
+      }),
     ).rejects.toThrow('Service-Plane capability grant denied');
   });
 
@@ -198,6 +224,7 @@ describe('capability issuer', () => {
 
     await expect(
       issuer.issueCapabilityToken({
+        callerAccess: 'service',
         callerServiceId: 'moco',
         scopes: [],
         targetServiceId: 'fizzy',
@@ -219,6 +246,7 @@ describe('capability issuer', () => {
     });
 
     const issued = await issuer.issueCapabilityToken({
+      callerAccess: 'service',
       callerServiceId: 'moco',
       scopes: ['fizzy.users.lookup'],
       targetServiceId: 'fizzy',
@@ -228,6 +256,7 @@ describe('capability issuer', () => {
 
     await expect(
       issuer.issueCapabilityToken({
+        callerAccess: 'service',
         callerServiceId: 'moco',
         scopes: ['fizzy.users.lookup'],
         targetServiceId: 'fizzy',
@@ -237,6 +266,7 @@ describe('capability issuer', () => {
 
     await expect(
       issuer.issueCapabilityToken({
+        callerAccess: 'service',
         callerServiceId: 'moco',
         scopes: ['fizzy.users.lookup'],
         targetServiceId: 'fizzy',
@@ -246,6 +276,7 @@ describe('capability issuer', () => {
 
     await expect(
       issuer.issueCapabilityToken({
+        callerAccess: 'service',
         callerServiceId: 'moco',
         scopes: ['fizzy.users.lookup'],
         targetServiceId: 'fizzy',
@@ -433,6 +464,7 @@ describe('capability issuer', () => {
     expect(jwks.keys[0]).not.toHaveProperty('d');
 
     const issued = await issuer.issueCapabilityToken({
+      callerAccess: 'service',
       callerServiceId: 'moco',
       scopes: ['fizzy.users.lookup'],
       targetServiceId: 'fizzy',

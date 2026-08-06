@@ -118,7 +118,7 @@ describe('forwarded connection info', () => {
     const api = await abilitySession<{ whoCalled(input: Record<string, never>): Promise<{ address: string | null }> }>({
       abilityId: 'audit.calls',
       callerServiceId: 'control-plane',
-      requestToken: (input) => fixture.issuer.issueCapabilityToken(input),
+      requestToken: (input) => fixture.issuer.issueCapabilityToken({ ...input, callerAccess: 'service' }),
       scopes: ['audit.read'],
       targetServiceId: 'audit',
       transport: cloudflareServiceBindingRpc(spoofing, '/rpc/audit.calls', 'https://audit.internal'),

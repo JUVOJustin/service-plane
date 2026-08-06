@@ -419,6 +419,7 @@ describe('ability handler safety', () => {
 
   const identity = (tokenId: string): CapabilityIdentity => ({
     audience: 'example',
+    callerAccess: 'service',
     expiresAt: new Date('2100-01-01T00:00:00Z'),
     issuer: 'control-plane',
     scopes: ['example.search'],

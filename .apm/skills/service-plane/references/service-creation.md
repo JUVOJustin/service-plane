@@ -112,6 +112,8 @@ export const asanaTasks = defineAbility({
 
 `access: 'plane'` is the default Service Plane path: the control plane or gateway decides whether an upstream product user, API key, or anonymous request may invoke the ability. Use `access: 'service'` only for abilities that should be brokered for authenticated service callers.
 
+The service enforces this itself. Every capability token names the access class the control plane authenticated for the caller ([`identity.callerAccess`](auth.md#context-and-identity)), and an `access: 'service'` ability rejects a `plane` caller with 403 before the handler is created. The check reads the ability definition in front of you, not the plane's discovered catalog, so tightening an ability takes effect the moment the service deploys.
+
 ## 4. Implement The Handler
 
 The handler receives already-validated input. Service Plane validates input before the method call and validates output after the method returns.

@@ -145,7 +145,7 @@ ETag revalidation helps less than it looks: a 304 skips parsing and validating t
 
 Staleness here is mostly a convergence question. A token minted from a stale catalog is still checked by the service against its current definition, so a scope the service no longer declares is refused at the service regardless of what the plane cached. Grants are plane-side configuration and are re-read on every request, so revoking one takes effect immediately.
 
-**One catalog change is not covered by that.** `access` is enforced by the broker, from the catalog, and the service does not re-check it. Tightening an ability from `access: 'plane'` to `access: 'service'` therefore takes effect only once the cache refreshes: until then a non-service caller that already holds a grant for the scope can still reach it. Revoke the grant for immediate effect, or set `discoveryCache: false` on a plane where `access` changes must land at once. Tracked in [#32](https://github.com/JUVOJustin/service-plane/issues/32).
+`access` is checked twice for the same reason. The broker reads it from the catalog, which the plane caches, so on its own it would be the one field whose staleness *loosens* enforcement: an ability tightened from `access: 'plane'` to `access: 'service'` would stay brokerable for the rest of the TTL. The caller's access class therefore also rides the token as [`spa`](reference.md#capability-token-claims), and the service re-checks it against its own definition. A stale catalog can still broker such a call, but the service refuses it — tightening lands when the service deploys, and the cache only decides where the 403 comes from.
 
 ## OpenAPI Cache
 
@@ -201,7 +201,7 @@ new ServicePlaneControlPlane({
 
 Both mounts also accept `connInfo`, an opt-in resolver that forwards the original client's connection to the target service (`connInfo: (c) => getConnInfo(c)`, importing `getConnInfo` from your runtime's Hono adapter). It reaches handlers only on brokered calls into ingress-protected services and is advisory — see [Forwarded Connection Info](auth.md#forwarded-connection-info).
 
-`caller` returns a `BrokerCaller` — `{ id, kind: 'service' | 'user' }` — or an application-owned `Response`. Existing Hono authentication middleware is the preferred place to generate a challenge when it already owns that policy. Service callers (`kind: 'service'`) can reach `access: 'service'` abilities and are brokered under their own service id; other callers are brokered under the control-plane identity for `access: 'plane'` abilities. To intentionally allow anonymous access, return a fixed caller from the resolver — it is always an explicit choice, never a default.
+`caller` returns a `BrokerCaller` — `{ id, kind: 'service' | 'user' }` — or an application-owned `Response`. Existing Hono authentication middleware is the preferred place to generate a challenge when it already owns that policy. Service callers (`kind: 'service'`) can reach `access: 'service'` abilities and are brokered under their own service id; other callers are brokered under the control-plane identity for `access: 'plane'` abilities. The resolver's answer is what the plane attests in the token's [`spa` claim](reference.md#capability-token-claims), so returning `kind: 'service'` for a caller the plane did not actually authenticate as a service hands it service-only abilities at every service in the fleet. To intentionally allow anonymous access, return a fixed caller from the resolver — it is always an explicit choice, never a default.
 
 The broker connects by ability:
 

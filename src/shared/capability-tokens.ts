@@ -117,6 +117,10 @@ export async function verifyCapabilityToken(token: string, options: VerifyCapabi
   return {
     audience: claims.aud,
     ...(claims.spb ? { brokerServiceId: claims.spb } : {}),
+    // Absent means "issued before the plane attested a caller class", which resolves to the class
+    // that can reach the least. Services enforce `access: 'service'` against this, so defaulting the
+    // other way would turn a missing claim into service authority.
+    callerAccess: claims.spa ?? 'plane',
     // Only reachable once the proof above verified, so its presence means the caller was proven present.
     ...(claims.cnf ? { confirmation: claims.cnf } : {}),
     expiresAt: new Date(claims.exp * 1000),
@@ -170,7 +174,7 @@ function decodeCapabilityToken(token: string): { header: unknown; payload: unkno
 
 function parseCapabilityClaims(value: unknown): CapabilityClaims {
   if (!isRecord(value)) throw new CapabilityAuthError('Invalid Service-Plane capability claims');
-  const { act, aud, cnf, exp, iat, iss, jti, nbf, scp, spb, spo, sub } = value;
+  const { act, aud, cnf, exp, iat, iss, jti, nbf, scp, spa, spb, spo, sub } = value;
   if (
     typeof aud !== 'string' ||
     typeof exp !== 'number' ||
@@ -179,6 +183,9 @@ function parseCapabilityClaims(value: unknown): CapabilityClaims {
     typeof jti !== 'string' ||
     typeof nbf !== 'number' ||
     typeof sub !== 'string' ||
+    // An unreadable access claim is refused rather than dropped: silently ignoring it would read the
+    // token as plane-class and make a service caller's own call fail, which looks like a grant bug.
+    !(spa === undefined || spa === 'plane' || spa === 'service') ||
     !(spb === undefined || typeof spb === 'string') ||
     !Array.isArray(scp) ||
     scp.length === 0 ||
@@ -216,6 +223,7 @@ function parseCapabilityClaims(value: unknown): CapabilityClaims {
     jti,
     nbf,
     scp,
+    ...(spa ? { spa } : {}),
     ...(spb ? { spb } : {}),
     ...(spo ? { spo } : {}),
     sub,

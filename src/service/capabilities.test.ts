@@ -67,6 +67,7 @@ describe('Cap’n Web service capabilities', () => {
     const { left, right } = memoryRpcTransportPair();
     new RpcSession(right, new PublicRoot());
     const issued = await issuer.issueCapabilityToken({
+      callerAccess: 'service',
       callerServiceId: 'moco',
       scopes: ['example.users.lookup'],
       targetServiceId: 'example',
@@ -92,6 +93,7 @@ describe('Cap’n Web service capabilities', () => {
   it('rejects methods when the bound identity lacks a required scope', async () => {
     const target = bindCapabilityIdentity(new RpcTarget(), {
       audience: 'example',
+      callerAccess: 'service',
       expiresAt: new Date('2026-05-09T12:05:00.000Z'),
       issuer: 'control-plane',
       scopes: ['example.read'],

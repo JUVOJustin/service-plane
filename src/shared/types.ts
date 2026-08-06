@@ -314,6 +314,12 @@ export type CapabilityClaims = {
   jti: string;
   nbf: number;
   scp: string[];
+  /**
+   * Service Plane-specific: the access class the control plane authenticated for the caller. Optional
+   * on the wire only so a token from a control plane that predates the claim still verifies — it then
+   * reads as `plane`, the class that can reach the least.
+   */
+  spa?: AbilityAccess;
   spb?: string;
   spo?: string;
   sub: string;
@@ -322,6 +328,13 @@ export type CapabilityClaims = {
 export type CapabilityIdentity = {
   audience: string;
   brokerServiceId?: string;
+  /**
+   * The access class the control plane vouched for: `service` when it authenticated the caller as
+   * another service, `plane` for every caller it fronts itself — end users, API keys, anonymous.
+   * Abilities declared `access: 'service'` accept only `service`, and a token carrying no such claim
+   * reads as `plane`, so an unattested caller is never mistaken for a service.
+   */
+  callerAccess: AbilityAccess;
   /**
    * Present when the token is sender-constrained. A verified identity only ever carries this after a
    * matching proof of possession was checked, so handlers can treat it as proof the caller was present.

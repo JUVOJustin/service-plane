@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import * as z from 'zod';
 import { abilityMethod, defineAbility, RpcTarget, requireScopes } from '../service/index.js';
-import { DEMO_CALLER_ID, type DemoApp, type DemoServiceSpec, demoApp } from '../test-support/index.js';
+import type { AbilityAccess } from '../shared/types.js';
+import { DEMO_CALLER_ID, type DemoApp, type DemoReplica, type DemoServiceSpec, demoApp } from '../test-support/index.js';
+import { memoryRegistryCache } from './registry.js';
 
 // One plane, two independently deployed services. `beta` is redeployed mid-test with a renamed
 // scope while the plane still grants the old name — the drift window described in
@@ -93,6 +95,52 @@ describe('one plane, two services, one upgraded', () => {
   });
 });
 
+// `access` is the one catalog field a stale snapshot could keep *loosened* rather than merely
+// delayed, because the broker decides it from the snapshot. The service re-checks it against its own
+// definition, so a tightening lands at deploy time no matter what the plane still has cached.
+describe('one service tightens its access', () => {
+  let app: DemoApp | undefined;
+
+  afterEach(() => {
+    app?.close();
+    app = undefined;
+  });
+
+  it('refuses a plane-class caller at the service while the plane still has the old catalog', async () => {
+    // Replica 0 caches discovery; replica 1 rediscovers per request. Same fleet, same services —
+    // the two replicas differ only in how current their view of the catalog is.
+    app = await demoApp({
+      replicas: [{ registryCache: memoryRegistryCache() }, {}],
+      services: [jobsService('alpha', 'alpha.run')],
+    });
+    const cached = app.replica(0);
+    await expect(runBrokeredOn(cached, 'alpha', 'alpha.run')).resolves.toMatchObject({ service: 'alpha' });
+
+    // `alpha` redeploys as service-only. Replica 0 keeps serving the snapshot it cached.
+    const tightened = jobsService('alpha', 'alpha.run', 'service');
+    app.redeploy('alpha', { abilities: tightened.abilities, version: '2.0.0' });
+
+    // The broker still brokers it — its catalog says `plane` — and the service refuses the call it
+    // was handed. Before this check the same call succeeded for the rest of the cache TTL.
+    await expect(runBrokeredOn(cached, 'alpha', 'alpha.run')).rejects.toThrow('callable by services only');
+
+    // The replica that sees the new catalog refuses earlier, at the broker.
+    await expect(runBrokeredOn(app.replica(1), 'alpha', 'alpha.run')).rejects.toThrow('requires service access');
+  });
+
+  it('keeps the tightened ability reachable for a service caller', async () => {
+    app = await demoApp({
+      brokerCaller: { id: DEMO_CALLER_ID, kind: 'service' },
+      services: [jobsService('alpha', 'alpha.run', 'service')],
+    });
+
+    await expect(runBrokered(app, 'alpha', 'alpha.run')).resolves.toMatchObject({ caller: DEMO_CALLER_ID, service: 'alpha' });
+    // A direct session holds a token from the plane's service-to-service endpoint, which is
+    // service-class for the same reason: the caller authenticated as a service.
+    await expect(runDirect(app, 'alpha', 'alpha.run')).resolves.toMatchObject({ caller: DEMO_CALLER_ID, service: 'alpha' });
+  });
+});
+
 // A real deploy replaces what the service publishes; the plane's grant is untouched.
 function upgradeBeta(app: DemoApp, scopeId: string) {
   const next = jobsService('beta', scopeId);
@@ -105,6 +153,11 @@ function runDirect(app: DemoApp, serviceId: string, scope: string) {
 
 function runBrokered(app: DemoApp, serviceId: string, scope: string) {
   return app.brokerRoot<JobsApiShape>().ability(serviceId, `${serviceId}.jobs`).connect([scope]).run({ job: 'nightly' });
+}
+
+// The same call against one named replica, for tests whose subject is what that replica has cached.
+function runBrokeredOn(replica: DemoReplica, serviceId: string, scope: string) {
+  return replica.brokerRoot<JobsApiShape>().ability(serviceId, `${serviceId}.jobs`).connect([scope]).run({ job: 'nightly' });
 }
 
 class JobsApi extends RpcTarget {
@@ -121,11 +174,11 @@ class JobsApi extends RpcTarget {
   }
 }
 
-function jobsService(serviceId: string, scopeId: string): DemoServiceSpec {
+function jobsService(serviceId: string, scopeId: string, access: AbilityAccess = 'plane'): DemoServiceSpec {
   return {
     abilities: ({ transports }) => [
       defineAbility({
-        access: 'plane',
+        access,
         exposure: 'published',
         id: `${serviceId}.jobs`,
         methods: {

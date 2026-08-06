@@ -51,6 +51,7 @@ const capabilities = defineCapabilities({ scopes: [{ id: 'example.search' }], se
 
 const identity: CapabilityIdentity = {
   audience: 'example',
+  callerAccess: 'service',
   expiresAt: new Date('2100-01-01T00:00:00Z'),
   issuer: 'control-plane',
   scopes: ['example.search'],
@@ -256,6 +257,7 @@ describe('standard schema streaming over a session transport', () => {
       privateJwks: [keys.privateJwk],
     });
     const issued = await issuer.issueCapabilityToken({
+      callerAccess: 'service',
       callerServiceId: 'worker-a',
       scopes: ['example.read'],
       targetServiceId: 'example',
