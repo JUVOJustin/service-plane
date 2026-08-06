@@ -4,20 +4,9 @@ import { etag } from 'hono/etag';
 import { type RequestIdVariables, requestId } from 'hono/request-id';
 import type { UpgradeWebSocket } from 'hono/ws';
 import { type ConnInfo, normalizeConnInfo } from '../shared/conn-info.js';
-import {
-  parseTimeoutMs,
-  remainingTimeoutMs,
-  resolveTimeoutMs,
-  SERVICE_PLANE_TIMEOUT_HEADER,
-  SERVICE_PLANE_TIMEOUT_QUERY_PARAM,
-  type ServicePlaneTimeoutPolicy,
-} from '../shared/deadline.js';
+import { resolveTimeoutMs, type ServicePlaneTimeoutPolicy, timeoutMsFromRequest, validateTimeoutPolicy } from '../shared/deadline.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
-import {
-  normalizeIdempotencyKey,
-  SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER,
-  SERVICE_PLANE_IDEMPOTENCY_KEY_QUERY_PARAM,
-} from '../shared/idempotency.js';
+import { idempotencyKeyFromRequest } from '../shared/idempotency.js';
 import { defaultServicePlaneLogSink, type ServicePlaneControlPlaneLogEvent, type ServicePlaneLogSink } from '../shared/logging.js';
 import {
   DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
@@ -236,6 +225,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   constructor(private readonly options: ServicePlaneControlPlaneOptions<TEnv>) {
     this.app = (options.app ?? new Hono<ServicePlaneControlPlaneEnv<TEnv>>()) as Hono<ServicePlaneControlPlaneEnv<TEnv>>;
     this.log = options.log === false ? undefined : (options.log ?? defaultServicePlaneLogSink);
+    validateTimeoutPolicy(options.timeout);
     this.discoveryCaches = discoveryCachesFor(options.discoveryCache);
 
     this.app.use(
@@ -324,12 +314,6 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       }
       const resolved = await this.resolveBrokeredRequest(context as Context<TEnv>, mcpOptions);
       if (resolved instanceof Response) return resolved;
-      // MCP resolves and dispatches in one shot, so the whole decrement happens here rather than
-      // inside the handler.
-      const timeoutMs = remainingTimeoutMs(resolved.timeoutMs, Date.now() - receivedAt);
-      if (timeoutMs === 0) {
-        return context.json({ error: "Service-Plane exhausted the caller's deadline before reaching the service" }, 504);
-      }
       const log = this.log;
       return handleControlPlaneMcpRequest(context.req.raw, {
         ...(mcpOptions.allowedOrigins ? { allowedOrigins: mcpOptions.allowedOrigins } : {}),
@@ -342,8 +326,9 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
         registry: resolved.registry,
         ...(resolved.requestId ? { requestId: resolved.requestId } : {}),
         ...(mcpOptions.serverInfo ? { serverInfo: mcpOptions.serverInfo } : {}),
+        receivedAt,
         ...(mcpOptions.streamLimits ? { streamLimits: mcpOptions.streamLimits } : {}),
-        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+        ...(resolved.timeoutMs === undefined ? {} : { timeoutMs: resolved.timeoutMs }),
       });
     });
   }
@@ -408,9 +393,11 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
         ...this.discoveryCacheKeyFor(context, services),
         services,
       }),
-      idempotencyKey: brokerIdempotencyKey(context),
+      idempotencyKey: idempotencyKeyFromRequest(context.req),
       requestId: brokerRequestId(context),
-      timeoutMs: resolveTimeoutMs(brokerTimeoutMs(context), this.options.timeout),
+      // The caller states its own budget; the plane spends from it rather than granting one unless
+      // a defaultMs policy says otherwise.
+      timeoutMs: resolveTimeoutMs(timeoutMsFromRequest(context.req), this.options.timeout),
     };
   }
 
@@ -533,18 +520,6 @@ function missingAuthenticateCaller(context: Context, log: ServicePlaneLogSink | 
 
 function brokerRequestId(context: Context): string | undefined {
   return requestIdFromContext(context) ?? context.req.header(SERVICE_PLANE_REQUEST_ID_HEADER)?.trim() ?? undefined;
-}
-
-// The caller states its own budget; the plane spends from it rather than granting one. A caller that
-// sends nothing gets no deadline, which is the behavior every existing consumer already has.
-function brokerIdempotencyKey(context: Context): string | undefined {
-  return normalizeIdempotencyKey(
-    context.req.header(SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER) ?? context.req.query(SERVICE_PLANE_IDEMPOTENCY_KEY_QUERY_PARAM),
-  );
-}
-
-function brokerTimeoutMs(context: Context): number | undefined {
-  return parseTimeoutMs(context.req.header(SERVICE_PLANE_TIMEOUT_HEADER) ?? context.req.query(SERVICE_PLANE_TIMEOUT_QUERY_PARAM));
 }
 
 // Fails closed: a broker/MCP request with no configured resolver is a 500 (misconfiguration). A

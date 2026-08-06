@@ -19,6 +19,9 @@ export type ServicePlaneErrorCode =
   | 'timeout';
 
 export type ServicePlaneErrorOptions = {
+  /**
+   * The taxonomy entry this failure belongs to; defaults to `internal`.
+   */
   code?: ServicePlaneErrorCode;
   /**
    * Whether the *same* call may succeed if made again. Defaults from the status. This says the
@@ -40,6 +43,11 @@ export class ServicePlaneError extends Error {
   readonly code: ServicePlaneErrorCode;
   /** @see ServicePlaneErrorOptions.retryable */
   readonly retryable: boolean;
+  /**
+   * HTTP-style classification of the failure, not the HTTP status of the response that carried it:
+   * an RPC-level failure travels inside a 200 batch. The number is for gateways mapping the failure
+   * onto their own responses, and for the shells where they answer HTTP directly.
+   */
   readonly status: number;
 
   constructor(message: string, status = 500, options: ServicePlaneErrorOptions = {}) {
@@ -122,21 +130,41 @@ export type AbilityValidationIssue = {
   readonly path?: ReadonlyArray<PropertyKey> | undefined;
 };
 
+/**
+ * The taxonomy read off a caught value by {@link servicePlaneErrorInfo} — the shape to branch on,
+ * since the error class itself does not survive an RPC hop.
+ */
 export type ServicePlaneErrorInfo = {
+  /** @see ServicePlaneErrorCode */
   code: ServicePlaneErrorCode;
+  /**
+   * The error message, empty when the peer sent none.
+   */
   message: string;
+  /**
+   * The application-owned discriminator a handler attached via {@link AbilityHandlerError}.
+   */
   reason?: string;
+  /**
+   * Whether the same call may succeed if made again. Transience only — retrying a non-idempotent
+   * method can still double an effect.
+   */
   retryable: boolean;
+  /** @see ServicePlaneError.status */
   status: number;
 };
 
-const SERVICE_PLANE_ERROR_CODES: ReadonlySet<string> = new Set<ServicePlaneErrorCode>([
-  'ability_validation',
-  'capability_auth',
-  'handler',
-  'internal',
-  'timeout',
-]);
+// A Record keyed by the union is the one shape the compiler checks in both directions: a code added
+// to the union without a row here is a compile error, and an extra row is too. A bare Set literal
+// would drift silently and make servicePlaneErrorInfo blind to the new code.
+const SERVICE_PLANE_ERROR_CODE_ROWS: Record<ServicePlaneErrorCode, true> = {
+  ability_validation: true,
+  capability_auth: true,
+  handler: true,
+  internal: true,
+  timeout: true,
+};
+const SERVICE_PLANE_ERROR_CODES: ReadonlySet<string> = new Set(Object.keys(SERVICE_PLANE_ERROR_CODE_ROWS));
 
 /**
  * Reads the Service Plane taxonomy off a caught value, whether it is still a real

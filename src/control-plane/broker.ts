@@ -62,10 +62,11 @@ export type CreateControlPlaneRpcBrokerOptions = {
    */
   now?: () => number;
   /**
-   * When this request reached the plane. Defaults to construction time, which is only the same
-   * thing when the broker is built first — a shell that authenticates the caller or resolves its
-   * catalog before constructing the broker must pass its own entry timestamp, or that work is not
-   * charged to the caller's budget.
+   * When this request reached the plane. Defaults to the moment `rootCapability` is called — a
+   * shell that authenticates the caller or resolves its catalog before that must pass its own entry
+   * timestamp, or that work is not charged to the caller's budget. The remaining budget is then
+   * snapshotted once per `connect`: calls on a stub held long after connecting are bounded by the
+   * connect-time remainder, not a re-depleted one.
    */
   receivedAt?: number;
   registry?: ServiceRegistry;
@@ -97,11 +98,12 @@ export function createControlPlaneRpcBroker(options: CreateControlPlaneRpcBroker
   const now = options.now ?? (() => Date.now());
   const timeoutMs = normalizeTimeoutMs(options.timeoutMs);
   const idempotencyKey = normalizeIdempotencyKey(options.idempotencyKey);
-  // Everything the plane does from this point on is time the caller is already waiting, so it comes
-  // out of the budget forwarded downstream.
-  const receivedAt = options.receivedAt ?? now();
   return {
     rootCapability(caller, rootOptions) {
+      // Stamped per root, not per broker: a broker held at module scope would otherwise measure
+      // process uptime as elapsed budget and refuse every connect once uptime exceeds it. A shell
+      // that did real work before building the broker still passes its own receivedAt.
+      const receivedAt = options.receivedAt ?? now();
       return new BrokerRoot(
         {
           allowStreaming: rootOptions?.allowStreaming ?? false,

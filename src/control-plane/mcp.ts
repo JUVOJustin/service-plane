@@ -1,6 +1,7 @@
 import { abilitySession, disposeAbilitySession } from '../service/index.js';
 import type { ConnInfo } from '../shared/conn-info.js';
-import { CapabilityAuthError } from '../shared/errors.js';
+import { remainingTimeoutMs } from '../shared/deadline.js';
+import { CapabilityAuthError, ServicePlaneTimeoutError } from '../shared/errors.js';
 import type { ServicePlaneBrokerLogEvent } from '../shared/logging.js';
 import {
   type DiscoveredServiceAbility,
@@ -43,6 +44,12 @@ export type ControlPlaneMcpHandlerOptions = {
   idempotencyKey?: string;
   issuer: CapabilityIssuer;
   log?: (event: ServicePlaneBrokerLogEvent) => void;
+  /**
+   * When the request reached the plane, for deadline accounting: the budget forwarded to a service
+   * is what is left of `timeoutMs` after everything since this instant — JSON-RPC parsing, the
+   * catalog fan-out, token minting. Defaults to handler entry.
+   */
+  receivedAt?: number;
   registry: ServiceRegistry;
   requestId?: string;
   serverInfo?: Partial<ControlPlaneMcpServerInfo>;
@@ -663,6 +670,16 @@ async function openMethodSession(
 ): Promise<{ api: Record<string, (methodInput: unknown) => Promise<unknown>>; dispose: () => Promise<void> }> {
   authorizePublishedAbility(match.ability, options.caller);
   const subject = brokerCallerSubject(options.caller);
+  // Decremented here, beside the session it bounds, so everything the plane did since request entry
+  // — parse, discovery fan-out, token mint — is charged to the caller. Mirrors the broker's
+  // decrement in BrokeredAbility.connect; registry-local requests (initialize, tools/list) never
+  // reach this point and are not refused by an exhausted forwarding budget.
+  const timeoutMs = remainingTimeoutMs(options.timeoutMs, Date.now() - (options.receivedAt ?? Date.now()));
+  if (timeoutMs === 0) {
+    throw new ServicePlaneTimeoutError(
+      `Service-Plane exhausted the caller's deadline before reaching the service: ${match.ability.serviceId}/${match.ability.id}`,
+    );
+  }
   const api = await abilitySession<Record<string, (methodInput: unknown) => Promise<unknown>>>({
     abilityId: match.ability.id,
     callerServiceId: options.caller?.kind === 'service' ? options.caller.id : options.controlPlaneServiceId,
@@ -676,7 +693,7 @@ async function openMethodSession(
         : options.issuer.issueCapabilityToken(tokenInput),
     scopes: match.scopes,
     targetServiceId: match.ability.serviceId,
-    ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
     transport: transportForAbility(match.ability, {
       requiresStreaming: match.ability.methods[match.method]?.stream === true,
     }),

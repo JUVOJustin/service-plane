@@ -22,7 +22,9 @@ import {
   serializeConnInfo,
 } from '../shared/conn-info.js';
 import {
+  discardDisposableValue,
   normalizeTimeoutMs,
+  raceDeadline,
   SERVICE_PLANE_TIMEOUT_GRACE_MS,
   SERVICE_PLANE_TIMEOUT_HEADER,
   SERVICE_PLANE_TIMEOUT_QUERY_PARAM,
@@ -155,9 +157,16 @@ export type CloudflareAbilityRpcBinding = {
   connectAbility(input: {
     abilityId: string;
     connInfo?: ConnInfo;
+    /**
+     * The caller's key for this attempt, surfaced to handlers as `idempotencyKey`.
+     */
     idempotencyKey?: string;
     proof?: string;
     requestId?: string;
+    /**
+     * Milliseconds of the caller's budget. Native binding sessions are opened once and cached, so
+     * this bounds the whole session, not each call on it.
+     */
     timeoutMs?: number;
     token: string;
   }): Promise<object> | object;
@@ -211,7 +220,8 @@ export type CapabilityRpcSessionOptions<Scoped> = (
   connInfo?: ConnInfo;
   /**
    * Identifies one logical attempt so a service can recognize a retry of it. Forwarded to the
-   * service; this package neither generates nor deduplicates it.
+   * service; this package neither generates nor deduplicates it. Not forwarded over the `custom`
+   * transport, which has no header channel.
    */
   idempotencyKey?: string;
   // Required when the plane sender-constrains this caller's tokens (`cnf`), because such a token is
@@ -226,9 +236,13 @@ export type CapabilityRpcSessionOptions<Scoped> = (
   rpcSessionOptions?: RpcSessionOptions;
   /**
    * Milliseconds this caller is willing to wait. Enforced locally per method call and forwarded to
-   * the service, which turns it into the `signal` its handlers receive. Over a per-call transport
-   * (HTTP-batch, native binding) the forwarded budget is per call; over a session transport
-   * (WebSocket) it is fixed when the socket opens and therefore bounds the whole session.
+   * the service, which turns it into the `signal` its handlers receive. Over HTTP-batch the
+   * forwarded budget is per call; over the session transports — WebSocket, and the native binding,
+   * whose `connectAbility` runs once and is cached — it is fixed when the session opens and
+   * therefore bounds the whole session. An explicit `0` means the budget is already exhausted:
+   * every call fails immediately with a timeout instead of running unbounded, which is what makes
+   * the chain pattern (`timeoutMs: remainingTimeoutMs?.()`) safe at exhaustion. The `custom`
+   * transport has no header channel, so nothing is forwarded there — only the local bound applies.
    */
   timeoutMs?: number;
   transport: CapabilityRpcTransport;
@@ -442,7 +456,24 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
   };
   const rejectStreamMethods = options.rejectStreamMethods ? new Set(options.rejectStreamMethods) : undefined;
   const timeoutMs = normalizeTimeoutMs(options.timeoutMs);
+  // `0` is not "no deadline": it says the budget was already gone when the session was requested —
+  // the value remainingTimeoutMs() hands a handler at exhaustion — so calls fail fast instead of
+  // spawning unbounded downstream work the original caller stopped waiting for.
+  const exhaustedBudget = options.timeoutMs === 0;
   const idempotencyKey = normalizeIdempotencyKey(options.idempotencyKey);
+  // Session-constant wire values, derived once rather than re-serialized on every HTTP-batch call.
+  const forwardedMeta: ForwardedSessionMeta = {
+    connInfo: serializeConnInfo(options.connInfo),
+    idempotencyKey,
+    requestId: options.requestId,
+    timeout: serializeTimeoutMs(timeoutMs),
+  };
+  const openSessionInput = {
+    ...(options.abilityId === undefined ? {} : { abilityId: options.abilityId }),
+    ...(options.requestIdHeaderName === undefined ? {} : { requestIdHeaderName: options.requestIdHeaderName }),
+    ...(options.rpcSessionOptions === undefined ? {} : { rpcSessionOptions: options.rpcSessionOptions }),
+    transport: options.transport,
+  };
   // The persistent session's Cap'n Web root stub is Disposable; keep it so the underlying
   // transport (socket) can be released — the scoped stub alone does not close the session.
   let persistentRoot: AuthenticatedRoot<Scoped> | undefined;
@@ -508,7 +539,7 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
     const token = await tokenProvider.token();
     const proof = await proveToken(token);
     assertActive();
-    const root = openSession<Scoped>(options);
+    const root = openSession<Scoped>({ ...openSessionInput, forwardedMeta });
     persistentRoot = root;
     try {
       const scoped = authenticate(root, token, proof);
@@ -521,6 +552,9 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
   };
   const invokeMethod = async (property: string, args: unknown[]): Promise<unknown> => {
     assertActive();
+    if (exhaustedBudget) {
+      throw new ServicePlaneTimeoutError(`Service-Plane ability call started with an exhausted deadline: ${property}`);
+    }
     if (rejectStreamMethods?.has(property)) {
       throw new CapabilityAuthError(`Service-Plane streaming method requires a session transport to the caller: ${property}`, 405);
     }
@@ -549,7 +583,7 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
       const token = await tokenProvider.token();
       const proof = await proveToken(token);
       assertActive();
-      scoped = authenticate(openSession<Scoped>(options), token, proof);
+      scoped = authenticate(openSession<Scoped>({ ...openSessionInput, forwardedMeta }), token, proof);
     } else {
       if (persistent === undefined) {
         persistentOpening ??= openPersistentSession();
@@ -590,10 +624,17 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
         const call = invokeMethod(property, args);
         // The remote peer keeps working after a local timeout — Cap'n Web has no cancel message, so
         // this frees the caller rather than the callee. The same budget travels to the service,
-        // which is what actually stops the handler.
-        // Grace on top of the forwarded budget so the service's own deadline fires first and the
-        // caller gets the error the service actually raised, not a bare local abort.
-        return timeoutMs === undefined ? call : withCallDeadline(call, timeoutMs + SERVICE_PLANE_TIMEOUT_GRACE_MS, property);
+        // which is what actually stops the handler; the grace on top keeps the service's own error
+        // first in the common case. A result that arrives after the race was lost is disposed so a
+        // stub or stream does not stay pinned on a live session.
+        return timeoutMs === undefined
+          ? call
+          : raceDeadline(call, {
+              ceilingMs: timeoutMs + SERVICE_PLANE_TIMEOUT_GRACE_MS,
+              deadlineError: () =>
+                new ServicePlaneTimeoutError(`Service-Plane ability method exceeded its ${timeoutMs}ms deadline: ${property}`),
+              discardLateValue: discardDisposableValue,
+            });
       };
     },
     // Cap'n Web only retains and remotely disposes an RpcTarget when Symbol.dispose is visible
@@ -618,28 +659,6 @@ export async function disposeAbilitySession(session: unknown): Promise<void> {
     return;
   }
   disposable?.[DISPOSE_SYMBOL]?.call(session);
-}
-
-// Bounds the caller's own wait. Cap'n Web has no cancel message, so the peer keeps running and its
-// eventual result is discarded — the budget forwarded to the service is what actually stops the
-// handler. Settling either way clears the timer, and the losing outcome stays handled so a late
-// rejection cannot surface as an unhandled one.
-function withCallDeadline<T>(call: Promise<T>, timeoutMs: number, methodName: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new ServicePlaneTimeoutError(`Service-Plane ability method exceeded its ${timeoutMs}ms deadline: ${methodName}`));
-    }, timeoutMs);
-    call.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error: unknown) => {
-        clearTimeout(timer);
-        reject(error as Error);
-      },
-    );
-  });
 }
 
 function disposeSessionRoot(root: unknown): void {
@@ -852,21 +871,23 @@ function defaultAuthenticate<Scoped>(root: AuthenticatedRoot<Scoped>, token: str
 // caller's Scoped shape; the runtime stub is identical either way.
 type UntypedAuthenticatedRoot = AuthenticatedRoot<Record<string, unknown>>;
 
+type ForwardedSessionMeta = {
+  connInfo: string | undefined;
+  idempotencyKey: string | undefined;
+  requestId: string | undefined;
+  timeout: string | undefined;
+};
+
 function openSession<Scoped>(options: {
   abilityId?: string;
-  connInfo?: ConnInfo;
-  idempotencyKey?: string;
-  requestId?: string;
+  forwardedMeta: ForwardedSessionMeta;
   requestIdHeaderName?: string;
   rpcSessionOptions?: RpcSessionOptions;
-  timeoutMs?: number;
   transport: CapabilityRpcTransport;
 }): AuthenticatedRoot<Scoped> {
-  const { abilityId, requestId, rpcSessionOptions, transport } = options;
+  const { abilityId, rpcSessionOptions, transport } = options;
+  const { connInfo, idempotencyKey, requestId, timeout } = options.forwardedMeta;
   const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
-  const connInfo = serializeConnInfo(options.connInfo);
-  const timeout = serializeTimeoutMs(options.timeoutMs);
-  const idempotencyKey = normalizeIdempotencyKey(options.idempotencyKey);
   const forwarded = {
     ...(requestId ? { [requestIdHeaderName]: requestId } : {}),
     ...(connInfo ? { [SERVICE_PLANE_CONN_INFO_HEADER]: connInfo } : {}),

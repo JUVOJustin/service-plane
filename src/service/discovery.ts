@@ -2,7 +2,7 @@ import type { StandardJSONSchemaV1, StandardSchemaV1 } from '@standard-schema/sp
 import { RpcPromise, RpcTarget } from 'capnweb';
 import type { Context, Env } from 'hono';
 import type { ConnInfo } from '../shared/conn-info.js';
-import { DEFAULT_ABILITY_TIMEOUT_MS, normalizeTimeoutMs } from '../shared/deadline.js';
+import { DEFAULT_ABILITY_TIMEOUT_MS, discardDisposableValue, raceDeadline } from '../shared/deadline.js';
 import {
   AbilityValidationError,
   type AbilityValidationIssue,
@@ -10,6 +10,7 @@ import {
   rememberHandlerFailureCause,
   ServicePlaneError,
   ServicePlaneTimeoutError,
+  servicePlaneErrorInfo,
 } from '../shared/errors.js';
 import { isOriginRelativePath } from '../shared/paths.js';
 import {
@@ -67,8 +68,10 @@ export type AbilityMethodDefinition<TInput extends AbilitySchema = AbilitySchema
   stream?: true;
   /**
    * How long this method may run, overriding the service-wide ceiling. Set it on the one export
-   * that legitimately takes minutes rather than raising the ceiling for everything. Ignored on
-   * streaming methods. `0` removes the ceiling for this method.
+   * that legitimately takes minutes rather than raising the ceiling for everything — unlike a
+   * forwarded deadline it is not clamped to the 10-minute wire ceiling. Ignored on streaming
+   * methods. `0` removes the ceiling for this method; anything else must be a positive integer or
+   * the service definition is refused.
    */
   timeoutMs?: number;
 };
@@ -281,20 +284,28 @@ export type CreateValidatingAbilityHandlerOptions = {
    */
   allowStreaming?: boolean;
   /**
-   * The caller's forwarded deadline. A method whose handler outlives it fails with a timeout error
-   * rather than resolving late, so a handler that ignores its `signal` still cannot exceed the
-   * budget the caller was promised.
+   * The caller's deadline as an absolute reading of this machine's clock. A method whose handler
+   * outlives it fails with a timeout error rather than resolving late, so a handler that ignores
+   * its `signal` still cannot exceed the budget the caller was promised. A number rather than an
+   * AbortSignal so per-call enforcement needs no listener on a shared session signal.
    */
-  signal?: AbortSignal;
+  deadlineAt?: number;
+  /**
+   * Told about every handler failure the wrapper replaces with an opaque error, with the original
+   * throw — the one place a service can still log what actually broke, since the replacement is all
+   * the caller ever sees.
+   */
+  onHandlerFailure?: (cause: unknown, methodName: string) => void;
 };
 
 type ValidatingAbilityHandlerState = {
   abilityId: string;
   allowStreaming: boolean;
+  deadlineAt?: number;
   disposed: boolean;
   handler: RpcTarget & Record<string, unknown>;
   methods: Record<string, NormalizedAbilityMethodDefinition>;
-  signal?: AbortSignal;
+  onHandlerFailure?: (cause: unknown, methodName: string) => void;
 };
 
 type ValidatingAbilityHandlerConstructor = new () => RpcTarget;
@@ -323,10 +334,11 @@ export function createValidatingAbilityHandler<TEnv extends Env>(
   validatingHandlerStateByTarget.set(target, {
     abilityId: ability.id,
     allowStreaming: options.allowStreaming ?? false,
+    ...(options.deadlineAt === undefined ? {} : { deadlineAt: options.deadlineAt }),
     disposed: false,
     handler,
     methods: ability.methods,
-    ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.onHandlerFailure ? { onHandlerFailure: options.onHandlerFailure } : {}),
   });
   return bindCapabilityIdentity(target, identity);
 }
@@ -377,91 +389,53 @@ async function invokeValidatingAbilityMethod(target: RpcTarget, methodName: stri
 
   const input = await validateAbilityValue(method.input, args[0], `input for ${methodName}`, 422);
   activeValidatingAbilityHandlerState(target);
-  // Checked after validation rather than before: a budget already gone means the caller stopped
-  // waiting, so there is nothing to gain by running the handler.
-  assertDeadlineNotExceeded(state.signal, methodName);
   let output: unknown;
   try {
     // Two independent bounds, whichever fires first: the caller's session budget and this method's
     // own ceiling. Layered the way Envoy layers a route timeout under a client's, so a service stays
-    // bounded even when nobody upstream set anything.
-    output = await abortableAbilityCall(
-      implementation.call(state.handler, input),
-      state.signal,
-      methodName,
-      method.stream ? undefined : method.timeoutMs,
+    // bounded even when nobody upstream set anything. One race, one timer; an already-spent budget
+    // rejects before the handler runs — the caller stopped waiting, so there is nothing to gain.
+    output = await raceDeadline(
+      Promise.resolve().then(() => implementation.call(state.handler, input)),
+      {
+        ceilingError: (ceilingMs) =>
+          new ServicePlaneTimeoutError(`Service-Plane ability method exceeded its ${ceilingMs}ms limit: ${methodName}`),
+        ...(method.stream || method.timeoutMs === undefined ? {} : { ceilingMs: method.timeoutMs }),
+        ...(state.deadlineAt === undefined ? {} : { deadlineAt: state.deadlineAt }),
+        deadlineError: () => new ServicePlaneTimeoutError(`Service-Plane ability method exceeded its caller's deadline: ${methodName}`),
+        discardLateValue: discardDisposableValue,
+      },
     );
   } catch (error) {
-    throw abilityHandlerFailure(error, methodName);
+    throw abilityHandlerFailure(error, methodName, state.onHandlerFailure);
   }
   // Streaming methods return their items as a native Cap'n Web ReadableStream, validated
   // one item at a time as the consumer pulls.
-  if (method.stream) return validatedAbilityItemStream(method, methodName, output);
+  if (method.stream) return validatedAbilityItemStream(method, methodName, output, state);
   return validateAbilityValue(method.output, output, `output for ${methodName}`, 500);
 }
 
-/**
- * The one place a handler's failure becomes what the caller sees.
- *
- * Errors this package raised are deliberate — a scope refusal, a schema failure, a deadline — and
- * already say only what a caller should know, so they pass through. `AbilityHandlerError` is a
- * service author making the same choice explicitly. Everything else is whatever the handler's
- * dependencies threw: those messages and properties were written for an operator, not a caller, and
- * routinely carry connection strings, internal hostnames, SQL, or row data. Only the fact of the
- * failure crosses the boundary; the original stays reachable in-process through
- * `handlerFailureCause` for logging.
- */
-function abilityHandlerFailure(error: unknown, methodName: string): unknown {
-  if (error instanceof ServicePlaneError) return error;
+// The one place a handler's failure becomes what the caller sees. Errors carrying the taxonomy pass
+// through: instances this process raised, and — because Cap'n Web rebuilds a received error as a
+// plain Error whose own props survive — errors a downstream service already shaped, which would
+// otherwise be flattened to an opaque 500 at every intermediate hop of a chain. Everything else is
+// whatever the handler's dependencies threw: written for an operator, not a caller, and routinely
+// carrying connection strings, hostnames, SQL, or row data. Only the fact of the failure crosses
+// the boundary; the original goes to onFailure and stays reachable through handlerFailureCause.
+function abilityHandlerFailure(
+  error: unknown,
+  methodName: string,
+  onFailure: ((cause: unknown, methodName: string) => void) | undefined,
+): unknown {
+  if (error instanceof ServicePlaneError || servicePlaneErrorInfo(error) !== undefined) return error;
   const opaque = new ServicePlaneError(`Service-Plane ability handler failed: ${methodName}`, 500);
   rememberHandlerFailureCause(opaque, error);
-  return opaque;
-}
-
-function assertDeadlineNotExceeded(signal: AbortSignal | undefined, methodName: string): void {
-  if (signal?.aborted) {
-    throw new ServicePlaneTimeoutError(`Service-Plane ability method exceeded its caller's deadline: ${methodName}`);
+  try {
+    onFailure?.(error, methodName);
+  } catch {
+    // A logging hook must never replace the failure it is reporting.
   }
-}
-
-// The handler keeps running after an abort — JavaScript cannot interrupt it, and a handler that
-// honours its `signal` stops on its own. What this guarantees is the contract the caller was given:
-// the method never resolves after the budget is gone. The losing outcome stays handled so a late
-// rejection cannot surface as an unhandled one.
-function abortableAbilityCall(
-  call: unknown,
-  signal: AbortSignal | undefined,
-  methodName: string,
-  ceilingMs: number | undefined,
-): Promise<unknown> {
-  const settled = Promise.resolve(call);
-  if (!signal && ceilingMs === undefined) return settled;
-  return new Promise<unknown>((resolve, reject) => {
-    const onAbort = () =>
-      reject(new ServicePlaneTimeoutError(`Service-Plane ability method exceeded its caller's deadline: ${methodName}`));
-    signal?.addEventListener('abort', onAbort, { once: true });
-    const timer =
-      ceilingMs === undefined
-        ? undefined
-        : setTimeout(
-            () => reject(new ServicePlaneTimeoutError(`Service-Plane ability method exceeded its ${ceilingMs}ms limit: ${methodName}`)),
-            ceilingMs,
-          );
-    const release = () => {
-      signal?.removeEventListener('abort', onAbort);
-      if (timer !== undefined) clearTimeout(timer);
-    };
-    settled.then(
-      (value) => {
-        release();
-        resolve(value);
-      },
-      (error: unknown) => {
-        release();
-        reject(error as Error);
-      },
-    );
-  });
+  return opaque;
 }
 
 // Standard Schema reports failures as issues rather than by throwing, so the boundary that owns
@@ -547,6 +521,7 @@ function validatedAbilityItemStream(
   method: NormalizedAbilityMethodDefinition,
   methodName: string,
   source: unknown,
+  state: Pick<ValidatingAbilityHandlerState, 'deadlineAt' | 'onHandlerFailure'>,
 ): ReadableStream<unknown> {
   const puller = abilityStreamPuller(source, methodName);
   // Constant for the whole stream; building it per item would allocate once per pull for a
@@ -561,6 +536,12 @@ function validatedAbilityItemStream(
     },
     async pull(controller) {
       try {
+        // The wrapper's promise-level bound cannot see individual pulls, so the deadline is
+        // re-checked here: without it, items would keep flowing past a budget the caller's other
+        // calls are already being refused under.
+        if (state.deadlineAt !== undefined && Date.now() >= state.deadlineAt) {
+          throw new ServicePlaneTimeoutError(`Service-Plane streaming method exceeded its caller's deadline: ${methodName}`);
+        }
         const next = await puller.next();
         if (next.done) {
           controller.close();
@@ -573,7 +554,7 @@ function validatedAbilityItemStream(
         // reader locks are not stranded. Cancel with the original — the source's own cleanup is
         // in-process — but surface the same replacement a unary failure would get.
         puller.cancel(error);
-        throw abilityHandlerFailure(error, methodName);
+        throw abilityHandlerFailure(error, methodName, state.onHandlerFailure);
       }
     },
   });
@@ -639,6 +620,7 @@ function normalizeAbilities<TEnv extends Env>(
   if (abilities.length === 0) {
     throw new CapabilityAuthError('Service-Plane service must define at least one ability', 500);
   }
+  const methodTimeoutDefault = validateDefaultMethodTimeoutMs(defaultMethodTimeoutMs);
 
   const knownScopes = new Set(capabilities?.scopes.map((scope) => normalizeScope(scope.id)) ?? []);
   const seenIds = new Set<string>();
@@ -666,7 +648,7 @@ function normalizeAbilities<TEnv extends Env>(
       knownScopes,
       capabilities,
       requireAbilityScopes,
-      defaultMethodTimeoutMs,
+      methodTimeoutDefault,
     );
     const path = normalizePath(ability.rpc?.path ?? defaultAbilityRpcPath(id), id);
     if (seenPaths.has(path)) throw new CapabilityAuthError(`Duplicate Service-Plane ability RPC path: ${path}`, 500);
@@ -756,20 +738,21 @@ function normalizeMethods(
       }
       // Resolved once here rather than per call: a streaming method is exempt (the bound that suits
       // a request is wrong for a stream), an explicit 0 opts out, and anything else falls back to
-      // the service-wide ceiling.
-      const timeoutMs = method.stream
-        ? undefined
-        : method.timeoutMs === undefined
-          ? (normalizeTimeoutMs(defaultMethodTimeoutMs === false ? undefined : defaultMethodTimeoutMs) ?? undefined)
-          : normalizeTimeoutMs(method.timeoutMs);
+      // the service-wide ceiling. Validated like every other definition mistake — an invalid value
+      // must not silently drop the ceiling (or worse: an unvalidated 0 once enforced as a 0ms limit).
+      const timeoutMs = method.stream ? undefined : resolveMethodTimeoutMs(abilityId, name, method.timeoutMs, defaultMethodTimeoutMs);
       const rest = method.rest ? normalizeRestProjection(abilityId, name, method.rest) : undefined;
       const mcp = method.mcp ? normalizeMcpProjection(abilityId, name, method.mcp) : undefined;
       const mcpPrompt = method.mcpPrompt ? normalizeMcpPromptProjection(abilityId, name, method.mcpPrompt) : undefined;
       const mcpResource = method.mcpResource ? normalizeMcpResourceProjection(abilityId, name, method.mcpResource) : undefined;
+      // The raw definition's own timeoutMs must not survive the spread: the resolved value below is
+      // the only one enforcement and discovery may see, and for streams and opt-outs that value is
+      // "absent", not whatever the author wrote.
+      const { timeoutMs: _declaredTimeoutMs, ...methodWithoutTimeout } = method;
       return [
         name,
         {
-          ...method,
+          ...methodWithoutTimeout,
           inputSchema: abilityJsonSchema(
             method.input,
             'input',
@@ -793,6 +776,46 @@ function normalizeMethods(
       ];
     }),
   );
+}
+
+// setTimeout clamps delays above 2^31-1 to 1ms, so a huge ceiling would fire instantly instead of
+// never — the definition-time bound exists to keep that footgun out of production.
+const MAX_METHOD_TIMEOUT_MS = 2 ** 31 - 1;
+
+// A method's own ceiling is trusted definition-time config, not hostile wire input, so mistakes
+// throw here like every other definition error instead of being silently normalized away. `0` is
+// the documented opt-out; the 10-minute wire clamp deliberately does not apply — a batch export may
+// legitimately run longer than any forwarded deadline is allowed to promise.
+function resolveMethodTimeoutMs(
+  abilityId: string,
+  methodName: string,
+  declared: number | undefined,
+  serviceDefault: false | number,
+): number | undefined {
+  if (declared !== undefined) {
+    if (declared === 0) return undefined;
+    if (!Number.isSafeInteger(declared) || declared < 0 || declared > MAX_METHOD_TIMEOUT_MS) {
+      throw new CapabilityAuthError(
+        `Service-Plane ability method timeoutMs must be 0 or a positive integer no greater than ${MAX_METHOD_TIMEOUT_MS}: ${abilityId}/${methodName}`,
+        500,
+      );
+    }
+    return declared;
+  }
+  return serviceDefault === false ? undefined : serviceDefault;
+}
+
+// The service-wide ceiling is validated once, at definition: `0` is refused with a pointer at the
+// explicit opt-out so "disable" is spelled one way, not two.
+function validateDefaultMethodTimeoutMs(value: false | number): false | number {
+  if (value === false) return value;
+  if (!Number.isSafeInteger(value) || value <= 0 || value > MAX_METHOD_TIMEOUT_MS) {
+    throw new CapabilityAuthError(
+      `Service-Plane timeout.methodMs must be false or a positive integer no greater than ${MAX_METHOD_TIMEOUT_MS}`,
+      500,
+    );
+  }
+  return value;
 }
 
 function validateMethodScopesDeclaredByAbility(

@@ -166,8 +166,15 @@ export type ServiceAbilityNativeRpcBinding = {
   connectAbility(input: {
     abilityId: string;
     connInfo?: ConnInfo;
+    /**
+     * The caller's key for this attempt, surfaced to handlers as `idempotencyKey`.
+     */
     idempotencyKey?: string;
     requestId?: string;
+    /**
+     * Milliseconds of the caller's budget. Native binding sessions are opened once and cached, so
+     * this bounds the whole session, not each call on it.
+     */
     timeoutMs?: number;
     token: string;
   }): Promise<object> | object;

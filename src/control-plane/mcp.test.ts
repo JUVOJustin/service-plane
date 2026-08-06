@@ -430,6 +430,32 @@ describe('control-plane MCP endpoint', () => {
     );
   });
 
+  it('frames an exhausted forwarded budget in-band and leaves the handshake unaffected', async () => {
+    const { mcp } = await createFixture();
+    // 1ms of budget: caller resolution and issuer construction consume it before any service leg,
+    // so the decrement in openMethodSession refuses the call — as a JSON-RPC-framed tool failure,
+    // never a bare non-protocol body the client cannot correlate.
+    const exhausted = (await (
+      await mcp(rpc('tools/call', { arguments: { query: 'x' }, name: 'example_search' }, 9), { 'X-Service-Plane-Timeout': '1' })
+    ).json()) as {
+      id: unknown;
+      jsonrpc: string;
+      result: { content: Array<{ text: string }>; isError: boolean };
+    };
+    expect(exhausted.jsonrpc).toBe('2.0');
+    expect(exhausted.id).toBe(9);
+    expect(exhausted.result.isError).toBe(true);
+    expect(exhausted.result.content[0]?.text).toContain("exhausted the caller's deadline");
+
+    // Registry-local methods never reach the forwarding decrement.
+    const initialized = (await (
+      await mcp(rpc('initialize', { protocolVersion: '2025-11-25' }), { 'X-Service-Plane-Timeout': '1' })
+    ).json()) as {
+      result?: unknown;
+    };
+    expect(initialized.result).toBeDefined();
+  });
+
   it('reports tool execution failures in-band with isError', async () => {
     const { events, mcp } = await createFixture();
 

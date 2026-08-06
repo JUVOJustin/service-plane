@@ -1,3 +1,5 @@
+import { ServicePlaneError } from './errors.js';
+
 /**
  * A call deadline travels as the milliseconds still available, not as an absolute timestamp. Two
  * clocks that disagree would shift an absolute deadline by the whole skew, and this package already
@@ -57,11 +59,134 @@ export type ServicePlaneTimeoutPolicy = {
   maxMs?: number;
 };
 
+/**
+ * Turns a requested budget into the effective one under a policy: the default fills in when the
+ * caller asked for nothing, and the ceiling clamps what may be asked — including the default.
+ */
 export function resolveTimeoutMs(requested: number | undefined, policy: ServicePlaneTimeoutPolicy | undefined): number | undefined {
   const asked = normalizeTimeoutMs(requested) ?? normalizeTimeoutMs(policy?.defaultMs);
   if (asked === undefined) return undefined;
   const max = normalizeTimeoutMs(policy?.maxMs);
   return max === undefined ? asked : Math.min(asked, max);
+}
+
+/**
+ * Rejects a policy whose values the normalizer would silently drop. `maxMs: 0` would otherwise
+ * remove the clamp entirely — the exact opposite of what an operator writing it intends — so
+ * misconfiguration fails at construction rather than silently loosening at runtime.
+ */
+export function validateTimeoutPolicy(policy: ServicePlaneTimeoutPolicy | undefined): ServicePlaneTimeoutPolicy | undefined {
+  if (!policy) return policy;
+  for (const [field, value] of [
+    ['defaultMs', policy.defaultMs],
+    ['maxMs', policy.maxMs],
+  ] as const) {
+    if (value === undefined) continue;
+    if (normalizeTimeoutMs(value) !== value) {
+      throw new ServicePlaneError(
+        `Service-Plane timeout policy ${field} must be a positive integer no greater than ${MAX_SERVICE_PLANE_TIMEOUT_MS} milliseconds`,
+      );
+    }
+  }
+  return policy;
+}
+
+/**
+ * The header-or-query read both shells share. Header wins because it is the primary channel; the
+ * query parameter exists only for WebSocket upgrades, which cannot carry custom headers portably.
+ * One implementation so the plane and the service cannot disagree about a request carrying both.
+ */
+export function timeoutMsFromRequest(request: ForwardedValueSource): number | undefined {
+  return parseTimeoutMs(request.header(SERVICE_PLANE_TIMEOUT_HEADER) ?? request.query(SERVICE_PLANE_TIMEOUT_QUERY_PARAM));
+}
+
+/**
+ * Structural view of a Hono request: just enough to read a forwarded value from header or query.
+ */
+export type ForwardedValueSource = {
+  header(name: string): string | undefined;
+  query(name: string): string | undefined;
+};
+
+/**
+ * Bounds for one in-flight call, raced by {@link raceDeadline}. `deadlineAt` is the caller's
+ * absolute deadline on this machine's clock; `ceilingMs` is the method's own limit measured from
+ * now. Whichever is nearer arms the single timer.
+ */
+export type RaceDeadlineOptions = {
+  ceilingError?: (ceilingMs: number) => Error;
+  ceilingMs?: number;
+  deadlineAt?: number;
+  deadlineError: () => Error;
+  /**
+   * Called with a result that arrived after the race was lost, so a disposable value — a Cap'n Web
+   * stub, a ReadableStream — is released instead of pinning its remote resource on a live session.
+   */
+  discardLateValue?: (value: unknown) => void;
+};
+
+/**
+ * One race, one clearable timer, both settle paths released. An already-expired deadline rejects
+ * immediately — an abort listener would never fire for it — and the losing outcome stays handled so
+ * a late rejection cannot surface as an unhandled one.
+ */
+export function raceDeadline<T>(call: Promise<T>, options: RaceDeadlineOptions): Promise<T> {
+  const now = Date.now();
+  const remaining = options.deadlineAt === undefined ? undefined : options.deadlineAt - now;
+  if (remaining !== undefined && remaining <= 0) {
+    // The call is already running; its eventual outcome must stay handled and any late value freed.
+    call.then(
+      (value) => options.discardLateValue?.(value),
+      () => undefined,
+    );
+    return Promise.reject(options.deadlineError());
+  }
+  const ceiling = options.ceilingMs;
+  if (remaining === undefined && ceiling === undefined) return call;
+
+  const deadlineIsNearer = ceiling === undefined || (remaining !== undefined && remaining < ceiling);
+  const waitMs = deadlineIsNearer ? (remaining as number) : (ceiling as number);
+  return new Promise<T>((resolve, reject) => {
+    let lost = false;
+    const timer = setTimeout(() => {
+      lost = true;
+      reject(deadlineIsNearer || !options.ceilingError ? options.deadlineError() : options.ceilingError(ceiling as number));
+    }, waitMs);
+    call.then(
+      (value) => {
+        clearTimeout(timer);
+        if (lost) {
+          options.discardLateValue?.(value);
+          return;
+        }
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error as Error);
+      },
+    );
+  });
+}
+
+/**
+ * Best-effort release of a value nobody will consume: Cap'n Web stubs expose the platform dispose
+ * hooks, and a streaming method's ReadableStream must be cancelled or its source stays pinned.
+ */
+export function discardDisposableValue(value: unknown): void {
+  try {
+    if (value instanceof ReadableStream) {
+      void value.cancel().catch(() => undefined);
+      return;
+    }
+    const disposable = value as Record<symbol, (() => unknown) | undefined> | null;
+    if (typeof value === 'object' && value !== null) {
+      const dispose = disposable?.[Symbol.asyncDispose as unknown as symbol] ?? disposable?.[Symbol.dispose as unknown as symbol];
+      if (typeof dispose === 'function') void Promise.resolve(dispose.call(value)).catch(() => undefined);
+    }
+  } catch {
+    // Cleanup must never turn a timeout into a different failure.
+  }
 }
 
 /**
@@ -74,11 +199,18 @@ export function normalizeTimeoutMs(value: unknown): number | undefined {
   return Math.min(value, MAX_SERVICE_PLANE_TIMEOUT_MS);
 }
 
+/**
+ * Wire form of a budget, or nothing when the value is not one a peer would accept.
+ */
 export function serializeTimeoutMs(timeoutMs: number | undefined): string | undefined {
   const normalized = normalizeTimeoutMs(timeoutMs);
   return normalized === undefined ? undefined : String(normalized);
 }
 
+/**
+ * Reads the wire form a peer sent. Digits only, bounded, clamped — never trusted merely because it
+ * arrived from the plane.
+ */
 export function parseTimeoutMs(value: string | null | undefined): number | undefined {
   const trimmed = value?.trim();
   // Digits only, and short enough that a hostile value cannot turn into a huge Number parse. The

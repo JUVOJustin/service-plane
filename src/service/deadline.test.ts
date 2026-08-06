@@ -315,16 +315,8 @@ describe('broker deadline accounting', () => {
 
 describe('websocket deadline forwarding', () => {
   it('carries the budget as a query parameter where headers cannot travel', async () => {
-    const { issuer, keys } = await issuerWithKeys();
+    const { issuer } = await issuerWithKeys();
     const { workAbility } = buildService();
-    const service = new ServicePlaneService({
-      abilities: [workAbility],
-      auth: { issuer: 'control-plane', jwks: { keys: [keys.publicJwk] }, now: () => VERIFIED_AT },
-      capabilities,
-      id: 'example',
-      title: 'Example',
-      version: '0.1.0',
-    });
     const issued = await issuer.issueCapabilityToken({
       callerServiceId: 'worker-a',
       scopes: ['example.work.run'],
@@ -352,7 +344,6 @@ describe('websocket deadline forwarding', () => {
     ).rejects.toThrow();
 
     expect(new URL(socketUrl as string).searchParams.get(SERVICE_PLANE_TIMEOUT_QUERY_PARAM)).toBe('1500');
-    expect(service.discoveryPath).toBeTruthy();
   });
 });
 

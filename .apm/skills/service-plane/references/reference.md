@@ -298,7 +298,10 @@ new ServicePlaneService({
 });
 
 bigExport: abilityMethod({ timeoutMs: 120_000, ... });  // the one slow method
+bigMigration: abilityMethod({ timeoutMs: 0, ... });     // opt this one out entirely
 ```
+
+Method values are validated at definition time — a negative, fractional, or absurdly large value refuses the service instead of silently dropping or clamping the ceiling — and a method's own ceiling is deliberately **not** clamped to the 10-minute wire limit: that limit bounds what a *caller* may ask for, not how long a service allows its own export to run.
 
 Raise the exception, not the ceiling. **Streaming methods are never bounded this way** — for the reason Envoy documents about its own route timeout, a bound that suits a request is wrong for a stream. Session lifetime is untouched either way.
 
@@ -342,6 +345,8 @@ handler: ({ remainingTimeoutMs, signal }) => ({
 
 Skip it and the next hop starts a **fresh** budget: `A(5s) → B` where B calls C with its own 5s means the end-to-end bound A asked for is gone. Nothing enforces this for you — a service that calls onward has to opt in.
 
+At exhaustion the pattern stays safe: `remainingTimeoutMs()` returns `0` once the budget is gone, and a session opened with `timeoutMs: 0` fails every call immediately with a `timeout` error instead of running unbounded — the same fail-fast the broker applies before opening a service leg.
+
 ### What This Does And Does Not Bound
 
 Three of the four mechanisms are plain timers over a duration, so they do not read a clock and cannot drift:
@@ -376,7 +381,7 @@ new ServicePlaneControlPlane({ timeout: { defaultMs: 10_000, maxMs: 60_000 } });
 new ServicePlaneService({ timeout: { defaultMs: 5_000, maxMs: 30_000 } });
 ```
 
-`defaultMs` supplies a budget when the caller sent none; `maxMs` clamps one that asks for more than you are willing to hold a connection for. The plane has no built-in default on purpose — it forwards a budget rather than doing the work, so the bound that must always exist lives at the service. Set `defaultMs` when you want the plane to be the policy point, the role Envoy's route timeout plays.
+`defaultMs` supplies a budget when the caller sent none — on per-call transports (HTTP-batch) only. A session transport (WebSocket, native binding) resolves its budget once at session open, so a manufactured default would become a death timer for long-lived sessions whose callers never asked for one; an explicit caller budget on a session transport still applies. `maxMs` clamps any budget — explicit or defaulted — that asks for more than you are willing to hold a connection for. Invalid policy values (`0`, negatives, fractions) are refused at construction rather than silently loosening at runtime. The plane has no built-in default on purpose — it forwards a budget rather than doing the work, so the bound that must always exist lives at the service. Set `defaultMs` when you want the plane to be the policy point, the role Envoy's route timeout plays.
 
 A caller's own local wait is set slightly **above** the budget it forwards (`SERVICE_PLANE_TIMEOUT_GRACE_MS`, 250ms). [Armeria does the same thing](https://armeria.dev/docs/advanced/understanding-timeouts/) — its client response timeout of 15s sits above its 10s server request timeout — so that the service's own enforcement fires first and the caller gets the error the service actually raised instead of a bare local abort that says nothing about what happened downstream.
 
@@ -392,7 +397,7 @@ The last row is the honest gap: Cap'n Web has no cancel message, so a caller giv
 
 `retryable` is `true` for a timeout, matching Envoy's treatment of 504 as a `gateway-error` worth retrying — but only retry when the method is also `idempotent`. See [Idempotency](#idempotency).
 
-**`status` is a classification, not an HTTP status code.** A method's failure is a value inside the Cap'n Web batch, so the HTTP response is `200` and the error travels in its body. Read the classification with `servicePlaneErrorInfo`; do not expect to see 504 on the wire. The number matters when a gateway maps the failure onto its own response — and it is the number the shells do use where they answer HTTP directly, such as the plane refusing an MCP call whose budget is already spent.
+**`status` is a classification, not an HTTP status code.** A method's failure is a value inside the Cap'n Web batch, so the HTTP response is `200` and the error travels in its body. Read the classification with `servicePlaneErrorInfo`; do not expect to see 504 on the wire. The number matters when a gateway maps the failure onto its own response. On the MCP surface even an exhausted forwarding budget stays inside the protocol: the refusal is a JSON-RPC-framed tool failure the client can correlate, never a bare HTTP error body.
 
 Unlike forwarded connection info, a deadline is honoured from **any** caller without requiring ingress. It is not an authorization input: a caller shortening its own budget can only cut itself off, and a long one is clamped.
 
@@ -440,6 +445,7 @@ Service events (`ServicePlaneLogEvent`):
 - `service_plane.discovery.served`
 - `service_plane.request.completed`
 - `service_plane.request.failed`
+- `service_plane.ability.handler_failed` — a handler throw the wrapper replaced with an opaque error; carries the original name and message
 
 Control-plane events:
 
@@ -534,6 +540,10 @@ Service-Plane ability handler failed: <methodName>
 ```
 
 That is deliberate. A database driver error or a `TypeError` was written for an operator, not a caller, and routinely carries connection strings, internal hostnames, SQL, or row data. The same replacement applies to a streaming method that fails mid-stream.
+
+The replacement also holds across chains: an error that already carries the taxonomy — thrown by a downstream service and rebuilt as a plain `Error` on the way through — passes intermediate hops untouched instead of being re-replaced, so the original `code`/`status`/`retryable`/`reason` reach the first caller.
+
+Every replacement is logged service-side as a `service_plane.ability.handler_failed` event carrying the original error's name and message (the RPC response is a 200 batch, so `request.failed` never fires for it). The original object also stays reachable in-process via `handlerFailureCause(error)`.
 
 To choose what the caller sees, throw `AbilityHandlerError`:
 
