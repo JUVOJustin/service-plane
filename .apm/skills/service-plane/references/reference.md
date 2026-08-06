@@ -303,6 +303,46 @@ What each participant does with it:
 handler: ({ signal }) => new MyApi(signal), // pass it to outbound fetch, long loops, DB calls
 ```
 
+### Chains
+
+A budget only survives a chain if each service passes on what is left of its own. Handlers get `remainingTimeoutMs()` for exactly that:
+
+```ts
+handler: ({ remainingTimeoutMs, signal }) => ({
+  async run(input) {
+    const downstream = await abilitySession({ ...opts, timeoutMs: remainingTimeoutMs?.() });
+    return downstream.doWork(input);
+  },
+});
+```
+
+Skip it and the next hop starts a **fresh** budget: `A(5s) → B` where B calls C with its own 5s means the end-to-end bound A asked for is gone. Nothing enforces this for you — a service that calls onward has to opt in.
+
+### What This Does And Does Not Bound
+
+Three of the four mechanisms are plain timers over a duration, so they do not read a clock and cannot drift:
+
+- the caller's own wait (`setTimeout`),
+- the `signal` handed to handlers (`AbortSignal.timeout`),
+- the wrapper's refusal to resolve a method past the deadline.
+
+Only the plane's decrement does clock arithmetic — `Date.now()` at request entry versus at the moment it opens the service leg. Both readings are on the same machine, so there is no cross-host skew to worry about.
+
+It does **not**:
+
+- **cancel the peer.** Cap'n Web has no cancel message. A caller-side timeout frees the caller; the service keeps running until its own budget expires. The forwarded budget is what actually stops work.
+- **close a session.** The deadline fails a *method*. A WebSocket session stays open, so on Cloudflare a Durable Object holding one keeps billing duration — see [Transports](transports.md). Use an idle timeout to bound that, not a deadline.
+- **bound a stream's lifetime.** It bounds the call that returns the stream, not consumption of its items.
+
+### On Cloudflare
+
+Workers freeze `Date.now()` during synchronous execution and advance it on I/O (a Spectre mitigation). That suits this design rather than breaking it: the plane's decrement measures *waiting* — the discovery fan-out, the token mint — and waiting is I/O, which is exactly when the clock moves. What stays invisible is pure CPU time, which the Workers CPU limit already bounds and which is small next to a network hop. The effect is that a plane's decrement can slightly under-count, never over-count, so a service is handed a budget that is generous rather than short.
+
+Two caveats worth stating:
+
+- The runtime matrix in [#11](https://github.com/JUVOJustin/service-plane/issues/11) does not run yet, so the above reflects documented workerd behavior, not a test result on workerd.
+- If Cap'n Web ever gains WebSocket Hibernation ([capnweb#36](https://github.com/cloudflare/capnweb/issues/36)), a hibernating Durable Object would lose the in-memory `AbortSignal.timeout` behind a session-scoped deadline, and it would silently never fire on wake. Today Cap'n Web sessions cannot hibernate, so this is not reachable — but a deadline set before hibernation is not something to assume survives it.
+
 Values are clamped to `MAX_SERVICE_PLANE_TIMEOUT_MS` (10 minutes) and anything that is not a positive integer count of milliseconds is ignored, so a caller sending nothing keeps today's behavior: no deadline.
 
 Unlike forwarded connection info, a deadline is honoured from **any** caller without requiring ingress. It is not an authorization input: a caller shortening its own budget can only cut itself off, and a long one is clamped.

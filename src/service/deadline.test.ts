@@ -355,3 +355,88 @@ describe('websocket deadline forwarding', () => {
     expect(service.discoveryPath).toBeTruthy();
   });
 });
+
+describe('deadline across a service chain', () => {
+  it('shrinks the budget at each hop when a handler passes the remainder on', async () => {
+    const { issuer, keys } = await issuerWithKeys();
+
+    // The downstream service. Records the budget it was handed.
+    let downstreamBudget: number | undefined;
+    const { workAbility: leafAbility } = buildService();
+    const leaf = new ServicePlaneService({
+      abilities: [leafAbility],
+      auth: { issuer: 'control-plane', jwks: { keys: [keys.publicJwk] }, now: () => VERIFIED_AT },
+      capabilities,
+      id: 'example',
+      title: 'Example',
+      version: '0.1.0',
+    });
+
+    const issued = await issuer.issueCapabilityToken({
+      callerServiceId: 'worker-a',
+      scopes: ['example.work.run'],
+      targetServiceId: 'example',
+    });
+
+    // The middle service: its handler calls the leaf, forwarding what is left of its own budget.
+    const middleAbility = defineAbility({
+      id: 'example.work',
+      methods: {
+        runFast: abilityMethod({
+          input: z.object({}),
+          output: z.object({ ok: z.literal(true) }),
+          scopes: ['example.work.run'],
+        }),
+      },
+      rpc: { transports: ['cloudflare-binding-rpc'] },
+      scopes: ['example.work.run'],
+      handler: ({ remainingTimeoutMs }) => {
+        class MiddleApi extends RpcTarget {
+          async runFast() {
+            await sleep(60);
+            const onward = remainingTimeoutMs?.();
+            downstreamBudget = onward;
+            const downstream = await abilitySession<AbilityRpc<typeof leafAbility>>({
+              abilityId: 'example.work',
+              callerServiceId: 'worker-a',
+              requestToken: async () => issued,
+              scopes: ['example.work.run'],
+              targetServiceId: 'example',
+              ...(onward === undefined ? {} : { timeoutMs: onward }),
+              transport: cloudflareNativeRpc({ connectAbility: (input) => leaf.connectAbility(input) }),
+            });
+            return downstream.runFast({});
+          }
+        }
+        return new MiddleApi() as MiddleApi & Record<string, unknown>;
+      },
+    });
+
+    const middle = new ServicePlaneService({
+      abilities: [middleAbility],
+      auth: { issuer: 'control-plane', jwks: { keys: [keys.publicJwk] }, now: () => VERIFIED_AT },
+      capabilities,
+      id: 'example',
+      title: 'Example',
+      version: '0.1.0',
+    });
+
+    const api = await abilitySession<AbilityRpc<typeof middleAbility>>({
+      abilityId: 'example.work',
+      callerServiceId: 'worker-a',
+      requestToken: async () => issued,
+      scopes: ['example.work.run'],
+      targetServiceId: 'example',
+      timeoutMs: 2_000,
+      transport: cloudflareNativeRpc({ connectAbility: (input) => middle.connectAbility(input) }),
+    });
+
+    await expect(api.runFast({})).resolves.toEqual({ ok: true });
+
+    // The middle service burned ~60ms of the caller's 2000ms before calling on, so the leaf must
+    // start from visibly less than the original budget rather than a fresh one.
+    expect(downstreamBudget).toBeDefined();
+    expect(downstreamBudget as number).toBeLessThanOrEqual(2_000 - 30);
+    expect(downstreamBudget as number).toBeGreaterThan(0);
+  });
+});

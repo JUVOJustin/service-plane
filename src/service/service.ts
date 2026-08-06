@@ -10,7 +10,13 @@ import {
   SERVICE_PLANE_CONN_INFO_HEADER,
   SERVICE_PLANE_CONN_INFO_QUERY_PARAM,
 } from '../shared/conn-info.js';
-import { normalizeTimeoutMs, parseTimeoutMs, SERVICE_PLANE_TIMEOUT_HEADER, SERVICE_PLANE_TIMEOUT_QUERY_PARAM } from '../shared/deadline.js';
+import {
+  normalizeTimeoutMs,
+  parseTimeoutMs,
+  remainingTimeoutMs,
+  SERVICE_PLANE_TIMEOUT_HEADER,
+  SERVICE_PLANE_TIMEOUT_QUERY_PARAM,
+} from '../shared/deadline.js';
 import { CapabilityAuthError } from '../shared/errors.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
 import {
@@ -244,12 +250,18 @@ class AuthRoot<TEnv extends Env> extends RpcTarget {
     // authorization input, a caller shortening its own budget can only cut itself off, and the
     // normalizer clamps a long one. So it is honoured from any caller.
     const signal = this.timeoutMs === undefined ? undefined : AbortSignal.timeout(this.timeoutMs);
+    // Both readings are this machine's clock, so what a handler passes to the next hop never depends
+    // on two machines agreeing about the time.
+    const budget = this.timeoutMs;
+    const startedAt = Date.now();
+    const remaining = budget === undefined ? undefined : () => remainingTimeoutMs(budget, Date.now() - startedAt) ?? 0;
     const handler = await this.ability.handler({
       abilityId: this.ability.id,
       ...(connInfo ? { connInfo } : {}),
       context: this.context,
       ...(this.idempotencyKey ? { idempotencyKey: this.idempotencyKey } : {}),
       identity,
+      ...(remaining ? { remainingTimeoutMs: remaining } : {}),
       ...(signal ? { signal } : {}),
     });
     return createValidatingAbilityHandler(this.ability, handler, identity, {

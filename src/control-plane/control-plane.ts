@@ -4,7 +4,7 @@ import { etag } from 'hono/etag';
 import { type RequestIdVariables, requestId } from 'hono/request-id';
 import type { UpgradeWebSocket } from 'hono/ws';
 import { type ConnInfo, normalizeConnInfo } from '../shared/conn-info.js';
-import { parseTimeoutMs, SERVICE_PLANE_TIMEOUT_HEADER, SERVICE_PLANE_TIMEOUT_QUERY_PARAM } from '../shared/deadline.js';
+import { parseTimeoutMs, remainingTimeoutMs, SERVICE_PLANE_TIMEOUT_HEADER, SERVICE_PLANE_TIMEOUT_QUERY_PARAM } from '../shared/deadline.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
 import {
   normalizeIdempotencyKey,
@@ -264,6 +264,10 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   private mountBroker(brokerOptions: Exclude<ServicePlaneControlPlaneOptions<TEnv>['broker'], false | undefined>): void {
     const path = brokerOptions.path ?? '/rpc/broker';
     this.app.all(path, async (context) => {
+      // Before caller resolution and catalog resolution, not after: resolving the catalog is a
+      // fan-out across every service, and on a cold cache it is the most expensive thing the plane
+      // does. Stamping later would hand the service a budget the caller has already partly spent.
+      const receivedAt = Date.now();
       const resolved = await this.resolveBrokeredRequest(context as Context<TEnv>, brokerOptions);
       if (resolved instanceof Response) return resolved;
       const log = this.log;
@@ -273,6 +277,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
         ...(resolved.idempotencyKey ? { idempotencyKey: resolved.idempotencyKey } : {}),
         issuer: resolved.issuer,
         ...(log ? { log: (event) => log(event, context) } : {}),
+        receivedAt,
         registry: resolved.registry,
         ...(resolved.requestId ? { requestId: resolved.requestId } : {}),
         ...(resolved.timeoutMs === undefined ? {} : { timeoutMs: resolved.timeoutMs }),
@@ -291,6 +296,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   private mountMcp(mcpOptions: Exclude<ServicePlaneControlPlaneOptions<TEnv>['mcp'], false | undefined>): void {
     const path = mcpOptions.path ?? DEFAULT_MCP_PATH;
     this.app.all(path, async (context) => {
+      const receivedAt = Date.now();
       const transportError = validateControlPlaneMcpTransportRequest(context.req.raw, mcpOptions.allowedOrigins);
       if (transportError) return transportError;
       // This implementation is stateless POST-only. Reject unsupported transport methods before
@@ -301,6 +307,12 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       }
       const resolved = await this.resolveBrokeredRequest(context as Context<TEnv>, mcpOptions);
       if (resolved instanceof Response) return resolved;
+      // MCP resolves and dispatches in one shot, so the whole decrement happens here rather than
+      // inside the handler.
+      const timeoutMs = remainingTimeoutMs(resolved.timeoutMs, Date.now() - receivedAt);
+      if (timeoutMs === 0) {
+        return context.json({ error: "Service-Plane exhausted the caller's deadline before reaching the service" }, 504);
+      }
       const log = this.log;
       return handleControlPlaneMcpRequest(context.req.raw, {
         ...(mcpOptions.allowedOrigins ? { allowedOrigins: mcpOptions.allowedOrigins } : {}),
@@ -314,7 +326,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
         ...(resolved.requestId ? { requestId: resolved.requestId } : {}),
         ...(mcpOptions.serverInfo ? { serverInfo: mcpOptions.serverInfo } : {}),
         ...(mcpOptions.streamLimits ? { streamLimits: mcpOptions.streamLimits } : {}),
-        ...(resolved.timeoutMs === undefined ? {} : { timeoutMs: resolved.timeoutMs }),
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
       });
     });
   }

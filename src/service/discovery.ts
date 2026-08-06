@@ -86,6 +86,20 @@ export type ServiceAbilityHandlerFactoryInput<TEnv extends Env = Env> = {
    */
   idempotencyKey?: string;
   /**
+   * Milliseconds still left of the caller's deadline, read at call time. Present only when the
+   * caller sent one, and 0 once the budget is gone.
+   *
+   * This is what makes a chain work: a handler that calls another service must pass the remainder
+   * on as that call's `timeoutMs`, or the next hop starts a fresh budget and the end-to-end bound
+   * the first caller asked for is lost. Both readings come from this machine's clock, so no hop
+   * has to agree with any other about the time.
+   *
+   * ```ts
+   * const downstream = await abilitySession({ ...opts, timeoutMs: remainingTimeoutMs?.() });
+   * ```
+   */
+  remainingTimeoutMs?: () => number;
+  /**
    * Aborts when the caller's forwarded deadline elapses. Present only when the caller sent one.
    * Pass it to outbound `fetch` calls and long-running work so a handler stops doing work nobody is
    * waiting for; the wrapper also fails the method on abort, so ignoring it costs the work, not

@@ -61,6 +61,13 @@ export type CreateControlPlaneRpcBrokerOptions = {
    * for tests.
    */
   now?: () => number;
+  /**
+   * When this request reached the plane. Defaults to construction time, which is only the same
+   * thing when the broker is built first — a shell that authenticates the caller or resolves its
+   * catalog before constructing the broker must pass its own entry timestamp, or that work is not
+   * charged to the caller's budget.
+   */
+  receivedAt?: number;
   registry?: ServiceRegistry;
   requestId?: string;
   services?: ServiceEndpoint[];
@@ -90,9 +97,9 @@ export function createControlPlaneRpcBroker(options: CreateControlPlaneRpcBroker
   const now = options.now ?? (() => Date.now());
   const timeoutMs = normalizeTimeoutMs(options.timeoutMs);
   const idempotencyKey = normalizeIdempotencyKey(options.idempotencyKey);
-  // Stamped when the broker is built, which is per request: everything the plane does from here on
-  // is time the caller is already waiting, so it comes out of the budget forwarded downstream.
-  const receivedAt = now();
+  // Everything the plane does from this point on is time the caller is already waiting, so it comes
+  // out of the budget forwarded downstream.
+  const receivedAt = options.receivedAt ?? now();
   return {
     rootCapability(caller, rootOptions) {
       return new BrokerRoot(
