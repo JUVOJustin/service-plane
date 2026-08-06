@@ -30,6 +30,11 @@ import {
 import { CapabilityAuthError, ServicePlaneTimeoutError } from '../shared/errors.js';
 import { SERVICE_PLANE_HMAC_CLIENT_HEADER, SERVICE_PLANE_HMAC_TIMESTAMP_HEADER, signServicePlaneHmacRequest } from '../shared/hmac-auth.js';
 import {
+  normalizeIdempotencyKey,
+  SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER,
+  SERVICE_PLANE_IDEMPOTENCY_KEY_QUERY_PARAM,
+} from '../shared/idempotency.js';
+import {
   SERVICE_PLANE_JWK_ASSERTION_AUDIENCE,
   SERVICE_PLANE_JWK_CLIENT_HEADER,
   SERVICE_PLANE_JWK_KEY_ID_HEADER,
@@ -149,6 +154,7 @@ export type CloudflareAbilityRpcBinding = {
   connectAbility(input: {
     abilityId: string;
     connInfo?: ConnInfo;
+    idempotencyKey?: string;
     proof?: string;
     requestId?: string;
     timeoutMs?: number;
@@ -202,6 +208,11 @@ export type CapabilityRpcSessionOptions<Scoped> = (
   // Advisory connection info about the original client, forwarded to the service alongside the
   // request id. Only a brokered call into an ingress-protected service surfaces it to handlers.
   connInfo?: ConnInfo;
+  /**
+   * Identifies one logical attempt so a service can recognize a retry of it. Forwarded to the
+   * service; this package neither generates nor deduplicates it.
+   */
+  idempotencyKey?: string;
   // Required when the plane sender-constrains this caller's tokens (`cnf`), because such a token is
   // rejected by the service without a matching proof.
   proveTokenPossession?: CapabilityProofSigner;
@@ -430,6 +441,7 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
   };
   const rejectStreamMethods = options.rejectStreamMethods ? new Set(options.rejectStreamMethods) : undefined;
   const timeoutMs = normalizeTimeoutMs(options.timeoutMs);
+  const idempotencyKey = normalizeIdempotencyKey(options.idempotencyKey);
   // The persistent session's Cap'n Web root stub is Disposable; keep it so the underlying
   // transport (socket) can be released — the scoped stub alone does not close the session.
   let persistentRoot: AuthenticatedRoot<Scoped> | undefined;
@@ -478,6 +490,7 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
     const target = await options.transport.binding.connectAbility({
       abilityId: options.abilityId ?? missingAbilityId(),
       ...(connInfo ? { connInfo } : {}),
+      ...(idempotencyKey ? { idempotencyKey } : {}),
       ...(proof ? { proof } : {}),
       ...(options.requestId ? { requestId: options.requestId } : {}),
       ...(timeoutMs === undefined ? {} : { timeoutMs }),
@@ -839,6 +852,7 @@ type UntypedAuthenticatedRoot = AuthenticatedRoot<Record<string, unknown>>;
 function openSession<Scoped>(options: {
   abilityId?: string;
   connInfo?: ConnInfo;
+  idempotencyKey?: string;
   requestId?: string;
   requestIdHeaderName?: string;
   rpcSessionOptions?: RpcSessionOptions;
@@ -849,10 +863,12 @@ function openSession<Scoped>(options: {
   const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
   const connInfo = serializeConnInfo(options.connInfo);
   const timeout = serializeTimeoutMs(options.timeoutMs);
+  const idempotencyKey = normalizeIdempotencyKey(options.idempotencyKey);
   const forwarded = {
     ...(requestId ? { [requestIdHeaderName]: requestId } : {}),
     ...(connInfo ? { [SERVICE_PLANE_CONN_INFO_HEADER]: connInfo } : {}),
     ...(timeout ? { [SERVICE_PLANE_TIMEOUT_HEADER]: timeout } : {}),
+    ...(idempotencyKey ? { [SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER]: idempotencyKey } : {}),
   };
   const headers = Object.keys(forwarded).length > 0 ? forwarded : undefined;
   if (transport.kind === 'http-batch') {
@@ -862,7 +878,7 @@ function openSession<Scoped>(options: {
     ) as unknown as AuthenticatedRoot<Scoped>;
   }
   if (transport.kind === 'websocket') {
-    const url = withServicePlaneQueryParams(transport.url, requestId, connInfo, timeout);
+    const url = withServicePlaneQueryParams(transport.url, requestId, connInfo, timeout, idempotencyKey);
     const endpoint = transport.createWebSocket?.(url) ?? url;
     return openWebSocketSession(endpoint, rpcSessionOptions) as unknown as AuthenticatedRoot<Scoped>;
   }
@@ -909,12 +925,14 @@ function withServicePlaneQueryParams(
   requestId: string | undefined,
   connInfo: string | undefined,
   timeout: string | undefined,
+  idempotencyKey: string | undefined,
 ): string {
-  if (!requestId && !connInfo && !timeout) return url;
+  if (!requestId && !connInfo && !timeout && !idempotencyKey) return url;
   const parsed = new URL(url);
   if (requestId) parsed.searchParams.set(SERVICE_PLANE_REQUEST_ID_QUERY_PARAM, requestId);
   if (connInfo) parsed.searchParams.set(SERVICE_PLANE_CONN_INFO_QUERY_PARAM, connInfo);
   if (timeout) parsed.searchParams.set(SERVICE_PLANE_TIMEOUT_QUERY_PARAM, timeout);
+  if (idempotencyKey) parsed.searchParams.set(SERVICE_PLANE_IDEMPOTENCY_KEY_QUERY_PARAM, idempotencyKey);
   return parsed.toString();
 }
 

@@ -14,6 +14,11 @@ import { normalizeTimeoutMs, parseTimeoutMs, SERVICE_PLANE_TIMEOUT_HEADER, SERVI
 import { CapabilityAuthError } from '../shared/errors.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
 import {
+  normalizeIdempotencyKey,
+  SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER,
+  SERVICE_PLANE_IDEMPOTENCY_KEY_QUERY_PARAM,
+} from '../shared/idempotency.js';
+import {
   type CapabilityIdentity,
   type CapabilityJwksResolver,
   type CapabilityVerifierOptions,
@@ -122,7 +127,15 @@ export class ServicePlaneService<TEnv extends Env = Env> {
   fetch: Hono<ServicePlaneServiceEnv<TEnv>>['fetch'] = (request, env, executionCtx) => this.app.fetch(request, env, executionCtx);
 
   async connectAbility(
-    input: { abilityId: string; connInfo?: ConnInfo; proof?: string; requestId?: string; timeoutMs?: number; token: string },
+    input: {
+      abilityId: string;
+      connInfo?: ConnInfo;
+      idempotencyKey?: string;
+      proof?: string;
+      requestId?: string;
+      timeoutMs?: number;
+      token: string;
+    },
     bindings?: TEnv['Bindings'],
   ): Promise<RpcTarget> {
     const ability = this.definition.abilities.find((candidate) => candidate.id === input.abilityId);
@@ -141,6 +154,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
       true,
       input.connInfo,
       normalizeTimeoutMs(input.timeoutMs),
+      normalizeIdempotencyKey(input.idempotencyKey),
     );
     return root.authenticate(input.token, input.proof);
   }
@@ -188,6 +202,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
           upgrade,
           forwardedConnInfo(context),
           forwardedTimeoutMs(context),
+          forwardedIdempotencyKey(context),
         ),
         this.options.rpc,
       );
@@ -205,6 +220,7 @@ class AuthRoot<TEnv extends Env> extends RpcTarget {
     private readonly allowStreaming: boolean,
     private readonly connInfo: ConnInfo | undefined,
     private readonly timeoutMs: number | undefined,
+    private readonly idempotencyKey: string | undefined,
   ) {
     super();
   }
@@ -232,6 +248,7 @@ class AuthRoot<TEnv extends Env> extends RpcTarget {
       abilityId: this.ability.id,
       ...(connInfo ? { connInfo } : {}),
       context: this.context,
+      ...(this.idempotencyKey ? { idempotencyKey: this.idempotencyKey } : {}),
       identity,
       ...(signal ? { signal } : {}),
     });
@@ -276,6 +293,12 @@ function forwardedConnInfo(context: Context): ConnInfo | undefined {
 
 function forwardedTimeoutMs(context: Context): number | undefined {
   return parseTimeoutMs(context.req.header(SERVICE_PLANE_TIMEOUT_HEADER) ?? context.req.query(SERVICE_PLANE_TIMEOUT_QUERY_PARAM));
+}
+
+function forwardedIdempotencyKey(context: Context): string | undefined {
+  return normalizeIdempotencyKey(
+    context.req.header(SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER) ?? context.req.query(SERVICE_PLANE_IDEMPOTENCY_KEY_QUERY_PARAM),
+  );
 }
 
 // Mirrors hono/request-id's header validation so a query-supplied id cannot smuggle

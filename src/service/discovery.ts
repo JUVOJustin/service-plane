@@ -46,6 +46,12 @@ type AbilitySchemaInput<TSchema extends AbilitySchema> = StandardSchemaV1.InferI
 type AbilitySchemaOutput<TSchema extends AbilitySchema> = StandardSchemaV1.InferOutput<TSchema>;
 
 export type AbilityMethodDefinition<TInput extends AbilitySchema = AbilitySchema, TOutput extends AbilitySchema = AbilitySchema> = {
+  /**
+   * Declares that calling this method again with the same input cannot double its effect, so a
+   * caller may safely retry an ambiguous failure. Projected into discovery for callers and
+   * gateways to read; this package never retries on its own.
+   */
+  idempotent?: true;
   input: TInput;
   mcp?: ServiceAbilityMcpProjection;
   mcpPrompt?: ServiceAbilityMcpPromptProjection;
@@ -72,6 +78,13 @@ export type ServiceAbilityHandlerFactoryInput<TEnv extends Env = Env> = {
   connInfo?: ConnInfo;
   context: Context<TEnv>;
   identity: CapabilityIdentity;
+  /**
+   * The caller's key for this attempt, when it sent one. It identifies the attempt, not the
+   * individual method call, so a handler that stores results must scope it by method name —
+   * `${idempotencyKey}:createTask` — or two different methods on one session would collide.
+   * Storing and expiring those results is the service's job; this package only forwards the key.
+   */
+  idempotencyKey?: string;
   /**
    * Aborts when the caller's forwarded deadline elapses. Present only when the caller sent one.
    * Pass it to outbound `fetch` calls and long-running work so a handler stops doing work nobody is
@@ -738,6 +751,7 @@ function abilityDiscovery<TEnv extends Env>(ability: NormalizedServiceAbility<TE
           ...(method.mcpPrompt ? { mcpPrompt: method.mcpPrompt } : {}),
           ...(method.mcpResource ? { mcpResource: method.mcpResource } : {}),
           outputSchema: method.outputSchema,
+          ...(method.idempotent ? { idempotent: true as const } : {}),
           ...(method.rest ? { rest: method.rest } : {}),
           scopes: method.scopes,
           ...(method.stream ? { stream: true as const } : {}),

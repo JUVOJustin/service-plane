@@ -26,6 +26,11 @@ export {
   servicePlaneHttpCacheHeaders,
 } from '../shared/http-cache.js';
 export {
+  normalizeIdempotencyKey,
+  SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER,
+  SERVICE_PLANE_IDEMPOTENCY_KEY_QUERY_PARAM,
+} from '../shared/idempotency.js';
+export {
   defaultServicePlaneLogSink,
   type ServicePlaneBrokerLogEvent,
   type ServicePlaneControlPlaneLogEvent,

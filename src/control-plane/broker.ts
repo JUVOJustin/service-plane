@@ -4,6 +4,7 @@ import { normalizeCapabilitySubject } from '../shared/capability-tokens.js';
 import type { ConnInfo } from '../shared/conn-info.js';
 import { normalizeTimeoutMs, remainingTimeoutMs } from '../shared/deadline.js';
 import { CapabilityAuthError, ServicePlaneTimeoutError } from '../shared/errors.js';
+import { normalizeIdempotencyKey } from '../shared/idempotency.js';
 import type { ServicePlaneBrokerLogEvent } from '../shared/logging.js';
 import { isOriginRelativePath } from '../shared/paths.js';
 import type { CapabilitySubject, DiscoveredServiceAbility, ServiceEndpoint, ServiceRegistry } from '../shared/types.js';
@@ -47,6 +48,11 @@ export type CreateControlPlaneRpcBrokerOptions = {
    */
   connInfo?: ConnInfo;
   controlPlaneServiceId: string;
+  /**
+   * The caller's key for this attempt, forwarded to the target service so a retry through the plane
+   * is recognizable as one. The plane never generates it and never deduplicates on it.
+   */
+  idempotencyKey?: string;
   issuer: CapabilityIssuer;
   log?: (event: ServicePlaneBrokerLogEvent) => void;
   /**
@@ -83,6 +89,7 @@ export function createControlPlaneRpcBroker(options: CreateControlPlaneRpcBroker
   const registry = options.registry ?? createServiceRegistry({ services: options.services ?? [] });
   const now = options.now ?? (() => Date.now());
   const timeoutMs = normalizeTimeoutMs(options.timeoutMs);
+  const idempotencyKey = normalizeIdempotencyKey(options.idempotencyKey);
   // Stamped when the broker is built, which is per request: everything the plane does from here on
   // is time the caller is already waiting, so it comes out of the budget forwarded downstream.
   const receivedAt = now();
@@ -93,6 +100,7 @@ export function createControlPlaneRpcBroker(options: CreateControlPlaneRpcBroker
           allowStreaming: rootOptions?.allowStreaming ?? false,
           ...(options.connInfo ? { connInfo: options.connInfo } : {}),
           controlPlaneServiceId: options.controlPlaneServiceId,
+          ...(idempotencyKey ? { idempotencyKey } : {}),
           issuer: options.issuer,
           ...(options.log ? { log: options.log } : {}),
           now,
@@ -113,6 +121,7 @@ class BrokerRoot extends RpcTarget {
       allowStreaming: boolean;
       connInfo?: ConnInfo;
       controlPlaneServiceId: string;
+      idempotencyKey?: string;
       issuer: CapabilityIssuer;
       log?: (event: ServicePlaneBrokerLogEvent) => void;
       now: () => number;
@@ -139,6 +148,7 @@ class BrokerRoot extends RpcTarget {
         ...(this.options.connInfo ? { connInfo: this.options.connInfo } : {}),
         caller: this.caller,
         callerServiceId: this.caller?.kind === 'service' ? this.caller.id : this.options.controlPlaneServiceId,
+        ...(this.options.idempotencyKey ? { idempotencyKey: this.options.idempotencyKey } : {}),
         issuer: this.options.issuer,
         ability,
         ...(this.options.log ? { log: this.options.log } : {}),
@@ -163,6 +173,7 @@ class BrokeredAbility extends RpcTarget {
       caller: BrokerCaller | undefined;
       connInfo?: ConnInfo;
       callerServiceId: string;
+      idempotencyKey?: string;
       issuer: CapabilityIssuer;
       log?: (event: ServicePlaneBrokerLogEvent) => void;
       now: () => number;
@@ -213,6 +224,7 @@ class BrokeredAbility extends RpcTarget {
         abilityId: this.input.ability.id,
         callerServiceId: this.input.callerServiceId,
         ...(this.input.connInfo ? { connInfo: this.input.connInfo } : {}),
+        ...(this.input.idempotencyKey ? { idempotencyKey: this.input.idempotencyKey } : {}),
         ...(subject ? { subject } : {}),
         ...(rejectStreamMethods && rejectStreamMethods.length > 0 ? { rejectStreamMethods } : {}),
         ...(this.input.requestId ? { requestId: this.input.requestId } : {}),

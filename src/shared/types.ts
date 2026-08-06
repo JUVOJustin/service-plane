@@ -94,6 +94,12 @@ export type ServiceAbilityMethodDiscovery = {
   mcpResource?: ServiceAbilityMcpResourceProjection;
   outputSchema: OpenApiObject;
   rest?: ServiceAbilityRestProjection;
+  /**
+   * The method is safe to call again with the same input: a retry after an ambiguous failure
+   * cannot double its effect. Advertised so callers and gateways can decide whether retrying is
+   * safe — this package never retries on its own.
+   */
+  idempotent?: true;
   scopes: string[];
   /**
    * Streaming methods return a ReadableStream of output items over a Cap'n Web session
@@ -154,6 +160,7 @@ export type ServiceAbilityNativeRpcBinding = {
   connectAbility(input: {
     abilityId: string;
     connInfo?: ConnInfo;
+    idempotencyKey?: string;
     requestId?: string;
     timeoutMs?: number;
     token: string;

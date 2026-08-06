@@ -58,6 +58,8 @@ Validation failures raise `AbilityValidationError` carrying the issues the schem
 
 Optional `rest` metadata projects the method into the generated OpenAPI 3.2 document; `rest.method` accepts `get`, `post`, `put`, `patch`, `delete`, and `query` (HTTP QUERY per RFC 10008 — request parameters in the body, safe and idempotent). See [OpenAPI and MCP](openapi-mcp.md#openapi).
 
+Optional `idempotent: true` declares that calling the method again with the same input cannot double its effect, so a caller may safely retry an ambiguous failure. See [Idempotency](#idempotency).
+
 ## Streaming Methods
 
 Some methods produce many results over time — large file transfers, long exports. Declare them with `stream: true`; the `output` schema then validates **each streamed item**, and the handler returns an async iterable (usually an async generator), a sync iterable, or a `ReadableStream`:
@@ -306,6 +308,41 @@ Values are clamped to `MAX_SERVICE_PLANE_TIMEOUT_MS` (10 minutes) and anything t
 Unlike forwarded connection info, a deadline is honoured from **any** caller without requiring ingress. It is not an authorization input: a caller shortening its own budget can only cut itself off, and a long one is clamped.
 
 One limit worth knowing: the budget rides the transport, and a session transport is established once. Over HTTP-batch and native bindings a session is one call, so the budget is per call. Over WebSocket it is fixed when the socket opens and therefore bounds every call on that session.
+
+## Idempotency
+
+Deadlines create ambiguous failures — a call that timed out may or may not have run — so a caller needs two things to retry correctly: whether the method is safe to call again, and a way for the service to recognize the retry.
+
+**The method says whether it is safe.** Mark it in the ability definition, the same way `stream` is marked:
+
+```ts
+lookupTask: abilityMethod({
+  idempotent: true,
+  input: TaskQuery,
+  output: Task,
+  scopes: ['asana.tasks.read'],
+});
+```
+
+It is projected into the discovery document so callers and gateways can read it. An unmarked method is **absent** from the projection rather than `false`: it makes no claim, which is the safe reading. Note that this package never retries on its own — retry policy is the caller's, and mesh-level retry belongs to your platform.
+
+Combined with `retryable` from the error taxonomy, the decision is: retry only when the failure was transient **and** the method is idempotent.
+
+**The caller says which attempt this is.** Pass a key and it travels the same three channels as the request id — `X-Service-Plane-Idempotency-Key`, the `idempotency_key` query parameter, and the `idempotencyKey` field on `connectAbility(...)` — reaching the handler as `idempotencyKey`:
+
+```ts
+const api = await abilitySession({ /* ... */ idempotencyKey: 'attempt-7f3a' });
+
+// service side
+handler: ({ idempotencyKey }) => new TaskApi(idempotencyKey);
+```
+
+The package forwards the key and nothing else. Deduplicating means storing a result and expiring it, which needs a store and a retention policy — the same reason discovery snapshots and token caches are yours to supply.
+
+Two things to get right when you build that store:
+
+- **Scope the key by method name.** The key identifies the caller's *attempt*, not one method call, because it rides the transport rather than the RPC payload. Two different methods on one session would otherwise collide. Store under `${idempotencyKey}:${methodName}`.
+- Keys are validated on both send and receive: word characters, `-`, and `=` only, up to 255 characters. Anything else is dropped rather than forwarded, so a key can never smuggle a separator into a log line or a store key.
 
 Both shells log structured JSON events to the console by default. Every event carries `event`, `level`, and (when known) `requestId`.
 

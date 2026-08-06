@@ -37,6 +37,10 @@ export type ControlPlaneMcpHandlerOptions = {
    */
   connInfo?: ConnInfo;
   controlPlaneServiceId: string;
+  /**
+   * The caller's key for this attempt, forwarded to the target service.
+   */
+  idempotencyKey?: string;
   issuer: CapabilityIssuer;
   log?: (event: ServicePlaneBrokerLogEvent) => void;
   registry: ServiceRegistry;
@@ -663,6 +667,7 @@ async function openMethodSession(
     abilityId: match.ability.id,
     callerServiceId: options.caller?.kind === 'service' ? options.caller.id : options.controlPlaneServiceId,
     ...(options.connInfo ? { connInfo: options.connInfo } : {}),
+    ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
     ...(subject ? { subject } : {}),
     ...(options.requestId ? { requestId: options.requestId } : {}),
     requestToken: (tokenInput) =>

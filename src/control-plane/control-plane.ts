@@ -6,6 +6,11 @@ import type { UpgradeWebSocket } from 'hono/ws';
 import { type ConnInfo, normalizeConnInfo } from '../shared/conn-info.js';
 import { parseTimeoutMs, SERVICE_PLANE_TIMEOUT_HEADER, SERVICE_PLANE_TIMEOUT_QUERY_PARAM } from '../shared/deadline.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
+import {
+  normalizeIdempotencyKey,
+  SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER,
+  SERVICE_PLANE_IDEMPOTENCY_KEY_QUERY_PARAM,
+} from '../shared/idempotency.js';
 import { defaultServicePlaneLogSink, type ServicePlaneControlPlaneLogEvent, type ServicePlaneLogSink } from '../shared/logging.js';
 import {
   DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
@@ -73,6 +78,7 @@ export type ConnInfoResolver<TEnv extends Env = Env> = (context: Context<TEnv>) 
 type BrokeredRequest = {
   caller: BrokerCaller;
   connInfo: ConnInfo | undefined;
+  idempotencyKey: string | undefined;
   issuer: CapabilityIssuer;
   registry: ServiceRegistry;
   requestId: string | undefined;
@@ -264,6 +270,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       const broker = createControlPlaneRpcBroker({
         ...(resolved.connInfo ? { connInfo: resolved.connInfo } : {}),
         controlPlaneServiceId: this.options.controlPlaneServiceId ?? 'control-plane',
+        ...(resolved.idempotencyKey ? { idempotencyKey: resolved.idempotencyKey } : {}),
         issuer: resolved.issuer,
         ...(log ? { log: (event) => log(event, context) } : {}),
         registry: resolved.registry,
@@ -300,6 +307,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
         caller: resolved.caller,
         ...(resolved.connInfo ? { connInfo: resolved.connInfo } : {}),
         controlPlaneServiceId: this.options.controlPlaneServiceId ?? 'control-plane',
+        ...(resolved.idempotencyKey ? { idempotencyKey: resolved.idempotencyKey } : {}),
         issuer: resolved.issuer,
         ...(log ? { log: (event) => log(event, context) } : {}),
         registry: resolved.registry,
@@ -371,6 +379,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
         ...this.discoveryCacheKeyFor(context, services),
         services,
       }),
+      idempotencyKey: brokerIdempotencyKey(context),
       requestId: brokerRequestId(context),
       timeoutMs: brokerTimeoutMs(context),
     };
@@ -499,6 +508,12 @@ function brokerRequestId(context: Context): string | undefined {
 
 // The caller states its own budget; the plane spends from it rather than granting one. A caller that
 // sends nothing gets no deadline, which is the behavior every existing consumer already has.
+function brokerIdempotencyKey(context: Context): string | undefined {
+  return normalizeIdempotencyKey(
+    context.req.header(SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER) ?? context.req.query(SERVICE_PLANE_IDEMPOTENCY_KEY_QUERY_PARAM),
+  );
+}
+
 function brokerTimeoutMs(context: Context): number | undefined {
   return parseTimeoutMs(context.req.header(SERVICE_PLANE_TIMEOUT_HEADER) ?? context.req.query(SERVICE_PLANE_TIMEOUT_QUERY_PARAM));
 }
