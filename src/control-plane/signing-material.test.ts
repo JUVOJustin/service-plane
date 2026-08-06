@@ -217,7 +217,11 @@ describe('signing material memo', () => {
     expect(derivations.count).toBe(3);
   });
 
-  it('does not let a rotation mid-derivation poison the JWKS memo', async () => {
+  // Not runnable on workerd: the setup needs a setTimeout(0) to fire *between* the derivation's
+  // internal awaits, and workerd only advances timers at I/O boundaries — the rotation can never
+  // land mid-derivation there, so the test would assert nothing. The memo behavior itself is
+  // runtime-independent; the race arrangement is what is Node-specific.
+  it.skipIf(navigator.userAgent === 'Cloudflare-Workers')('does not let a rotation mid-derivation poison the JWKS memo', async () => {
     const secret = await generateCapabilitySigningSecret();
     const rotated = await generateCapabilitySigningSecret();
     const keys = [{ kid: 'test-key', secret }];

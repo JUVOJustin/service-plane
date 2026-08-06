@@ -47,6 +47,7 @@
     "sync:skill-docs": "cp docs/*.md .apm/skills/service-plane/references/",
     "bench": "vitest bench --run",
     "test": "vitest run",
+    "test:workerd": "vitest run --config vitest.workerd.config.ts",
     "smoke:build": "node scripts/smoke.mjs build",
     "smoke:workerd": "node scripts/smoke.mjs workerd",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
@@ -73,6 +74,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.7",
+    "@cloudflare/vitest-pool-workers": "^0.20.2",
     "@types/node": "^26.1.2",
     "@vitest/coverage-v8": "^4.1.10",
     "esbuild": "^0.28.1",

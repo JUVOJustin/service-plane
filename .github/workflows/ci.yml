@@ -59,11 +59,13 @@ jobs:
       - name: Smoke (bundled)
         run: npm run smoke:build && node smoke-dist/cli.mjs
 
-  # The portability claim, exercised for real: the full suite stays Node-only, while a bundled
-  # smoke (HTTP-batch end to end, streaming over a session transport, token verify both ways)
-  # runs on real workerd, Deno, and Bun. workerd and Deno take the setTimeout(0) batch-flush
-  # fallback; Bun proves the setImmediate fast path outside Node.
-  smoke-workerd:
+  # The portability claim, exercised for real. workerd — the deployment runtime — runs the full
+  # vitest suite inside actual isolates via vitest-pool-workers. Deno and Bun run a bundled smoke
+  # (HTTP-batch end to end, streaming over a session transport, token verify both ways): neither
+  # has a supported vitest path, and for them the claim is portability, not deployment. workerd
+  # and Deno take the setTimeout(0) batch-flush fallback; Bun proves the setImmediate fast path
+  # outside Node.
+  test-workerd:
     needs: quality
     runs-on: ubuntu-latest
     steps:
@@ -79,8 +81,8 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Smoke on workerd (miniflare)
-        run: npm run smoke:workerd
+      - name: Test suite on workerd (vitest-pool-workers)
+        run: npm run test:workerd
 
   smoke-deno:
     needs: quality
