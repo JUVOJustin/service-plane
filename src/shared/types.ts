@@ -151,7 +151,13 @@ export type ServiceGrantDefinition = {
  * streaming method returns flow through it natively.
  */
 export type ServiceAbilityNativeRpcBinding = {
-  connectAbility(input: { abilityId: string; connInfo?: ConnInfo; requestId?: string; token: string }): Promise<object> | object;
+  connectAbility(input: {
+    abilityId: string;
+    connInfo?: ConnInfo;
+    requestId?: string;
+    timeoutMs?: number;
+    token: string;
+  }): Promise<object> | object;
 };
 
 export type ServiceEndpoint = {

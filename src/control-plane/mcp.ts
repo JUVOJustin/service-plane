@@ -48,6 +48,11 @@ export type ControlPlaneMcpHandlerOptions = {
    * independently caps optional progress-notification bytes so an opaque token is not amplified.
    */
   streamLimits?: { maxBytes?: number; maxItems?: number };
+  /**
+   * The caller's remaining budget in milliseconds, forwarded to the target service so an MCP tool
+   * call inherits the same deadline a brokered call would.
+   */
+  timeoutMs?: number;
 };
 
 const DEFAULT_MCP_STREAM_MAX_ITEMS = 10_000;
@@ -666,6 +671,7 @@ async function openMethodSession(
         : options.issuer.issueCapabilityToken(tokenInput),
     scopes: match.scopes,
     targetServiceId: match.ability.serviceId,
+    ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
     transport: transportForAbility(match.ability, {
       requiresStreaming: match.ability.methods[match.method]?.stream === true,
     }),

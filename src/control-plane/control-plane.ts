@@ -4,6 +4,7 @@ import { etag } from 'hono/etag';
 import { type RequestIdVariables, requestId } from 'hono/request-id';
 import type { UpgradeWebSocket } from 'hono/ws';
 import { type ConnInfo, normalizeConnInfo } from '../shared/conn-info.js';
+import { parseTimeoutMs, SERVICE_PLANE_TIMEOUT_HEADER, SERVICE_PLANE_TIMEOUT_QUERY_PARAM } from '../shared/deadline.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
 import { defaultServicePlaneLogSink, type ServicePlaneControlPlaneLogEvent, type ServicePlaneLogSink } from '../shared/logging.js';
 import {
@@ -75,6 +76,7 @@ type BrokeredRequest = {
   issuer: CapabilityIssuer;
   registry: ServiceRegistry;
   requestId: string | undefined;
+  timeoutMs: number | undefined;
 };
 
 // The two ways the catalog gets used, which is the only split worth configuring. `token` covers the
@@ -266,6 +268,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
         ...(log ? { log: (event) => log(event, context) } : {}),
         registry: resolved.registry,
         ...(resolved.requestId ? { requestId: resolved.requestId } : {}),
+        ...(resolved.timeoutMs === undefined ? {} : { timeoutMs: resolved.timeoutMs }),
       });
       // Only a WebSocket-upgraded caller leg can carry a returned stream back; over HTTP-batch
       // the broker rejects streaming methods with a clear 405 instead of a dangling stub.
@@ -303,6 +306,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
         ...(resolved.requestId ? { requestId: resolved.requestId } : {}),
         ...(mcpOptions.serverInfo ? { serverInfo: mcpOptions.serverInfo } : {}),
         ...(mcpOptions.streamLimits ? { streamLimits: mcpOptions.streamLimits } : {}),
+        ...(resolved.timeoutMs === undefined ? {} : { timeoutMs: resolved.timeoutMs }),
       });
     });
   }
@@ -368,6 +372,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
         services,
       }),
       requestId: brokerRequestId(context),
+      timeoutMs: brokerTimeoutMs(context),
     };
   }
 
@@ -490,6 +495,12 @@ function missingAuthenticateCaller(context: Context, log: ServicePlaneLogSink | 
 
 function brokerRequestId(context: Context): string | undefined {
   return requestIdFromContext(context) ?? context.req.header(SERVICE_PLANE_REQUEST_ID_HEADER)?.trim() ?? undefined;
+}
+
+// The caller states its own budget; the plane spends from it rather than granting one. A caller that
+// sends nothing gets no deadline, which is the behavior every existing consumer already has.
+function brokerTimeoutMs(context: Context): number | undefined {
+  return parseTimeoutMs(context.req.header(SERVICE_PLANE_TIMEOUT_HEADER) ?? context.req.query(SERVICE_PLANE_TIMEOUT_QUERY_PARAM));
 }
 
 // Fails closed: a broker/MCP request with no configured resolver is a 500 (misconfiguration). A

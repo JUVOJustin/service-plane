@@ -278,6 +278,35 @@ Every request that enters a `ServicePlaneControlPlane` gets an `X-Request-Id` (i
 
 Connection info about the original client rides the same three channels when `broker.connInfo` / `mcp.connInfo` are configured: the `X-Service-Plane-Conn-Info` header, the `conn_info` query parameter (`SERVICE_PLANE_CONN_INFO_QUERY_PARAM`), and the `connInfo` field on `connectAbility(...)`. Services expose it to handlers as `connInfo` only for brokered calls with ingress enabled — see [Forwarded Connection Info](auth.md#forwarded-connection-info).
 
+## Deadlines
+
+A caller states how long it is willing to wait; every hop spends from that budget rather than granting a new one.
+
+```ts
+const api = await abilitySession<AbilityRpc<typeof syncAbility>>({
+  // ...
+  timeoutMs: 5_000,
+});
+```
+
+The value travels on the same three channels as the request id: the `X-Service-Plane-Timeout` header, the `timeout` query parameter (`SERVICE_PLANE_TIMEOUT_QUERY_PARAM`), and the `timeoutMs` field on `connectAbility(...)`. It is **relative milliseconds remaining**, not an absolute timestamp — two clocks that disagree would shift an absolute deadline by the whole skew, and this package already assumes clocks can differ. Each hop measures its own elapsed time on its own clock and forwards what is left, which is the trade `grpc-timeout` makes for the same reason.
+
+What each participant does with it:
+
+- **The caller** bounds its own wait per method call and rejects with `ServicePlaneTimeoutError` when the budget elapses. Cap'n Web has no cancel message, so this frees the caller, not the callee.
+- **The control plane** reads an inbound `X-Service-Plane-Timeout` on broker and MCP requests and forwards *what is left* after its own work — resolving the catalog, minting a token. If nothing is left, `connect()` fails before a service session is opened.
+- **The service** turns it into the `signal` its ability handlers receive, and the validating wrapper fails the method if the handler outlives it. A handler that ignores `signal` therefore loses the work, not correctness.
+
+```ts
+handler: ({ signal }) => new MyApi(signal), // pass it to outbound fetch, long loops, DB calls
+```
+
+Values are clamped to `MAX_SERVICE_PLANE_TIMEOUT_MS` (10 minutes) and anything that is not a positive integer count of milliseconds is ignored, so a caller sending nothing keeps today's behavior: no deadline.
+
+Unlike forwarded connection info, a deadline is honoured from **any** caller without requiring ingress. It is not an authorization input: a caller shortening its own budget can only cut itself off, and a long one is clamped.
+
+One limit worth knowing: the budget rides the transport, and a session transport is established once. Over HTTP-batch and native bindings a session is one call, so the budget is per call. Over WebSocket it is fixed when the socket opens and therefore bounds every call on that session.
+
 Both shells log structured JSON events to the console by default. Every event carries `event`, `level`, and (when known) `requestId`.
 
 Service events (`ServicePlaneLogEvent`):
@@ -329,6 +358,7 @@ Token cache keys include caller id, target service id, ability id, normalized sc
 - Missing scope: `CapabilityAuthError` with 403-style status.
 - Invalid caller input: `AbilityValidationError` with 422-style status.
 - Invalid service output or streamed item: `AbilityValidationError` with 500-style status — the handler broke its own declared contract.
+- Deadline elapsed: `ServicePlaneTimeoutError` with 504-style status, thrown by whichever hop notices first. See [Deadlines](#deadlines).
 
 `AbilityValidationError.issues` carries the schema library's issues as `{ message, path? }` entries, so a gateway can build a field-level response without parsing the joined message:
 

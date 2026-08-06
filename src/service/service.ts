@@ -10,6 +10,7 @@ import {
   SERVICE_PLANE_CONN_INFO_HEADER,
   SERVICE_PLANE_CONN_INFO_QUERY_PARAM,
 } from '../shared/conn-info.js';
+import { normalizeTimeoutMs, parseTimeoutMs, SERVICE_PLANE_TIMEOUT_HEADER, SERVICE_PLANE_TIMEOUT_QUERY_PARAM } from '../shared/deadline.js';
 import { CapabilityAuthError } from '../shared/errors.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
 import {
@@ -121,7 +122,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
   fetch: Hono<ServicePlaneServiceEnv<TEnv>>['fetch'] = (request, env, executionCtx) => this.app.fetch(request, env, executionCtx);
 
   async connectAbility(
-    input: { abilityId: string; connInfo?: ConnInfo; proof?: string; requestId?: string; token: string },
+    input: { abilityId: string; connInfo?: ConnInfo; proof?: string; requestId?: string; timeoutMs?: number; token: string },
     bindings?: TEnv['Bindings'],
   ): Promise<RpcTarget> {
     const ability = this.definition.abilities.find((candidate) => candidate.id === input.abilityId);
@@ -131,7 +132,16 @@ export class ServicePlaneService<TEnv extends Env = Env> {
     }
     const context = nativeBindingContext<TEnv>(ability.rpc.path, bindings, input.requestId);
     // Native bindings are session-shaped (Workers RPC), so streaming returns are allowed.
-    const root = new AuthRoot(this.options.auth, this.options.ingress, this.definition.id, ability, context, true, input.connInfo);
+    const root = new AuthRoot(
+      this.options.auth,
+      this.options.ingress,
+      this.definition.id,
+      ability,
+      context,
+      true,
+      input.connInfo,
+      normalizeTimeoutMs(input.timeoutMs),
+    );
     return root.authenticate(input.token, input.proof);
   }
 
@@ -177,6 +187,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
           context as unknown as Context<TEnv>,
           upgrade,
           forwardedConnInfo(context),
+          forwardedTimeoutMs(context),
         ),
         this.options.rpc,
       );
@@ -193,6 +204,7 @@ class AuthRoot<TEnv extends Env> extends RpcTarget {
     private readonly context: Context<TEnv>,
     private readonly allowStreaming: boolean,
     private readonly connInfo: ConnInfo | undefined,
+    private readonly timeoutMs: number | undefined,
   ) {
     super();
   }
@@ -212,13 +224,21 @@ class AuthRoot<TEnv extends Env> extends RpcTarget {
     // brokered tokens, and `brokerServiceId` is a signed claim only the control plane can mint.
     // Without ingress any direct caller could set the header, so handlers see nothing.
     const connInfo = this.ingress && identity.brokerServiceId ? normalizeConnInfo(this.connInfo) : undefined;
+    // Unlike conn info, a forwarded deadline needs no brokered provenance: it is not an
+    // authorization input, a caller shortening its own budget can only cut itself off, and the
+    // normalizer clamps a long one. So it is honoured from any caller.
+    const signal = this.timeoutMs === undefined ? undefined : AbortSignal.timeout(this.timeoutMs);
     const handler = await this.ability.handler({
       abilityId: this.ability.id,
       ...(connInfo ? { connInfo } : {}),
       context: this.context,
       identity,
+      ...(signal ? { signal } : {}),
     });
-    return createValidatingAbilityHandler(this.ability, handler, identity, { allowStreaming: this.allowStreaming });
+    return createValidatingAbilityHandler(this.ability, handler, identity, {
+      allowStreaming: this.allowStreaming,
+      ...(signal ? { signal } : {}),
+    });
   }
 }
 
@@ -252,6 +272,10 @@ async function verifyServiceIngress<TEnv extends Env>(
 // query-parameter form. Parsing re-validates the payload; nothing here is trusted yet.
 function forwardedConnInfo(context: Context): ConnInfo | undefined {
   return parseConnInfo(context.req.header(SERVICE_PLANE_CONN_INFO_HEADER) ?? context.req.query(SERVICE_PLANE_CONN_INFO_QUERY_PARAM));
+}
+
+function forwardedTimeoutMs(context: Context): number | undefined {
+  return parseTimeoutMs(context.req.header(SERVICE_PLANE_TIMEOUT_HEADER) ?? context.req.query(SERVICE_PLANE_TIMEOUT_QUERY_PARAM));
 }
 
 // Mirrors hono/request-id's header validation so a query-supplied id cannot smuggle

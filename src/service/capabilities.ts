@@ -21,7 +21,13 @@ import {
   SERVICE_PLANE_CONN_INFO_QUERY_PARAM,
   serializeConnInfo,
 } from '../shared/conn-info.js';
-import { CapabilityAuthError } from '../shared/errors.js';
+import {
+  normalizeTimeoutMs,
+  SERVICE_PLANE_TIMEOUT_HEADER,
+  SERVICE_PLANE_TIMEOUT_QUERY_PARAM,
+  serializeTimeoutMs,
+} from '../shared/deadline.js';
+import { CapabilityAuthError, ServicePlaneTimeoutError } from '../shared/errors.js';
 import { SERVICE_PLANE_HMAC_CLIENT_HEADER, SERVICE_PLANE_HMAC_TIMESTAMP_HEADER, signServicePlaneHmacRequest } from '../shared/hmac-auth.js';
 import {
   SERVICE_PLANE_JWK_ASSERTION_AUDIENCE,
@@ -145,6 +151,7 @@ export type CloudflareAbilityRpcBinding = {
     connInfo?: ConnInfo;
     proof?: string;
     requestId?: string;
+    timeoutMs?: number;
     token: string;
   }): Promise<object> | object;
 };
@@ -205,6 +212,13 @@ export type CapabilityRpcSessionOptions<Scoped> = (
   requestId?: string;
   requestIdHeaderName?: string;
   rpcSessionOptions?: RpcSessionOptions;
+  /**
+   * Milliseconds this caller is willing to wait. Enforced locally per method call and forwarded to
+   * the service, which turns it into the `signal` its handlers receive. Over a per-call transport
+   * (HTTP-batch, native binding) the forwarded budget is per call; over a session transport
+   * (WebSocket) it is fixed when the socket opens and therefore bounds the whole session.
+   */
+  timeoutMs?: number;
   transport: CapabilityRpcTransport;
 };
 
@@ -415,6 +429,7 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
     });
   };
   const rejectStreamMethods = options.rejectStreamMethods ? new Set(options.rejectStreamMethods) : undefined;
+  const timeoutMs = normalizeTimeoutMs(options.timeoutMs);
   // The persistent session's Cap'n Web root stub is Disposable; keep it so the underlying
   // transport (socket) can be released — the scoped stub alone does not close the session.
   let persistentRoot: AuthenticatedRoot<Scoped> | undefined;
@@ -465,6 +480,7 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
       ...(connInfo ? { connInfo } : {}),
       ...(proof ? { proof } : {}),
       ...(options.requestId ? { requestId: options.requestId } : {}),
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
       token,
     });
     nativeTarget ??= target;
@@ -489,6 +505,60 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
       throw error;
     }
   };
+  const invokeMethod = async (property: string, args: unknown[]): Promise<unknown> => {
+    assertActive();
+    if (rejectStreamMethods?.has(property)) {
+      throw new CapabilityAuthError(`Service-Plane streaming method requires a session transport to the caller: ${property}`, 405);
+    }
+    if (options.transport.kind === 'cloudflare-binding-rpc') {
+      let target = nativeTarget as Record<string, unknown> | undefined;
+      if (!target) {
+        nativeBinding ??= openNativeBinding();
+        const opening = nativeBinding;
+        try {
+          target = (await opening) as Record<string, unknown>;
+        } catch (error) {
+          if (nativeBinding === opening) nativeBinding = undefined;
+          throw error;
+        }
+      }
+      assertActive();
+      const method = target[property];
+      if (typeof method !== 'function') throw new CapabilityAuthError(`Service-Plane ability method is not available: ${property}`, 500);
+      // Workers RPC and Cap'n Web targets can expose callable proxies; keep this as a member
+      // call so `.apply` is not interpreted as another remote property.
+      return (target as Record<string, (...methodArgs: unknown[]) => unknown>)[property]?.(...args);
+    }
+
+    let scoped: Scoped;
+    if (options.transport.kind === 'http-batch' || options.transport.kind === 'fetch') {
+      const token = await tokenProvider.token();
+      const proof = await proveToken(token);
+      assertActive();
+      scoped = authenticate(openSession<Scoped>(options), token, proof);
+    } else {
+      if (persistent === undefined) {
+        persistentOpening ??= openPersistentSession();
+        const opening = persistentOpening;
+        try {
+          await opening;
+        } catch (error) {
+          if (persistentOpening === opening) persistentOpening = undefined;
+          throw error;
+        }
+      }
+      assertActive();
+      if (persistent === undefined) throw new CapabilityAuthError('Service-Plane ability session failed to authenticate', 500);
+      scoped = persistent;
+    }
+    const method = (scoped as Record<string, unknown>)[property];
+    if (typeof method !== 'function') {
+      throw new CapabilityAuthError(`Service-Plane ability method is not available: ${property}`, 500);
+    }
+    // Keep this as a member call: Cap'n Web method stubs are callable proxies whose `.apply`
+    // property would itself be interpreted as a remote method named "apply".
+    return (scoped as Record<string, (...methodArgs: unknown[]) => unknown>)[property]?.(...args);
+  };
   // The proxy target is RpcTarget-branded so the session object survives being returned over
   // another Cap'n Web session by reference (e.g. the broker handing a connected ability to a
   // remote caller) instead of being serialized into an empty plain object.
@@ -502,60 +572,12 @@ export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSession
       }
       if (property === 'then') return undefined;
       if (typeof property !== 'string') return undefined;
-      return async (...args: unknown[]) => {
-        assertActive();
-        if (rejectStreamMethods?.has(property)) {
-          throw new CapabilityAuthError(`Service-Plane streaming method requires a session transport to the caller: ${property}`, 405);
-        }
-        if (options.transport.kind === 'cloudflare-binding-rpc') {
-          let target = nativeTarget as Record<string, unknown> | undefined;
-          if (!target) {
-            nativeBinding ??= openNativeBinding();
-            const opening = nativeBinding;
-            try {
-              target = (await opening) as Record<string, unknown>;
-            } catch (error) {
-              if (nativeBinding === opening) nativeBinding = undefined;
-              throw error;
-            }
-          }
-          assertActive();
-          const method = target[property];
-          if (typeof method !== 'function')
-            throw new CapabilityAuthError(`Service-Plane ability method is not available: ${property}`, 500);
-          // Workers RPC and Cap'n Web targets can expose callable proxies; keep this as a member
-          // call so `.apply` is not interpreted as another remote property.
-          return (target as Record<string, (...methodArgs: unknown[]) => unknown>)[property]?.(...args);
-        }
-
-        let scoped: Scoped;
-        if (options.transport.kind === 'http-batch' || options.transport.kind === 'fetch') {
-          const token = await tokenProvider.token();
-          const proof = await proveToken(token);
-          assertActive();
-          scoped = authenticate(openSession<Scoped>(options), token, proof);
-        } else {
-          if (persistent === undefined) {
-            persistentOpening ??= openPersistentSession();
-            const opening = persistentOpening;
-            try {
-              await opening;
-            } catch (error) {
-              if (persistentOpening === opening) persistentOpening = undefined;
-              throw error;
-            }
-          }
-          assertActive();
-          if (persistent === undefined) throw new CapabilityAuthError('Service-Plane ability session failed to authenticate', 500);
-          scoped = persistent;
-        }
-        const method = (scoped as Record<string, unknown>)[property];
-        if (typeof method !== 'function') {
-          throw new CapabilityAuthError(`Service-Plane ability method is not available: ${property}`, 500);
-        }
-        // Keep this as a member call: Cap'n Web method stubs are callable proxies whose `.apply`
-        // property would itself be interpreted as a remote method named "apply".
-        return (scoped as Record<string, (...methodArgs: unknown[]) => unknown>)[property]?.(...args);
+      return (...args: unknown[]) => {
+        const call = invokeMethod(property, args);
+        // The remote peer keeps working after a local timeout — Cap'n Web has no cancel message, so
+        // this frees the caller rather than the callee. The same budget travels to the service,
+        // which is what actually stops the handler.
+        return timeoutMs === undefined ? call : withCallDeadline(call, timeoutMs, property);
       };
     },
     // Cap'n Web only retains and remotely disposes an RpcTarget when Symbol.dispose is visible
@@ -580,6 +602,28 @@ export async function disposeAbilitySession(session: unknown): Promise<void> {
     return;
   }
   disposable?.[DISPOSE_SYMBOL]?.call(session);
+}
+
+// Bounds the caller's own wait. Cap'n Web has no cancel message, so the peer keeps running and its
+// eventual result is discarded — the budget forwarded to the service is what actually stops the
+// handler. Settling either way clears the timer, and the losing outcome stays handled so a late
+// rejection cannot surface as an unhandled one.
+function withCallDeadline<T>(call: Promise<T>, timeoutMs: number, methodName: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new ServicePlaneTimeoutError(`Service-Plane ability method exceeded its ${timeoutMs}ms deadline: ${methodName}`));
+    }, timeoutMs);
+    call.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error as Error);
+      },
+    );
+  });
 }
 
 function disposeSessionRoot(root: unknown): void {
@@ -798,14 +842,17 @@ function openSession<Scoped>(options: {
   requestId?: string;
   requestIdHeaderName?: string;
   rpcSessionOptions?: RpcSessionOptions;
+  timeoutMs?: number;
   transport: CapabilityRpcTransport;
 }): AuthenticatedRoot<Scoped> {
   const { abilityId, requestId, rpcSessionOptions, transport } = options;
   const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
   const connInfo = serializeConnInfo(options.connInfo);
+  const timeout = serializeTimeoutMs(options.timeoutMs);
   const forwarded = {
     ...(requestId ? { [requestIdHeaderName]: requestId } : {}),
     ...(connInfo ? { [SERVICE_PLANE_CONN_INFO_HEADER]: connInfo } : {}),
+    ...(timeout ? { [SERVICE_PLANE_TIMEOUT_HEADER]: timeout } : {}),
   };
   const headers = Object.keys(forwarded).length > 0 ? forwarded : undefined;
   if (transport.kind === 'http-batch') {
@@ -815,7 +862,7 @@ function openSession<Scoped>(options: {
     ) as unknown as AuthenticatedRoot<Scoped>;
   }
   if (transport.kind === 'websocket') {
-    const url = withServicePlaneQueryParams(transport.url, requestId, connInfo);
+    const url = withServicePlaneQueryParams(transport.url, requestId, connInfo, timeout);
     const endpoint = transport.createWebSocket?.(url) ?? url;
     return openWebSocketSession(endpoint, rpcSessionOptions) as unknown as AuthenticatedRoot<Scoped>;
   }
@@ -857,11 +904,17 @@ function withServicePlaneHeaders(url: Request | string, headers: Record<string, 
   return request;
 }
 
-function withServicePlaneQueryParams(url: string, requestId: string | undefined, connInfo: string | undefined): string {
-  if (!requestId && !connInfo) return url;
+function withServicePlaneQueryParams(
+  url: string,
+  requestId: string | undefined,
+  connInfo: string | undefined,
+  timeout: string | undefined,
+): string {
+  if (!requestId && !connInfo && !timeout) return url;
   const parsed = new URL(url);
   if (requestId) parsed.searchParams.set(SERVICE_PLANE_REQUEST_ID_QUERY_PARAM, requestId);
   if (connInfo) parsed.searchParams.set(SERVICE_PLANE_CONN_INFO_QUERY_PARAM, connInfo);
+  if (timeout) parsed.searchParams.set(SERVICE_PLANE_TIMEOUT_QUERY_PARAM, timeout);
   return parsed.toString();
 }
 

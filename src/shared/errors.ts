@@ -15,6 +15,18 @@ export class CapabilityAuthError extends ServicePlaneError {
   }
 }
 
+/**
+ * The call ran out of the budget its caller gave it. Thrown on whichever hop notices first: the
+ * caller when its own wait elapses, the broker when no budget is left to forward, and the service
+ * when a handler outlives the deadline it was handed.
+ */
+export class ServicePlaneTimeoutError extends ServicePlaneError {
+  constructor(message: string, status = 504) {
+    super(message, status);
+    this.name = 'ServicePlaneTimeoutError';
+  }
+}
+
 export class AbilityValidationError extends ServicePlaneError {
   // The schema library's own issues, kept structured so a gateway can build a field-level
   // response instead of re-parsing the joined message. Empty when the failure did not come

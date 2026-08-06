@@ -1,5 +1,16 @@
 export { type ConnInfo, SERVICE_PLANE_CONN_INFO_HEADER, SERVICE_PLANE_CONN_INFO_QUERY_PARAM } from '../shared/conn-info.js';
-export { AbilityValidationError, type AbilityValidationIssue, CapabilityAuthError, ServicePlaneError } from '../shared/errors.js';
+export {
+  MAX_SERVICE_PLANE_TIMEOUT_MS,
+  SERVICE_PLANE_TIMEOUT_HEADER,
+  SERVICE_PLANE_TIMEOUT_QUERY_PARAM,
+} from '../shared/deadline.js';
+export {
+  AbilityValidationError,
+  type AbilityValidationIssue,
+  CapabilityAuthError,
+  ServicePlaneError,
+  ServicePlaneTimeoutError,
+} from '../shared/errors.js';
 export {
   DEFAULT_HTTP_CACHE_MAX_AGE_SECONDS,
   DEFAULT_HTTP_CACHE_STALE_WHILE_REVALIDATE_SECONDS,

@@ -2,7 +2,7 @@ import type { StandardJSONSchemaV1, StandardSchemaV1 } from '@standard-schema/sp
 import { RpcPromise, RpcTarget } from 'capnweb';
 import type { Context, Env } from 'hono';
 import type { ConnInfo } from '../shared/conn-info.js';
-import { AbilityValidationError, type AbilityValidationIssue, CapabilityAuthError } from '../shared/errors.js';
+import { AbilityValidationError, type AbilityValidationIssue, CapabilityAuthError, ServicePlaneTimeoutError } from '../shared/errors.js';
 import { isOriginRelativePath } from '../shared/paths.js';
 import {
   type AbilityAccess,
@@ -65,6 +65,14 @@ export type ServiceAbilityHandlerFactoryInput<TEnv extends Env = Env> = {
   connInfo?: ConnInfo;
   context: Context<TEnv>;
   identity: CapabilityIdentity;
+  /**
+   * Aborts when the caller's forwarded deadline elapses. Present only when the caller sent one.
+   * Pass it to outbound `fetch` calls and long-running work so a handler stops doing work nobody is
+   * waiting for; the wrapper also fails the method on abort, so ignoring it costs the work, not
+   * correctness. Over a session transport the budget is fixed when the session opens and therefore
+   * bounds every call on it, not each call separately.
+   */
+  signal?: AbortSignal;
 };
 
 /**
@@ -221,6 +229,12 @@ export type CreateValidatingAbilityHandlerOptions = {
    * streaming methods then fail with a clear 405 instead of a dangling stub after the batch ends.
    */
   allowStreaming?: boolean;
+  /**
+   * The caller's forwarded deadline. A method whose handler outlives it fails with a timeout error
+   * rather than resolving late, so a handler that ignores its `signal` still cannot exceed the
+   * budget the caller was promised.
+   */
+  signal?: AbortSignal;
 };
 
 type ValidatingAbilityHandlerState = {
@@ -229,6 +243,7 @@ type ValidatingAbilityHandlerState = {
   disposed: boolean;
   handler: RpcTarget & Record<string, unknown>;
   methods: Record<string, NormalizedAbilityMethodDefinition>;
+  signal?: AbortSignal;
 };
 
 type ValidatingAbilityHandlerConstructor = new () => RpcTarget;
@@ -260,6 +275,7 @@ export function createValidatingAbilityHandler<TEnv extends Env>(
     disposed: false,
     handler,
     methods: ability.methods,
+    ...(options.signal ? { signal: options.signal } : {}),
   });
   return bindCapabilityIdentity(target, identity);
 }
@@ -310,11 +326,44 @@ async function invokeValidatingAbilityMethod(target: RpcTarget, methodName: stri
 
   const input = await validateAbilityValue(method.input, args[0], `input for ${methodName}`, 422);
   activeValidatingAbilityHandlerState(target);
-  const output = await implementation.call(state.handler, input);
+  // Checked after validation rather than before: a budget already gone means the caller stopped
+  // waiting, so there is nothing to gain by running the handler.
+  assertDeadlineNotExceeded(state.signal, methodName);
+  const output = await abortableAbilityCall(implementation.call(state.handler, input), state.signal, methodName);
   // Streaming methods return their items as a native Cap'n Web ReadableStream, validated
   // one item at a time as the consumer pulls.
   if (method.stream) return validatedAbilityItemStream(method, methodName, output);
   return validateAbilityValue(method.output, output, `output for ${methodName}`, 500);
+}
+
+function assertDeadlineNotExceeded(signal: AbortSignal | undefined, methodName: string): void {
+  if (signal?.aborted) {
+    throw new ServicePlaneTimeoutError(`Service-Plane ability method exceeded its caller's deadline: ${methodName}`);
+  }
+}
+
+// The handler keeps running after an abort — JavaScript cannot interrupt it, and a handler that
+// honours its `signal` stops on its own. What this guarantees is the contract the caller was given:
+// the method never resolves after the budget is gone. The losing outcome stays handled so a late
+// rejection cannot surface as an unhandled one.
+function abortableAbilityCall(call: unknown, signal: AbortSignal | undefined, methodName: string): Promise<unknown> {
+  const settled = Promise.resolve(call);
+  if (!signal) return settled;
+  return new Promise<unknown>((resolve, reject) => {
+    const onAbort = () =>
+      reject(new ServicePlaneTimeoutError(`Service-Plane ability method exceeded its caller's deadline: ${methodName}`));
+    signal.addEventListener('abort', onAbort, { once: true });
+    settled.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error as Error);
+      },
+    );
+  });
 }
 
 // Standard Schema reports failures as issues rather than by throwing, so the boundary that owns

@@ -2,7 +2,8 @@ import { type RpcStub, RpcTarget } from 'capnweb';
 import { abilitySession, cloudflareNativeRpc, cloudflareServiceBindingRpc, websocketRpc } from '../service/capabilities.js';
 import { normalizeCapabilitySubject } from '../shared/capability-tokens.js';
 import type { ConnInfo } from '../shared/conn-info.js';
-import { CapabilityAuthError } from '../shared/errors.js';
+import { normalizeTimeoutMs, remainingTimeoutMs } from '../shared/deadline.js';
+import { CapabilityAuthError, ServicePlaneTimeoutError } from '../shared/errors.js';
 import type { ServicePlaneBrokerLogEvent } from '../shared/logging.js';
 import { isOriginRelativePath } from '../shared/paths.js';
 import type { CapabilitySubject, DiscoveredServiceAbility, ServiceEndpoint, ServiceRegistry } from '../shared/types.js';
@@ -48,9 +49,21 @@ export type CreateControlPlaneRpcBrokerOptions = {
   controlPlaneServiceId: string;
   issuer: CapabilityIssuer;
   log?: (event: ServicePlaneBrokerLogEvent) => void;
+  /**
+   * Reads the current time for deadline accounting. Both readings happen on this machine, so the
+   * elapsed value never depends on the plane and the service agreeing about the clock. Injectable
+   * for tests.
+   */
+  now?: () => number;
   registry?: ServiceRegistry;
   requestId?: string;
   services?: ServiceEndpoint[];
+  /**
+   * The caller's remaining budget in milliseconds when this request reached the plane. What is left
+   * after the plane's own work — resolving the catalog, minting a token — is forwarded to the
+   * service, so a slow plane spends the caller's budget rather than extending it.
+   */
+  timeoutMs?: number;
 };
 
 export type RootCapabilityOptions = {
@@ -68,6 +81,11 @@ export type ControlPlaneRpcBroker = {
 
 export function createControlPlaneRpcBroker(options: CreateControlPlaneRpcBrokerOptions): ControlPlaneRpcBroker {
   const registry = options.registry ?? createServiceRegistry({ services: options.services ?? [] });
+  const now = options.now ?? (() => Date.now());
+  const timeoutMs = normalizeTimeoutMs(options.timeoutMs);
+  // Stamped when the broker is built, which is per request: everything the plane does from here on
+  // is time the caller is already waiting, so it comes out of the budget forwarded downstream.
+  const receivedAt = now();
   return {
     rootCapability(caller, rootOptions) {
       return new BrokerRoot(
@@ -77,8 +95,11 @@ export function createControlPlaneRpcBroker(options: CreateControlPlaneRpcBroker
           controlPlaneServiceId: options.controlPlaneServiceId,
           issuer: options.issuer,
           ...(options.log ? { log: options.log } : {}),
+          now,
+          receivedAt,
           registry,
           ...(options.requestId ? { requestId: options.requestId } : {}),
+          ...(timeoutMs === undefined ? {} : { timeoutMs }),
         },
         caller,
       );
@@ -94,8 +115,11 @@ class BrokerRoot extends RpcTarget {
       controlPlaneServiceId: string;
       issuer: CapabilityIssuer;
       log?: (event: ServicePlaneBrokerLogEvent) => void;
+      now: () => number;
+      receivedAt: number;
       registry: ServiceRegistry;
       requestId?: string;
+      timeoutMs?: number;
     },
     private readonly caller: BrokerCaller | undefined,
   ) {
@@ -118,7 +142,10 @@ class BrokerRoot extends RpcTarget {
         issuer: this.options.issuer,
         ability,
         ...(this.options.log ? { log: this.options.log } : {}),
+        now: this.options.now,
+        receivedAt: this.options.receivedAt,
         ...(this.options.requestId ? { requestId: this.options.requestId } : {}),
+        ...(this.options.timeoutMs === undefined ? {} : { timeoutMs: this.options.timeoutMs }),
       });
     } catch (error) {
       this.options.log?.(brokerConnectFailedEvent(error, { abilityId, caller: this.caller, requestId: this.options.requestId, serviceId }));
@@ -138,7 +165,10 @@ class BrokeredAbility extends RpcTarget {
       callerServiceId: string;
       issuer: CapabilityIssuer;
       log?: (event: ServicePlaneBrokerLogEvent) => void;
+      now: () => number;
+      receivedAt: number;
       requestId?: string;
+      timeoutMs?: number;
     },
   ) {
     super();
@@ -162,6 +192,15 @@ class BrokeredAbility extends RpcTarget {
 
       const brokered = Boolean(this.input.ability.serviceIngress?.required);
       const subject = brokerCallerSubject(this.input.caller);
+      // What the caller has left after the plane's own work. Measured against the plane's own clock
+      // on both ends, so no clock agreement with the service is assumed. A budget already spent here
+      // fails now rather than opening a session the caller has stopped waiting for.
+      const timeoutMs = remainingTimeoutMs(this.input.timeoutMs, this.input.now() - this.input.receivedAt);
+      if (timeoutMs === 0) {
+        throw new ServicePlaneTimeoutError(
+          `Service-Plane broker exhausted the caller's deadline before reaching the service: ${this.input.ability.serviceId}/${this.input.ability.id}`,
+        );
+      }
       // If the caller's own leg to the broker cannot carry a stream (HTTP-batch), reject the
       // ability's streaming methods with a clear 405 rather than returning a stream that fails
       // to serialize back to the caller and leaks the plane→service session.
@@ -183,6 +222,7 @@ class BrokeredAbility extends RpcTarget {
             : this.input.issuer.issueCapabilityToken(input),
         scopes: requested,
         targetServiceId: this.input.ability.serviceId,
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
         // Streaming methods are rejected outright when the caller's leg cannot carry a stream, so
         // the plane→service leg must not escalate to a persistent WebSocket it would never use.
         transport: transportForAbility(this.input.ability, this.input.allowStreaming ? {} : { requiresStreaming: false }),
