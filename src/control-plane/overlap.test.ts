@@ -105,6 +105,36 @@ describe('key derivation overlaps catalog resolution after authentication', () =
     expect(issued.token).toBeTruthy();
   });
 
+  it('surfaces a key failure immediately even while the catalog fetch hangs', async () => {
+    // The regression the first-rejection join exists to prevent: a rejected signingKeys must answer
+    // the request now, not wait behind a discovery fetch that may never settle.
+    let releaseCatalog!: () => void;
+    const plane = new ServicePlaneControlPlane({
+      authenticateCaller: () => 'worker-a',
+      broker: false,
+      discoveryCache: false,
+      issuer: PLANE_ORIGIN,
+      log: false,
+      mcp: false,
+      services: () =>
+        new Promise((resolve) => {
+          releaseCatalog = () => resolve([]);
+        }),
+      signingKeys: () => Promise.reject(new Error('signing keys unavailable')),
+    });
+
+    const response = await plane.fetch(
+      new Request(`${PLANE_ORIGIN}${SERVICE_PLANE_CAPABILITY_TOKEN_PATH}`, {
+        body: JSON.stringify({ scopes: ['example.work.run'], targetServiceId: 'example' }),
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
+      }),
+    );
+    expect(response.status).toBeGreaterThanOrEqual(500);
+    releaseCatalog();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
   it('surfaces a catalog failure without leaving the pending key work as an unhandled rejection', async () => {
     const secret = await generateCapabilitySigningSecret();
     let releaseKeys!: () => void;

@@ -459,19 +459,23 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     // discovery fan-out on the other. Started together, a cold request pays the slower of the two
     // instead of their sum. Deliberately inside issuerFor, after caller authentication: refused
     // callers must keep costing nothing (the contract control-plane.test.ts pins), so the overlap
-    // never widens what an unauthenticated request can trigger. The catch keeps a catalog failure
-    // from leaving the still-pending key work as an unhandled rejection; awaiting it below rethrows
-    // key errors exactly as before, though a request where both halves fail now reports the catalog
-    // failure first.
+    // never widens what an unauthenticated request can trigger. Joined with first-rejection
+    // semantics: a key failure must not wait behind a slow — or hung — catalog fetch, and vice
+    // versa, so whichever half fails first answers the request. The pre-attached catches only keep
+    // the surviving half's later rejection from surfacing as an unhandled one.
     const resolvingMaterial = (async () => this.signingMaterialFor(await this.options.signingKeys(context.env, context)))();
     resolvingMaterial.catch(() => undefined);
-    const resolvedServices = services ?? (await this.options.services(context));
-    const capabilities = await discoverServiceCapabilities(
-      resolvedServices,
-      this.discoveryCaches.token,
-      this.discoveryCacheKeyFor(context, resolvedServices).cacheKey,
-    );
-    const privateJwks = await resolvingMaterial;
+    const resolvingCatalog = (async () => {
+      const resolvedServices = services ?? (await this.options.services(context));
+      const capabilities = await discoverServiceCapabilities(
+        resolvedServices,
+        this.discoveryCaches.token,
+        this.discoveryCacheKeyFor(context, resolvedServices).cacheKey,
+      );
+      return { capabilities, resolvedServices };
+    })();
+    resolvingCatalog.catch(() => undefined);
+    const [privateJwks, { capabilities, resolvedServices }] = await Promise.all([resolvingMaterial, resolvingCatalog]);
     const grantDefinition = {
       grants: serviceGrantsFromEndpoints(resolvedServices),
     };
