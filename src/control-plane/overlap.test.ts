@@ -46,14 +46,16 @@ function buildService() {
   });
 }
 
-// Interlock instead of timing: the signing-key resolver only completes once services() has been
-// invoked. Sequential resolution (keys first, catalog after) would deadlock on the interlock and
-// time the test out, so completing at all is a deterministic proof of concurrency — never a race
-// that merely usually wins. Both entries into issuerFor are covered: the broker mount and the STS
-// token endpoint.
+// Interlock instead of timing: the signing-key resolver only completes once the service binding has
+// received its discovery fetch. That fetch happens inside issuerFor's catalog half on both entries —
+// the broker path resolves the endpoint *list* earlier in resolveBrokeredRequest, but never the
+// discovery documents — so sequential resolution (keys first, catalog after) would deadlock on the
+// interlock and time the test out. Completing at all is a deterministic proof of concurrency, never
+// a race that merely usually wins. Gating on services() instead would be vacuous for the broker
+// mount, which invokes it before issuerFor runs.
 describe('key derivation overlaps catalog resolution after authentication', () => {
   function interlockedPlane(secret: string, extra: { authenticateCaller?: () => Promise<string> | string } = {}) {
-    const servicesStarted = deferred();
+    const discoveryRequested = deferred();
     const service = buildService();
     return new ServicePlaneControlPlane({
       ...(extra.authenticateCaller ? { authenticateCaller: extra.authenticateCaller } : {}),
@@ -61,21 +63,23 @@ describe('key derivation overlaps catalog resolution after authentication', () =
       discoveryCache: false,
       issuer: PLANE_ORIGIN,
       log: false,
-      services: () => {
-        servicesStarted.resolve();
-        return [
-          cloudflareServiceBinding({
-            binding: { fetch: async (request: Request) => service.fetch(request) },
-            grants: [
-              { caller: 'gateway', scopes: ['example.work.run'] },
-              { caller: 'worker-a', scopes: ['example.work.run'] },
-            ],
-            id: 'example',
-          }),
-        ];
-      },
+      services: () => [
+        cloudflareServiceBinding({
+          binding: {
+            fetch: async (request: Request) => {
+              discoveryRequested.resolve();
+              return service.fetch(request);
+            },
+          },
+          grants: [
+            { caller: 'gateway', scopes: ['example.work.run'] },
+            { caller: 'worker-a', scopes: ['example.work.run'] },
+          ],
+          id: 'example',
+        }),
+      ],
       signingKeys: async () => {
-        await servicesStarted.promise;
+        await discoveryRequested.promise;
         return [{ kid: 'k1', secret }];
       },
     });
