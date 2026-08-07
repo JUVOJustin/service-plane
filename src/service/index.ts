@@ -165,6 +165,7 @@ export {
   defineAbility,
   defineAbilityService,
   serviceDiscoveryDocument,
+  verifyAbilityAccess,
 } from './discovery.js';
 export {
   type ServicePlaneLogEvent,

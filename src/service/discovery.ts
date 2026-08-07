@@ -19,6 +19,7 @@ import {
   type AbilityTransport,
   type CapabilityCatalog,
   type CapabilityIdentity,
+  isAbilityAccess,
   type OpenApiObject,
   SERVICE_DISCOVERY_PATH,
   type ServiceAbilityDiscovery,
@@ -316,12 +317,27 @@ type ValidatingAbilityHandlerConstructor = new () => RpcTarget;
 const validatingHandlerConstructorByAbility = new WeakMap<object, ValidatingAbilityHandlerConstructor>();
 const validatingHandlerStateByTarget = new WeakMap<object, ValidatingAbilityHandlerState>();
 
+/**
+ * Refuses a caller class the ability does not admit, from the service's own definition rather than
+ * any discovered catalog. `ServicePlaneService` runs this before the handler factory; it is also
+ * built into `createValidatingAbilityHandler`, so custom shells assembled from these primitives
+ * inherit the same boundary. Guard-return shape mirrors the broker's check on purpose — the two
+ * must visibly agree.
+ */
+export function verifyAbilityAccess(ability: Pick<NormalizedServiceAbility, 'access' | 'id'>, identity: CapabilityIdentity): void {
+  if (ability.access !== 'service') return;
+  if (identity.callerAccess === 'service') return;
+  throw new CapabilityAuthError(`Service-Plane ability is callable by services only: ${ability.id}`, 403);
+}
+
 export function createValidatingAbilityHandler<TEnv extends Env>(
   ability: NormalizedServiceAbility<TEnv>,
   handler: RpcTarget & Record<string, unknown>,
   identity: CapabilityIdentity,
   options: CreateValidatingAbilityHandlerOptions = {},
 ): RpcTarget {
+  // Backstop for custom shells; the shipped shell has already refused before the handler factory ran.
+  verifyAbilityAccess(ability, identity);
   // A handler instance carries one caller's identity; a factory that returns a shared
   // instance would let concurrent sessions overwrite each other's identity and scopes.
   if (capabilityIdentity(handler)) {
@@ -998,7 +1014,7 @@ function normalizeAbilityExposure(exposure: AbilityExposure, abilityId: string):
 }
 
 function normalizeAbilityAccess(access: AbilityAccess, abilityId: string): AbilityAccess {
-  if (access !== 'plane' && access !== 'service') {
+  if (!isAbilityAccess(access)) {
     throw new CapabilityAuthError(`Unknown Service-Plane ability access for ${abilityId}: ${String(access)}`, 500);
   }
   return access;

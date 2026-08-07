@@ -99,6 +99,7 @@ export {
 } from '../shared/types.js';
 export {
   type BrokerCaller,
+  brokerCallerAccess,
   brokerCallerSubject,
   type ControlPlaneRpcBroker,
   type CreateControlPlaneRpcBrokerOptions,
@@ -120,6 +121,7 @@ export {
   type CallerAuthenticator,
   type CallerAuthResult,
   type CapabilityIssuer,
+  type CapabilityIssuerInput,
   type CapabilityIssuerResolver,
   type CapabilityJwksProvider,
   type CapabilityJwksProviderResolver,

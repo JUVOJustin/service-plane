@@ -7,7 +7,15 @@ import { CapabilityAuthError, ServicePlaneTimeoutError } from '../shared/errors.
 import { normalizeIdempotencyKey } from '../shared/idempotency.js';
 import type { ServicePlaneBrokerLogEvent } from '../shared/logging.js';
 import { isOriginRelativePath } from '../shared/paths.js';
-import type { CapabilitySubject, DiscoveredServiceAbility, ServiceEndpoint, ServiceRegistry } from '../shared/types.js';
+import type {
+  AbilityAccess,
+  CapabilitySubject,
+  DiscoveredServiceAbility,
+  IssueCapabilityTokenInput,
+  IssuedCapabilityToken,
+  ServiceEndpoint,
+  ServiceRegistry,
+} from '../shared/types.js';
 import type { CapabilityIssuer } from './capabilities.js';
 import { createServiceRegistry } from './registry.js';
 
@@ -27,6 +35,37 @@ export function brokerCallerSubject(caller: BrokerCaller | undefined): Capabilit
   if (caller?.kind !== 'user') return undefined;
   const orgId = caller.orgId?.trim();
   return normalizeCapabilitySubject({ id: caller.id, ...(orgId ? { orgId } : {}) });
+}
+
+/**
+ * The access class the plane vouches for when it mints a token. Only a caller it authenticated as
+ * another service counts as `service`; a user, an API key, an anonymous request, and a broker used
+ * with no caller at all are all `plane`. Services enforce this against their ability's own `access`,
+ * so the mapping here is the same decision `authorizeAbility` makes, carried into the token.
+ */
+export function brokerCallerAccess(caller: BrokerCaller | undefined): AbilityAccess {
+  return caller?.kind === 'service' ? 'service' : 'plane';
+}
+
+/**
+ * One token requester for broker and MCP so the brokered-vs-plain fork and the caller-class stamp
+ * cannot drift between the two mounts — the same anti-drift contract as `transportForAbility` and
+ * `brokerCallerLogFields`. Minting brokered tokens for ingress-required targets and stamping the
+ * resolver's caller class are both security-relevant, so they live in exactly one place.
+ */
+export function brokerRequestToken(options: {
+  ability: DiscoveredServiceAbility;
+  brokerServiceId: string;
+  caller: BrokerCaller | undefined;
+  issuer: CapabilityIssuer;
+}): (input: IssueCapabilityTokenInput) => Promise<IssuedCapabilityToken> {
+  const callerAccess = brokerCallerAccess(options.caller);
+  return (input) => {
+    const request = { ...input, callerAccess };
+    return options.ability.serviceIngress?.required
+      ? options.issuer.issueBrokeredCapabilityToken({ ...request, brokerServiceId: options.brokerServiceId })
+      : options.issuer.issueCapabilityToken(request);
+  };
 }
 
 /**
@@ -237,10 +276,12 @@ class BrokeredAbility extends RpcTarget {
         ...(subject ? { subject } : {}),
         ...(rejectStreamMethods && rejectStreamMethods.length > 0 ? { rejectStreamMethods } : {}),
         ...(this.input.requestId ? { requestId: this.input.requestId } : {}),
-        requestToken: (input) =>
-          brokered
-            ? this.input.issuer.issueBrokeredCapabilityToken({ ...input, brokerServiceId: this.input.brokerServiceId })
-            : this.input.issuer.issueCapabilityToken(input),
+        requestToken: brokerRequestToken({
+          ability: this.input.ability,
+          brokerServiceId: this.input.brokerServiceId,
+          caller: this.input.caller,
+          issuer: this.input.issuer,
+        }),
         scopes: requested,
         targetServiceId: this.input.ability.serviceId,
         ...(timeoutMs === undefined ? {} : { timeoutMs }),
@@ -282,16 +323,13 @@ function brokerConnectFailedEvent(
   };
 }
 
-// Decided from the discovered catalog, which the plane caches. That makes `access` the one catalog
-// field whose staleness *loosens* enforcement rather than delaying availability: the service checks
-// scopes and ingress but never re-checks `access`, so tightening an ability from 'plane' to
-// 'service' only takes effect once the plane's discovery cache refreshes. Until then a non-service
-// caller that already holds a grant for the scope still gets through. Revoking the grant is the
-// immediate lever; closing it properly needs the caller kind inside the token so the service can
-// enforce this itself. Tracked in #32.
+// Decided from the discovered catalog, which the plane caches, so this is the earlier and more
+// legible of two checks rather than the only one: the same decision rides into the token as `spa`
+// and the service re-checks it against its own definition. A catalog that has not caught up with a
+// tightened `access` therefore refuses the call at the service instead of letting it through.
 function authorizeAbility(ability: DiscoveredServiceAbility, caller: BrokerCaller | undefined): void {
   if (ability.access === 'plane') return;
-  if (ability.access === 'service' && caller?.kind === 'service') return;
+  if (ability.access === 'service' && brokerCallerAccess(caller) === 'service') return;
   throw new CapabilityAuthError('Service-Plane broker ability requires service access', 403);
 }
 

@@ -185,6 +185,8 @@ being published, which is why token TTLs are short and why the maximum is capped
 
 Use the simplest option that matches the deployment boundary.
 
+Everything the token endpoint's `authenticateCaller` admits becomes a **service-class** caller: its tokens carry [`spa: 'service'`](reference.md#capability-token-claims) and can reach `access: 'service'` abilities on any service the grants allow. Wire only genuine services into it — end users, product API keys, and anonymous traffic belong in front of the broker, whose caller resolver brokers them as plane-class. This is the same fleet-wide consequence the broker resolver's `kind: 'service'` carries, made explicit because reusing an existing product-credential store as token-endpoint clients would silently promote every credential in it.
+
 Cloudflare same-account callers should use private RPC token requests through a service binding:
 
 ```ts
@@ -366,9 +368,14 @@ context.env.CONTROL_PLANE
   audience: 'asana',
   scopes: ['asana.tasks.write'],
   tokenId: 'cap_123',
-  subject: { id: 'user-7', orgId: 'org-42' }, // only on delegated (user-brokered) calls
+  callerAccess: 'service',                    // 'plane' when the control plane fronts the caller
+  subject: { id: 'user-7', orgId: 'org-42' }, // only on delegated calls — those are always plane-class
 }
 ```
+
+The two annotated fields never combine as shown: a delegated subject is by definition a caller the plane fronts, so `subject` only ever appears alongside `callerAccess: 'plane'` — the issuer refuses to mint the other pairing. A `service`-class identity is always a plain service-to-service call with no `subject`.
+
+`callerAccess` is the access class the control plane authenticated for the caller, and it is what enforces an ability's `access` at the service. `service` means the plane proved the caller is another service; `plane` covers every caller the plane fronts itself — end users, API keys, anonymous traffic. An ability declared `access: 'service'` refuses a `plane` caller with 403 before the handler is created, using the service's own definition rather than the plane's cached catalog. See [`spa`](reference.md#capability-token-claims).
 
 Keep identity small. It carries Service Plane caller and authorization claims, plus the delegated end-user subject on user-brokered calls. Any other product-level connection context is application-owned; pass it through validated method input if the service needs it. Store provider credentials in the service's own storage.
 
@@ -376,7 +383,7 @@ Keep identity small. It carries Service Plane caller and authorization claims, p
 
 When the control plane brokers a call for an authenticated end user, the token uses RFC 8693's `act` actor-claim semantics: `sub` carries the end user and `act.sub` names the acting service. The `spo` organization claim is Service Plane-specific. Services read the user as `identity.subject`, while `identity.serviceId` stays the acting service.
 
-Service Plane does not expose the RFC 8693 token-exchange protocol. `/.well-known/service-plane/capability-token` is a package-specific JSON capability endpoint, and `scp`, `spo`, and `spb` are Service Plane-specific claims. The established claim names stay the same; only `act` borrows RFC 8693's delegation relationship.
+Service Plane does not expose the RFC 8693 token-exchange protocol. `/.well-known/service-plane/capability-token` is a package-specific JSON capability endpoint, and `scp`, `spa`, `spo`, and `spb` are Service Plane-specific claims. The established claim names stay the same; only `act` borrows RFC 8693's delegation relationship.
 
 The flow with an application identity provider such as Supabase:
 
@@ -425,9 +432,11 @@ Boundaries to keep in mind:
 
 - The subject is delegation the control plane vouches for. It rides the same issuer/JWKS trust chain as every other claim, so services may rely on it for auditing and per-user decisions.
 - The subject does not replace scope or grant checks. Ability authorization stays with scopes, grants, and ingress. Tenancy authorization stays with the service that owns the data.
-- Only control-plane code asserts subjects: the broker caller resolver or direct `issueCapabilityToken({ subject, ... })` calls. The HTTP token endpoint rejects caller-supplied `subject` fields, and the shipped token requesters (`controlPlaneHmacTokenRequester`, `controlPlaneJwkTokenRequester`, `controlPlaneRpcTokenRequester`) refuse to send one, so an authenticated service cannot claim it acts for an arbitrary user. The `subject` option on `createCapabilityTokenProvider` therefore only works with a `requestToken` that calls the issuer in-process.
+- Only control-plane code asserts subjects: the broker caller resolver or direct `issueCapabilityToken({ subject, callerAccess: 'plane', ... })` calls. The HTTP token endpoint rejects caller-supplied `subject` fields, and the shipped token requesters (`controlPlaneHmacTokenRequester`, `controlPlaneJwkTokenRequester`, `controlPlaneRpcTokenRequester`) refuse to send one, so an authenticated service cannot claim it acts for an arbitrary user. The `subject` option on `createCapabilityTokenProvider` therefore only works with a `requestToken` that calls the issuer in-process.
+- A delegated subject is always plane-class. The issuer requires `callerAccess` on every direct mint and refuses `subject` together with `callerAccess: 'service'` — that pair would hand an end user the service-only reach that [`access: 'service'`](reference.md#capability-token-claims) exists to withhold.
 - Direct `issueCapabilityToken({ subject, ... })` mints a non-brokered token. For a target with `ingress` required, delegate through the broker instead — it selects `issueBrokeredCapabilityToken` automatically; a directly issued token is rejected by the ingress check.
 - Tokens delegated to a subject are cached per subject. `capabilityTokenCacheKey` includes the subject, so a token minted for one user is never served for another.
+- The cache key does **not** include the caller's access class — that is decided by the requester, which the key never sees. Plane-side code that shares one `CapabilityTokenCache` between in-process requesters minting different classes for the same caller id, target, and scopes must give them distinct `cacheKey`s, or a cached `spa: 'service'` token can be served to a plane-class flow. The shipped requesters all mint service-class, so this only arises with hand-built requesters.
 
 ## Forwarded Connection Info
 

@@ -19,6 +19,15 @@ export const SERVICE_PLANE_REQUEST_ID_HEADER = 'X-Request-Id';
 export const SERVICE_PLANE_REQUEST_ID_QUERY_PARAM = 'request_id';
 
 export type AbilityAccess = 'plane' | 'service';
+
+/**
+ * The one membership test for `AbilityAccess`. Registry validation, discovery normalization, token
+ * issuance, and claim parsing all gate on this union; a single predicate next to the type keeps a
+ * future widening from needing four synchronized hand-written checks.
+ */
+export function isAbilityAccess(value: unknown): value is AbilityAccess {
+  return value === 'plane' || value === 'service';
+}
 export type AbilityExposure = 'private' | 'published';
 export type AbilityTransport = 'cloudflare-binding-rpc' | 'http-batch' | 'websocket';
 /**
@@ -340,6 +349,12 @@ export type CapabilityClaims = {
   jti: string;
   nbf: number;
   scp: string[];
+  /**
+   * Service Plane-specific: the access class the control plane authenticated for the caller. Optional
+   * on the wire only so a token from a control plane that predates the claim still verifies — it then
+   * reads as `plane`, the class that can reach the least.
+   */
+  spa?: AbilityAccess;
   spb?: string;
   spo?: string;
   sub: string;
@@ -348,6 +363,13 @@ export type CapabilityClaims = {
 export type CapabilityIdentity = {
   audience: string;
   brokerServiceId?: string;
+  /**
+   * The access class the control plane vouched for: `service` when it authenticated the caller as
+   * another service, `plane` for every caller it fronts itself — end users, API keys, anonymous.
+   * Abilities declared `access: 'service'` accept only `service`, and a token carrying no such claim
+   * reads as `plane`, so an unattested caller is never mistaken for a service.
+   */
+  callerAccess: AbilityAccess;
   /**
    * Present when the token is sender-constrained. A verified identity only ever carries this after a
    * matching proof of possession was checked, so handlers can treat it as proof the caller was present.

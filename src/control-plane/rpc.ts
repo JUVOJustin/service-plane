@@ -35,6 +35,9 @@ export async function issueCapabilityTokenForCaller(
   }
   rejectCallerAssertedSubject(input.subject);
   const issued = await issuer.issueCapabilityToken({
+    // The binding's caller is a service the deployment configuration established, so this path mints
+    // service-class tokens for the same reason the HTTP token endpoint does.
+    callerAccess: 'service',
     callerServiceId,
     scopes: input.scopes,
     targetServiceId: input.targetServiceId,

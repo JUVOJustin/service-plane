@@ -99,6 +99,36 @@ describe('STS capability tokens', () => {
     expect(identity.subject).toBeUndefined();
   });
 
+  it('reads the caller access claim, defaulting a token without one to the plane class', async () => {
+    const keys = await testKeys();
+    const verify = (token: string) =>
+      verifyCapabilityToken(token, {
+        expectedAudience: 'fizzy',
+        issuer: 'control-plane',
+        jwks: keys.jwks,
+        now: new Date('2026-05-09T12:01:00.000Z'),
+      });
+    const claims = { aud: 'fizzy', iss: 'control-plane', scp: ['fizzy.users.lookup'], sub: 'moco' };
+    const signed = (spa?: unknown) =>
+      signCapabilityToken({
+        claims: spa === undefined ? claims : { ...claims, spa: spa as never },
+        keyId: 'test-key',
+        now: NOW,
+        privateJwk: keys.privateJwk,
+      });
+
+    await expect(verify((await signed('service')).token)).resolves.toMatchObject({ callerAccess: 'service' });
+    await expect(verify((await signed('plane')).token)).resolves.toMatchObject({ callerAccess: 'plane' });
+
+    // A control plane that predates the claim. Reading it as plane-class keeps such a token usable
+    // for everything except the service-only abilities it was never attested for.
+    await expect(verify((await signed()).token)).resolves.toMatchObject({ callerAccess: 'plane' });
+
+    for (const spa of ['', 'user', 'SERVICE', 42, null, {}]) {
+      await expect(verify((await signed(spa)).token)).rejects.toThrow('Invalid Service-Plane capability claims');
+    }
+  });
+
   it('rejects malformed actor claims and org claims without delegation', async () => {
     const keys = await testKeys();
     const malformedActors: unknown[] = ['control-plane', {}, { sub: '' }, { sub: 42 }, { sub: 'x'.repeat(600) }];

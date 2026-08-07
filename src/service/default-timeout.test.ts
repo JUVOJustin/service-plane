@@ -121,6 +121,7 @@ describe('enforcement of the ceiling', () => {
     });
     const service = buildService({ methodMs: 30 }, keys.publicJwk);
     const issued = await issuer.issueCapabilityToken({
+      callerAccess: 'service',
       callerServiceId: 'worker-a',
       scopes: ['example.work.run'],
       targetServiceId: 'example',

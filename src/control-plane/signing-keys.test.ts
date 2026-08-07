@@ -23,7 +23,12 @@ function issuerFor(keys: CapabilitySigningKey[], issuer = 'control-plane') {
 }
 
 function issue(issuer: Awaited<ReturnType<typeof issuerFor>>) {
-  return issuer.issueCapabilityToken({ callerServiceId: 'moco', scopes: ['fizzy.users.lookup'], targetServiceId: 'fizzy' });
+  return issuer.issueCapabilityToken({
+    callerAccess: 'service',
+    callerServiceId: 'moco',
+    scopes: ['fizzy.users.lookup'],
+    targetServiceId: 'fizzy',
+  });
 }
 
 describe('control-plane signing keys', () => {

@@ -79,6 +79,7 @@ async function connectedApi() {
     version: '0.1.0',
   });
   const issued = await issuer.issueCapabilityToken({
+    callerAccess: 'service',
     callerServiceId: 'worker-a',
     scopes: ['example.work.run'],
     targetServiceId: 'example',
@@ -185,6 +186,7 @@ describe('how a taxonomy error reaches the wire', () => {
       version: '0.1.0',
     });
     const issued = await issuer.issueCapabilityToken({
+      callerAccess: 'service',
       callerServiceId: 'worker-a',
       scopes: ['example.work.run'],
       targetServiceId: 'example',

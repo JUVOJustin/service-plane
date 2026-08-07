@@ -40,6 +40,7 @@ import {
   type ServiceAbilityHandlerFactoryInput,
   type ServiceDefinition,
   serviceDiscoveryDocument,
+  verifyAbilityAccess,
 } from './discovery.js';
 import {
   recordServicePlaneLogEvent,
@@ -301,6 +302,10 @@ class AuthRoot<TEnv extends Env> extends RpcTarget {
       ...(proof === undefined ? {} : { proof }),
     });
     await verifyServiceIngress(auth, ingress, identity, context);
+    // From the ability's own definition, before the handler factory runs. The broker checks the
+    // same rule from its cached catalog; this is the authoritative end, so tightening an ability
+    // to `access: 'service'` takes effect the moment the service deploys.
+    verifyAbilityAccess(ability, identity);
     // Connection info is an unsigned assertion about a connection this service never saw, so it is
     // only trustworthy once the peer is proven to be the broker: ingress restricts the service to
     // brokered tokens, and `brokerServiceId` is a signed claim only the control plane can mint.

@@ -70,6 +70,7 @@ describe('per-method timeoutMs: 0 opt-out', () => {
       version: '0.1.0',
     });
     const issued = await issuer.issueCapabilityToken({
+      callerAccess: 'service',
       callerServiceId: 'worker-a',
       scopes: ['example.work.run'],
       targetServiceId: 'example',
@@ -216,6 +217,7 @@ describe('exhausted chain budget fails fast', () => {
       version: '0.1.0',
     });
     const issued = await issuer.issueCapabilityToken({
+      callerAccess: 'service',
       callerServiceId: 'worker-a',
       scopes: ['example.work.run'],
       targetServiceId: 'example',
@@ -279,6 +281,7 @@ describe('taxonomy across a serializing chain', () => {
       version: '0.1.0',
     });
     const issued = await issuer.issueCapabilityToken({
+      callerAccess: 'service',
       callerServiceId: 'worker-a',
       scopes: ['example.work.run'],
       targetServiceId: 'example',
@@ -379,6 +382,7 @@ describe('session transports get no manufactured default budget', () => {
       version: '0.1.0',
     });
     const issued = await issuer.issueCapabilityToken({
+      callerAccess: 'service',
       callerServiceId: 'worker-a',
       scopes: ['example.work.run'],
       targetServiceId: 'example',
@@ -425,6 +429,7 @@ describe('replaced handler failures are logged', () => {
       version: '0.1.0',
     });
     const issued = await issuer.issueCapabilityToken({
+      callerAccess: 'service',
       callerServiceId: 'worker-a',
       scopes: ['example.work.run'],
       targetServiceId: 'example',

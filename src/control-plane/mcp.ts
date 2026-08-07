@@ -18,7 +18,14 @@ import {
   type ServiceRegistry,
   type ServiceRegistrySnapshot,
 } from '../shared/types.js';
-import { type BrokerCaller, brokerCallerLogFields, brokerCallerSubject, transportForAbility } from './broker.js';
+import {
+  type BrokerCaller,
+  brokerCallerAccess,
+  brokerCallerLogFields,
+  brokerCallerSubject,
+  brokerRequestToken,
+  transportForAbility,
+} from './broker.js';
 import type { CapabilityIssuer } from './capabilities.js';
 
 export type ControlPlaneMcpServerInfo = {
@@ -687,10 +694,12 @@ async function openMethodSession(
     ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
     ...(subject ? { subject } : {}),
     ...(options.requestId ? { requestId: options.requestId } : {}),
-    requestToken: (tokenInput) =>
-      match.ability.serviceIngress?.required
-        ? options.issuer.issueBrokeredCapabilityToken({ ...tokenInput, brokerServiceId: options.controlPlaneServiceId })
-        : options.issuer.issueCapabilityToken(tokenInput),
+    requestToken: brokerRequestToken({
+      ability: match.ability,
+      brokerServiceId: options.controlPlaneServiceId,
+      caller: options.caller,
+      issuer: options.issuer,
+    }),
     scopes: match.scopes,
     targetServiceId: match.ability.serviceId,
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
@@ -852,9 +861,11 @@ function logMcpFailed(
   });
 }
 
+// Same catalog-based check as the broker, and likewise not the last word: the caller class rides the
+// token and the service re-checks it against its own definition.
 function authorizePublishedAbility(ability: DiscoveredServiceAbility, caller: BrokerCaller | undefined): void {
   if (ability.access === 'plane') return;
-  if (ability.access === 'service' && caller?.kind === 'service') return;
+  if (ability.access === 'service' && brokerCallerAccess(caller) === 'service') return;
   throw new CapabilityAuthError('Service-Plane MCP call requires service access', 403);
 }
 

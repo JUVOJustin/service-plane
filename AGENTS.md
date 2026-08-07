@@ -40,7 +40,7 @@ Use `exposure: 'published'` only for abilities intended to become product or int
 
 Use `access: 'plane'` for the default Service Plane path. The control plane or gateway owns any product-level user, API-key, or anonymous access decision before it asks the service to run an ability.
 
-Use `access: 'service'` for internal service-to-service abilities that should only be brokered when the broker caller is another service. Do not use service access to model end-user authentication.
+Use `access: 'service'` for internal service-to-service abilities that only a service caller may reach. It is enforced at both ends: the broker refuses a non-service caller from the discovered catalog, and the service refuses one from its own definition using the caller-access claim on the token. Do not use service access to model end-user authentication.
 
 Define scopes at the service capability catalog, then reference them at both ability and method level. Ability scopes declare the maximum scope surface. Method scopes declare the minimum scopes for one operation. A method must not require a scope that the parent ability does not declare.
 

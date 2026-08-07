@@ -101,7 +101,13 @@ export type CreateCapabilityTokenProviderOptions = {
   callerServiceId: string;
   now?: () => Date;
   refreshSkewSeconds?: number;
-  requestToken(input: IssueCapabilityTokenInput): Promise<IssuedCapabilityToken | { expiresAt: Date | string; token: string }>;
+  /**
+   * Property-function on purpose, not method syntax: methods compare parameters bivariantly, which
+   * would let a raw `CapabilityIssuer` (whose input additionally requires `callerAccess`) slot in
+   * here and compile — then fail at runtime on the first request. This shape makes that a type error;
+   * wrap the issuer in a closure that supplies `callerAccess` instead.
+   */
+  requestToken: (input: IssueCapabilityTokenInput) => Promise<IssuedCapabilityToken | { expiresAt: Date | string; token: string }>;
   scopes: string[];
   subject?: CapabilitySubject;
   targetServiceId: string;
@@ -138,7 +144,12 @@ export type ControlPlaneJwkTokenRequesterOptions = ControlPlaneTokenRequestOptio
 };
 
 export type ControlPlaneRpcTokenBinding = {
-  issueCapabilityToken(input: IssueCapabilityTokenInput): Promise<IssuedCapabilityToken | { expiresAt: Date | string; token: string }>;
+  /**
+   * Property-function for the same reason as `requestToken`: a raw `CapabilityIssuer` must not
+   * satisfy this seam — its input requires `callerAccess`, which no service-side caller supplies.
+   * Expose a control-plane entrypoint (e.g. `issueCapabilityTokenForCaller`) instead.
+   */
+  issueCapabilityToken: (input: IssueCapabilityTokenInput) => Promise<IssuedCapabilityToken | { expiresAt: Date | string; token: string }>;
 };
 
 export type ControlPlaneRpcCallerTokenBinding = {
