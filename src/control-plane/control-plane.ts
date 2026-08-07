@@ -454,16 +454,28 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   // Authorization catalog plus signing authority: needs discovered capabilities and grants, so it
   // can fail while a target service is down. Only token issuance and brokering depend on it.
   private async issuerFor(context: Context<TEnv>, services?: ServiceEndpoint[]): Promise<CapabilityIssuer> {
-    const keys = await this.options.signingKeys(context.env, context);
-    // Resolved before the memo lookup so a miss only has to assemble the catalog, which is
-    // microseconds — the key work is already done and shared across every configuration.
-    const privateJwks = await this.signingMaterialFor(keys);
-    const resolvedServices = services ?? (await this.options.services(context));
-    const capabilities = await discoverServiceCapabilities(
-      resolvedServices,
-      this.discoveryCaches.token,
-      this.discoveryCacheKeyFor(context, resolvedServices).cacheKey,
-    );
+    // Key-material derivation and catalog resolution are independent, and each is the slow half on
+    // its own cold path — the P-256 derivation plus proof round-trip (~9.5ms) on one side, the
+    // discovery fan-out on the other. Started together, a cold request pays the slower of the two
+    // instead of their sum. Deliberately inside issuerFor, after caller authentication: refused
+    // callers must keep costing nothing (the contract control-plane.test.ts pins), so the overlap
+    // never widens what an unauthenticated request can trigger. Joined with first-rejection
+    // semantics: a key failure must not wait behind a slow — or hung — catalog fetch, and vice
+    // versa, so whichever half fails first answers the request. The pre-attached catches only keep
+    // the surviving half's later rejection from surfacing as an unhandled one.
+    const resolvingMaterial = (async () => this.signingMaterialFor(await this.options.signingKeys(context.env, context)))();
+    resolvingMaterial.catch(() => undefined);
+    const resolvingCatalog = (async () => {
+      const resolvedServices = services ?? (await this.options.services(context));
+      const capabilities = await discoverServiceCapabilities(
+        resolvedServices,
+        this.discoveryCaches.token,
+        this.discoveryCacheKeyFor(context, resolvedServices).cacheKey,
+      );
+      return { capabilities, resolvedServices };
+    })();
+    resolvingCatalog.catch(() => undefined);
+    const [privateJwks, { capabilities, resolvedServices }] = await Promise.all([resolvingMaterial, resolvingCatalog]);
     const grantDefinition = {
       grants: serviceGrantsFromEndpoints(resolvedServices),
     };
