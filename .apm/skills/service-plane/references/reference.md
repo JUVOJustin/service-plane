@@ -58,6 +58,8 @@ Validation failures raise `AbilityValidationError` carrying the issues the schem
 
 Optional `rest` metadata projects the method into the generated OpenAPI 3.2 document; `rest.method` accepts `get`, `post`, `put`, `patch`, `delete`, and `query` (HTTP QUERY per RFC 10008 — request parameters in the body, safe and idempotent). See [OpenAPI and MCP](openapi-mcp.md#openapi).
 
+Optional `idempotent: true` declares that calling the method again with the same input cannot double its effect, so a caller may safely retry an ambiguous failure. See [Idempotency](#idempotency).
+
 ## Streaming Methods
 
 Some methods produce many results over time — large file transfers, long exports. Declare them with `stream: true`; the `output` schema then validates **each streamed item**, and the handler returns an async iterable (usually an async generator), a sync iterable, or a `ReadableStream`:
@@ -283,6 +285,164 @@ Every request that enters a `ServicePlaneControlPlane` gets an `X-Request-Id` (i
 
 Connection info about the original client rides the same three channels when `broker.connInfo` / `mcp.connInfo` are configured: the `X-Service-Plane-Conn-Info` header, the `conn_info` query parameter (`SERVICE_PLANE_CONN_INFO_QUERY_PARAM`), and the `connInfo` field on `connectAbility(...)`. Services expose it to handlers as `connInfo` only for brokered calls with ingress enabled — see [Forwarded Connection Info](auth.md#forwarded-connection-info).
 
+## Deadlines
+
+Two bounds, layered. A **service-side ceiling** that always exists, and an **end-to-end budget** a caller may set on top of it. Whichever expires first wins.
+
+### The ceiling you get for free
+
+Every unary ability method is bounded at `DEFAULT_ABILITY_TIMEOUT_MS` — 10 seconds — without anyone configuring anything.
+
+That default is deliberate. gRPC and [Connect](https://connectrpc.com/docs/node/timeouts/) leave deadlines entirely to the caller, and the standing advice in [gRPC's own guidance](https://grpc.io/blog/deadlines/) is to *"always set a deadline"* — a rule that only needs stating because the unset case is unbounded. Systems that own a default do not need the reminder: [Envoy routes time out at 15s](https://www.envoyproxy.io/docs/envoy/latest/faq/configuration/timeouts), and [Armeria's server request timeout is 10s](https://armeria.dev/docs/server/timeouts/). 10s matches the closest analogue — a server bounding its own request handling.
+
+Tune it where it belongs:
+
+```ts
+new ServicePlaneService({
+  timeout: { methodMs: 2_500 },     // service-wide ceiling; `false` removes it
+});
+
+bigExport: abilityMethod({ timeoutMs: 120_000, ... });  // the one slow method
+bigMigration: abilityMethod({ timeoutMs: 0, ... });     // opt this one out entirely
+```
+
+Method values are validated at definition time — a negative, fractional, or absurdly large value refuses the service instead of silently dropping or clamping the ceiling — and a method's own ceiling is deliberately **not** clamped to the 10-minute wire limit: that limit bounds what a *caller* may ask for, not how long a service allows its own export to run.
+
+Raise the exception, not the ceiling. **Streaming methods are never bounded this way** — for the reason Envoy documents about its own route timeout, a bound that suits a request is wrong for a stream. Session lifetime is untouched either way.
+
+The effective ceiling is advertised per method in the discovery document, so a gateway can size its own wait against it.
+
+### The budget a caller sets
+
+A caller states how long it is willing to wait; every hop spends from that budget rather than granting a new one.
+
+```ts
+const api = await abilitySession<AbilityRpc<typeof syncAbility>>({
+  // ...
+  timeoutMs: 5_000,
+});
+```
+
+The value travels on the same three channels as the request id: the `X-Service-Plane-Timeout` header, the `timeout` query parameter (`SERVICE_PLANE_TIMEOUT_QUERY_PARAM`), and the `timeoutMs` field on `connectAbility(...)`. It is **relative milliseconds remaining**, not an absolute timestamp — two clocks that disagree would shift an absolute deadline by the whole skew, and this package already assumes clocks can differ. Each hop measures its own elapsed time on its own clock and forwards what is left, which is the trade `grpc-timeout` makes for the same reason.
+
+What each participant does with it:
+
+- **The caller** bounds its own wait per method call and rejects with `ServicePlaneTimeoutError` when the budget elapses. Cap'n Web has no cancel message, so this frees the caller, not the callee.
+- **The control plane** reads an inbound `X-Service-Plane-Timeout` on broker and MCP requests and forwards *what is left* after its own work — resolving the catalog, minting a token. If nothing is left, `connect()` fails before a service session is opened.
+- **The service** turns it into the `signal` its ability handlers receive, and the validating wrapper fails the method if the handler outlives it. A handler that ignores `signal` therefore loses the work, not correctness.
+
+```ts
+handler: ({ signal }) => new MyApi(signal), // pass it to outbound fetch, long loops, DB calls
+```
+
+### Chains
+
+A budget only survives a chain if each service passes on what is left of its own. Handlers get `remainingTimeoutMs()` for exactly that:
+
+```ts
+handler: ({ remainingTimeoutMs, signal }) => ({
+  async run(input) {
+    const downstream = await abilitySession({ ...opts, timeoutMs: remainingTimeoutMs?.() });
+    return downstream.doWork(input);
+  },
+});
+```
+
+Skip it and the next hop starts a **fresh** budget: `A(5s) → B` where B calls C with its own 5s means the end-to-end bound A asked for is gone. Nothing enforces this for you — a service that calls onward has to opt in.
+
+At exhaustion the pattern stays safe: `remainingTimeoutMs()` returns `0` once the budget is gone, and a session opened with `timeoutMs: 0` fails every call immediately with a `timeout` error instead of running unbounded — the same fail-fast the broker applies before opening a service leg.
+
+### What This Does And Does Not Bound
+
+Three of the four mechanisms are plain timers over a duration, so they do not read a clock and cannot drift:
+
+- the caller's own wait (`setTimeout`),
+- the `signal` handed to handlers (`AbortSignal.timeout`),
+- the wrapper's refusal to resolve a method past the deadline.
+
+Only the plane's decrement does clock arithmetic — `Date.now()` at request entry versus at the moment it opens the service leg. Both readings are on the same machine, so there is no cross-host skew to worry about.
+
+It does **not**:
+
+- **cancel the peer.** Cap'n Web has no cancel message. A caller-side timeout frees the caller; the service keeps running until its own budget expires. The forwarded budget is what actually stops work.
+- **close a session.** The deadline fails a *method*. A WebSocket session stays open, so on Cloudflare a Durable Object holding one keeps billing duration — see [Transports](transports.md). Use an idle timeout to bound that, not a deadline.
+- **bound a stream's lifetime.** It bounds the call that returns the stream, not consumption of its items.
+
+### On Cloudflare
+
+Workers freeze `Date.now()` during synchronous execution and advance it on I/O (a Spectre mitigation). That suits this design rather than breaking it: the plane's decrement measures *waiting* — the discovery fan-out, the token mint — and waiting is I/O, which is exactly when the clock moves. What stays invisible is pure CPU time, which the Workers CPU limit already bounds and which is small next to a network hop. The effect is that a plane's decrement can slightly under-count, never over-count, so a service is handed a budget that is generous rather than short.
+
+Two caveats worth stating:
+
+- The runtime matrix in [#11](https://github.com/JUVOJustin/service-plane/issues/11) does not run yet, so the above reflects documented workerd behavior, not a test result on workerd.
+- If Cap'n Web ever gains WebSocket Hibernation ([capnweb#36](https://github.com/cloudflare/capnweb/issues/36)), a hibernating Durable Object would lose the in-memory `AbortSignal.timeout` behind a session-scoped deadline, and it would silently never fire on wake. Today Cap'n Web sessions cannot hibernate, so this is not reachable — but a deadline set before hibernation is not something to assume survives it.
+
+Values are clamped to `MAX_SERVICE_PLANE_TIMEOUT_MS` (10 minutes) and anything that is not a positive integer count of milliseconds is ignored. A caller that sends nothing forwards nothing — the service-side ceiling above is what still bounds the call.
+
+Both shells take a policy for what they will accept:
+
+```ts
+new ServicePlaneControlPlane({ timeout: { defaultMs: 10_000, maxMs: 60_000 } });
+new ServicePlaneService({ timeout: { defaultMs: 5_000, maxMs: 30_000 } });
+```
+
+`defaultMs` supplies a budget when the caller sent none — on per-call transports (HTTP-batch) only. A session transport (WebSocket, native binding) resolves its budget once at session open, so a manufactured default would become a death timer for long-lived sessions whose callers never asked for one; an explicit caller budget on a session transport still applies. `maxMs` clamps any budget — explicit or defaulted — that asks for more than you are willing to hold a connection for. Invalid policy values (`0`, negatives, fractions) are refused at construction rather than silently loosening at runtime. The plane has no built-in default on purpose — it forwards a budget rather than doing the work, so the bound that must always exist lives at the service. Set `defaultMs` when you want the plane to be the policy point, the role Envoy's route timeout plays.
+
+A caller's own local wait is set slightly **above** the budget it forwards (`SERVICE_PLANE_TIMEOUT_GRACE_MS`, 250ms). [Armeria does the same thing](https://armeria.dev/docs/advanced/understanding-timeouts/) — its client response timeout of 15s sits above its 10s server request timeout — so that the service's own enforcement fires first and the caller gets the error the service actually raised instead of a bare local abort that says nothing about what happened downstream.
+
+### When a deadline fires
+
+| | This package | gRPC | Envoy | Armeria |
+| --- | --- | --- | --- | --- |
+| Caller sees | `code: 'timeout'`, `status: 504` **inside the RPC payload** — the HTTP response is 200 | `DEADLINE_EXCEEDED` (maps to 504) | 504 Gateway Timeout | `ResponseTimeoutException` |
+| Service sees | The method rejects; `signal` is aborted | Context cancelled (`CANCELLED`) | Upstream stream reset | `RequestTimeoutException`, work cancelled |
+| Peer is told | **No** | Yes | Yes | Yes (RST_STREAM / close) |
+
+The last row is the honest gap: Cap'n Web has no cancel message, so a caller giving up cannot tell the service. That is why the budget is forwarded rather than relied on locally — the service's own copy is what stops the work. Everyone else in that table can signal the peer; we compensate by making the service-side bound the one that always exists.
+
+`retryable` is `true` for a timeout, matching Envoy's treatment of 504 as a `gateway-error` worth retrying — but only retry when the method is also `idempotent`. See [Idempotency](#idempotency).
+
+**`status` is a classification, not an HTTP status code.** A method's failure is a value inside the Cap'n Web batch, so the HTTP response is `200` and the error travels in its body. Read the classification with `servicePlaneErrorInfo`; do not expect to see 504 on the wire. The number matters when a gateway maps the failure onto its own response. On the MCP surface even an exhausted forwarding budget stays inside the protocol: the refusal is a JSON-RPC-framed tool failure the client can correlate, never a bare HTTP error body.
+
+Unlike forwarded connection info, a deadline is honoured from **any** caller without requiring ingress. It is not an authorization input: a caller shortening its own budget can only cut itself off, and a long one is clamped.
+
+One limit worth knowing: the budget rides the transport, and a session transport is established once. Over HTTP-batch and native bindings a session is one call, so the budget is per call. Over WebSocket it is fixed when the socket opens and therefore bounds every call on that session.
+
+## Idempotency
+
+Deadlines create ambiguous failures — a call that timed out may or may not have run — so a caller needs two things to retry correctly: whether the method is safe to call again, and a way for the service to recognize the retry.
+
+**The method says whether it is safe.** Mark it in the ability definition, the same way `stream` is marked:
+
+```ts
+lookupTask: abilityMethod({
+  idempotent: true,
+  input: TaskQuery,
+  output: Task,
+  scopes: ['asana.tasks.read'],
+});
+```
+
+It is projected into the discovery document so callers and gateways can read it. An unmarked method is **absent** from the projection rather than `false`: it makes no claim, which is the safe reading. Note that this package never retries on its own — retry policy is the caller's, and mesh-level retry belongs to your platform.
+
+Combined with `retryable` from the error taxonomy, the decision is: retry only when the failure was transient **and** the method is idempotent.
+
+**The caller says which attempt this is.** Pass a key and it travels the same three channels as the request id — `X-Service-Plane-Idempotency-Key`, the `idempotency_key` query parameter, and the `idempotencyKey` field on `connectAbility(...)` — reaching the handler as `idempotencyKey`:
+
+```ts
+const api = await abilitySession({ /* ... */ idempotencyKey: 'attempt-7f3a' });
+
+// service side
+handler: ({ idempotencyKey }) => new TaskApi(idempotencyKey);
+```
+
+The package forwards the key and nothing else. Deduplicating means storing a result and expiring it, which needs a store and a retention policy — the same reason discovery snapshots and token caches are yours to supply.
+
+Two things to get right when you build that store:
+
+- **Scope the key by method name.** The key identifies the caller's *attempt*, not one method call, because it rides the transport rather than the RPC payload. Two different methods on one session would otherwise collide. Store under `${idempotencyKey}:${methodName}`.
+- Keys are validated on both send and receive: word characters, `-`, and `=` only, up to 255 characters. Anything else is dropped rather than forwarded, so a key can never smuggle a separator into a log line or a store key.
+
 Both shells log structured JSON events to the console by default. Every event carries `event`, `level`, and (when known) `requestId`.
 
 Service events (`ServicePlaneLogEvent`):
@@ -290,6 +450,7 @@ Service events (`ServicePlaneLogEvent`):
 - `service_plane.discovery.served`
 - `service_plane.request.completed`
 - `service_plane.request.failed`
+- `service_plane.ability.handler_failed` — a handler throw the wrapper replaced with an opaque error; carries the original name and message
 
 Control-plane events:
 
@@ -334,6 +495,7 @@ Token cache keys include caller id, target service id, ability id, normalized sc
 - Missing scope: `CapabilityAuthError` with 403-style status.
 - Invalid caller input: `AbilityValidationError` with 422-style status.
 - Invalid service output or streamed item: `AbilityValidationError` with 500-style status — the handler broke its own declared contract.
+- Deadline elapsed: `ServicePlaneTimeoutError` with 504-style status, thrown by whichever hop notices first. See [Deadlines](#deadlines).
 
 `AbilityValidationError.issues` carries the schema library's issues as `{ message, path? }` entries, so a gateway can build a field-level response without parsing the joined message:
 
@@ -349,6 +511,58 @@ try {
   throw error;
 }
 ```
+
+### Reading An Error A Caller Received
+
+`instanceof` works in-process, but **not** on an error that arrived over RPC. Cap'n Web rebuilds a received error as a plain `Error`: its class table holds only built-in error types, and the sent class name is used to choose from that table rather than restored onto the result. Own enumerable properties do survive, which is why the taxonomy lives in `code`, `status`, and `retryable`. Read them with `servicePlaneErrorInfo`, which works for both a local instance and a received one:
+
+```ts
+import { servicePlaneErrorInfo } from 'service-plane/service';
+
+const info = servicePlaneErrorInfo(error);
+if (info?.retryable) return retryLater();
+if (info?.code === 'capability_auth') return refreshTokenAndRetry();
+```
+
+| `code` | Meaning |
+| --- | --- |
+| `capability_auth` | Token, scope, ingress, or proof-of-possession check refused the call |
+| `ability_validation` | Input or output did not satisfy the method's schema |
+| `timeout` | The caller's deadline elapsed |
+| `handler` | The handler failed deliberately and chose what the caller sees |
+| `internal` | Anything else, including a handler failure the service did not shape |
+
+`retryable` means the failure is transient — the same call may succeed later. It does **not** mean retrying is safe: for a non-idempotent method a retry can still double an effect. It defaults from the status (408, 429, 502, 503, 504) and can be set explicitly. A 500 is deliberately not retryable by default: a handler that broke once usually breaks again, and saying otherwise invites a retry storm against a service already failing.
+
+Every field is re-validated when read, so a hostile or buggy peer cannot make a refusal look retryable.
+
+### What An Ability Handler May Throw
+
+Errors this package raises are already shaped for callers and pass through untouched. Everything else a handler throws is **replaced** with an opaque 500 before it leaves the service:
+
+```
+Service-Plane ability handler failed: <methodName>
+```
+
+That is deliberate. A database driver error or a `TypeError` was written for an operator, not a caller, and routinely carries connection strings, internal hostnames, SQL, or row data. The same replacement applies to a streaming method that fails mid-stream.
+
+The replacement also holds across chains: an error that already carries the taxonomy — thrown by a downstream service and rebuilt as a plain `Error` on the way through — passes intermediate hops untouched instead of being re-replaced, so the original `code`/`status`/`retryable`/`reason` reach the first caller.
+
+Every replacement is logged service-side as a `service_plane.ability.handler_failed` event carrying the original error's name and message (the RPC response is a 200 batch, so `request.failed` never fires for it). The original object also stays reachable in-process via `handlerFailureCause(error)`.
+
+To choose what the caller sees, throw `AbilityHandlerError`:
+
+```ts
+import { AbilityHandlerError } from 'service-plane/service';
+
+throw new AbilityHandlerError('Monthly export quota is used up', {
+  reason: 'quota_exhausted', // your own discriminator, carried alongside code: 'handler'
+  retryable: false,
+  status: 429,
+});
+```
+
+The original failure is not lost — it is held beside the replacement, reachable in-process with `handlerFailureCause(error)` so a service can log it. It is deliberately not attached as `cause`: Cap'n Web serializes `cause` unconditionally, which would defeat the replacement.
 
 A schema that deviates from the Standard Schema contract fails closed: a validator that throws, or returns neither a value nor issues, raises `AbilityValidationError` rather than letting the value through. A schema missing `~standard.validate` or `~standard.jsonSchema` is rejected when the service is defined, not on the first call.
 

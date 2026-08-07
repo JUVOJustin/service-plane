@@ -346,7 +346,9 @@ describe('streaming ability methods', () => {
     const failing = await api.failMid({});
     const failingReader = failing.getReader();
     await expect(failingReader.read()).resolves.toEqual({ done: false, value: { caller: 'example', index: 0 } });
-    await expect(failingReader.read()).rejects.toThrow('stream exploded');
+    // Mid-stream handler failures get the same replacement a unary one does: the consumer sees
+    // that the method failed, not what the generator threw.
+    await expect(failingReader.read()).rejects.toThrow('Service-Plane ability handler failed: failMid');
 
     const invalid = await api.badItem({});
     await expect(drainStream(invalid)).rejects.toThrow();
@@ -460,7 +462,7 @@ describe('streaming ability methods', () => {
       targetServiceId: 'example',
       transport: cloudflareNativeRpc(fixture.service),
     });
-    await expect(drainStream(await api.failingNext({}))).rejects.toThrow('iterator next exploded');
+    await expect(drainStream(await api.failingNext({}))).rejects.toThrow('Service-Plane ability handler failed: failingNext');
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(failingIteratorReturned).toBe(true);
   });

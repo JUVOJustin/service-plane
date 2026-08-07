@@ -273,6 +273,11 @@ function isAbilityMethodDiscovery(value: unknown): value is ServiceAbilityMethod
     isRecord(value.inputSchema) &&
     isRecord(value.outputSchema) &&
     (value.stream === undefined || value.stream === true) &&
+    // Mirrors defineAbilityService for the same reason as the projection checks below: a foreign
+    // document does not get to advertise a bound the defining side could never produce.
+    (value.idempotent === undefined || value.idempotent === true) &&
+    (value.timeoutMs === undefined ||
+      (typeof value.timeoutMs === 'number' && Number.isSafeInteger(value.timeoutMs) && value.timeoutMs > 0 && value.stream !== true)) &&
     // Mirrors defineAbilityService: streaming methods cannot claim single-response projections,
     // and foreign discovery documents do not get to bypass that.
     (value.stream !== true || (value.mcpPrompt === undefined && value.mcpResource === undefined && value.rest === undefined)) &&

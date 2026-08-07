@@ -4,7 +4,9 @@ import { etag } from 'hono/etag';
 import { type RequestIdVariables, requestId } from 'hono/request-id';
 import type { UpgradeWebSocket } from 'hono/ws';
 import { type ConnInfo, normalizeConnInfo } from '../shared/conn-info.js';
+import { resolveTimeoutMs, type ServicePlaneTimeoutPolicy, timeoutMsFromRequest, validateTimeoutPolicy } from '../shared/deadline.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
+import { idempotencyKeyFromRequest } from '../shared/idempotency.js';
 import { defaultServicePlaneLogSink, type ServicePlaneControlPlaneLogEvent, type ServicePlaneLogSink } from '../shared/logging.js';
 import {
   DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
@@ -72,9 +74,11 @@ export type ConnInfoResolver<TEnv extends Env = Env> = (context: Context<TEnv>) 
 type BrokeredRequest = {
   caller: BrokerCaller;
   connInfo: ConnInfo | undefined;
+  idempotencyKey: string | undefined;
   issuer: CapabilityIssuer;
   registry: ServiceRegistry;
   requestId: string | undefined;
+  timeoutMs: number | undefined;
 };
 
 // The two ways the catalog gets used, which is the only split worth configuring. `token` covers the
@@ -184,6 +188,16 @@ export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
    * downtime.
    */
   signingKeys: (bindings: TEnv['Bindings'], context: Context<TEnv>) => CapabilitySigningKey[] | Promise<CapabilitySigningKey[]>;
+  /**
+   * Policy for the deadline the plane forwards. `defaultMs` bounds callers that send none of their
+   * own; `maxMs` clamps one that asks for more than this plane is willing to hold a connection for.
+   *
+   * There is no built-in default here on purpose. The plane forwards a budget rather than doing the
+   * work, so the bound that must always exist belongs at the service, where
+   * `DEFAULT_ABILITY_TIMEOUT_MS` already applies it per method. Set `defaultMs` when the plane
+   * itself should be the policy point — the role Envoy's route timeout plays.
+   */
+  timeout?: ServicePlaneTimeoutPolicy;
   ttlSeconds?: number;
 };
 
@@ -211,6 +225,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   constructor(private readonly options: ServicePlaneControlPlaneOptions<TEnv>) {
     this.app = (options.app ?? new Hono<ServicePlaneControlPlaneEnv<TEnv>>()) as Hono<ServicePlaneControlPlaneEnv<TEnv>>;
     this.log = options.log === false ? undefined : (options.log ?? defaultServicePlaneLogSink);
+    validateTimeoutPolicy(options.timeout);
     this.discoveryCaches = discoveryCachesFor(options.discoveryCache);
 
     this.app.use(
@@ -256,16 +271,23 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   private mountBroker(brokerOptions: Exclude<ServicePlaneControlPlaneOptions<TEnv>['broker'], false | undefined>): void {
     const path = brokerOptions.path ?? '/rpc/broker';
     this.app.all(path, async (context) => {
+      // Before caller resolution and catalog resolution, not after: resolving the catalog is a
+      // fan-out across every service, and on a cold cache it is the most expensive thing the plane
+      // does. Stamping later would hand the service a budget the caller has already partly spent.
+      const receivedAt = Date.now();
       const resolved = await this.resolveBrokeredRequest(context as Context<TEnv>, brokerOptions);
       if (resolved instanceof Response) return resolved;
       const log = this.log;
       const broker = createControlPlaneRpcBroker({
         ...(resolved.connInfo ? { connInfo: resolved.connInfo } : {}),
         controlPlaneServiceId: this.options.controlPlaneServiceId ?? 'control-plane',
+        ...(resolved.idempotencyKey ? { idempotencyKey: resolved.idempotencyKey } : {}),
         issuer: resolved.issuer,
         ...(log ? { log: (event) => log(event, context) } : {}),
+        receivedAt,
         registry: resolved.registry,
         ...(resolved.requestId ? { requestId: resolved.requestId } : {}),
+        ...(resolved.timeoutMs === undefined ? {} : { timeoutMs: resolved.timeoutMs }),
       });
       // Only a WebSocket-upgraded caller leg can carry a returned stream back; over HTTP-batch
       // the broker rejects streaming methods with a clear 405 instead of a dangling stub.
@@ -281,6 +303,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   private mountMcp(mcpOptions: Exclude<ServicePlaneControlPlaneOptions<TEnv>['mcp'], false | undefined>): void {
     const path = mcpOptions.path ?? DEFAULT_MCP_PATH;
     this.app.all(path, async (context) => {
+      const receivedAt = Date.now();
       const transportError = validateControlPlaneMcpTransportRequest(context.req.raw, mcpOptions.allowedOrigins);
       if (transportError) return transportError;
       // This implementation is stateless POST-only. Reject unsupported transport methods before
@@ -297,12 +320,15 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
         caller: resolved.caller,
         ...(resolved.connInfo ? { connInfo: resolved.connInfo } : {}),
         controlPlaneServiceId: this.options.controlPlaneServiceId ?? 'control-plane',
+        ...(resolved.idempotencyKey ? { idempotencyKey: resolved.idempotencyKey } : {}),
         issuer: resolved.issuer,
         ...(log ? { log: (event) => log(event, context) } : {}),
         registry: resolved.registry,
         ...(resolved.requestId ? { requestId: resolved.requestId } : {}),
         ...(mcpOptions.serverInfo ? { serverInfo: mcpOptions.serverInfo } : {}),
+        receivedAt,
         ...(mcpOptions.streamLimits ? { streamLimits: mcpOptions.streamLimits } : {}),
+        ...(resolved.timeoutMs === undefined ? {} : { timeoutMs: resolved.timeoutMs }),
       });
     });
   }
@@ -367,7 +393,11 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
         ...this.discoveryCacheKeyFor(context, services),
         services,
       }),
+      idempotencyKey: idempotencyKeyFromRequest(context.req),
       requestId: brokerRequestId(context),
+      // The caller states its own budget; the plane spends from it rather than granting one unless
+      // a defaultMs policy says otherwise.
+      timeoutMs: resolveTimeoutMs(timeoutMsFromRequest(context.req), this.options.timeout),
     };
   }
 

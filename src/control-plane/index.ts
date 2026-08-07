@@ -1,5 +1,26 @@
 export { type ConnInfo, SERVICE_PLANE_CONN_INFO_HEADER, SERVICE_PLANE_CONN_INFO_QUERY_PARAM } from '../shared/conn-info.js';
-export { AbilityValidationError, type AbilityValidationIssue, CapabilityAuthError, ServicePlaneError } from '../shared/errors.js';
+export {
+  DEFAULT_ABILITY_TIMEOUT_MS,
+  MAX_SERVICE_PLANE_TIMEOUT_MS,
+  SERVICE_PLANE_TIMEOUT_GRACE_MS,
+  SERVICE_PLANE_TIMEOUT_HEADER,
+  SERVICE_PLANE_TIMEOUT_QUERY_PARAM,
+  type ServicePlaneTimeoutPolicy,
+} from '../shared/deadline.js';
+export {
+  AbilityHandlerError,
+  type AbilityHandlerErrorOptions,
+  AbilityValidationError,
+  type AbilityValidationIssue,
+  CapabilityAuthError,
+  handlerFailureCause,
+  ServicePlaneError,
+  type ServicePlaneErrorCode,
+  type ServicePlaneErrorInfo,
+  type ServicePlaneErrorOptions,
+  ServicePlaneTimeoutError,
+  servicePlaneErrorInfo,
+} from '../shared/errors.js';
 export {
   DEFAULT_HTTP_CACHE_MAX_AGE_SECONDS,
   DEFAULT_HTTP_CACHE_STALE_WHILE_REVALIDATE_SECONDS,
@@ -7,6 +28,11 @@ export {
   type ServicePlaneHttpCacheOptions,
   servicePlaneHttpCacheHeaders,
 } from '../shared/http-cache.js';
+export {
+  normalizeIdempotencyKey,
+  SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER,
+  SERVICE_PLANE_IDEMPOTENCY_KEY_QUERY_PARAM,
+} from '../shared/idempotency.js';
 export {
   defaultServicePlaneLogSink,
   type ServicePlaneBrokerLogEvent,

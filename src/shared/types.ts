@@ -103,12 +103,24 @@ export type ServiceAbilityMethodDiscovery = {
   mcpResource?: ServiceAbilityMcpResourceProjection;
   outputSchema: OpenApiObject;
   rest?: ServiceAbilityRestProjection;
+  /**
+   * The method is safe to call again with the same input: a retry after an ambiguous failure
+   * cannot double its effect. Advertised so callers and gateways can decide whether retrying is
+   * safe — this package never retries on its own.
+   */
+  idempotent?: true;
   scopes: string[];
   /**
    * Streaming methods return a ReadableStream of output items over a Cap'n Web session
    * transport; `outputSchema` then describes one streamed item, not the whole response.
    */
   stream?: true;
+  /**
+   * How long this method may run, in milliseconds, independent of any caller budget. Advertised so
+   * a gateway can size its own wait against it. Absent on streaming methods, which are not bounded
+   * this way.
+   */
+  timeoutMs?: number;
 };
 
 export type ServiceAbilityDiscovery = {
@@ -160,7 +172,21 @@ export type ServiceGrantDefinition = {
  * streaming method returns flow through it natively.
  */
 export type ServiceAbilityNativeRpcBinding = {
-  connectAbility(input: { abilityId: string; connInfo?: ConnInfo; requestId?: string; token: string }): Promise<object> | object;
+  connectAbility(input: {
+    abilityId: string;
+    connInfo?: ConnInfo;
+    /**
+     * The caller's key for this attempt, surfaced to handlers as `idempotencyKey`.
+     */
+    idempotencyKey?: string;
+    requestId?: string;
+    /**
+     * Milliseconds of the caller's budget. Native binding sessions are opened once and cached, so
+     * this bounds the whole session, not each call on it.
+     */
+    timeoutMs?: number;
+    token: string;
+  }): Promise<object> | object;
 };
 
 export type ServiceEndpoint = {
