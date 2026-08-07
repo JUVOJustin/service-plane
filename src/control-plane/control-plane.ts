@@ -454,16 +454,24 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   // Authorization catalog plus signing authority: needs discovered capabilities and grants, so it
   // can fail while a target service is down. Only token issuance and brokering depend on it.
   private async issuerFor(context: Context<TEnv>, services?: ServiceEndpoint[]): Promise<CapabilityIssuer> {
-    const keys = await this.options.signingKeys(context.env, context);
-    // Resolved before the memo lookup so a miss only has to assemble the catalog, which is
-    // microseconds — the key work is already done and shared across every configuration.
-    const privateJwks = await this.signingMaterialFor(keys);
+    // Key-material derivation and catalog resolution are independent, and each is the slow half on
+    // its own cold path — the P-256 derivation plus proof round-trip (~9.5ms) on one side, the
+    // discovery fan-out on the other. Started together, a cold request pays the slower of the two
+    // instead of their sum. Deliberately inside issuerFor, after caller authentication: refused
+    // callers must keep costing nothing (the contract control-plane.test.ts pins), so the overlap
+    // never widens what an unauthenticated request can trigger. The catch keeps a catalog failure
+    // from leaving the still-pending key work as an unhandled rejection; awaiting it below rethrows
+    // key errors exactly as before, though a request where both halves fail now reports the catalog
+    // failure first.
+    const resolvingMaterial = (async () => this.signingMaterialFor(await this.options.signingKeys(context.env, context)))();
+    resolvingMaterial.catch(() => undefined);
     const resolvedServices = services ?? (await this.options.services(context));
     const capabilities = await discoverServiceCapabilities(
       resolvedServices,
       this.discoveryCaches.token,
       this.discoveryCacheKeyFor(context, resolvedServices).cacheKey,
     );
+    const privateJwks = await resolvingMaterial;
     const grantDefinition = {
       grants: serviceGrantsFromEndpoints(resolvedServices),
     };
