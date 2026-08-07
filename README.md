@@ -13,6 +13,8 @@ Ability-first service APIs for TypeScript services.
 
 Service authors define abilities. Hono stays the HTTP shell for middleware, discovery, and adapter routes.
 
+The library is written against web-standard globals only (`crypto.subtle`, `fetch`/`Request`, `TextEncoder`, timers) and runs on Node 20+, Cloudflare Workers, Deno, and Bun. That claim is exercised in CI on every push: the full test suite runs on Node 20/22/24 **and inside real workerd isolates** (via `@cloudflare/vitest-pool-workers`), and a bundled smoke — HTTP-batch end to end, streaming over a session transport, token verification accepting and rejecting — runs on Deno and Bun.
+
 ## Install
 
 ```sh

@@ -217,44 +217,51 @@ describe('signing material memo', () => {
     expect(derivations.count).toBe(3);
   });
 
-  it('does not let a rotation mid-derivation poison the JWKS memo', async () => {
-    const secret = await generateCapabilitySigningSecret();
-    const rotated = await generateCapabilitySigningSecret();
-    const keys = [{ kid: 'test-key', secret }];
-    let scheduled = false;
-    const plane = new ServicePlaneControlPlane({
-      authenticateCaller: () => 'worker-a',
-      log: false,
-      services: () => [
-        cloudflareServiceBinding({
-          binding: { fetch: async () => Response.json(discovery) },
-          grants: [{ caller: 'worker-a', scopes: ['example.sync.run'] }],
-          id: 'example',
-        }),
-      ],
-      signingKeys: () => {
-        if (!scheduled) {
-          scheduled = true;
-          // A macrotask, deliberately: a microtask would fire on the `await` of this very resolver,
-          // before the snapshot is taken, and prove nothing. This lands while the derivation it
-          // feeds is still running — the window in which a snapshot taken *after* the await would
-          // record the new key set alongside material derived from the old one.
-          setTimeout(() => {
-            keys[0] = { kid: 'test-key', secret: rotated };
-          }, 0);
-        }
-        return keys;
-      },
-    });
+  // Not runnable on workerd: the setup needs a setTimeout(0) to fire *between* the derivation's
+  // internal awaits, and workerd only advances timers at I/O boundaries — the rotation can never
+  // land mid-derivation there, so the test would assert nothing. The memo behavior itself is
+  // runtime-independent; the race arrangement is what is Node-specific.
+  it.skipIf(typeof navigator !== 'undefined' && navigator.userAgent === 'Cloudflare-Workers')(
+    'does not let a rotation mid-derivation poison the JWKS memo',
+    async () => {
+      const secret = await generateCapabilitySigningSecret();
+      const rotated = await generateCapabilitySigningSecret();
+      const keys = [{ kid: 'test-key', secret }];
+      let scheduled = false;
+      const plane = new ServicePlaneControlPlane({
+        authenticateCaller: () => 'worker-a',
+        log: false,
+        services: () => [
+          cloudflareServiceBinding({
+            binding: { fetch: async () => Response.json(discovery) },
+            grants: [{ caller: 'worker-a', scopes: ['example.sync.run'] }],
+            id: 'example',
+          }),
+        ],
+        signingKeys: () => {
+          if (!scheduled) {
+            scheduled = true;
+            // A macrotask, deliberately: a microtask would fire on the `await` of this very resolver,
+            // before the snapshot is taken, and prove nothing. This lands while the derivation it
+            // feeds is still running — the window in which a snapshot taken *after* the await would
+            // record the new key set alongside material derived from the old one.
+            setTimeout(() => {
+              keys[0] = { kid: 'test-key', secret: rotated };
+            }, 0);
+          }
+          return keys;
+        },
+      });
 
-    expect((await plane.fetch(jwksRequest())).status).toBe(200);
-    expect(derivations.count).toBe(1);
+      expect((await plane.fetch(jwksRequest())).status).toBe(200);
+      expect(derivations.count).toBe(1);
 
-    // The memo must describe the key set the authority was actually built from. If it recorded the
-    // rotated one instead, this request would read as a hit and JWKS would keep publishing the
-    // retired key while issuance had already moved on — every token minted after the move would
-    // then fail verification against the published set.
-    expect((await plane.fetch(jwksRequest())).status).toBe(200);
-    expect(derivations.count).toBe(2);
-  });
+      // The memo must describe the key set the authority was actually built from. If it recorded the
+      // rotated one instead, this request would read as a hit and JWKS would keep publishing the
+      // retired key while issuance had already moved on — every token minted after the move would
+      // then fail verification against the published set.
+      expect((await plane.fetch(jwksRequest())).status).toBe(200);
+      expect(derivations.count).toBe(2);
+    },
+  );
 });

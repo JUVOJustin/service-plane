@@ -48,6 +48,31 @@ describe('capability proof of possession', () => {
     ).resolves.toBeUndefined();
   });
 
+  it('signs with a workerd-shaped JWK whose absent members exist with undefined values', async () => {
+    // workerd's exportKey('jwk') materializes every JsonWebKey member — `alg: undefined` included —
+    // where Node omits the absent ones. Reproduced here on Node so a regression fails everywhere,
+    // not only in the workerd suite.
+    const keys = await callerKeys();
+    // The double cast is the point: TS's JsonWebKey cannot express "property present, value
+    // undefined", but that is exactly the runtime shape workerd hands back.
+    const workerdShaped = { ...keys.privateJwk, alg: undefined, e: undefined, k: undefined, n: undefined, use: undefined };
+    const proof = await signCapabilityProof({
+      abilityId: 'example.sync',
+      privateJwk: workerdShaped as unknown as JsonWebKey,
+      targetServiceId: 'example',
+      token: TOKEN,
+    });
+
+    await expect(
+      verifyCapabilityProof(proof, {
+        abilityId: 'example.sync',
+        confirmation: { jkt: keys.thumbprint },
+        targetServiceId: 'example',
+        token: TOKEN,
+      }),
+    ).resolves.toBeUndefined();
+  });
+
   it.each([
     ['a different ability', { abilityId: 'example.other' }, /ability mismatch/u],
     ['a different service', { targetServiceId: 'other' }, /audience mismatch/u],

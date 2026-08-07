@@ -1,7 +1,7 @@
 import { decode, sign, verify } from 'hono/jwt';
 import { CapabilityAuthError } from './errors.js';
 import { sha256Base64Url } from './hmac-auth.js';
-import { randomServicePlaneJwkId, SERVICE_PLANE_JWK_ALGORITHM, servicePlaneJwkThumbprint } from './jwk-auth.js';
+import { randomServicePlaneJwkId, SERVICE_PLANE_JWK_ALGORITHM, servicePlaneJwkSigningKey, servicePlaneJwkThumbprint } from './jwk-auth.js';
 import type { CapabilityConfirmation } from './types.js';
 
 // A proof of possession is a short-lived JWS the caller signs with the key its capability token is
@@ -55,7 +55,11 @@ export async function signCapabilityProof(options: SignCapabilityProofOptions): 
       iat: issuedAt,
       jti: randomServicePlaneJwkId(),
     },
-    options.privateJwk as Parameters<typeof sign>[1],
+    // Normalized like token signing (alg pinned), not passed raw: workerd's exportKey('jwk')
+    // materializes every JWK member including `alg: undefined`, and hono's sign() adopts `alg`
+    // whenever the property exists — a raw workerd-exported key would override ES256 with
+    // undefined and fail to sign.
+    servicePlaneJwkSigningKey(options.privateJwk) as Parameters<typeof sign>[1],
     SERVICE_PLANE_JWK_ALGORITHM,
   );
 }
