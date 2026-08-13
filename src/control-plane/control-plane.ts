@@ -374,7 +374,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   }
 
   private mountRest(restOptions: ControlPlaneRestOptions): void {
-    this.app.all('*', async (context) => {
+    this.app.all('*', async (context, next) => {
       const receivedAt = Date.now();
       const typedContext = context as Context<TEnv>;
       const services = await this.options.services(typedContext);
@@ -387,6 +387,10 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
         ...(this.log ? { log: (event) => this.log?.(event, context) } : {}),
         ...(restOptions.maxBodyBytes === undefined ? {} : { maxBodyBytes: restOptions.maxBodyBytes }),
         onInvocation: (invocation) => setControlPlaneInvocation(context, invocation),
+        onNotFound: async () => {
+          await next();
+          return context.res;
+        },
         runInvocationMiddleware: (next) => this.runInvocationMiddleware(context, next),
         receivedAt,
         registry,

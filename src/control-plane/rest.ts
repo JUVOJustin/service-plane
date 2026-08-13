@@ -1,6 +1,13 @@
 import { CapabilityAuthError, servicePlaneErrorInfo } from '../shared/errors.js';
+import { jsonSchemaRootProperties } from '../shared/json-schema.js';
 import type { ServicePlaneBrokerLogEvent } from '../shared/logging.js';
-import type { DiscoveredServiceAbility, ServiceHttpMethod, ServiceRegistry, ServiceRegistrySnapshot } from '../shared/types.js';
+import type {
+  DiscoveredServiceAbility,
+  OpenApiObject,
+  ServiceHttpMethod,
+  ServiceRegistry,
+  ServiceRegistrySnapshot,
+} from '../shared/types.js';
 import { brokerCallerLogFields } from './broker.js';
 import { type ControlPlaneInvocationOptions, invokeControlPlaneMethod } from './invocation.js';
 
@@ -29,6 +36,8 @@ export type ControlPlaneRestHandlerOptions = {
   log?: (event: ServicePlaneBrokerLogEvent) => void;
   /** Receives the resolved service, ability, and method before invocation. */
   onInvocation?: (invocation: ControlPlaneRestInvocation) => void;
+  /** Continues application routing when no published REST path matches. */
+  onNotFound?: () => Promise<Response> | Response;
   /** Time the HTTP request entered the plane, used for deadline accounting. */
   receivedAt?: number;
   /** Registry used to resolve published REST metadata. */
@@ -75,10 +84,10 @@ export async function handleControlPlaneRestRequest(request: Request, options: C
     const snapshot = await options.registry.discover();
     const url = new URL(request.url);
     const method = request.method.toLowerCase();
-    if (!isRestMethod(method)) return methodNotAllowed(snapshot, url.pathname);
+    if (!isRestMethod(method)) return restRouteMiss(snapshot, url.pathname, options.onNotFound);
 
     const match = findRestMethod(snapshot, method, url.pathname);
-    if (!match) return methodNotAllowed(snapshot, url.pathname);
+    if (!match) return restRouteMiss(snapshot, url.pathname, options.onNotFound);
     matched = match;
 
     options.onInvocation?.({
@@ -94,7 +103,13 @@ export async function handleControlPlaneRestRequest(request: Request, options: C
         const resolved = await options.resolveInvocation();
         if (resolved instanceof Response) return resolved;
         invocationOptions = resolved;
-        const input = await restInput(request, url, match.params, options.maxBodyBytes ?? DEFAULT_REST_MAX_BODY_BYTES);
+        const input = await restInput(
+          request,
+          url,
+          match.params,
+          options.maxBodyBytes ?? DEFAULT_REST_MAX_BODY_BYTES,
+          match.ability.methods[match.method]?.inputSchema,
+        );
         const result = await invokeControlPlaneMethod(match, input, invocationOptions);
         const status = match.ability.methods[match.method]?.rest?.status ?? 200;
         options.log?.({
@@ -148,7 +163,11 @@ function restMatches(snapshot: ServiceRegistrySnapshot, pathname: string): RestM
   return matches;
 }
 
-function methodNotAllowed(snapshot: ServiceRegistrySnapshot, pathname: string): Response {
+function restRouteMiss(
+  snapshot: ServiceRegistrySnapshot,
+  pathname: string,
+  onNotFound: ControlPlaneRestHandlerOptions['onNotFound'],
+): Promise<Response> | Response {
   const allowed = [
     ...new Set(
       restMatches(snapshot, pathname)
@@ -156,7 +175,9 @@ function methodNotAllowed(snapshot: ServiceRegistrySnapshot, pathname: string): 
         .filter((method): method is ServiceHttpMethod => method !== undefined),
     ),
   ].sort();
-  if (allowed.length === 0) return Response.json({ error: 'Not Found' }, { status: 404 });
+  if (allowed.length === 0) {
+    return onNotFound ? onNotFound() : Response.json({ error: 'Not Found' }, { status: 404 });
+  }
   return Response.json(
     { error: 'Method Not Allowed' },
     { headers: { allow: allowed.map((method) => method.toUpperCase()).join(', ') }, status: 405 },
@@ -202,14 +223,25 @@ function decodePathSegment(segment: string): string | undefined {
   }
 }
 
-async function restInput(request: Request, url: URL, path: Record<string, string>, maxBodyBytes: number): Promise<unknown> {
+async function restInput(
+  request: Request,
+  url: URL,
+  path: Record<string, string>,
+  maxBodyBytes: number,
+  inputSchema: OpenApiObject | undefined,
+): Promise<unknown> {
   if (!Number.isSafeInteger(maxBodyBytes) || maxBodyBytes <= 0) {
     throw new CapabilityAuthError('Service-Plane REST maxBodyBytes must be a positive integer', 500);
   }
   // Query names are caller-controlled and must never reach Object.prototype setters.
   const query = Object.create(null) as Record<string, string | string[]>;
+  const arrayQueryNames = inputSchema ? stringArrayQueryNames(inputSchema) : new Set<string>();
   for (const [name, value] of url.searchParams) {
     const previous = query[name];
+    if (arrayQueryNames.has(name)) {
+      query[name] = previous === undefined ? [value] : [...(Array.isArray(previous) ? previous : [previous]), value];
+      continue;
+    }
     query[name] = previous === undefined ? value : Array.isArray(previous) ? [...previous, value] : [previous, value];
   }
 
@@ -228,6 +260,17 @@ async function restInput(request: Request, url: URL, path: Record<string, string
   if (isRecord(body)) return { ...query, ...body, ...path };
   if (Object.keys(query).length === 0 && Object.keys(path).length === 0) return body;
   throw new CapabilityAuthError('Service-Plane REST path and query inputs require an object request body', 400);
+}
+
+function stringArrayQueryNames(schema: OpenApiObject): Set<string> {
+  const properties = jsonSchemaRootProperties(schema);
+  if (!properties) return new Set();
+  return new Set(
+    Object.entries(properties).flatMap(([name, property]) => {
+      if (!isRecord(property) || property.type !== 'array' || !isRecord(property.items) || property.items.type !== 'string') return [];
+      return [name];
+    }),
+  );
 }
 
 async function readBoundedBody(request: Request, maxBytes: number): Promise<string> {

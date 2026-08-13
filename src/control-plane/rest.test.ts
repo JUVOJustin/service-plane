@@ -21,7 +21,7 @@ type TestEnv = {
 };
 
 describe('control-plane REST facade', () => {
-  it('uses middleware identity and connection info, resolves the exact route, and applies path > body > query', async () => {
+  it('uses middleware identity and connection info, preserves query arrays, and applies path > body > query', async () => {
     const observed: Array<{ input: unknown; subject: unknown; connInfo: ConnInfo | undefined }> = [];
     const { endpoint, signingKey } = await restService(observed);
     let invocation: ServicePlaneControlPlaneInvocation | undefined;
@@ -43,7 +43,7 @@ describe('control-plane REST facade', () => {
     });
 
     const response = await plane.fetch(
-      new Request(`${PLANE_ORIGIN}/connections/conn-path/snapshots?connectionId=conn-query&dryRun=true`, {
+      new Request(`${PLANE_ORIGIN}/connections/conn-path/snapshots?connectionId=conn-query&dryRun=true&tags=nightly`, {
         body: JSON.stringify({ connectionId: 'conn-body', name: 'Nightly' }),
         headers: { 'content-type': 'application/json' },
         method: 'POST',
@@ -55,7 +55,7 @@ describe('control-plane REST facade', () => {
     expect(observed).toEqual([
       {
         connInfo: { remote: { address: '203.0.113.7', port: 443 } },
-        input: { connectionId: 'conn-path', dryRun: 'true', name: 'Nightly' },
+        input: { connectionId: 'conn-path', dryRun: 'true', name: 'Nightly', tags: ['nightly'] },
         subject: { id: 'user-7', orgId: 'org-42' },
       },
     ]);
@@ -76,6 +76,23 @@ describe('control-plane REST facade', () => {
       }),
     );
     expect(prefix.status).toBe(404);
+  });
+
+  it('falls through unmatched projections to application routes registered later', async () => {
+    const plane = new ServicePlaneControlPlane({
+      rpc: false,
+      log: false,
+      mcp: false,
+      openapi: false,
+      services: () => [],
+      signingKeys: () => [],
+    });
+    plane.app.get('/ui', (context) => context.text('docs'));
+
+    const response = await plane.fetch(new Request(`${PLANE_ORIGIN}/ui`));
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('docs');
   });
 
   it('runs invocation middleware only for an exact match and exposes metadata plus the final response', async () => {
@@ -363,7 +380,7 @@ async function restService(observed: Array<{ input: unknown; subject: unknown; c
     id: 'connections.snapshots',
     methods: {
       createSnapshot: abilityMethod({
-        input: z.object({ connectionId: z.string(), dryRun: z.string(), name: z.string() }),
+        input: z.object({ connectionId: z.string(), dryRun: z.string(), name: z.string(), tags: z.array(z.string()).optional() }),
         output: z.object({ connectionId: z.string(), name: z.string() }),
         rest: { method: 'post', path: '/connections/{connectionId}/snapshots', status },
         scopes: [SCOPE],
@@ -372,7 +389,7 @@ async function restService(observed: Array<{ input: unknown; subject: unknown; c
     scopes: [SCOPE],
     handler: ({ connInfo, identity }) => {
       class SnapshotsHandler extends RpcTarget {
-        async createSnapshot(input: { connectionId: string; dryRun: string; name: string }) {
+        async createSnapshot(input: { connectionId: string; dryRun: string; name: string; tags?: string[] }) {
           observed.push({ connInfo, input, subject: identity.subject });
           return { connectionId: input.connectionId, name: input.name };
         }

@@ -303,7 +303,9 @@ function isValidRestDiscovery(rest: unknown, inputSchema: Record<string, unknown
     !isHttpMethod(rest.method) ||
     typeof rest.path !== 'string' ||
     !isOriginRelativePath(rest.path) ||
-    (rest.operationId !== undefined && typeof rest.operationId !== 'string')
+    (rest.operationId !== undefined && typeof rest.operationId !== 'string') ||
+    (rest.status !== undefined &&
+      (typeof rest.status !== 'number' || !Number.isInteger(rest.status) || rest.status < 200 || rest.status > 299))
   ) {
     return false;
   }
