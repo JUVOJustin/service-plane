@@ -378,6 +378,39 @@ describe('ServicePlaneControlPlane', () => {
     await expect(response.json()).resolves.toMatchObject({ paths: {} });
   });
 
+  it('does not share cached OpenAPI documents across different reserved routes', async () => {
+    const collidingDiscovery = structuredClone(discovery);
+    const search = collidingDiscovery.abilities[1]?.methods.search;
+    if (!search?.rest) throw new Error('missing REST projection');
+    search.rest.path = SERVICE_PLANE_MCP_PATH;
+    const cache = memoryOpenApiDocumentCache();
+    const services = () => [
+      cloudflareServiceBinding({
+        binding: { fetch: async () => Response.json(collidingDiscovery) },
+        id: 'example',
+      }),
+    ];
+    const withoutMcp = new ServicePlaneControlPlane({
+      log: false,
+      mcp: false,
+      openapi: { cache },
+      services,
+      signingKeys: () => [],
+    });
+    const withMcp = new ServicePlaneControlPlane({
+      log: false,
+      openapi: { cache },
+      services,
+      signingKeys: () => [],
+    });
+
+    const available = await withoutMcp.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`));
+    await expect(available.json()).resolves.toMatchObject({ paths: { [SERVICE_PLANE_MCP_PATH]: { post: {} } } });
+
+    const reserved = await withMcp.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`));
+    await expect(reserved.json()).resolves.toMatchObject({ paths: {} });
+  });
+
   it('emits cache headers on OpenAPI and JWKS when httpCache is enabled and never caches token responses', async () => {
     const plane = new ServicePlaneControlPlane({
       httpCache: true,

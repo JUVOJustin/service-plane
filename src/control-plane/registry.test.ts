@@ -240,6 +240,38 @@ describe('service registry', () => {
     await expect(registry.discover()).resolves.toMatchObject({ abilities: [], services: [] });
   });
 
+  it.each([{ length: 1 }, ['valid', 42], 'invalid'])('omits discovery documents with malformed REST tags %#', async (tags) => {
+    const ability = document.abilities.at(0);
+    if (!ability) throw new Error('missing test ability');
+    const method = ability.methods.runSync;
+    if (!method) throw new Error('missing test method');
+    const registry = createServiceRegistry({
+      services: [
+        httpsService({
+          baseUrl: 'https://example.internal',
+          discovery: {
+            ...document,
+            abilities: [
+              {
+                ...ability,
+                exposure: 'published',
+                methods: {
+                  runSync: {
+                    ...method,
+                    rest: { method: 'post', path: '/examples', tags: tags as string[] },
+                  },
+                },
+              },
+            ],
+          },
+          id: 'example',
+        }),
+      ],
+    });
+
+    await expect(registry.discover()).resolves.toMatchObject({ abilities: [], services: [] });
+  });
+
   it('rejects discovery documents that claim another configured endpoint id', async () => {
     const victimDocument: ServiceDiscoveryDocument = {
       ...document,

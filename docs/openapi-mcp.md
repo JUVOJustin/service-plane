@@ -267,4 +267,9 @@ openapi:bundle -> generated OpenAPI document
 
 Discovery cache keeps service metadata fresh without refetching every service on every request. OpenAPI cache avoids rebuilding the merged document for each docs request.
 
+The derived OpenAPI document cache key includes the configured service endpoints, document options,
+and reserved control-plane routes, so one shared cache can safely serve plane instances with
+different MCP or RPC paths. An explicit `openapi.cacheKey` overrides that derivation; applications
+using it must namespace the key across every configuration that changes the projected document.
+
 Next: [create a control plane](plane-creation.md), [reference](reference.md), and [architecture](architecture.md).

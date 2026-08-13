@@ -321,6 +321,7 @@ function isValidRestDiscovery(rest: unknown, inputSchema: Record<string, unknown
     !isOriginRelativePath(rest.path) ||
     reservedRestPaths.has(normalizePath(rest.path)) ||
     (rest.operationId !== undefined && typeof rest.operationId !== 'string') ||
+    (rest.tags !== undefined && (!Array.isArray(rest.tags) || !rest.tags.every((tag) => typeof tag === 'string'))) ||
     (rest.status !== undefined &&
       (typeof rest.status !== 'number' || !Number.isInteger(rest.status) || rest.status < 200 || rest.status > 299))
   ) {

@@ -274,4 +274,11 @@ describe('controlPlaneOpenApiCacheKey', () => {
     const security = { security: [{ ProductApiKey: [] }], securitySchemes: { ProductApiKey: { type: 'apiKey' } } };
     expect(controlPlaneOpenApiCacheKey([endpoint], security)).not.toBe(controlPlaneOpenApiCacheKey([endpoint], {}));
   });
+
+  it('namespaces and normalizes reserved REST routes', () => {
+    expect(controlPlaneOpenApiCacheKey([endpoint], {}, ['/mcp'])).not.toBe(controlPlaneOpenApiCacheKey([endpoint], {}));
+    expect(controlPlaneOpenApiCacheKey([endpoint], {}, ['/rpc/', ' /mcp'])).toBe(
+      controlPlaneOpenApiCacheKey([endpoint], {}, ['/mcp/', '/rpc']),
+    );
+  });
 });

@@ -485,7 +485,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     this.app.get(path, async (context) => {
       applyHttpCacheHeaders(cacheHeaders, (name, value) => context.header(name, value));
       const services = await this.options.services(context as Context<TEnv>);
-      const cacheKey = openApiOptions.cacheKey ?? controlPlaneOpenApiCacheKey(services, openApiOptions);
+      const cacheKey = openApiOptions.cacheKey ?? controlPlaneOpenApiCacheKey(services, openApiOptions, this.reservedRestPaths);
       const cached = await openApiOptions.cache?.get(cacheKey);
       if (cached) return context.json(cached);
 

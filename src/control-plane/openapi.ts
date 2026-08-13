@@ -1,4 +1,5 @@
 import { inlineJsonSchemaRoot } from '../shared/json-schema.js';
+import { normalizePath } from '../shared/paths.js';
 import {
   DEFAULT_REGISTRY_CACHE_TTL_SECONDS,
   type OpenApiDocument,
@@ -97,10 +98,12 @@ export function generateControlPlaneOpenApi(options: GenerateControlPlaneOpenApi
 export function controlPlaneOpenApiCacheKey(
   services: Array<Pick<ServiceEndpoint, 'id' | 'origin'>>,
   options: Pick<ControlPlaneOpenApiOptions, 'description' | 'path' | 'security' | 'securitySchemes' | 'servers' | 'title' | 'version'>,
+  reservedRestPaths: string[] = [],
 ): string {
   return JSON.stringify({
     description: options.description ?? null,
     path: options.path ?? SERVICE_PLANE_OPENAPI_PATH,
+    reservedRestPaths: [...new Set(reservedRestPaths.map(normalizePath))].sort(),
     security: options.security ?? null,
     securitySchemes: options.securitySchemes ?? null,
     servers: options.servers ?? null,
