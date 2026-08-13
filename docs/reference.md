@@ -56,7 +56,11 @@ Each method accepts one input object and returns one output value. The wrapper v
 
 Validation failures raise `AbilityValidationError` carrying the issues the schema library reported. See [Errors](#errors).
 
-Optional `rest` metadata projects the method into the generated OpenAPI 3.2 document; `rest.method` accepts `get`, `post`, `put`, `patch`, `delete`, and `query` (HTTP QUERY per RFC 10008 — request parameters in the body, safe and idempotent). See [OpenAPI and MCP](openapi-mcp.md#openapi).
+Optional `rest` metadata projects the method into the generated OpenAPI 3.2 document and mounts the
+live control-plane route; `rest.method` accepts `get`, `post`, `put`, `patch`, `delete`, and `query`
+(HTTP QUERY per RFC 10008 — request parameters in the body, safe and idempotent). `rest.status`
+declares the successful 2xx response and defaults to `200`. See [OpenAPI and
+MCP](openapi-mcp.md#openapi).
 
 Optional `idempotent: true` declares that calling the method again with the same input cannot double its effect, so a caller may safely retry an ambiguous failure. See [Idempotency](#idempotency).
 
@@ -85,7 +89,7 @@ for await (const item of stream) {
 
 Cap'n Web streams ride the ongoing session, so streaming methods require a **session transport**: WebSocket (`websocketRpc`), the Cloudflare native binding (`cloudflareNativeRpc`), or a custom bidirectional transport. The one-round-trip HTTP-batch transport cannot carry them — calling a streaming method over HTTP-batch fails with a 405, and an ability that declares streaming methods must enable `websocket` or `cloudflare-binding-rpc` in `rpc.transports` (checked at setup). Unary methods on the same ability keep working over HTTP-batch.
 
-Through the broker, streams proxy transparently: connect to `/rpc/broker` over WebSocket, and the plane reaches the service over its own session transport — preferring the endpoint's native ability RPC binding (`ServiceEndpoint.abilityRpc`, set explicitly via `cloudflareServiceBinding({ abilityRpc })` — a Workers stub answers any property with a callable proxy, so it cannot be detected), then WebSocket. When the caller's own leg cannot carry a stream (HTTP-batch), the ability's streaming methods are rejected with a 405 and the plane leg stays on HTTP-batch — no socket is opened for a stream that could never be returned. Streaming methods cannot project MCP prompts, resources, or REST operations (single-response surfaces); MCP tools are supported.
+Through the broker, streams proxy transparently: connect to `/rpc` over WebSocket, and the plane reaches the service over its own session transport — preferring the endpoint's native ability RPC binding (`ServiceEndpoint.abilityRpc`, set explicitly via `cloudflareServiceBinding({ abilityRpc })` — a Workers stub answers any property with a callable proxy, so it cannot be detected), then WebSocket. When the caller's own leg cannot carry a stream (HTTP-batch), the ability's streaming methods are rejected with a 405 and the plane leg stays on HTTP-batch — no socket is opened for a stream that could never be returned. Streaming methods cannot project MCP prompts, resources, or REST operations (single-response surfaces); MCP tools are supported.
 
 For high-frequency streams (LLM token deltas), batch deltas in the handler and declare the batch as the item (`output: z.array(...)`) — see the coalescing recipe in [Streaming](streaming.md#high-frequency-streams).
 
@@ -138,9 +142,10 @@ ALL /rpc/<abilityId>
 new ServicePlaneControlPlane({
   signingKeys,
   authenticateCaller,
+  invocationMiddleware,
   services,
   openapi,
-  broker,
+  rpc,
   mcp,
 });
 ```
@@ -151,39 +156,63 @@ Mounted routes:
 POST /.well-known/service-plane/capability-token
 GET  /.well-known/service-plane/jwks.json
 GET  /openapi.json
-POST /rpc/mcp                                    (MCP streamable HTTP)
-ALL  /rpc/broker
+POST /mcp                                        (when published MCP projections exist)
+ALL  /rpc                                        (only when `rpc` is configured)
+*    <published rest.path>                       (REST facade)
 ```
 
-The plane serves the OpenAPI document only. Mount a documentation UI yourself on `plane.app` (e.g. `@hono/swagger-ui` or `@scalar/hono-api-reference`) pointed at `/openapi.json`.
+The plane serves the OpenAPI document and mounts every published non-streaming REST projection as a
+live route. Mount a documentation UI yourself on `plane.app` (e.g. `@hono/swagger-ui` or
+`@scalar/hono-api-reference`) pointed at `/openapi.json`.
+
+REST input is assembled as query, then JSON body, then path parameters. The generated operation
+removes path fields from its body schema, represents them as required path parameters, and exposes
+top-level string/string-array fields as optional query fallbacks. The service validates the combined
+value. Every `{name}` in the route must match a top-level input field; inconsistent definitions or
+discovery documents are rejected, and empty request segments do not match variables.
+`openapi.security` and `openapi.securitySchemes` describe the public authentication performed
+by `invocationMiddleware`; neither is invented by default because middleware may use any scheme or
+an explicit anonymous caller.
+
+The top-level `rpc` option controls the control plane's public Cap'n Web broker route. `rpc: {}`
+mounts it at `/rpc`; `rpc: { path: '/custom' }` overrides that path, and omitting `rpc` (or setting
+`rpc: false`) leaves it unmounted. This is separate from an ability's `rpc` metadata, which describes
+how the control plane reaches that ability on its owning service.
 
 The JWKS route is served from the signing authority (`signingKeys`, `issuer`) and never
 resolves `services` or fetches discovery documents, so key publication survives a service-discovery
-outage. The capability-token, broker, and MCP routes additionally need the authorization catalog
+outage. The capability-token, REST, broker, and MCP routes additionally need the authorization catalog
 (discovered capabilities and grants) and fail closed when it cannot be built. See
 [auth.md](auth.md#signing-authority-and-authorization-catalog).
 
 `httpCache` is optional and mirrors the service option: when set, the OpenAPI and JWKS routes emit `Cache-Control` and `Cache-Tag` headers. The capability-token endpoint always responds with `Cache-Control: no-store` and `Pragma: no-cache`. Broker and MCP RPC responses are never cache-eligible.
 
-`discoveryCache` caches the discovered service catalog for every route that needs it — token issuance, broker, MCP, and OpenAPI. It defaults to a process-local cache; pass a `RegistryCache` to share one across a fleet, `false` to resolve fresh every time, or an object keyed by `token` (issuance, broker and MCP), `openapi`, and `default` to give either path its own store. `openapi.cache` is separate and caches the generated document rather than the catalog behind it; set its TTL with `openapi.cacheTtlSeconds`.
+`discoveryCache` caches the discovered service catalog for every route that needs it — token issuance, REST, broker, MCP, and OpenAPI. It defaults to a process-local cache; pass a `RegistryCache` to share one across a fleet, `false` to resolve fresh every time, or an object keyed by `token` (issuance, REST, broker and MCP), `openapi`, and `default` to give either path its own store. `openapi.cache` is separate and caches the generated document rather than the catalog behind it; set its TTL with `openapi.cacheTtlSeconds`.
 
 `services(context)` resolves runtime bindings and deployment configuration for one logical service
 catalog. Its endpoint set and discovery metadata must not vary by caller or organization. Services
 own organization-specific data scoping behind their stable ability definitions; applications that
 need genuinely different catalogs should use separate control-plane instances and discovery caches.
 
-`broker.caller` and `mcp.caller` use `BrokerCallerResolver`. The resolver may return a
-`BrokerCaller`, an application-owned `Response`, or `undefined`. A returned response passes through
-unchanged, which lets existing Hono auth middleware or the resolver emit the correct
-`WWW-Authenticate` challenge with a `401`. Returning `undefined` is a generic `403` refusal; an
-omitted resolver is a configuration error and returns `500`.
+The shared top-level `invocationMiddleware` is a Hono `MiddlewareHandler` that runs only for a
+matched published REST route, an available MCP endpoint, or the enabled broker. Before it calls
+`next()`, it must set `servicePlaneCaller` to a `BrokerCaller`; it may also set
+`servicePlaneConnInfo`. It can short-circuit with an application-owned response, preserving a `401`
+and its `WWW-Authenticate` challenge. Calling `next()` without a caller is a configuration error and
+returns `500`.
+
+Global middleware on a supplied Hono `app` may set the same variables instead.
+`servicePlaneInvocation` is available for policy and auditing: REST sets resolved service, ability,
+method, scopes, and path before invocation middleware runs; MCP enriches the surface during protocol
+dispatch; broker HTTP sessions expose the broker surface because later RPC calls can select multiple
+abilities.
 
 `mcp.streamLimits` accepts `maxItems` and `maxBytes` for streaming tools (defaults: 10,000 items and 1 MiB). `maxBytes` independently caps serialized item aggregation and cumulative optional progress-notification bytes. Exhausting the item aggregation budget fails the tool call in-band; exhausting only the progress budget stops further notifications while the bounded final result continues.
 
 The MCP endpoint accepts protocol revisions `2025-11-25`, `2025-06-18`, and `2025-03-26`; missing
 `MCP-Protocol-Version` means `2025-03-26`, while unsupported values return `400`. Incoming browser
 `Origin` headers must match the endpoint origin. `mcp.allowedOrigins` adds exact trusted origins for
-intentional cross-origin clients; other origins return `403` before caller resolution.
+intentional cross-origin clients; other origins return `403` before invocation middleware.
 
 ## Caller
 
@@ -281,17 +310,23 @@ Delegated (plane-principal) token:
 
 The `act` delegation relationship comes from RFC 8693 and `cnf` from RFC 7800 (with the `jkt` confirmation method registered by RFC 9449). `scp`, `spa`, `spk`, `spo`, and `spb` are Service Plane-specific claims, and `/.well-known/service-plane/capability-token` is the package's JSON capability endpoint, not an RFC 8693 token-exchange endpoint. `spk` is an optional application-owned string; its absence preserves the legacy user-subject shape, and it never influences `spa` or service access.
 
-`spa` is the access class the control plane authenticated for the caller. It is `service` for a caller the plane proved to be another service — the capability-token endpoint, `issueCapabilityTokenForCaller`, and a broker or MCP caller resolver returning `kind: 'service'` — and `plane` for every caller the plane fronts itself: users, API keys, anonymous traffic. Services compare it against the ability's own `access` and reject a mismatch with 403 before the handler is created. A token carrying no `spa` reads as `plane`, so a control plane that predates the claim can only reach `access: 'plane'` abilities.
+`spa` is the access class the control plane authenticated for the caller. It is `service` for a caller the plane proved to be another service — the capability-token endpoint, `issueCapabilityTokenForCaller`, and invocation middleware setting `kind: 'service'` — and `plane` for every caller the plane fronts itself: users, API keys, anonymous traffic. Services compare it against the ability's own `access` and reject a mismatch with 403 before the handler is created. A token carrying no `spa` reads as `plane`, so a control plane that predates the claim can only reach `access: 'plane'` abilities.
 
 That default dictates the rollout order: **upgrade the control plane before any service declares `access: 'service'`.** A service on this version behind an older plane refuses every caller of its service-only abilities — legitimate service callers included — until the plane mints the claim. The reverse mix is the transitional gap, not a hole in the new guarantee: a *service* still on an older package version never checks `spa`, so for that service tightening `access` keeps depending on the plane's catalog refresh until the service upgrades.
 
-Delegated subjects are minted only by control-plane code — the broker/MCP caller resolver (a `BrokerCaller` with `kind: 'user'` and optional `orgId` / `principalKind`) or a direct `issueCapabilityToken({ subject, ... })` call. The capability-token endpoint and `issueCapabilityTokenForCaller` reject caller-supplied subjects with 403, and the shipped token requesters fail fast locally instead of transmitting one. Direct issue mints a non-brokered token, so ingress-required targets must be reached through the broker, which selects `issueBrokeredCapabilityToken` automatically. See [auth](auth.md#subject-delegation).
+Delegated subjects are minted only by control-plane code — invocation middleware may set a
+`BrokerCaller` with `kind: 'user'` and optional `orgId` / `principalKind`, or code may call
+`issueCapabilityToken({ subject, ... })` directly. The capability-token endpoint and
+`issueCapabilityTokenForCaller` reject caller-supplied subjects with 403, and the shipped token
+requesters fail fast locally instead of transmitting one. Direct issue mints a non-brokered token,
+so ingress-required targets must be reached through the broker, which selects
+`issueBrokeredCapabilityToken` automatically. See [auth](auth.md#subject-delegation).
 
 ## Logging And Request Correlation
 
-Every request that enters a `ServicePlaneControlPlane` gets an `X-Request-Id` (incoming header value or a generated UUID, via `hono/request-id`). The broker and MCP endpoints forward that id on every outbound call to a service: as the `X-Request-Id` header for HTTP-batch and service-binding transports, as the `request_id` query parameter for WebSocket transports (`SERVICE_PLANE_REQUEST_ID_QUERY_PARAM`), and as the `requestId` field on `connectAbility(...)` for Cloudflare native RPC. `ServicePlaneService` adopts the propagated id into its own `requestId` context variable and echoes it on responses, so one id correlates plane and service logs end to end.
+Every request that enters a `ServicePlaneControlPlane` gets an `X-Request-Id` (incoming header value or a generated UUID, via `hono/request-id`). The REST, broker, and MCP endpoints forward that id on every outbound call to a service: as the `X-Request-Id` header for HTTP-batch and service-binding transports, as the `request_id` query parameter for WebSocket transports (`SERVICE_PLANE_REQUEST_ID_QUERY_PARAM`), and as the `requestId` field on `connectAbility(...)` for Cloudflare native RPC. `ServicePlaneService` adopts the propagated id into its own `requestId` context variable and echoes it on responses, so one id correlates plane and service logs end to end.
 
-Connection info about the original client rides the same three channels when `broker.connInfo` / `mcp.connInfo` are configured: the `X-Service-Plane-Conn-Info` header, the `conn_info` query parameter (`SERVICE_PLANE_CONN_INFO_QUERY_PARAM`), and the `connInfo` field on `connectAbility(...)`. Services expose it to handlers as `connInfo` only for brokered calls with ingress enabled — see [Forwarded Connection Info](auth.md#forwarded-connection-info).
+Connection info about the original client rides the same three channels when middleware sets `servicePlaneConnInfo`: the `X-Service-Plane-Conn-Info` header, the `conn_info` query parameter (`SERVICE_PLANE_CONN_INFO_QUERY_PARAM`), and the `connInfo` field on `connectAbility(...)`. Services expose it to handlers as `connInfo` only for brokered calls with ingress enabled — see [Forwarded Connection Info](auth.md#forwarded-connection-info).
 
 ## Deadlines
 
@@ -336,7 +371,7 @@ The value travels on the same three channels as the request id: the `X-Service-P
 What each participant does with it:
 
 - **The caller** bounds its own wait per method call and rejects with `ServicePlaneTimeoutError` when the budget elapses. Cap'n Web has no cancel message, so this frees the caller, not the callee.
-- **The control plane** reads an inbound `X-Service-Plane-Timeout` on broker and MCP requests and forwards *what is left* after its own work — resolving the catalog, minting a token. If nothing is left, `connect()` fails before a service session is opened.
+- **The control plane** reads an inbound `X-Service-Plane-Timeout` on REST, broker, and MCP requests and forwards *what is left* after its own work — resolving the catalog, minting a token. If nothing is left, the invocation fails before a service session is opened.
 - **The service** turns it into the `signal` its ability handlers receive, and the validating wrapper fails the method if the handler outlives it. A handler that ignores `signal` therefore loses the work, not correctness.
 
 ```ts
@@ -466,6 +501,7 @@ Control-plane events:
 - `service_plane.mcp.tool.completed` / `service_plane.mcp.tool.failed` (`ServicePlaneBrokerLogEvent`)
 - `service_plane.mcp.resource.completed` / `service_plane.mcp.resource.failed` (`ServicePlaneBrokerLogEvent`)
 - `service_plane.mcp.prompt.completed` / `service_plane.mcp.prompt.failed` (`ServicePlaneBrokerLogEvent`)
+- `service_plane.rest.completed` / `service_plane.rest.failed` (`ServicePlaneBrokerLogEvent`)
 - `service_plane.caller_auth.not_configured` (`ServicePlaneControlPlaneLogEvent`)
 - `service_plane.caller_auth.hmac_unauthorized` / `service_plane.caller_auth.jwk_unauthorized` (caller-auth middleware, own `log` option). The `reason` field names the check that failed.
 
@@ -480,7 +516,7 @@ new ServicePlaneService({
 
 new ServicePlaneControlPlane({
   // ...
-  log: (event, context) => appLogger.info(event), // or false to silence broker/MCP/config events
+  log: (event, context) => appLogger.info(event), // or false to silence REST/broker/MCP/config events
 });
 ```
 

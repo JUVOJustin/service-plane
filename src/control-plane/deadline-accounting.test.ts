@@ -76,9 +76,13 @@ async function planeForwardingTimeout(): Promise<string | null> {
   });
 
   plane = new ServicePlaneControlPlane({
-    broker: { caller: () => ({ id: 'gateway', kind: 'service' }) },
+    rpc: {},
     discoveryCache: false,
     issuer: PLANE_ORIGIN,
+    invocationMiddleware: async (context, next) => {
+      context.set('servicePlaneCaller', { id: 'gateway', kind: 'service' });
+      await next();
+    },
     log: false,
     // Stands in for the discovery fan-out on a cold cache: real plane work, before the broker
     // exists, that the caller is already waiting through.
@@ -100,7 +104,7 @@ async function planeForwardingTimeout(): Promise<string | null> {
   }) as typeof fetch;
 
   const root = newHttpBatchRpcSession<Record<string, never>>(
-    new Request(`${PLANE_ORIGIN}/rpc/broker`, {
+    new Request(`${PLANE_ORIGIN}/rpc`, {
       headers: { [SERVICE_PLANE_TIMEOUT_HEADER]: String(CALLER_BUDGET_MS) },
       method: 'POST',
     }),

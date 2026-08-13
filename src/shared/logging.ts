@@ -31,7 +31,9 @@ export type ServicePlaneBrokerLogEvent = {
     | 'service_plane.mcp.resource.completed'
     | 'service_plane.mcp.resource.failed'
     | 'service_plane.mcp.tool.completed'
-    | 'service_plane.mcp.tool.failed';
+    | 'service_plane.mcp.tool.failed'
+    | 'service_plane.rest.completed'
+    | 'service_plane.rest.failed';
   level: 'info' | 'warn';
   abilityId?: string;
   brokered?: boolean;

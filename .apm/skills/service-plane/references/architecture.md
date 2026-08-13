@@ -77,9 +77,9 @@ Methods that return many results over time (`stream: true`) use Cap'n Web's nati
 
 ## Observability
 
-One request id follows a call across the whole plane. The control plane assigns or adopts `X-Request-Id` on every inbound request, and its broker and MCP surfaces forward that id on every outbound service call (header for HTTP transports, `request_id` query parameter for WebSocket upgrades, `requestId` field for native bindings). The service shell adopts the propagated id into its Hono `requestId` variable, echoes it on responses, and includes it in its log events, so plane and service logs correlate without extra plumbing.
+One request id follows a call across the whole plane. The control plane assigns or adopts `X-Request-Id` on every inbound request, and its REST, broker, and MCP surfaces forward that id on every outbound service call (header for HTTP transports, `request_id` query parameter for WebSocket upgrades, `requestId` field for native bindings). The service shell adopts the propagated id into its Hono `requestId` variable, echoes it on responses, and includes it in its log events, so plane and service logs correlate without extra plumbing.
 
-Both shells emit typed, token-safe JSON log events (requests, broker connects, MCP tool calls, caller-auth rejections) to the console by default. The package never owns the application logger: every surface accepts a `log` callback that forwards events to whatever logger the app uses, and events are also exposed on the Hono context for app middleware. See the logging section in [the reference](reference.md).
+Both shells emit typed, token-safe JSON log events (requests, REST calls, broker connects, MCP tool calls, caller-auth rejections) to the console by default. The package never owns the application logger: every surface accepts a `log` callback that forwards events to whatever logger the app uses, and events are also exposed on the Hono context for app middleware. See the logging section in [the reference](reference.md).
 
 ## Horizontal Scaling
 
@@ -131,11 +131,11 @@ flowchart LR
   ClickUp["ClickUp service<br/>abilities + schemas"] --> Registry
   Moco["Moco service<br/>abilities + schemas"] --> Registry
   Registry --> OpenAPI["/openapi.json"]
-  Registry --> MCP["/rpc/mcp<br/>MCP tools"]
+  Registry --> MCP["/mcp<br/>MCP tools"]
   Registry --> Grants["STS grants<br/>scope checks"]
 ```
 
-Only `exposure: 'published'` methods with REST metadata enter OpenAPI. Only published methods with MCP metadata enter MCP. Private abilities remain available for broker routing and grant validation, but they are not user-facing projections.
+Only `exposure: 'published'` methods with REST metadata enter OpenAPI and the control plane's live REST facade. Only published methods with MCP metadata enter MCP. Private abilities remain available for broker routing and grant validation, but they are not user-facing projections.
 
 ## Core Terms
 

@@ -1,4 +1,5 @@
-import { isOriginRelativePath } from '../shared/paths.js';
+import { jsonSchemaRootProperties } from '../shared/json-schema.js';
+import { isOriginRelativePath, pathTemplateVariables } from '../shared/paths.js';
 import {
   type AbilityExposure,
   type AbilityTransport,
@@ -291,14 +292,25 @@ function isAbilityMethodDiscovery(value: unknown): value is ServiceAbilityMethod
     // Mirrors defineAbilityService: streaming methods cannot claim single-response projections,
     // and foreign discovery documents do not get to bypass that.
     (value.stream !== true || (value.mcpPrompt === undefined && value.mcpResource === undefined && value.rest === undefined)) &&
-    (value.rest === undefined ||
-      (isRecord(value.rest) &&
-        isHttpMethod(value.rest.method) &&
-        typeof value.rest.path === 'string' &&
-        isOriginRelativePath(value.rest.path) &&
-        (value.rest.operationId === undefined || typeof value.rest.operationId === 'string'))) &&
+    (value.rest === undefined || isValidRestDiscovery(value.rest, value.inputSchema)) &&
     (value.mcp === undefined || (isRecord(value.mcp) && typeof value.mcp.name === 'string'))
   );
+}
+
+function isValidRestDiscovery(rest: unknown, inputSchema: Record<string, unknown>): boolean {
+  if (
+    !isRecord(rest) ||
+    !isHttpMethod(rest.method) ||
+    typeof rest.path !== 'string' ||
+    !isOriginRelativePath(rest.path) ||
+    (rest.operationId !== undefined && typeof rest.operationId !== 'string')
+  ) {
+    return false;
+  }
+  const variables = pathTemplateVariables(rest.path);
+  if (!variables) return false;
+  const properties = jsonSchemaRootProperties(inputSchema);
+  return variables.every((name) => !!properties && Object.hasOwn(properties, name));
 }
 
 function isAbilityExposure(value: unknown): value is AbilityExposure {

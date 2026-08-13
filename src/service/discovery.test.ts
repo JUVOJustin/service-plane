@@ -121,6 +121,46 @@ describe('ability service discovery', () => {
     expect(() => withMethod('propfind')).toThrow('Unknown Service-Plane REST method: propfind');
   });
 
+  it('validates REST path templates and explicit success statuses', () => {
+    const withRest = (rest: { method: 'post'; path: string; status?: number }) =>
+      defineAbilityService({
+        abilities: [
+          defineAbility({
+            exposure: 'published',
+            id: 'example.write',
+            methods: {
+              write: abilityMethod({
+                input: z.object({ id: z.string() }),
+                output: z.object({ ok: z.boolean() }),
+                rest,
+                scopes: ['example.search'],
+              }),
+            },
+            scopes: ['example.search'],
+            handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
+          }),
+        ],
+        capabilities,
+        id: 'example',
+        title: 'Example',
+        version: '0.1.0',
+      });
+
+    expect(withRest({ method: 'post', path: '/examples/{id}' }).abilities[0]?.methods.write?.rest?.status).toBeUndefined();
+    for (const status of [201, 202, 205]) {
+      expect(withRest({ method: 'post', path: '/examples/{id}', status }).abilities[0]?.methods.write?.rest?.status).toBe(status);
+    }
+    expect(() => withRest({ method: 'post', path: '/examples/{id}/again/{id}' })).toThrow('invalid or duplicate template variable');
+    expect(() => withRest({ method: 'post', path: '/examples/{connectionId}' })).toThrow(
+      'REST path template variable must name a top-level input field: example.write/write -> connectionId',
+    );
+    for (const status of [199, 200.5, 300]) {
+      expect(() => withRest({ method: 'post', path: '/examples/{id}', status })).toThrow(
+        'success status must be an integer from 200 through 299',
+      );
+    }
+  });
+
   it('publishes MCP resource and prompt projections in discovery', () => {
     const service = defineAbilityService({
       abilities: [

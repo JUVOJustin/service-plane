@@ -87,7 +87,9 @@ const server = serve({ fetch: service.fetch, port: 8787 });
 injectWebSocket(server);
 ```
 
-Deno and Bun follow the same pattern with `upgradeWebSocket` from `hono/deno` or `hono/bun`. The control-plane broker takes the same option: `broker: { caller, upgradeWebSocket }`.
+Deno and Bun follow the same pattern with `upgradeWebSocket` from `hono/deno` or `hono/bun`. The
+control-plane configures authentication once at the top level and the socket upgrade on its RPC
+broker: `{ invocationMiddleware, rpc: { upgradeWebSocket } }`.
 
 On Cloudflare, same-account callers can skip WebSocket entirely: expose `connectAbility` from a `WorkerEntrypoint` and use native binding RPC, which streams natively (see [Cloudflare](cloudflare.md)).
 
@@ -151,7 +153,7 @@ Cancel by exiting the loop early (or `reader.cancel()`). For a handler-owned `Re
 
 ## Stream Through The Broker
 
-Streams proxy transparently across broker sessions — no extra routes. Connect to `/rpc/broker` over WebSocket; the plane authorizes the caller, mints the (brokered) token, and reaches the service over its own session transport:
+Streams proxy transparently across broker sessions — no extra routes. Connect to `/rpc` over WebSocket; the plane authorizes the caller, mints the (brokered) token, and reaches the service over its own session transport:
 
 1. the endpoint's native ability RPC binding, when available (`ServiceEndpoint.abilityRpc` — pass it explicitly as `cloudflareServiceBinding({ abilityRpc })`),
 2. otherwise WebSocket.

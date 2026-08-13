@@ -142,6 +142,39 @@ describe('service registry', () => {
     expect(snapshot.services.map((service) => service.id)).toEqual(['example']);
   });
 
+  it('omits discovery documents whose REST path variables are absent from the input schema', async () => {
+    const ability = document.abilities.at(0);
+    if (!ability) throw new Error('missing test ability');
+    const method = ability.methods.runSync;
+    if (!method) throw new Error('missing test method');
+    const registry = createServiceRegistry({
+      services: [
+        httpsService({
+          baseUrl: 'https://example.internal',
+          discovery: {
+            ...document,
+            abilities: [
+              {
+                ...ability,
+                exposure: 'published',
+                methods: {
+                  runSync: {
+                    ...method,
+                    inputSchema: { properties: { id: { type: 'string' } }, type: 'object' },
+                    rest: { method: 'post', path: '/examples/{connectionId}' },
+                  },
+                },
+              },
+            ],
+          },
+          id: 'example',
+        }),
+      ],
+    });
+
+    await expect(registry.discover()).resolves.toMatchObject({ abilities: [], services: [] });
+  });
+
   it('rejects discovery documents that claim another configured endpoint id', async () => {
     const victimDocument: ServiceDiscoveryDocument = {
       ...document,

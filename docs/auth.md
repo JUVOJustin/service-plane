@@ -185,7 +185,7 @@ being published, which is why token TTLs are short and why the maximum is capped
 
 Use the simplest option that matches the deployment boundary.
 
-Everything the token endpoint's `authenticateCaller` admits becomes a **service-class** caller: its tokens carry [`spa: 'service'`](reference.md#capability-token-claims) and can reach `access: 'service'` abilities on any service the grants allow. Wire only genuine services into it — end users, product API keys, and anonymous traffic belong in front of the broker, whose caller resolver brokers them as plane-class. This is the same fleet-wide consequence the broker resolver's `kind: 'service'` carries, made explicit because reusing an existing product-credential store as token-endpoint clients would silently promote every credential in it.
+Everything the token endpoint's `authenticateCaller` admits becomes a **service-class** caller: its tokens carry [`spa: 'service'`](reference.md#capability-token-claims) and can reach `access: 'service'` abilities on any service the grants allow. Wire only genuine services into it — end users, product API keys, and anonymous traffic belong in front of the broker, whose invocation middleware brokers them as plane-class. This is the same fleet-wide consequence that setting `servicePlaneCaller.kind: 'service'` carries, made explicit because reusing an existing product-credential store as token-endpoint clients would silently promote every credential in it.
 
 Cloudflare same-account callers should use private RPC token requests through a service binding:
 
@@ -334,7 +334,7 @@ sender-constrained never pay for a signature.
 | --- | --- |
 | JWK caller → token endpoint → service | Always. This is where a token leaves the plane. |
 | HMAC caller | None. A shared secret has no key to confirm; use JWK caller auth if you want binding. |
-| Brokered calls (`/rpc/broker`) | Not applicable. The broker mints the token and uses it on its own leg to the service — the caller never receives it. Ingress plus the signed `spb` claim already restricts those tokens to brokered use. |
+| Brokered calls (`/rpc`) | Not applicable. The broker mints the token and uses it on its own leg to the service — the caller never receives it. Ingress plus the signed `spb` claim already restricts those tokens to brokered use. |
 | Cloudflare service bindings | Unnecessary. Identity is pinned by the binding entrypoint and no token crosses a network. |
 
 ### Limits
@@ -400,20 +400,19 @@ sequenceDiagram
   Service->>Service: Verify token, read identity.subject
 ```
 
-Return the resolved user from the broker (or MCP) caller resolver:
+Write the resolved user into the shared REST/MCP/broker invocation context:
 
 ```ts
 const plane = new ServicePlaneControlPlane({
-  broker: {
-    caller: async (context) => {
-      const user = await verifySupabaseJwt(context); // application-owned verification
-      if (!user) {
-        return context.json({ error: 'Unauthorized' }, 401, {
-          'WWW-Authenticate': 'Bearer realm="service-plane"',
-        });
-      }
-      return { id: user.id, kind: 'user', orgId: user.orgId };
-    },
+  invocationMiddleware: async (context, next) => {
+    const user = await verifySupabaseJwt(context); // application-owned verification
+    if (!user) {
+      return context.json({ error: 'Unauthorized' }, 401, {
+        'WWW-Authenticate': 'Bearer realm="service-plane"',
+      });
+    }
+    context.set('servicePlaneCaller', { id: user.id, kind: 'user', orgId: user.orgId });
+    await next();
   },
   // ...
 });
@@ -457,7 +456,7 @@ Boundaries to keep in mind:
 
 - The subject is delegation the control plane vouches for. It rides the same issuer/JWKS trust chain as every other claim, so services may rely on it for auditing and per-user decisions.
 - The subject does not replace scope or grant checks. Ability authorization stays with scopes, grants, and ingress. Tenancy authorization stays with the service that owns the data.
-- Only control-plane code asserts subjects: the broker caller resolver or direct `issueCapabilityToken({ subject, callerAccess: 'plane', ... })` calls. The HTTP token endpoint rejects caller-supplied `subject` fields, and the shipped token requesters (`controlPlaneHmacTokenRequester`, `controlPlaneJwkTokenRequester`, `controlPlaneRpcTokenRequester`) refuse to send one, so an authenticated service cannot claim it acts for an arbitrary user. The `subject` option on `createCapabilityTokenProvider` therefore only works with a `requestToken` that calls the issuer in-process.
+- Only control-plane code asserts subjects: invocation middleware or direct `issueCapabilityToken({ subject, callerAccess: 'plane', ... })` calls. The HTTP token endpoint rejects caller-supplied `subject` fields, and the shipped token requesters (`controlPlaneHmacTokenRequester`, `controlPlaneJwkTokenRequester`, `controlPlaneRpcTokenRequester`) refuse to send one, so an authenticated service cannot claim it acts for an arbitrary user. The `subject` option on `createCapabilityTokenProvider` therefore only works with a `requestToken` that calls the issuer in-process.
 - A delegated subject is always plane-class. The issuer requires `callerAccess` on every direct mint and refuses `subject` together with `callerAccess: 'service'` — that pair would hand a fronted principal the service-only reach that [`access: 'service'`](reference.md#capability-token-claims) exists to withhold.
 - Direct `issueCapabilityToken({ subject, ... })` mints a non-brokered token. For a target with `ingress` required, delegate through the broker instead — it selects `issueBrokeredCapabilityToken` automatically; a directly issued token is rejected by the ingress check.
 - Tokens delegated to a subject are cached per complete subject identity, including principal kind. `capabilityTokenCacheKey` therefore never shares tokens across subjects or across kinds with the same id and org.
@@ -467,14 +466,19 @@ Boundaries to keep in mind:
 
 The plane terminates the client connection; the service only ever sees the plane. A service can therefore learn where a call came from only if the plane forwards it — and forwarding is opt-in, because it is an unsigned assertion.
 
-Wire the resolver on the broker and MCP mounts. `getConnInfo` is runtime-specific in Hono, so the application supplies the right one:
+Set the value in invocation middleware. `getConnInfo` is runtime-specific in Hono, so the application supplies the right one:
 
 ```ts
 import { getConnInfo } from 'hono/cloudflare-workers'; // or 'hono/deno', '@hono/node-server/conninfo', ...
 
 new ServicePlaneControlPlane({
-  broker: { caller: resolveCaller, connInfo: (c) => getConnInfo(c) },
-  mcp: { caller: resolveCaller, connInfo: (c) => getConnInfo(c) },
+  invocationMiddleware: async (c, next) => {
+    const caller = await resolveCaller(c);
+    if (!caller) return c.json({ error: 'Unauthorized' }, 401);
+    c.set('servicePlaneCaller', caller);
+    c.set('servicePlaneConnInfo', getConnInfo(c));
+    await next();
+  },
   // ...
 });
 ```
