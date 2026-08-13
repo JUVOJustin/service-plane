@@ -1,5 +1,11 @@
 import { type RpcStub, RpcTarget } from 'capnweb';
-import { abilitySession, cloudflareNativeRpc, cloudflareServiceBindingRpc, websocketRpc } from '../service/capabilities.js';
+import {
+  type AbilitySession,
+  abilitySession,
+  cloudflareNativeRpc,
+  cloudflareServiceBindingRpc,
+  websocketRpc,
+} from '../service/capabilities.js';
 import { normalizeCapabilitySubject } from '../shared/capability-tokens.js';
 import type { ConnInfo } from '../shared/conn-info.js';
 import { normalizeTimeoutMs, remainingTimeoutMs } from '../shared/deadline.js';
@@ -144,7 +150,26 @@ export type RootCapabilityOptions = {
   allowStreaming?: boolean;
 };
 
+/**
+ * Selects one ability for a trusted in-process broker session.
+ */
+export type ControlPlaneRpcBrokerAbilityInput = {
+  /** Ability id from the target service discovery document. */
+  abilityId: string;
+  /** Authenticated caller, or no caller for a plane-owned session. */
+  caller?: BrokerCaller;
+  /** Scopes the returned session may exercise. */
+  scopes: string[];
+  /** Service that owns the ability. */
+  targetServiceId: string;
+};
+
 export type ControlPlaneRpcBroker = {
+  /**
+   * Opens a local session through the same authorization, ingress, and transport path as a remote
+   * broker caller. In-process callers can carry streams, so no methods are hidden from the session.
+   */
+  abilitySession<Scoped>(input: ControlPlaneRpcBrokerAbilityInput): Promise<AbilitySession<Scoped>>;
   rootCapability(caller?: BrokerCaller, options?: RootCapabilityOptions): RpcTarget;
 };
 
@@ -153,29 +178,35 @@ export function createControlPlaneRpcBroker(options: CreateControlPlaneRpcBroker
   const now = options.now ?? (() => Date.now());
   const timeoutMs = normalizeTimeoutMs(options.timeoutMs);
   const idempotencyKey = normalizeIdempotencyKey(options.idempotencyKey);
+  const rootCapability = (caller?: BrokerCaller, rootOptions?: RootCapabilityOptions) => {
+    // Stamped per root, not per broker: a broker held at module scope would otherwise measure
+    // process uptime as elapsed budget and refuse every connect once uptime exceeds it. A shell
+    // that did real work before building the broker still passes its own receivedAt.
+    const receivedAt = options.receivedAt ?? now();
+    return new BrokerRoot(
+      {
+        allowStreaming: rootOptions?.allowStreaming ?? false,
+        ...(options.connInfo ? { connInfo: options.connInfo } : {}),
+        controlPlaneServiceId: options.controlPlaneServiceId,
+        ...(idempotencyKey ? { idempotencyKey } : {}),
+        issuer: options.issuer,
+        ...(options.log ? { log: options.log } : {}),
+        now,
+        receivedAt,
+        registry,
+        ...(options.requestId ? { requestId: options.requestId } : {}),
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      },
+      caller,
+    );
+  };
   return {
-    rootCapability(caller, rootOptions) {
-      // Stamped per root, not per broker: a broker held at module scope would otherwise measure
-      // process uptime as elapsed budget and refuse every connect once uptime exceeds it. A shell
-      // that did real work before building the broker still passes its own receivedAt.
-      const receivedAt = options.receivedAt ?? now();
-      return new BrokerRoot(
-        {
-          allowStreaming: rootOptions?.allowStreaming ?? false,
-          ...(options.connInfo ? { connInfo: options.connInfo } : {}),
-          controlPlaneServiceId: options.controlPlaneServiceId,
-          ...(idempotencyKey ? { idempotencyKey } : {}),
-          issuer: options.issuer,
-          ...(options.log ? { log: options.log } : {}),
-          now,
-          receivedAt,
-          registry,
-          ...(options.requestId ? { requestId: options.requestId } : {}),
-          ...(timeoutMs === undefined ? {} : { timeoutMs }),
-        },
-        caller,
-      );
+    async abilitySession<Scoped>(input: ControlPlaneRpcBrokerAbilityInput) {
+      const root = rootCapability(input.caller, { allowStreaming: true });
+      const ability = await root.ability(input.targetServiceId, input.abilityId);
+      return (await ability.connect(input.scopes)) as unknown as AbilitySession<Scoped>;
     },
+    rootCapability,
   };
 }
 

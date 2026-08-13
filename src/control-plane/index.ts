@@ -102,6 +102,7 @@ export {
   brokerCallerAccess,
   brokerCallerSubject,
   type ControlPlaneRpcBroker,
+  type ControlPlaneRpcBrokerAbilityInput,
   type CreateControlPlaneRpcBrokerOptions,
   createControlPlaneRpcBroker,
   type RootCapabilityOptions,
@@ -146,6 +147,7 @@ export {
 export {
   type BrokerCallerResolver,
   type ConnInfoResolver,
+  type ControlPlaneAbilitySessionOptions,
   type DiscoveryCacheRoute,
   ServicePlaneControlPlane,
   type ServicePlaneControlPlaneOptions,
