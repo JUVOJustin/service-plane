@@ -11,6 +11,7 @@ import { defaultServicePlaneLogSink, type ServicePlaneControlPlaneLogEvent, type
 import {
   DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
   type RegistryCache,
+  SERVICE_PLANE_CAPABILITY_JWKS_PATH,
   SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
   SERVICE_PLANE_OPENAPI_PATH,
   SERVICE_PLANE_REQUEST_ID_HEADER,
@@ -230,6 +231,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   // process on Node, the granularity a process-local cache can actually have.
   private readonly discoveryCaches: Record<DiscoveryCacheRoute, RegistryCache | undefined>;
   private readonly log: ServicePlaneLogSink | undefined;
+  private readonly reservedRestPaths: string[];
   // Single slot rather than a map: JWKS is a hot route, and the only reason the derived key set
   // changes is a rotation, which should replace the memo instead of growing it. The resolved key
   // set is kept alongside so a hit is a synchronous compare rather than an awaited digest; it holds
@@ -247,6 +249,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     this.log = options.log === false ? undefined : (options.log ?? defaultServicePlaneLogSink);
     validateTimeoutPolicy(options.timeout);
     this.discoveryCaches = discoveryCachesFor(options.discoveryCache);
+    this.reservedRestPaths = controlPlaneReservedRestPaths(options);
 
     this.app.use(
       '*',
@@ -342,6 +345,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       const cache = this.discoveryCaches.token;
       const registry = createServiceRegistry({
         ...(cache ? { cache } : {}),
+        reservedRestPaths: this.reservedRestPaths,
         services,
       });
       const snapshot = await registry.discover();
@@ -381,6 +385,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       const cache = this.discoveryCaches.token;
       const registry = createServiceRegistry({
         ...(cache ? { cache } : {}),
+        reservedRestPaths: this.reservedRestPaths,
         services,
       });
       return handleControlPlaneRestRequest(context.req.raw, {
@@ -426,6 +431,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       const openApiCache = this.discoveryCaches.openapi;
       const snapshot = await createServiceRegistry({
         ...(openApiCache ? { cache: openApiCache } : {}),
+        reservedRestPaths: this.reservedRestPaths,
         services,
       }).discover();
       const document = generateControlPlaneOpenApi({
@@ -467,6 +473,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
         knownRegistry ??
         createServiceRegistry({
           ...(cache ? { cache } : {}),
+          reservedRestPaths: this.reservedRestPaths,
           services,
         }),
       idempotencyKey: idempotencyKeyFromRequest(context.req),
@@ -551,7 +558,12 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     resolvingMaterial.catch(() => undefined);
     const resolvingCatalog = (async () => {
       const resolvedServices = services ?? (await this.options.services(context));
-      const capabilities = await discoverServiceCapabilities(resolvedServices, this.discoveryCaches.token);
+      const capabilities = await discoverServiceCapabilities(
+        resolvedServices,
+        this.discoveryCaches.token,
+        undefined,
+        this.reservedRestPaths,
+      );
       return { capabilities, resolvedServices };
     })();
     resolvingCatalog.catch(() => undefined);
@@ -662,10 +674,30 @@ function registryFromSnapshot(registry: ServiceRegistry, snapshot: ServiceRegist
   };
 }
 
-async function discoverServiceCapabilities(services: ServiceEndpoint[], cache?: RegistryCache, cacheKey?: string) {
-  const registry = createServiceRegistry({ ...(cache ? { cache } : {}), ...(cacheKey ? { cacheKey } : {}), services });
+async function discoverServiceCapabilities(
+  services: ServiceEndpoint[],
+  cache?: RegistryCache,
+  cacheKey?: string,
+  reservedRestPaths?: string[],
+) {
+  const registry = createServiceRegistry({
+    ...(cache ? { cache } : {}),
+    ...(cacheKey ? { cacheKey } : {}),
+    ...(reservedRestPaths ? { reservedRestPaths } : {}),
+    services,
+  });
   const snapshot = await registry.discover();
   return snapshot.services.flatMap((service) => (service.capabilities ? [service.capabilities] : []));
+}
+
+function controlPlaneReservedRestPaths<TEnv extends Env>(options: ServicePlaneControlPlaneOptions<TEnv>): string[] {
+  return [
+    SERVICE_PLANE_CAPABILITY_JWKS_PATH,
+    SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
+    ...(options.openapi === false ? [] : [options.openapi?.path ?? SERVICE_PLANE_OPENAPI_PATH]),
+    ...(options.mcp === false ? [] : [options.mcp?.path ?? DEFAULT_MCP_PATH]),
+    ...(options.rpc ? [options.rpc.path ?? '/rpc'] : []),
+  ];
 }
 
 function serviceGrantsFromEndpoints(services: ServiceEndpoint[]): ServiceGrant[] {

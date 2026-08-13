@@ -355,6 +355,29 @@ describe('ServicePlaneControlPlane', () => {
     expect(discoveryFetches).toBe(1);
   });
 
+  it('omits REST projections that collide with configured control-plane routes', async () => {
+    const collidingDiscovery = structuredClone(discovery);
+    const search = collidingDiscovery.abilities[1]?.methods.search;
+    if (!search?.rest) throw new Error('missing REST projection');
+    search.rest.path = '/protocol';
+    const plane = new ServicePlaneControlPlane({
+      log: false,
+      mcp: { path: '/protocol' },
+      services: () => [
+        cloudflareServiceBinding({
+          binding: { fetch: async () => Response.json(collidingDiscovery) },
+          id: 'example',
+        }),
+      ],
+      signingKeys: () => [],
+    });
+
+    const response = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`));
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ paths: {} });
+  });
+
   it('emits cache headers on OpenAPI and JWKS when httpCache is enabled and never caches token responses', async () => {
     const plane = new ServicePlaneControlPlane({
       httpCache: true,

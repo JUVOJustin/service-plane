@@ -155,8 +155,10 @@ input.
 Only published, non-streaming methods with `rest` metadata are routable. Unknown paths return `404`,
 a known path with the wrong verb returns `405` plus `Allow`, JSON bodies are bounded to one MiB by
 default (`rest.maxBodyBytes` changes the bound), and ambiguous equally specific templates fail
-closed. The service remains the authoritative schema validator: every facade call still passes
-through the generated ability wrapper before its handler runs.
+closed. Paths mounted by the control plane are reserved and cannot also be used by REST projections:
+the capability-token and JWKS routes are always reserved, and enabled OpenAPI, MCP, and RPC routes
+reserve their configured paths. The service remains the authoritative schema validator: every
+facade call still passes through the generated ability wrapper before its handler runs.
 
 ## MCP
 

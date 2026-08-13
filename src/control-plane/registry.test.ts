@@ -175,6 +175,39 @@ describe('service registry', () => {
     await expect(registry.discover()).resolves.toMatchObject({ abilities: [], services: [] });
   });
 
+  it('omits discovery documents whose REST projections collide with built-in control-plane paths', async () => {
+    const ability = document.abilities.at(0);
+    if (!ability) throw new Error('missing test ability');
+    const method = ability.methods.runSync;
+    if (!method) throw new Error('missing test method');
+    const registry = createServiceRegistry({
+      reservedRestPaths: ['/mcp'],
+      services: [
+        httpsService({
+          baseUrl: 'https://example.internal',
+          discovery: {
+            ...document,
+            abilities: [
+              {
+                ...ability,
+                exposure: 'published',
+                methods: {
+                  runSync: {
+                    ...method,
+                    rest: { method: 'get', path: '/mcp' },
+                  },
+                },
+              },
+            ],
+          },
+          id: 'example',
+        }),
+      ],
+    });
+
+    await expect(registry.discover()).resolves.toMatchObject({ abilities: [], services: [] });
+  });
+
   it.each([199, 300, 201.5, '201'])('omits discovery documents with invalid REST status $status', async (status) => {
     const ability = document.abilities.at(0);
     if (!ability) throw new Error('missing test ability');
@@ -302,6 +335,12 @@ describe('service registry', () => {
   });
 
   it('versions the derived cache namespace when discovery trust rules change', () => {
-    expect(serviceRegistryCacheKey([])).toContain('"namespace":"service-plane:registry:v2"');
+    expect(serviceRegistryCacheKey([])).toContain('"namespace":"service-plane:registry:v3"');
+  });
+
+  it('namespaces the cache by reserved control-plane REST paths', () => {
+    expect(serviceRegistryCacheKey([], SERVICE_DISCOVERY_PATH, ['/custom-mcp'])).not.toBe(
+      serviceRegistryCacheKey([], SERVICE_DISCOVERY_PATH),
+    );
   });
 });

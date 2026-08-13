@@ -764,7 +764,7 @@ function normalizeMethods(
         `${abilityId}/${name}`,
         schemaResourceId(serviceId, abilityId, name, 'input'),
       );
-      const rest = method.rest ? normalizeRestProjection(abilityId, name, method.rest, inputSchema) : undefined;
+      const rest = method.rest ? normalizeRestProjection(serviceId, abilityId, name, method.rest, inputSchema) : undefined;
       const mcp = method.mcp ? normalizeMcpProjection(abilityId, name, method.mcp) : undefined;
       const mcpPrompt = method.mcpPrompt ? normalizeMcpPromptProjection(abilityId, name, method.mcpPrompt) : undefined;
       const mcpResource = method.mcpResource ? normalizeMcpResourceProjection(abilityId, name, method.mcpResource) : undefined;
@@ -882,6 +882,7 @@ function abilityDiscovery<TEnv extends Env>(ability: NormalizedServiceAbility<TE
 }
 
 function normalizeRestProjection(
+  serviceId: string,
   abilityId: string,
   methodName: string,
   rest: ServiceAbilityRestProjection,
@@ -895,7 +896,7 @@ function normalizeRestProjection(
     method: normalizeHttpMethod(rest.method),
     operationId: rest.operationId
       ? normalizeValue(rest.operationId, `REST operation id for ${abilityId}/${methodName}`)
-      : `${abilityId}.${methodName}`,
+      : `${serviceId}.${abilityId}.${methodName}`,
     path,
     ...(rest.status === undefined ? {} : { status: normalizeRestStatus(rest.status, abilityId, methodName) }),
     ...(rest.tags ? { tags: normalizeTags(rest.tags, `${abilityId}/${methodName}`) } : {}),

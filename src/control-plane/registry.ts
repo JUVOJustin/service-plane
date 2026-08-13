@@ -1,5 +1,5 @@
 import { jsonSchemaRootProperties } from '../shared/json-schema.js';
-import { isOriginRelativePath, pathTemplateVariables } from '../shared/paths.js';
+import { isOriginRelativePath, normalizePath, pathTemplateVariables } from '../shared/paths.js';
 import {
   type AbilityExposure,
   type AbilityTransport,
@@ -24,12 +24,15 @@ export type CreateServiceRegistryOptions = {
   cacheKey?: string;
   cacheTtlSeconds?: number;
   discoveryPath?: string;
+  /** Control-plane paths that published REST projections must not shadow. */
+  reservedRestPaths?: string[];
   services: ServiceEndpoint[];
 };
 
 export function createServiceRegistry(options: CreateServiceRegistryOptions): ServiceRegistry {
   const discoveryPath = options.discoveryPath ?? SERVICE_DISCOVERY_PATH;
-  const cacheKey = options.cacheKey ?? serviceRegistryCacheKey(options.services, discoveryPath);
+  const reservedRestPaths = normalizedReservedRestPaths(options.reservedRestPaths);
+  const cacheKey = options.cacheKey ?? serviceRegistryCacheKey(options.services, discoveryPath, reservedRestPaths);
   const cacheTtlSeconds = options.cacheTtlSeconds ?? DEFAULT_REGISTRY_CACHE_TTL_SECONDS;
   const endpointsById = new Map(options.services.map((endpoint) => [endpoint.id, endpoint] as const));
 
@@ -56,7 +59,7 @@ export function createServiceRegistry(options: CreateServiceRegistryOptions): Se
       // writes its own entry below.
       const { complete, etags, services } = await coalescedDiscovery(options.cache, cacheKey, async () => {
         const stale = await options.cache?.getStale?.(cacheKey);
-        return discoverServices(options.services, discoveryPath, stale);
+        return discoverServices(options.services, discoveryPath, reservedRestPaths, stale);
       });
       const snapshot: ServiceDiscoverySnapshot = {
         discoveredAt: new Date().toISOString(),
@@ -91,10 +94,15 @@ export function createServiceRegistry(options: CreateServiceRegistryOptions): Se
   };
 }
 
-export function serviceRegistryCacheKey(services: ServiceEndpoint[], discoveryPath = SERVICE_DISCOVERY_PATH): string {
+export function serviceRegistryCacheKey(
+  services: ServiceEndpoint[],
+  discoveryPath = SERVICE_DISCOVERY_PATH,
+  reservedRestPaths: string[] = [],
+): string {
   return JSON.stringify({
     discoveryPath,
-    namespace: 'service-plane:registry:v2',
+    namespace: 'service-plane:registry:v3',
+    reservedRestPaths: normalizedReservedRestPaths(reservedRestPaths),
     services: services
       .map((service) => ({
         id: service.id,
@@ -152,15 +160,19 @@ function coalescedDiscovery(
 async function discoverServices(
   endpoints: ServiceEndpoint[],
   discoveryPath: string,
+  reservedRestPaths: string[],
   previous?: ServiceDiscoverySnapshot,
 ): Promise<DiscoveryResult> {
+  const reservedRestPathSet = new Set(reservedRestPaths);
   const previousServices = new Map(previous?.services.map((service) => [service.id, service]));
   const discovered = await Promise.all(
     endpoints.map(async (endpoint) => {
       try {
         if (endpoint.discovery) {
           const discovery = typeof endpoint.discovery === 'function' ? await endpoint.discovery() : endpoint.discovery;
-          return isDiscoveryForEndpoint(discovery, endpoint) ? { document: discovery, endpointId: endpoint.id } : undefined;
+          return isDiscoveryForEndpoint(discovery, endpoint, reservedRestPathSet)
+            ? { document: discovery, endpointId: endpoint.id }
+            : undefined;
         }
 
         const request = serviceDiscoveryRequest(endpoint, discoveryPath);
@@ -175,7 +187,7 @@ async function discoverServices(
         if (!response.ok) return undefined;
 
         const value = await response.json();
-        if (!isDiscoveryForEndpoint(value, endpoint)) return undefined;
+        if (!isDiscoveryForEndpoint(value, endpoint, reservedRestPathSet)) return undefined;
         const etag = response.headers.get('etag') ?? undefined;
         return { document: value, endpointId: endpoint.id, ...(etag ? { etag } : {}) };
       } catch {
@@ -197,9 +209,13 @@ async function discoverServices(
 
 // The configured endpoint is the plane's identity authority; discovery may describe that service,
 // but it cannot redirect metadata or capability scopes onto another configured endpoint.
-function isDiscoveryForEndpoint(value: unknown, endpoint: ServiceEndpoint): value is ServiceDiscoveryDocument {
+function isDiscoveryForEndpoint(
+  value: unknown,
+  endpoint: ServiceEndpoint,
+  reservedRestPaths: Set<string>,
+): value is ServiceDiscoveryDocument {
   return (
-    isServiceDiscoveryDocument(value) &&
+    isServiceDiscoveryDocument(value, reservedRestPaths) &&
     value.id === endpoint.id &&
     (value.capabilities === undefined || value.capabilities.serviceId === endpoint.id)
   );
@@ -233,7 +249,7 @@ function discoveredAbility(
   };
 }
 
-function isServiceDiscoveryDocument(value: unknown): value is ServiceDiscoveryDocument {
+function isServiceDiscoveryDocument(value: unknown, reservedRestPaths: Set<string>): value is ServiceDiscoveryDocument {
   if (!value || typeof value !== 'object') return false;
   const document = value as ServiceDiscoveryDocument;
   return (
@@ -241,7 +257,7 @@ function isServiceDiscoveryDocument(value: unknown): value is ServiceDiscoveryDo
     typeof document.title === 'string' &&
     typeof document.version === 'string' &&
     Array.isArray(document.abilities) &&
-    document.abilities.every(isAbilityDiscovery) &&
+    document.abilities.every((ability) => isAbilityDiscovery(ability, reservedRestPaths)) &&
     (document.capabilities === undefined ||
       (typeof document.capabilities === 'object' &&
         typeof document.capabilities.serviceId === 'string' &&
@@ -256,7 +272,7 @@ function isServiceDiscoveryDocument(value: unknown): value is ServiceDiscoveryDo
   );
 }
 
-function isAbilityDiscovery(value: unknown): value is ServiceAbilityDiscovery {
+function isAbilityDiscovery(value: unknown, reservedRestPaths: Set<string>): value is ServiceAbilityDiscovery {
   if (!value || typeof value !== 'object') return false;
   const ability = value as ServiceAbilityDiscovery;
   return (
@@ -272,11 +288,11 @@ function isAbilityDiscovery(value: unknown): value is ServiceAbilityDiscovery {
     Array.isArray(ability.rpc.transports) &&
     ability.rpc.transports.every(isAbilityTransport) &&
     isRecord(ability.methods) &&
-    Object.values(ability.methods).every(isAbilityMethodDiscovery)
+    Object.values(ability.methods).every((method) => isAbilityMethodDiscovery(method, reservedRestPaths))
   );
 }
 
-function isAbilityMethodDiscovery(value: unknown): value is ServiceAbilityMethodDiscovery {
+function isAbilityMethodDiscovery(value: unknown, reservedRestPaths: Set<string>): value is ServiceAbilityMethodDiscovery {
   if (!isRecord(value)) return false;
   return (
     Array.isArray(value.scopes) &&
@@ -292,17 +308,18 @@ function isAbilityMethodDiscovery(value: unknown): value is ServiceAbilityMethod
     // Mirrors defineAbilityService: streaming methods cannot claim single-response projections,
     // and foreign discovery documents do not get to bypass that.
     (value.stream !== true || (value.mcpPrompt === undefined && value.mcpResource === undefined && value.rest === undefined)) &&
-    (value.rest === undefined || isValidRestDiscovery(value.rest, value.inputSchema)) &&
+    (value.rest === undefined || isValidRestDiscovery(value.rest, value.inputSchema, reservedRestPaths)) &&
     (value.mcp === undefined || (isRecord(value.mcp) && typeof value.mcp.name === 'string'))
   );
 }
 
-function isValidRestDiscovery(rest: unknown, inputSchema: Record<string, unknown>): boolean {
+function isValidRestDiscovery(rest: unknown, inputSchema: Record<string, unknown>, reservedRestPaths: Set<string>): boolean {
   if (
     !isRecord(rest) ||
     !isHttpMethod(rest.method) ||
     typeof rest.path !== 'string' ||
     !isOriginRelativePath(rest.path) ||
+    reservedRestPaths.has(normalizePath(rest.path)) ||
     (rest.operationId !== undefined && typeof rest.operationId !== 'string') ||
     (rest.status !== undefined &&
       (typeof rest.status !== 'number' || !Number.isInteger(rest.status) || rest.status < 200 || rest.status > 299))
@@ -329,6 +346,10 @@ function isHttpMethod(value: unknown): value is ServiceHttpMethod {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function normalizedReservedRestPaths(paths: string[] | undefined): string[] {
+  return [...new Set((paths ?? []).map(normalizePath))].sort();
 }
 
 /**

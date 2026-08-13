@@ -73,7 +73,7 @@ describe('ability service discovery', () => {
                 required: ['results'],
                 type: 'object',
               },
-              rest: { method: 'get', operationId: 'example.search.search', path: '/examples/search' },
+              rest: { method: 'get', operationId: 'example.example.search.search', path: '/examples/search' },
               scopes: ['example.search'],
             },
           },
@@ -119,6 +119,22 @@ describe('ability service discovery', () => {
     // Uppercase input normalizes like the other verbs do.
     expect(withMethod('QUERY').abilities[0]?.methods.search?.rest?.method).toBe('query');
     expect(() => withMethod('propfind')).toThrow('Unknown Service-Plane REST method: propfind');
+  });
+
+  it('qualifies synthesized REST operation ids by service', () => {
+    const operationIdFor = (serviceId: string) => {
+      const service = defineAbilityService({
+        abilities: [searchAbility],
+        capabilities: defineCapabilities({ scopes: [{ id: 'example.search' }], serviceId }),
+        id: serviceId,
+        title: serviceId,
+        version: '0.1.0',
+      });
+      return serviceDiscoveryDocument(service).abilities[0]?.methods.search?.rest?.operationId;
+    };
+
+    expect(operationIdFor('alpha')).toBe('alpha.example.search.search');
+    expect(operationIdFor('beta')).toBe('beta.example.search.search');
   });
 
   it('validates REST path templates and explicit success statuses', () => {
