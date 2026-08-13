@@ -94,7 +94,7 @@ describe('capability issuer', () => {
       callerAccess: 'plane',
       callerServiceId: 'control-plane',
       scopes: ['fizzy.users.lookup'],
-      subject: { id: 'user-7', orgId: 'org-42' },
+      subject: { id: 'key-123', kind: 'api-key', orgId: 'org-42' },
       targetServiceId: 'fizzy',
     });
 
@@ -105,7 +105,11 @@ describe('capability issuer', () => {
         jwks: await issuer.jwks(),
         now: new Date('2026-05-09T12:00:01.000Z'),
       }),
-    ).resolves.toMatchObject({ callerAccess: 'plane', serviceId: 'control-plane', subject: { id: 'user-7', orgId: 'org-42' } });
+    ).resolves.toMatchObject({
+      callerAccess: 'plane',
+      serviceId: 'control-plane',
+      subject: { id: 'key-123', kind: 'api-key', orgId: 'org-42' },
+    });
 
     await expect(
       issuer.issueCapabilityToken({
@@ -113,6 +117,16 @@ describe('capability issuer', () => {
         callerServiceId: 'control-plane',
         scopes: ['fizzy.users.lookup'],
         subject: { id: '  ' },
+        targetServiceId: 'fizzy',
+      }),
+    ).rejects.toThrow('Invalid Service-Plane capability subject');
+
+    await expect(
+      issuer.issueCapabilityToken({
+        callerAccess: 'plane',
+        callerServiceId: 'control-plane',
+        scopes: ['fizzy.users.lookup'],
+        subject: { id: 'user-7', kind: 'x'.repeat(513) },
         targetServiceId: 'fizzy',
       }),
     ).rejects.toThrow('Invalid Service-Plane capability subject');

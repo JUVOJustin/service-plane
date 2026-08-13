@@ -29,18 +29,27 @@ export type BrokerCaller = {
   id: string;
   kind: 'service' | 'user';
   orgId?: string;
+  /**
+   * Application-owned category for a plane-class principal, signed into delegated tokens without
+   * changing the caller's `plane` access classification.
+   */
+  principalKind?: string;
 };
 
 /**
- * User callers become the RFC 8693 delegated subject (`sub` = user, `act` = brokering service) so
- * target services see verified end-user attribution; service callers already ride in `sub` alone.
- * A blank orgId from the resolver is dropped rather than failing the call; a blank id still fails
- * closed, but here at the boundary with a clear error instead of deep inside token minting.
+ * Plane-class callers become an RFC 8693 delegated subject (`sub` = principal, `act` = brokering
+ * service) so target services see verified principal attribution; service callers already ride in
+ * `sub` alone. A blank orgId from the resolver is dropped rather than failing the call; a blank id
+ * or principal kind fails closed here instead of deep inside token minting.
  */
 export function brokerCallerSubject(caller: BrokerCaller | undefined): CapabilitySubject | undefined {
   if (caller?.kind !== 'user') return undefined;
   const orgId = caller.orgId?.trim();
-  return normalizeCapabilitySubject({ id: caller.id, ...(orgId ? { orgId } : {}) });
+  return normalizeCapabilitySubject({
+    id: caller.id,
+    ...(orgId ? { orgId } : {}),
+    ...(caller.principalKind === undefined ? {} : { kind: caller.principalKind }),
+  });
 }
 
 /**
@@ -81,9 +90,16 @@ export function brokerCallerLogFields(caller: BrokerCaller | undefined): {
   callerId?: string;
   callerKind?: BrokerCaller['kind'];
   callerOrgId?: string;
+  callerPrincipalKind?: string;
 } {
   if (!caller) return {};
-  return { callerId: caller.id, callerKind: caller.kind, ...(caller.orgId ? { callerOrgId: caller.orgId } : {}) };
+  const principalKind = caller.kind === 'user' ? caller.principalKind?.trim() : undefined;
+  return {
+    callerId: caller.id,
+    callerKind: caller.kind,
+    ...(caller.orgId ? { callerOrgId: caller.orgId } : {}),
+    ...(principalKind ? { callerPrincipalKind: principalKind } : {}),
+  };
 }
 
 export type CreateControlPlaneRpcBrokerOptions = {

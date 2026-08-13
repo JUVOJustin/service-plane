@@ -265,6 +265,7 @@ function issueCapabilityToken(options: {
       scp: requestedScopes,
       spa: normalizeCallerAccess(options.input.callerAccess),
       ...(options.brokerServiceId ? { spb: options.brokerServiceId } : {}),
+      ...(subject?.kind ? { spk: subject.kind } : {}),
       ...(subject?.orgId ? { spo: subject.orgId } : {}),
       sub: subject ? subject.id : options.input.callerServiceId,
     },

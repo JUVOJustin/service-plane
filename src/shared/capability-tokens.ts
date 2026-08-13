@@ -45,6 +45,9 @@ export async function signCapabilityToken(options: SignCapabilityTokenOptions): 
   if (options.claims.spo !== undefined && options.claims.act === undefined) {
     throw new CapabilityAuthError('Service-Plane capability spo claim requires an act claim', 500);
   }
+  if (options.claims.spk !== undefined && options.claims.act === undefined) {
+    throw new CapabilityAuthError('Service-Plane capability spk claim requires an act claim', 500);
+  }
   const now = options.now ?? new Date();
   const issuedAt = Math.floor(now.getTime() / 1000);
   const ttlSeconds = normalizeTtlSeconds(options.ttlSeconds ?? DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS);
@@ -110,10 +113,10 @@ export async function verifyCapabilityToken(token: string, options: VerifyCapabi
     });
   }
 
-  // RFC 8693 delegation: with an act claim, sub is the end-user subject and act.sub is the acting
+  // RFC 8693 delegation: with an act claim, sub is the delegated principal and act.sub is the acting
   // service; without one, sub is the calling service itself.
   const { serviceId, subject } = claims.act
-    ? { serviceId: claims.act.sub, subject: toCapabilitySubject(claims.sub, claims.spo) }
+    ? { serviceId: claims.act.sub, subject: toCapabilitySubject(claims.sub, claims.spo, claims.spk) }
     : { serviceId: claims.sub, subject: undefined };
   return {
     audience: claims.aud,
@@ -134,16 +137,22 @@ export async function verifyCapabilityToken(token: string, options: VerifyCapabi
 }
 
 export function normalizeCapabilitySubject(subject: CapabilitySubject): CapabilitySubject {
-  const id = subject.id.trim();
-  const orgId = subject.orgId?.trim();
-  if (!isBoundedClaimString(id) || (orgId !== undefined && !isBoundedClaimString(orgId))) {
+  const id = typeof subject.id === 'string' ? subject.id.trim() : undefined;
+  const kind = typeof subject.kind === 'string' ? subject.kind.trim() : subject.kind;
+  const orgId = typeof subject.orgId === 'string' ? subject.orgId.trim() : subject.orgId;
+  if (
+    id === undefined ||
+    !isBoundedClaimString(id) ||
+    !(kind === undefined || (typeof kind === 'string' && isBoundedClaimString(kind))) ||
+    !(orgId === undefined || (typeof orgId === 'string' && isBoundedClaimString(orgId)))
+  ) {
     throw new CapabilityAuthError('Invalid Service-Plane capability subject', 400);
   }
-  return toCapabilitySubject(id, orgId);
+  return toCapabilitySubject(id, orgId, kind);
 }
 
-function toCapabilitySubject(id: string, orgId: string | undefined): CapabilitySubject {
-  return { id, ...(orgId ? { orgId } : {}) };
+function toCapabilitySubject(id: string, orgId: string | undefined, kind?: string): CapabilitySubject {
+  return { id, ...(kind ? { kind } : {}), ...(orgId ? { orgId } : {}) };
 }
 
 export function servicePlaneAuthorization(token: string): string {
@@ -175,7 +184,7 @@ function decodeCapabilityToken(token: string): { header: unknown; payload: unkno
 
 function parseCapabilityClaims(value: unknown): CapabilityClaims {
   if (!isRecord(value)) throw new CapabilityAuthError('Invalid Service-Plane capability claims');
-  const { act, aud, cnf, exp, iat, iss, jti, nbf, scp, spa, spb, spo, sub } = value;
+  const { act, aud, cnf, exp, iat, iss, jti, nbf, scp, spa, spb, spk, spo, sub } = value;
   if (
     typeof aud !== 'string' ||
     typeof exp !== 'number' ||
@@ -188,6 +197,7 @@ function parseCapabilityClaims(value: unknown): CapabilityClaims {
     // token as plane-class and make a service caller's own call fail, which looks like a grant bug.
     !(spa === undefined || isAbilityAccess(spa)) ||
     !(spb === undefined || typeof spb === 'string') ||
+    !(spk === undefined || typeof spk === 'string') ||
     !Array.isArray(scp) ||
     scp.length === 0 ||
     !scp.every((scope) => typeof scope === 'string')
@@ -200,16 +210,21 @@ function parseCapabilityClaims(value: unknown): CapabilityClaims {
     !isBoundedClaimString(jti) ||
     !isBoundedClaimString(sub) ||
     !(spb === undefined || isBoundedClaimString(spb)) ||
+    !(spk === undefined || isBoundedClaimString(spk)) ||
     scp.length > MAX_CAPABILITY_SCOPE_COUNT ||
     !scp.every(isBoundedClaimString)
   ) {
     throw new CapabilityAuthError('Invalid Service-Plane capability claims');
   }
   const actor = parseActorClaim(act);
-  // A subject-org claim is only meaningful on delegated tokens; reject it without an act claim
-  // so a plain service token cannot smuggle tenant context.
-  if (spo !== undefined) {
-    if (actor === undefined || typeof spo !== 'string' || !isBoundedClaimString(spo)) {
+  // Subject metadata is only meaningful on delegated tokens; reject it without an act claim so a
+  // plain service token cannot smuggle principal attribution.
+  if (spo !== undefined || spk !== undefined) {
+    if (
+      actor === undefined ||
+      !(spo === undefined || (typeof spo === 'string' && isBoundedClaimString(spo))) ||
+      !(spk === undefined || (typeof spk === 'string' && isBoundedClaimString(spk)))
+    ) {
       throw new CapabilityAuthError('Invalid Service-Plane capability claims');
     }
   }
@@ -226,6 +241,7 @@ function parseCapabilityClaims(value: unknown): CapabilityClaims {
     scp,
     ...(spa ? { spa } : {}),
     ...(spb ? { spb } : {}),
+    ...(spk ? { spk } : {}),
     ...(spo ? { spo } : {}),
     sub,
   };

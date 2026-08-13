@@ -38,6 +38,8 @@ export type ServicePlaneBrokerLogEvent = {
   callerId?: string;
   callerKind?: 'service' | 'user';
   callerOrgId?: string;
+  /** Application-owned category of a plane-class principal; never an access classification. */
+  callerPrincipalKind?: string;
   durationMs?: number;
   error?: {
     message: string;

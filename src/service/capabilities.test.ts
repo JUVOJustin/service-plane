@@ -186,6 +186,21 @@ describe('Cap’n Web service capabilities', () => {
     expect(
       capabilityTokenCacheKey({ callerServiceId: 'moco', scopes: ['a'], subject: { id: 'user-7' }, targetServiceId: 'example' }),
     ).not.toBe(capabilityTokenCacheKey({ callerServiceId: 'moco', scopes: ['a'], subject: { id: 'user-8' }, targetServiceId: 'example' }));
+    expect(
+      capabilityTokenCacheKey({
+        callerServiceId: 'moco',
+        scopes: ['a'],
+        subject: { id: 'principal-7', kind: 'api-key', orgId: 'org-42' },
+        targetServiceId: 'example',
+      }),
+    ).not.toBe(
+      capabilityTokenCacheKey({
+        callerServiceId: 'moco',
+        scopes: ['a'],
+        subject: { id: 'principal-7', kind: 'automation', orgId: 'org-42' },
+        targetServiceId: 'example',
+      }),
+    );
 
     const cache = memoryCapabilityTokenCache(() => new Date('2026-05-09T12:00:00.000Z').getTime());
     let issuedCount = 0;
@@ -230,6 +245,29 @@ describe('Cap’n Web service capabilities', () => {
     await expect(providerFor('user-7').token()).resolves.toBe('token-user-7-1');
     await expect(providerFor('user-8').token()).resolves.toBe('token-user-8-2');
     await expect(providerFor('user-7').token()).resolves.toBe('token-user-7-1');
+    expect(issuedCount).toBe(2);
+  });
+
+  it('partitions caller-supplied cache keys by delegated principal kind', async () => {
+    const cache = memoryCapabilityTokenCache(() => new Date('2026-05-09T12:00:00.000Z').getTime());
+    let issuedCount = 0;
+    const providerFor = (kind: string) =>
+      createCapabilityTokenProvider({
+        cache,
+        cacheKey: 'shared-principal',
+        callerServiceId: 'control-plane',
+        now: () => new Date('2026-05-09T12:00:00.000Z'),
+        requestToken: async () => {
+          issuedCount += 1;
+          return { expiresAt: new Date('2026-05-09T12:05:00.000Z'), token: `token-${kind}` };
+        },
+        scopes: ['example.users.lookup'],
+        subject: { id: 'principal-7', kind, orgId: 'org-42' },
+        targetServiceId: 'example',
+      });
+
+    await expect(providerFor('api-key').token()).resolves.toBe('token-api-key');
+    await expect(providerFor('automation').token()).resolves.toBe('token-automation');
     expect(issuedCount).toBe(2);
   });
 

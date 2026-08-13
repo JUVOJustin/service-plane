@@ -366,7 +366,7 @@ export function createCapabilityTokenProvider(options: CreateCapabilityTokenProv
   // proof-capable provider must never reuse an entry written by an unbound one.
   const cacheKey = options.cacheKey
     ? subject
-      ? `${options.cacheKey}${senderConstrained ? ':cnf' : ''}:subject:${encodeURIComponent(JSON.stringify({ id: subject.id, orgId: subject.orgId ?? null }))}`
+      ? `${options.cacheKey}${senderConstrained ? ':cnf' : ''}:subject:${encodeURIComponent(JSON.stringify(capabilitySubjectCacheIdentity(subject)))}`
       : `${options.cacheKey}${senderConstrained ? ':cnf' : ''}`
     : capabilityTokenCacheKey({
         ...(options.abilityId ? { abilityId: normalizeValue(options.abilityId, 'ability id') } : {}),
@@ -434,11 +434,15 @@ export function capabilityTokenCacheKey(input: {
     ...(input.senderConstrained ? { senderConstrained: true } : {}),
     // Included conditionally so subject-less keys stay byte-identical with earlier releases; tokens
     // delegated to a subject must never be shared across subjects through the token cache.
-    ...(input.subject ? { subject: { id: input.subject.id, orgId: input.subject.orgId ?? null } } : {}),
+    ...(input.subject ? { subject: capabilitySubjectCacheIdentity(input.subject) } : {}),
     targetServiceId: input.targetServiceId,
     ttlSeconds: input.ttlSeconds ?? null,
   };
   return `service-plane:capability-token:${encodeURIComponent(JSON.stringify(parts))}`;
+}
+
+function capabilitySubjectCacheIdentity(subject: CapabilitySubject): { id: string; kind?: string; orgId: string | null } {
+  return { id: subject.id, ...(subject.kind ? { kind: subject.kind } : {}), orgId: subject.orgId ?? null };
 }
 
 /**

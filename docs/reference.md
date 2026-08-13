@@ -177,7 +177,7 @@ The plane can open a typed, disposable ability session for trusted code running 
 ```ts
 type ControlPlaneAbilitySessionOptions = {
   abilityId: string;
-  caller?: { id: string; kind: 'service' | 'user'; orgId?: string };
+  caller?: { id: string; kind: 'service' | 'user'; orgId?: string; principalKind?: string };
   connInfo?: ConnInfo;
   idempotencyKey?: string;
   requestId?: string;
@@ -275,7 +275,7 @@ Token requesters:
 
 Capability tokens are ES256 JWS tokens with a closed claim set. Unknown claims are dropped at verification.
 
-Tokens come in two shapes, and `sub` always answers the same question: who is this token about. A plain service-to-service token is about the calling service. A delegated token uses RFC 8693's `act` actor-claim semantics: it is about the end user, while the calling service moves into `act.sub`. The presence of `act` is what switches the interpretation, and the verifier resolves it for you: `identity.serviceId` is always the calling service, and `identity.subject` is set only when a user is delegated.
+Tokens come in two shapes, and `sub` always answers the same question: who is this token about. A plain service-to-service token is about the calling service. A delegated token uses RFC 8693's `act` actor-claim semantics: it is about the plane-class principal, while the calling service moves into `act.sub`. The presence of `act` is what switches the interpretation, and the verifier resolves it for you: `identity.serviceId` is always the calling service, and `identity.subject` is set only when a principal is delegated.
 
 Plain service token:
 
@@ -285,18 +285,19 @@ Plain service token:
 
 → `identity.serviceId = 'workflow-runner'`, no `identity.subject`.
 
-Delegated (user-brokered) token:
+Delegated (plane-principal) token:
 
 ```json
-{ "iss": "control-plane", "sub": "user-7", "act": { "sub": "control-plane" }, "spo": "org-42", "aud": "asana", "scp": ["asana.tasks.write"], "spa": "plane" }
+{ "iss": "control-plane", "sub": "key-123", "act": { "sub": "control-plane" }, "spk": "api-key", "spo": "org-42", "aud": "asana", "scp": ["asana.tasks.write"], "spa": "plane" }
 ```
 
-→ `identity.serviceId = 'control-plane'` (from `act.sub`), `identity.subject = { id: 'user-7', orgId: 'org-42' }`.
+→ `identity.serviceId = 'control-plane'` (from `act.sub`), `identity.subject = { id: 'key-123', kind: 'api-key', orgId: 'org-42' }`.
 
 | Claim | Plain service token | Delegated token (`act` present) |
 | --- | --- | --- |
-| `sub` | calling service → `identity.serviceId` | end user → `identity.subject.id` |
+| `sub` | calling service → `identity.serviceId` | delegated principal → `identity.subject.id` |
 | `act` | absent | acting service, `{ sub }` → `identity.serviceId` |
+| `spk` | rejected at verification | optional principal kind → `identity.subject.kind` |
 | `spo` | rejected at verification | subject's org → `identity.subject.orgId` |
 | `iss` | control-plane issuer → `identity.issuer` | same |
 | `aud` | target service id → `identity.audience` | same |
@@ -307,13 +308,13 @@ Delegated (user-brokered) token:
 | `jti` | token id → `identity.tokenId` | same |
 | `exp` | expiry → `identity.expiresAt`; `iat`/`nbf` are also enforced | same |
 
-The `act` delegation relationship comes from RFC 8693 and `cnf` from RFC 7800 (with the `jkt` confirmation method registered by RFC 9449). `scp`, `spa`, `spo`, and `spb` are Service Plane-specific claims, and `/.well-known/service-plane/capability-token` is the package's JSON capability endpoint, not an RFC 8693 token-exchange endpoint.
+The `act` delegation relationship comes from RFC 8693 and `cnf` from RFC 7800 (with the `jkt` confirmation method registered by RFC 9449). `scp`, `spa`, `spk`, `spo`, and `spb` are Service Plane-specific claims, and `/.well-known/service-plane/capability-token` is the package's JSON capability endpoint, not an RFC 8693 token-exchange endpoint. `spk` is an optional application-owned string; its absence preserves the legacy user-subject shape, and it never influences `spa` or service access.
 
 `spa` is the access class the control plane authenticated for the caller. It is `service` for a caller the plane proved to be another service — the capability-token endpoint, `issueCapabilityTokenForCaller`, and a broker or MCP caller resolver returning `kind: 'service'` — and `plane` for every caller the plane fronts itself: users, API keys, anonymous traffic. Services compare it against the ability's own `access` and reject a mismatch with 403 before the handler is created. A token carrying no `spa` reads as `plane`, so a control plane that predates the claim can only reach `access: 'plane'` abilities.
 
 That default dictates the rollout order: **upgrade the control plane before any service declares `access: 'service'`.** A service on this version behind an older plane refuses every caller of its service-only abilities — legitimate service callers included — until the plane mints the claim. The reverse mix is the transitional gap, not a hole in the new guarantee: a *service* still on an older package version never checks `spa`, so for that service tightening `access` keeps depending on the plane's catalog refresh until the service upgrades.
 
-Delegated subjects are minted only by control-plane code — `ServicePlaneControlPlane.abilitySession()`, the broker/MCP caller resolver (a `BrokerCaller` with `kind: 'user'` and optional `orgId`), or a low-level direct `issueCapabilityToken({ subject, ... })` call. The capability-token endpoint and `issueCapabilityTokenForCaller` reject caller-supplied subjects with 403, and the shipped token requesters fail fast locally instead of transmitting one. Direct issue mints a non-brokered token; `abilitySession()` and the broker select `issueBrokeredCapabilityToken` automatically for ingress-required targets. See [auth](auth.md#subject-delegation).
+Delegated subjects are minted only by control-plane code — `ServicePlaneControlPlane.abilitySession()`, the broker/MCP caller resolver (a `BrokerCaller` with `kind: 'user'` and optional `orgId` / `principalKind`), or a low-level direct `issueCapabilityToken({ subject, ... })` call. The capability-token endpoint and `issueCapabilityTokenForCaller` reject caller-supplied subjects with 403, and the shipped token requesters fail fast locally instead of transmitting one. Direct issue mints a non-brokered token; `abilitySession()` and the broker select `issueBrokeredCapabilityToken` automatically for ingress-required targets. See [auth](auth.md#subject-delegation).
 
 ## Logging And Request Correlation
 
@@ -523,7 +524,7 @@ Use separate caches for:
 - control-plane JWKS fetched by services
 - caller capability tokens
 
-Token cache keys include caller id, target service id, ability id, normalized scopes, optional TTL, and the delegated subject when present — a token minted for one end user is never served for another.
+Token cache keys include caller id, target service id, ability id, normalized scopes, optional TTL, and the complete delegated subject when present — including principal kind — so tokens cannot collide across principals or principal categories.
 
 ## Errors
 
