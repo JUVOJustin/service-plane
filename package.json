@@ -73,7 +73,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.7",
-    "@cloudflare/vitest-pool-workers": "^0.20.2",
+    "@cloudflare/vitest-pool-workers": "^0.20.3",
     "@types/node": "^26.1.2",
     "@vitest/coverage-v8": "^4.1.10",
     "esbuild": "^0.28.1",
@@ -88,6 +88,6 @@
   "dependencies": {
     "@hono/capnweb": "^0.1.0",
     "@standard-schema/spec": "^1.1.0",
-    "capnweb": "^0.10.0"
+    "capnweb": "^0.11.1"
   }
 }

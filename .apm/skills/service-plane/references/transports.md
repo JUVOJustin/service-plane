@@ -16,7 +16,7 @@ Service Plane offers four transports. They are interchangeable at the ability le
 Apply in order; the first match wins.
 
 1. **Same Cloudflare account → native binding RPC. Always.** No public egress, streams work natively, and billing is favorable: requests through service bindings [do not incur additional request fees](https://developers.cloudflare.com/workers/platform/pricing/) — CPU time is billed once across the chain. This holds for streaming too.
-2. **Request/response between services → HTTP-batch. The default.** Stateless, retryable, observable, no connection lifecycle to manage, and promise pipelining resolves chained calls in one round trip. The price: the capability token is verified on every call (~100 µs of ES256; on Node currently plus a ~1 ms scheduling floor tracked in [#12](https://github.com/JUVOJustin/service-plane/issues/12)).
+2. **Request/response between services → HTTP-batch. The default.** Stateless, retryable, observable, no connection lifecycle to manage, and promise pipelining resolves chained calls in one round trip. The price: the capability token is verified on every call (~100 µs of ES256). Cap'n Web 0.11 removed Node and Bun's former ~1 ms batch-scheduling floor.
 3. **Chatty pair or streaming → WebSocket, but only if *both* ends can hold the socket.** A session authenticates once, then calls cost ~10 µs; streams require a session transport anyway. Which brings us to the question that decides most real cases:
 
 ### Can this end hold a socket?
@@ -37,7 +37,7 @@ If either end answers "no", use HTTP-batch (or restructure so a Durable Object o
 | CF worker → CF worker, same account — any shape, including streaming | `cloudflareNativeRpc` | Rule 1: free through bindings, streams natively, no public surface |
 | CF worker → CF worker, **different account**, request/response | `httpBatchRpc` over the public URL | No bindings across accounts; neither stateless worker can hold a socket, so per-request WebSocket = handshake + teardown every call. Both accounts bill their own requests either way |
 | CF worker → CF worker, different account, **streaming** | WebSocket, with a **Durable Object as the caller** holding the session | Someone must own the socket; only a DO can — and it bills duration for the whole connection (no hibernation for Cap'n Web sessions, [capnweb#36](https://github.com/cloudflare/capnweb/issues/36)). If the traffic doesn't justify that, reconsider: same-account placement (rule 1), or request/response with batched results |
-| Node service ↔ Node service, both long-running, frequent calls or streaming | `websocketRpc` | Sockets are free on Node; auth amortizes to once per session (~10 µs/call vs ~1.9 ms/call batch on Node today) |
+| Node service ↔ Node service, both long-running, frequent calls or streaming | `websocketRpc` | Sockets are free on Node; auth amortizes to once per session (~10 µs/call) instead of verifying a token for every batch |
 | Node ↔ Node, occasional calls (webhooks, cron fan-out) | `httpBatchRpc` | Reconnect/heartbeat upkeep isn't worth it below a few calls per second |
 | Many stateless CF workers → one Node service | `httpBatchRpc` | The callers can't hold sockets, so a WebSocket server on the Node side gains nothing |
 | Browser or AI session → control plane broker (interactive, streaming tools) | WebSocket to `/rpc/broker` | Long-lived by nature. On Cloudflare, serving the socket from a plain Worker costs no duration (only CPU per message); a Durable Object adds cross-connection coordination but bills duration for the whole connection — Cap'n Web can't hibernate ([capnweb#36](https://github.com/cloudflare/capnweb/issues/36)) — so keep sessions purposeful and close them when idle. Stock AI clients use the MCP endpoint instead |
@@ -57,7 +57,7 @@ Doc-backed facts that drive the rules above (see [Workers pricing](https://devel
 From `npm run bench` (in-memory, network excluded — see [Streaming](streaming.md#high-frequency-streams) for the streaming numbers):
 
 - Persistent session: **~10 µs per call** after the one-time authenticate; within ~25% of a raw Cap'n Web session.
-- HTTP-batch: **per-call token verify (~100 µs)** plus batch framing; on Node currently a ~1 ms scheduling floor on top ([#12](https://github.com/JUVOJustin/service-plane/issues/12)) — one more reason chatty Node pairs should hold a session.
+- HTTP-batch: **per-call token verify (~100 µs)** plus batch framing. Cap'n Web 0.11 uses `setImmediate` on Node and Bun, removing the former ~1 ms timer floor; Service Plane mirrors that scheduler for service-binding batches.
 - Native binding: no serialization at all in-process; on Cloudflare it is also the only transport with zero public egress.
 - A reused brokered session (plane in the data path) benchmarks ~2× *faster* than a hand-rolled two-hop Hono chain with bearer middleware — connection reuse pays for the real crypto.
 

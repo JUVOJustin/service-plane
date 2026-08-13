@@ -20,10 +20,10 @@ import { signCapabilityProof } from '../shared/proof-of-possession.js';
 
 // The portability smoke: one self-contained pass over the paths whose behavior differs by runtime,
 // written against web-standard globals only so the same bundle runs on Node, workerd, Deno, and Bun.
-// It exercises what the CI matrix exists to prove — the HTTP-batch flush (`nextMacrotask` falls back
-// to setTimeout(0) where setImmediate is missing: workerd, Deno), the WebCrypto verify path with its
-// cached key import, streaming over a session transport, and sender-constrained proofs. Kept out of
-// the published build; see tsconfig.json's exclude and scripts/smoke.mjs.
+// It exercises what the CI matrix exists to prove — the HTTP-batch flush (setImmediate on Node/Bun,
+// setTimeout(0) on workerd/Deno), the WebCrypto verify path with its cached key import, streaming
+// over a session transport, and sender-constrained proofs. Kept out of the published build; see
+// tsconfig.json's exclude and scripts/smoke.mjs.
 
 type SmokeApi = {
   chunks(input: { count: number }): Promise<ReadableStream<{ index: number }>>;

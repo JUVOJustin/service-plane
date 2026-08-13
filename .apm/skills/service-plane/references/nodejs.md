@@ -120,9 +120,9 @@ httpsService({
 ```
 
 This keeps WebSocket construction runtime-owned and does not require application code to install a
-persistent global. With Cap'n Web 0.10, Service Plane temporarily supplies
-`WebSocket.CONNECTING` only during synchronous session construction and restores the previous
-global immediately.
+persistent global. Cap'n Web still reads `WebSocket.CONNECTING` from the runtime global when a
+socket instance is supplied, so Service Plane temporarily supplies that constant only during
+synchronous session construction and restores the previous global immediately.
 
 For normal request/response calls, prefer HTTP-batch. It is easier to deploy, cache, observe, and retry. Streaming ability methods require a session transport; wire `upgradeWebSocket` from `@hono/node-ws` into the service shell as shown in [Streaming](streaming.md#serve-websocket-sessions). On long-running Node processes WebSockets are essentially free, so chatty service pairs should hold a session — the full decision guide is [Choosing A Transport](transports.md).
 
