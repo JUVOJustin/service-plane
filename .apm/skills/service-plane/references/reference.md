@@ -105,6 +105,8 @@ type ServiceDiscoveryDocument = {
 
 Ability discovery includes exposure, access, scopes, RPC path, transports, method names, method scopes, JSON Schemas, optional REST metadata, and optional MCP metadata. Streaming methods carry `stream: true`, with their `outputSchema` describing one streamed item.
 
+The control-plane registry accepts a discovery document only when its `id`, and its optional `capabilities.serviceId`, match the configured endpoint `id`. The endpoint configuration is the identity authority; a service cannot publish metadata for another configured service.
+
 ## Service
 
 ```ts

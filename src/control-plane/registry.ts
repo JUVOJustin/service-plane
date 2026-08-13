@@ -93,7 +93,7 @@ export function createServiceRegistry(options: CreateServiceRegistryOptions): Se
 export function serviceRegistryCacheKey(services: ServiceEndpoint[], discoveryPath = SERVICE_DISCOVERY_PATH): string {
   return JSON.stringify({
     discoveryPath,
-    namespace: 'service-plane:registry',
+    namespace: 'service-plane:registry:v2',
     services: services
       .map((service) => ({
         id: service.id,
@@ -159,7 +159,7 @@ async function discoverServices(
       try {
         if (endpoint.discovery) {
           const discovery = typeof endpoint.discovery === 'function' ? await endpoint.discovery() : endpoint.discovery;
-          return isServiceDiscoveryDocument(discovery) ? { document: discovery, endpointId: endpoint.id } : undefined;
+          return isDiscoveryForEndpoint(discovery, endpoint) ? { document: discovery, endpointId: endpoint.id } : undefined;
         }
 
         const request = serviceDiscoveryRequest(endpoint, discoveryPath);
@@ -174,7 +174,7 @@ async function discoverServices(
         if (!response.ok) return undefined;
 
         const value = await response.json();
-        if (!isServiceDiscoveryDocument(value)) return undefined;
+        if (!isDiscoveryForEndpoint(value, endpoint)) return undefined;
         const etag = response.headers.get('etag') ?? undefined;
         return { document: value, endpointId: endpoint.id, ...(etag ? { etag } : {}) };
       } catch {
@@ -192,6 +192,16 @@ async function discoverServices(
     }, {}),
     services: documents.map((entry) => entry.document),
   };
+}
+
+// The configured endpoint is the plane's identity authority; discovery may describe that service,
+// but it cannot redirect metadata or capability scopes onto another configured endpoint.
+function isDiscoveryForEndpoint(value: unknown, endpoint: ServiceEndpoint): value is ServiceDiscoveryDocument {
+  return (
+    isServiceDiscoveryDocument(value) &&
+    value.id === endpoint.id &&
+    (value.capabilities === undefined || value.capabilities.serviceId === endpoint.id)
+  );
 }
 
 function withAbilities(snapshot: ServiceDiscoverySnapshot, endpoints: ServiceEndpoint[]): ServiceRegistrySnapshot {
