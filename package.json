@@ -1,6 +1,6 @@
 {
   "name": "service-plane",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Ability-first Service Plane primitives for schema-backed Cap'n Web RPC, STS capability tokens, OpenAPI, and MCP projections.",
   "type": "module",
   "license": "MIT",
