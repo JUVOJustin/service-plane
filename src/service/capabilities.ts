@@ -442,10 +442,8 @@ export function capabilityTokenCacheKey(input: {
 }
 
 /**
- * The session proxy is deliberately NOT typed as a capnweb RpcStub: it is our own
- * promise-returning proxy at runtime, and capnweb's RpcCompatible machinery cannot represent
- * typed item streams (its types only bless ReadableStream<Uint8Array>), which would send the
- * compiler into unbounded recursion for abilities with streaming methods.
+ * The session proxy is deliberately not typed as a Cap'n Web `RpcStub`: it is a local
+ * promise-returning proxy that also owns token refresh, deadlines, and transport selection.
  */
 export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSessionOptions<Scoped>): Promise<AbilitySession<Scoped>> {
   const tokenProvider = options.tokenProvider ?? createCapabilityTokenProvider(options as CreateCapabilityTokenProviderOptions);
@@ -878,8 +876,8 @@ function defaultAuthenticate<Scoped>(root: AuthenticatedRoot<Scoped>, token: str
   return proof === undefined ? root.authenticate(token) : root.authenticate(token, proof);
 }
 
-// capnweb's generics are instantiated with an untyped root so RpcCompatible never sees the
-// caller's Scoped shape; the runtime stub is identical either way.
+// Keep the transport root independent of the consumer's ability shape. The returned stub is
+// wrapped behind AbilitySession, where Service Plane adds token, deadline, and disposal behavior.
 type UntypedAuthenticatedRoot = AuthenticatedRoot<Record<string, unknown>>;
 
 type ForwardedSessionMeta = {
@@ -933,9 +931,9 @@ function openWebSocketSession(endpoint: string | WebSocket, options: RpcSessionO
     return newWebSocketRpcSession<UntypedAuthenticatedRoot>(endpoint, undefined, options);
   }
 
-  // capnweb 0.10 reads the global WebSocket.CONNECTING even when given an instance. Node 20 can
-  // inject a standards-compatible client but has no default global, so provide that one constant
-  // only for the synchronous constructor call and restore the global immediately afterward.
+  // Cap'n Web reads the global WebSocket.CONNECTING even when given an instance. Node 20 can inject
+  // a standards-compatible client but has no default global, so provide that one constant only for
+  // the synchronous constructor call and restore the global immediately afterward.
   const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'WebSocket');
   try {
     Object.defineProperty(globalThis, 'WebSocket', { configurable: true, value: { CONNECTING: 0 } });
@@ -992,16 +990,21 @@ function missingAbilityId(): never {
   throw new CapabilityAuthError('Service-Plane abilityId is required for Cloudflare native RPC transport', 500);
 }
 
+// Matches Cap'n Web's batch scheduler: Node and Bun avoid their ~1 ms setTimeout(0) clamp, while
+// runtimes without setImmediate keep the portable timer fallback.
+const scheduleImmediate = (globalThis as { setImmediate?: (callback: () => void) => unknown }).setImmediate;
+const yieldToBatchMacrotask =
+  typeof scheduleImmediate === 'function'
+    ? () => new Promise<void>((resolve) => scheduleImmediate(resolve))
+    : () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
 function createFetchBatchTransport(fetcher: FetchLike, url: string, headers?: Record<string, string>): RpcTransport {
   let batchToSend: string[] | null = [];
   let batchToReceive: string[] | undefined;
   let aborted: unknown;
   const scheduled = (async () => {
-    // Waits for the caller's microtask cascade to drain before flushing, mirroring capnweb's
-    // stock batch client. Node clamps setTimeout(0) to ~1ms; accepted deliberately — see
-    // issue #12 and cloudflare/capnweb#219 before re-introducing a local workaround
-    // (reference implementation: commit 9278842).
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    // Wait for the caller's microtask cascade so same-tick promise-pipelined calls share a batch.
+    await yieldToBatchMacrotask();
     if (aborted !== undefined) throw aborted;
     const batch = batchToSend ?? [];
     batchToSend = null;

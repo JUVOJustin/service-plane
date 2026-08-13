@@ -213,7 +213,7 @@ Transports:
 - `websocketRpc(url, { createWebSocket? })` — the optional factory receives the final URL after
   `request_id` propagation, allowing Node runtimes without a global `WebSocket` to inject a
   standards-compatible client without requiring the application to install a persistent global;
-  the Cap'n Web 0.10 compatibility path uses a temporary synchronous shim that is restored
+  the compatibility path uses a temporary synchronous `WebSocket.CONNECTING` shim that is restored
   immediately.
 - `customRpcTransport(transport)`
 

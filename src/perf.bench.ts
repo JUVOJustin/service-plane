@@ -426,8 +426,7 @@ describe(`stream ${STREAM_ITEMS} LLM token deltas`, () => {
   bench(
     'raw capnweb stream over session (baseline)',
     async () => {
-      // Cast: raw capnweb's own types cannot express typed item streams (see PR notes).
-      await drain((await rawApi.streamTokens()) as unknown as ReadableStream<unknown>);
+      await drain(await rawApi.streamTokens());
     },
     STREAM_BENCH,
   );

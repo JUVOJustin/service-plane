@@ -300,8 +300,7 @@ describe('remote broker sessions', () => {
 
     const api = await (await root.ability('hub', 'hub.files')).connect(['hub.read']);
     await expect(api.stat({})).resolves.toEqual({ size: 3 });
-    // Cast: raw capnweb stub types cannot express typed item streams (see PR notes).
-    const stream = (await api.readFile({ parts: 3 })) as unknown as ReadableStream<{ chunk: string }>;
+    const stream = await api.readFile({ parts: 3 });
     await expect(drainStream(stream)).resolves.toEqual([{ chunk: 'part-0' }, { chunk: 'part-1' }, { chunk: 'part-2' }]);
   });
 });
