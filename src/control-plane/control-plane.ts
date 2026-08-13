@@ -3,6 +3,7 @@ import { Context, type Env, Hono } from 'hono';
 import { etag } from 'hono/etag';
 import { type RequestIdVariables, requestId } from 'hono/request-id';
 import type { UpgradeWebSocket } from 'hono/ws';
+import type { AbilitySession } from '../service/capabilities.js';
 import { type ConnInfo, normalizeConnInfo } from '../shared/conn-info.js';
 import { resolveTimeoutMs, type ServicePlaneTimeoutPolicy, timeoutMsFromRequest, validateTimeoutPolicy } from '../shared/deadline.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
@@ -70,6 +71,31 @@ export type BrokerCallerResolver<TEnv extends Env = Env> = (
  * application picks the right one: `connInfo: (c) => getConnInfo(c)`.
  */
 export type ConnInfoResolver<TEnv extends Env = Env> = (context: Context<TEnv>) => ConnInfo | undefined;
+
+/**
+ * Describes one trusted in-process ability session opened by the control plane.
+ */
+export type ControlPlaneAbilitySessionOptions = {
+  /** Ability id from the target service discovery document. */
+  abilityId: string;
+  /**
+   * Identity the plane has already authenticated. A user becomes the delegated subject; a service
+   * remains a service-class caller. Omit for a plane-owned call with no delegated subject.
+   */
+  caller?: BrokerCaller;
+  /** Advisory original-client connection info, surfaced only by ingress-protected services. */
+  connInfo?: ConnInfo;
+  /** Caller-owned key identifying one logical attempt across retries. */
+  idempotencyKey?: string;
+  /** Correlation id forwarded to the target service; a generated id is used when omitted. */
+  requestId?: string;
+  /** Scopes the returned session may exercise. */
+  scopes: string[];
+  /** Service that owns the ability. */
+  targetServiceId: string;
+  /** End-to-end budget in milliseconds, including discovery and token issuance. */
+  timeoutMs?: number;
+};
 
 type BrokeredRequest = {
   caller: BrokerCaller;
@@ -254,6 +280,41 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   }
 
   fetch: Hono<ServicePlaneControlPlaneEnv<TEnv>>['fetch'] = (request, env, executionCtx) => this.app.fetch(request, env, executionCtx);
+
+  /**
+   * Opens a trusted in-process ability session through the plane-owned broker path. The caller must
+   * already be authenticated by application code: passing a user here asserts subject delegation.
+   * External token surfaces remain unable to assert subjects.
+   */
+  async abilitySession<Scoped>(input: ControlPlaneAbilitySessionOptions, bindings: TEnv['Bindings']): Promise<AbilitySession<Scoped>> {
+    const receivedAt = Date.now();
+    const context = nativeControlPlaneContext<TEnv>(bindings);
+    const services = await this.options.services(context);
+    const cache = this.discoveryCaches.token;
+    const connInfo = normalizeConnInfo(input.connInfo);
+    const requestId = input.requestId?.trim() || brokerRequestId(context);
+    const log = this.log;
+    const broker = createControlPlaneRpcBroker({
+      ...(connInfo ? { connInfo } : {}),
+      controlPlaneServiceId: this.options.controlPlaneServiceId ?? 'control-plane',
+      ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+      issuer: await this.issuerFor(context, services),
+      ...(log ? { log: (event) => log(event, context) } : {}),
+      receivedAt,
+      registry: createServiceRegistry({
+        ...(cache ? { cache } : {}),
+        services,
+      }),
+      ...(requestId ? { requestId } : {}),
+      ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
+    });
+    return broker.abilitySession<Scoped>({
+      abilityId: input.abilityId,
+      ...(input.caller ? { caller: input.caller } : {}),
+      scopes: input.scopes,
+      targetServiceId: input.targetServiceId,
+    });
+  }
 
   async issueCapabilityTokenForCaller(
     callerServiceId: string,

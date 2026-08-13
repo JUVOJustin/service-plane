@@ -428,13 +428,49 @@ async createTask(input: CreateTaskInput) {
 }
 ```
 
+### Delegate an in-process plane call
+
+Use `ServicePlaneControlPlane.abilitySession()` when trusted control-plane code needs to call an
+ability on behalf of an already authenticated user without making a round trip through `/rpc/broker`:
+
+```ts
+import { disposeAbilitySession } from 'service-plane/service';
+
+const asana = await plane.abilitySession<AsanaTasksApi>(
+  {
+    abilityId: 'asana.tasks',
+    caller: { id: user.id, kind: 'user', orgId: user.orgId },
+    scopes: ['asana.tasks.write'],
+    targetServiceId: 'asana',
+  },
+  context.env,
+);
+
+try {
+  await asana.createTask({ name: 'Review delegated call' });
+} finally {
+  await disposeAbilitySession(asana);
+}
+```
+
+Authenticate the user before calling this method. There is deliberately no resolver on an
+in-process API: passing `kind: 'user'` is the trusted plane code asserting the delegated subject.
+The method resolves the configured catalog and grants, chooses the service transport, and uses the
+same token-selection path as the broker. A target advertising required ingress therefore receives a
+brokered token automatically; a target without required ingress receives a plain plane-class token.
+
+Passing `kind: 'service'` preserves the caller as a service-class identity with no delegated subject.
+Omitting `caller` creates a plane-class call under `controlPlaneServiceId`, also with no subject.
+The returned session is disposable in the same way as `abilitySession()` on the service-side caller
+API; use `using` when available or `disposeAbilitySession()` in `finally`.
+
 Boundaries to keep in mind:
 
 - The subject is delegation the control plane vouches for. It rides the same issuer/JWKS trust chain as every other claim, so services may rely on it for auditing and per-user decisions.
 - The subject does not replace scope or grant checks. Ability authorization stays with scopes, grants, and ingress. Tenancy authorization stays with the service that owns the data.
-- Only control-plane code asserts subjects: the broker caller resolver or direct `issueCapabilityToken({ subject, callerAccess: 'plane', ... })` calls. The HTTP token endpoint rejects caller-supplied `subject` fields, and the shipped token requesters (`controlPlaneHmacTokenRequester`, `controlPlaneJwkTokenRequester`, `controlPlaneRpcTokenRequester`) refuse to send one, so an authenticated service cannot claim it acts for an arbitrary user. The `subject` option on `createCapabilityTokenProvider` therefore only works with a `requestToken` that calls the issuer in-process.
+- Only control-plane code asserts subjects: `ServicePlaneControlPlane.abilitySession()`, the broker caller resolver, or a low-level direct `issueCapabilityToken({ subject, callerAccess: 'plane', ... })` call. The HTTP token endpoint rejects caller-supplied `subject` fields, and the shipped token requesters (`controlPlaneHmacTokenRequester`, `controlPlaneJwkTokenRequester`, `controlPlaneRpcTokenRequester`) refuse to send one, so an authenticated service cannot claim it acts for an arbitrary user.
 - A delegated subject is always plane-class. The issuer requires `callerAccess` on every direct mint and refuses `subject` together with `callerAccess: 'service'` — that pair would hand an end user the service-only reach that [`access: 'service'`](reference.md#capability-token-claims) exists to withhold.
-- Direct `issueCapabilityToken({ subject, ... })` mints a non-brokered token. For a target with `ingress` required, delegate through the broker instead — it selects `issueBrokeredCapabilityToken` automatically; a directly issued token is rejected by the ingress check.
+- Direct `issueCapabilityToken({ subject, ... })` mints a non-brokered token. Prefer `ServicePlaneControlPlane.abilitySession()` for an in-process call because it selects `issueBrokeredCapabilityToken` automatically when the target requires ingress; a directly issued token is rejected by that ingress check.
 - Tokens delegated to a subject are cached per subject. `capabilityTokenCacheKey` includes the subject, so a token minted for one user is never served for another.
 - The cache key does **not** include the caller's access class — that is decided by the requester, which the key never sees. Plane-side code that shares one `CapabilityTokenCache` between in-process requesters minting different classes for the same caller id, target, and scopes must give them distinct `cacheKey`s, or a cached `spa: 'service'` token can be served to a plane-class flow. The shipped requesters all mint service-class, so this only arises with hand-built requesters.
 
