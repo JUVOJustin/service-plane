@@ -102,6 +102,7 @@ export {
   brokerCallerAccess,
   brokerCallerSubject,
   type ControlPlaneRpcBroker,
+  type ControlPlaneRpcBrokerAbilityInput,
   type CreateControlPlaneRpcBrokerOptions,
   createControlPlaneRpcBroker,
   type RootCapabilityOptions,
@@ -144,6 +145,7 @@ export {
   mountCapabilityTokenEndpoint,
 } from './capabilities.js';
 export {
+  type ControlPlaneAbilitySessionOptions,
   type ControlPlaneRestOptions,
   type DiscoveryCacheRoute,
   ServicePlaneControlPlane,

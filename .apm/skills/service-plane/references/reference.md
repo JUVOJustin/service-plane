@@ -207,6 +207,35 @@ method, scopes, and path before invocation middleware runs; MCP enriches the sur
 dispatch; broker HTTP sessions expose the broker surface because later RPC calls can select multiple
 abilities.
 
+The plane can open a typed, disposable ability session for trusted code running in the same process:
+
+```ts
+type ControlPlaneAbilitySessionOptions = {
+  abilityId: string;
+  caller?: { id: string; kind: 'service' | 'user'; orgId?: string; principalKind?: string };
+  connInfo?: ConnInfo;
+  idempotencyKey?: string;
+  requestId?: string;
+  scopes: string[];
+  targetServiceId: string;
+  timeoutMs?: number;
+};
+
+const api = await plane.abilitySession<AsanaTasksApi>(options, bindings);
+```
+
+`caller: { kind: 'user', ... }` creates an RFC 8693 delegated subject and stamps
+`callerAccess: 'plane'`; `kind: 'service'` preserves the service id and stamps
+`callerAccess: 'service'`; omitting `caller`
+creates a plane-class call under `controlPlaneServiceId` without a subject. This is a trusted API,
+not an authentication boundary: application code must authenticate a user or service before passing
+that identity. The method reuses the plane catalog, grants, signing material, discovery cache,
+broker authorization, and transport selection. It automatically mints a brokered token for a target
+that advertises required ingress. `timeoutMs` includes catalog resolution and token issuance.
+
+The returned `AbilitySession<Scoped>` supports streaming and must be disposed with `using` or
+`disposeAbilitySession()`. Caller-facing capability-token endpoints still reject `subject`.
+
 `mcp.streamLimits` accepts `maxItems` and `maxBytes` for streaming tools (defaults: 10,000 items and 1 MiB). `maxBytes` independently caps serialized item aggregation and cumulative optional progress-notification bytes. Exhausting the item aggregation budget fails the tool call in-band; exhausting only the progress budget stops further notifications while the bounded final result continues.
 
 The MCP endpoint accepts protocol revisions `2025-11-25`, `2025-06-18`, and `2025-03-26`; missing
@@ -314,13 +343,7 @@ The `act` delegation relationship comes from RFC 8693 and `cnf` from RFC 7800 (w
 
 That default dictates the rollout order: **upgrade the control plane before any service declares `access: 'service'`.** A service on this version behind an older plane refuses every caller of its service-only abilities — legitimate service callers included — until the plane mints the claim. The reverse mix is the transitional gap, not a hole in the new guarantee: a *service* still on an older package version never checks `spa`, so for that service tightening `access` keeps depending on the plane's catalog refresh until the service upgrades.
 
-Delegated subjects are minted only by control-plane code — invocation middleware may set a
-`BrokerCaller` with `kind: 'user'` and optional `orgId` / `principalKind`, or code may call
-`issueCapabilityToken({ subject, ... })` directly. The capability-token endpoint and
-`issueCapabilityTokenForCaller` reject caller-supplied subjects with 403, and the shipped token
-requesters fail fast locally instead of transmitting one. Direct issue mints a non-brokered token,
-so ingress-required targets must be reached through the broker, which selects
-`issueBrokeredCapabilityToken` automatically. See [auth](auth.md#subject-delegation).
+Delegated subjects are minted only by control-plane code — `ServicePlaneControlPlane.abilitySession()`, invocation middleware setting a `BrokerCaller` with `kind: 'user'` and optional `orgId` / `principalKind`, or a low-level direct `issueCapabilityToken({ subject, ... })` call. The capability-token endpoint and `issueCapabilityTokenForCaller` reject caller-supplied subjects with 403, and the shipped token requesters fail fast locally instead of transmitting one. Direct issue mints a non-brokered token; `abilitySession()` and the broker select `issueBrokeredCapabilityToken` automatically for ingress-required targets. See [auth](auth.md#subject-delegation).
 
 ## Logging And Request Correlation
 
