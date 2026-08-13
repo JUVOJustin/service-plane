@@ -167,6 +167,11 @@ outage. The capability-token, broker, and MCP routes additionally need the autho
 
 `discoveryCache` caches the discovered service catalog for every route that needs it — token issuance, broker, MCP, and OpenAPI. It defaults to a process-local cache; pass a `RegistryCache` to share one across a fleet, `false` to resolve fresh every time, or an object keyed by `token` (issuance, broker and MCP), `openapi`, and `default` to give either path its own store. `openapi.cache` is separate and caches the generated document rather than the catalog behind it; set its TTL with `openapi.cacheTtlSeconds`.
 
+`services(context)` resolves runtime bindings and deployment configuration for one logical service
+catalog. Its endpoint set and discovery metadata must not vary by caller or organization. Services
+own organization-specific data scoping behind their stable ability definitions; applications that
+need genuinely different catalogs should use separate control-plane instances and discovery caches.
+
 `broker.caller` and `mcp.caller` use `BrokerCallerResolver`. The resolver may return a
 `BrokerCaller`, an application-owned `Response`, or `undefined`. A returned response passes through
 unchanged, which lets existing Hono auth middleware or the resolver emit the correct

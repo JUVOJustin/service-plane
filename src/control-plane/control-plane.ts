@@ -40,7 +40,7 @@ import {
   DEFAULT_OPENAPI_CACHE_TTL_SECONDS,
   generateControlPlaneOpenApi,
 } from './openapi.js';
-import { createServiceRegistry, memoryRegistryCache, serviceRegistryCacheKey } from './registry.js';
+import { createServiceRegistry, memoryRegistryCache } from './registry.js';
 import { type IssueCapabilityTokenForCallerInput, issueCapabilityTokenForCaller, type RpcIssuedCapabilityToken } from './rpc.js';
 import {
   type CapabilitySigningKey,
@@ -152,16 +152,6 @@ export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
    * here or per route, to resolve the catalog every time instead.
    */
   discoveryCache?: false | RegistryCache | ServicePlaneDiscoveryCaches;
-  /**
-   * Discriminates cache entries when one plane resolves different catalogs under the same service
-   * ids. `serviceRegistryCacheKey` covers ids and origins only, and `cloudflareServiceBinding`
-   * defaults the origin to `https://<id>.service-plane.internal`, so a plane handing each tenant its
-   * own binding under the id `asana` produces one key for all of them — and the first tenant's
-   * catalog is then served to the rest for the TTL. Return something that identifies the catalog
-   * (a tenant id) and it is folded into the key. Only needed for that shape; a plane whose service
-   * set is the same for every caller needs nothing here.
-   */
-  discoveryCacheKey?: (context: Context<TEnv>) => string | undefined;
   httpCache?: ServicePlaneHttpCacheOption;
   issuer?: string;
   log?: false | ServicePlaneLogSink;
@@ -177,6 +167,12 @@ export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
       };
   openapi?: false | ControlPlaneOpenApiOptions;
   requestId?: ServicePlaneRequestIdOptions;
+  /**
+   * Resolves the plane's service endpoints from the runtime context. The logical endpoint set and
+   * discovery catalog must be the same for every caller and organization; use the context to read
+   * bindings or deployment configuration, not to select a tenant-specific service catalog.
+   * Organization-specific data access belongs in each service behind its stable abilities.
+   */
   services: (context: Context<TEnv>) => ServiceEndpoint[] | Promise<ServiceEndpoint[]>;
   /**
    * `keys[0]` signs every new token; the rest are published in JWKS for verification only. Rotating
@@ -340,20 +336,13 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     this.app.get(path, async (context) => {
       applyHttpCacheHeaders(cacheHeaders, (name, value) => context.header(name, value));
       const services = await this.options.services(context as Context<TEnv>);
-      // The generated document inherits the same tenant discriminator as the catalog behind it: a
-      // per-tenant plane that caches documents would otherwise serve tenant A's published REST
-      // surface to tenant B until the document TTL expires — the registry key was scoped, the
-      // document key not. An explicit `openapi.cacheKey` keeps full responsibility instead.
-      const discriminator = this.options.discoveryCacheKey?.(context as Context<TEnv>);
-      const cacheKey =
-        openApiOptions.cacheKey ?? `${controlPlaneOpenApiCacheKey(services, openApiOptions)}${discriminator ? `|${discriminator}` : ''}`;
+      const cacheKey = openApiOptions.cacheKey ?? controlPlaneOpenApiCacheKey(services, openApiOptions);
       const cached = await openApiOptions.cache?.get(cacheKey);
       if (cached) return context.json(cached);
 
       const openApiCache = this.discoveryCaches.openapi;
       const snapshot = await createServiceRegistry({
         ...(openApiCache ? { cache: openApiCache } : {}),
-        ...this.discoveryCacheKeyFor(context as Context<TEnv>, services),
         services,
       }).discover();
       const document = generateControlPlaneOpenApi({
@@ -390,7 +379,6 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       issuer: await this.issuerFor(context, services),
       registry: createServiceRegistry({
         ...(cache ? { cache } : {}),
-        ...this.discoveryCacheKeyFor(context, services),
         services,
       }),
       idempotencyKey: idempotencyKeyFromRequest(context.req),
@@ -421,14 +409,6 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     const authority = createCapabilitySigningAuthority({ issuer, privateJwks: await this.signingMaterialFor(resolved) });
     this.signingAuthority = { authority, issuer, keys: resolved };
     return authority;
-  }
-
-  // Folds the caller-supplied discriminator into the derived key, or leaves the derived one alone
-  // when there is none. Returned as a spreadable so every call site stays exact-optional-safe.
-  private discoveryCacheKeyFor(context: Context<TEnv>, services: ServiceEndpoint[]): { cacheKey?: string } {
-    const discriminator = this.options.discoveryCacheKey?.(context);
-    if (!discriminator) return {};
-    return { cacheKey: `${serviceRegistryCacheKey(services)}|${discriminator}` };
   }
 
   // Memoized by direct key comparison rather than a digest: the caller already holds the key set, so
@@ -467,11 +447,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     resolvingMaterial.catch(() => undefined);
     const resolvingCatalog = (async () => {
       const resolvedServices = services ?? (await this.options.services(context));
-      const capabilities = await discoverServiceCapabilities(
-        resolvedServices,
-        this.discoveryCaches.token,
-        this.discoveryCacheKeyFor(context, resolvedServices).cacheKey,
-      );
+      const capabilities = await discoverServiceCapabilities(resolvedServices, this.discoveryCaches.token);
       return { capabilities, resolvedServices };
     })();
     resolvingCatalog.catch(() => undefined);
