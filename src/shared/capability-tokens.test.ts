@@ -55,8 +55,9 @@ describe('STS capability tokens', () => {
         aud: 'fizzy',
         iss: 'control-plane',
         scp: ['fizzy.users.lookup'],
+        spk: 'api-key',
         spo: 'org-42',
-        sub: 'user-7',
+        sub: 'key-123',
       },
       keyId: 'test-key',
       now: NOW,
@@ -72,7 +73,7 @@ describe('STS capability tokens', () => {
       }),
     ).resolves.toMatchObject({
       serviceId: 'control-plane',
-      subject: { id: 'user-7', orgId: 'org-42' },
+      subject: { id: 'key-123', kind: 'api-key', orgId: 'org-42' },
     });
   });
 
@@ -97,6 +98,30 @@ describe('STS capability tokens', () => {
     });
     expect(identity.serviceId).toBe('moco');
     expect(identity.subject).toBeUndefined();
+  });
+
+  it('keeps legacy delegated subjects usable when the principal kind claim is absent', async () => {
+    const keys = await testKeys();
+    const issued = await signCapabilityToken({
+      claims: {
+        act: { sub: 'control-plane' },
+        aud: 'fizzy',
+        iss: 'control-plane',
+        scp: ['fizzy.users.lookup'],
+        spo: 'org-42',
+        sub: 'user-7',
+      },
+      keyId: 'test-key',
+      now: NOW,
+      privateJwk: keys.privateJwk,
+    });
+
+    const identity = await verifyCapabilityToken(issued.token, {
+      expectedAudience: 'fizzy',
+      jwks: keys.jwks,
+      now: new Date('2026-05-09T12:01:00.000Z'),
+    });
+    expect(identity.subject).toEqual({ id: 'user-7', orgId: 'org-42' });
   });
 
   it('reads the caller access claim, defaulting a token without one to the plane class', async () => {
@@ -181,9 +206,36 @@ describe('STS capability tokens', () => {
         now: new Date('2026-05-09T12:01:00.000Z'),
       }),
     ).rejects.toThrow('Invalid Service-Plane capability claims');
+
+    for (const spk of ['', 42, 'x'.repeat(513)]) {
+      const malformedKind = await sign(
+        {
+          act: { sub: 'control-plane' },
+          aud: 'fizzy',
+          exp: 9999999999,
+          iat: 1,
+          iss: 'control-plane',
+          jti: 'x',
+          nbf: 1,
+          scp: ['fizzy.users.lookup'],
+          spk,
+          sub: 'key-123',
+        },
+        servicePlaneJwkSigningKey(keys.privateJwk, 'test-key'),
+        SERVICE_PLANE_JWK_ALGORITHM,
+      );
+
+      await expect(
+        verifyCapabilityToken(malformedKind, {
+          expectedAudience: 'fizzy',
+          jwks: keys.jwks,
+          now: new Date('2026-05-09T12:01:00.000Z'),
+        }),
+      ).rejects.toThrow('Invalid Service-Plane capability claims');
+    }
   });
 
-  it('refuses to sign an spo claim without an act claim', async () => {
+  it('refuses to sign subject metadata claims without an act claim', async () => {
     const keys = await testKeys();
 
     await expect(
@@ -200,6 +252,21 @@ describe('STS capability tokens', () => {
         privateJwk: keys.privateJwk,
       }),
     ).rejects.toThrow('Service-Plane capability spo claim requires an act claim');
+
+    await expect(
+      signCapabilityToken({
+        claims: {
+          aud: 'fizzy',
+          iss: 'control-plane',
+          scp: ['fizzy.users.lookup'],
+          spk: 'api-key',
+          sub: 'moco',
+        },
+        keyId: 'test-key',
+        now: NOW,
+        privateJwk: keys.privateJwk,
+      }),
+    ).rejects.toThrow('Service-Plane capability spk claim requires an act claim');
   });
 
   it('rejects invalid signatures', async () => {

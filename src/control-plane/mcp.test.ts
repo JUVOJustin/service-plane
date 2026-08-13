@@ -14,7 +14,11 @@ import { generateCapabilitySigningSecret } from './signing-keys.js';
 class ExampleApi extends RpcTarget {
   async search(input: { query: string }) {
     const caller = requireScopes(this, 'example.read');
-    return { caller: caller.serviceId, results: [input.query] };
+    return {
+      caller: caller.serviceId,
+      results: [input.query],
+      ...(caller.subject?.kind ? { subjectKind: caller.subject.kind } : {}),
+    };
   }
 
   async count(input: { values: string[] }) {
@@ -226,7 +230,7 @@ function exampleService(options: FixtureOptions): DemoServiceSpec {
           search: abilityMethod({
             input: z.object({ query: z.string() }),
             mcp: { description: 'Search examples', name: 'example_search' },
-            output: z.object({ caller: z.string(), results: z.array(z.string()) }),
+            output: z.object({ caller: z.string(), results: z.array(z.string()), subjectKind: z.string().optional() }),
             scopes: ['example.read'],
           }),
           summarize: abilityMethod({
@@ -430,6 +434,26 @@ describe('control-plane MCP endpoint', () => {
     );
   });
 
+  it('preserves and logs the principal kind resolved for an MCP caller', async () => {
+    const { events, mcp } = await createFixture({
+      caller: { id: 'key-123', kind: 'user', orgId: 'org-42', principalKind: 'api-key' },
+    });
+    const search = (await (await mcp(rpc('tools/call', { arguments: { query: 'blue' }, name: 'example_search' }))).json()) as Record<
+      string,
+      unknown
+    >;
+
+    expect(search).toMatchObject({ result: { structuredContent: { caller: 'control-plane', subjectKind: 'api-key' } } });
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        callerId: 'key-123',
+        callerKind: 'user',
+        callerPrincipalKind: 'api-key',
+        event: 'service_plane.mcp.tool.completed',
+      }),
+    );
+  });
+
   it('frames an exhausted forwarded budget in-band and leaves the handshake unaffected', async () => {
     const { mcp } = await createFixture();
     // 1ms of budget: caller resolution and issuer construction consume it before any service leg,
@@ -583,6 +607,14 @@ describe('control-plane MCP endpoint', () => {
     ).json()) as Record<string, unknown>;
     expect(denied).toMatchObject({ error: { code: -32603, data: { status: 403 } } });
     expect(userFixture.events).toContainEqual(expect.objectContaining({ event: 'service_plane.mcp.tool.failed', status: 403 }));
+
+    const spoofedServiceFixture = await createFixture({
+      caller: { id: 'principal-7', kind: 'user', principalKind: 'service' },
+    });
+    const spoofed = (await (
+      await spoofedServiceFixture.mcp(rpc('tools/call', { arguments: { query: 'x' }, name: 'internal_tool' }))
+    ).json()) as Record<string, unknown>;
+    expect(spoofed).toMatchObject({ error: { data: { status: 403 } } });
 
     const serviceFixture = await createFixture({ caller: { id: 'gateway-svc', kind: 'service' } });
     const allowed = (await (

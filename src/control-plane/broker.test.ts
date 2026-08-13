@@ -182,7 +182,7 @@ describe('control-plane RPC broker', () => {
     );
   });
 
-  it('carries user callers to the service as RFC 8693 delegated subjects', async () => {
+  it('carries plane principals to the service as RFC 8693 delegated subjects', async () => {
     const keys = await testKeys();
     const capabilities = defineCapabilities({
       scopes: [{ id: 'example.events.ingest' }],
@@ -205,7 +205,12 @@ describe('control-plane RPC broker', () => {
       methods: {
         ingest: abilityMethod({
           input: z.object({ payload: z.string() }),
-          output: z.object({ caller: z.string(), subjectId: z.string().optional(), subjectOrgId: z.string().optional() }),
+          output: z.object({
+            caller: z.string(),
+            subjectId: z.string().optional(),
+            subjectKind: z.string().optional(),
+            subjectOrgId: z.string().optional(),
+          }),
           scopes: ['example.events.ingest'],
         }),
       },
@@ -242,10 +247,15 @@ describe('control-plane RPC broker', () => {
 
     type Brokered = {
       connect(scopes: string[]): Promise<{
-        ingest(input: { payload: string }): Promise<{ caller: string; subjectId?: string; subjectOrgId?: string }>;
+        ingest(input: { payload: string }): Promise<{
+          caller: string;
+          subjectId?: string;
+          subjectKind?: string;
+          subjectOrgId?: string;
+        }>;
       }>;
     };
-    const root = broker.rootCapability({ id: 'user-7', kind: 'user', orgId: 'org-42' }) as unknown as {
+    const root = broker.rootCapability({ id: 'key-123', kind: 'user', orgId: 'org-42', principalKind: 'api-key' }) as unknown as {
       ability(serviceId: string, abilityId: string): Promise<Brokered>;
     };
     const brokered = await root.ability('example', 'example.events');
@@ -253,14 +263,16 @@ describe('control-plane RPC broker', () => {
 
     await expect(api.ingest({ payload: 'hello' })).resolves.toEqual({
       caller: 'control-plane',
-      subjectId: 'user-7',
+      subjectId: 'key-123',
+      subjectKind: 'api-key',
       subjectOrgId: 'org-42',
     });
     expect(brokerEvents).toContainEqual(
       expect.objectContaining({
-        callerId: 'user-7',
+        callerId: 'key-123',
         callerKind: 'user',
         callerOrgId: 'org-42',
+        callerPrincipalKind: 'api-key',
         event: 'service_plane.broker.connect.completed',
       }),
     );
@@ -269,8 +281,15 @@ describe('control-plane RPC broker', () => {
   it('normalizes user caller subjects at the boundary', () => {
     expect(brokerCallerSubject({ id: 'user-7', kind: 'user', orgId: '  ' })).toEqual({ id: 'user-7' });
     expect(brokerCallerSubject({ id: ' user-7 ', kind: 'user', orgId: ' org-42 ' })).toEqual({ id: 'user-7', orgId: 'org-42' });
+    expect(brokerCallerSubject({ id: ' key-123 ', kind: 'user', principalKind: ' api-key ' })).toEqual({
+      id: 'key-123',
+      kind: 'api-key',
+    });
     expect(brokerCallerSubject({ id: 'worker-a', kind: 'service' })).toBeUndefined();
     expect(() => brokerCallerSubject({ id: '   ', kind: 'user' })).toThrow('Invalid Service-Plane capability subject');
+    expect(() => brokerCallerSubject({ id: 'user-7', kind: 'user', principalKind: '   ' })).toThrow(
+      'Invalid Service-Plane capability subject',
+    );
   });
 
   it('rejects service-access abilities without a service caller', async () => {
@@ -371,6 +390,7 @@ class SubjectEchoApi extends RpcTarget {
     return {
       caller: caller.serviceId,
       ...(caller.subject ? { subjectId: caller.subject.id } : {}),
+      ...(caller.subject?.kind ? { subjectKind: caller.subject.kind } : {}),
       ...(caller.subject?.orgId ? { subjectOrgId: caller.subject.orgId } : {}),
     };
   }

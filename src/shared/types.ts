@@ -315,13 +315,18 @@ export type McpDiscoveryDocument = {
 };
 
 /**
- * Control-plane-verified end-user delegation following RFC 8693: on delegated tokens `sub` is the
- * end user the call is made on behalf of, `act` names the acting service, and `spo` carries the
- * subject's org. Attribution for audit and per-user decisions; never a substitute for scope or
- * grant authorization.
+ * Control-plane-verified principal delegation following RFC 8693: on delegated tokens `sub` is
+ * the principal the call is made on behalf of, `act` names the acting service, and Service Plane
+ * claims carry optional principal metadata. Attribution for audit and principal-level decisions;
+ * never a substitute for scope, grant, or service-access authorization.
  */
 export type CapabilitySubject = {
   id: string;
+  /**
+   * Application-owned principal category such as `api-key`, `automation`, or `user`. This is
+   * signed attribution only; it never changes the caller's Service Plane access class.
+   */
+  kind?: string;
   orgId?: string;
 };
 
@@ -356,6 +361,8 @@ export type CapabilityClaims = {
    */
   spa?: AbilityAccess;
   spb?: string;
+  /** Service Plane-specific principal kind for a delegated subject. */
+  spk?: string;
   spo?: string;
   sub: string;
 };
