@@ -229,7 +229,11 @@ const hubEndpoint = cloudflareServiceBinding({
 });
 
 plane = new ServicePlaneControlPlane({
-  broker: { caller: () => ({ id: 'bench-caller', kind: 'service' as const }) },
+  rpc: {},
+  invocationMiddleware: async (context, next) => {
+    context.set('servicePlaneCaller', { id: 'bench-caller', kind: 'service' });
+    await next();
+  },
   log: false,
   services: () => [hubEndpoint],
   signingKeys: () => [{ kid: 'test-key', secret: signingSecret }],
@@ -345,7 +349,7 @@ describe('unary: request -> plane -> service (one call per request)', () => {
   bench(
     'service-plane broker, connect + call per request (pipelined HTTP-batch)',
     async () => {
-      const root = newHttpBatchRpcSession<Record<string, never>>('https://plane.internal/rpc/broker') as unknown as BrokerPipeline;
+      const root = newHttpBatchRpcSession<Record<string, never>>('https://plane.internal/rpc') as unknown as BrokerPipeline;
       await root.ability('hub', 'hub.llm').connect(['llm.call']).complete(PROMPT);
     },
     UNARY_BENCH,

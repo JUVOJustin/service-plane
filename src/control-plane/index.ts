@@ -145,12 +145,14 @@ export {
   mountCapabilityTokenEndpoint,
 } from './capabilities.js';
 export {
-  type BrokerCallerResolver,
-  type ConnInfoResolver,
   type ControlPlaneAbilitySessionOptions,
+  type ControlPlaneRestOptions,
   type DiscoveryCacheRoute,
   ServicePlaneControlPlane,
+  type ServicePlaneControlPlaneEnv,
+  type ServicePlaneControlPlaneInvocation,
   type ServicePlaneControlPlaneOptions,
+  type ServicePlaneControlPlaneVariables,
   type ServicePlaneDiscoveryCaches,
 } from './control-plane.js';
 export {
@@ -179,6 +181,11 @@ export {
   memoryRegistryCache,
   serviceRegistryCacheKey,
 } from './registry.js';
+export {
+  type ControlPlaneRestHandlerOptions,
+  type ControlPlaneRestInvocation,
+  handleControlPlaneRestRequest,
+} from './rest.js';
 export {
   type IssueCapabilityTokenForCallerInput,
   issueCapabilityTokenForCaller,

@@ -15,6 +15,13 @@ import {
 
 export default new ServicePlaneControlPlane({
   signingKeys: (env) => [{ kid: '2026-07', secret: env.STS_SIGNING_SECRET }],
+  invocationMiddleware: async (c, next) => {
+    if (c.req.header('authorization') !== `Bearer ${c.env.PRODUCT_API_TOKEN}`) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    c.set('servicePlaneCaller', { id: 'product-api', kind: 'user' });
+    await next();
+  },
   authenticateCaller: (c) =>
     hmacServiceClientAuth({
       clients: [{ clientId: 'workflow-runner', secret: c.env.WORKFLOW_RUNNER_SECRET }],
@@ -35,7 +42,8 @@ This mounts:
 POST /.well-known/service-plane/capability-token
 GET  /.well-known/service-plane/jwks.json
 GET  /openapi.json
-POST /rpc/mcp                                    (MCP streamable HTTP)
+POST /mcp                                        (when published MCP projections exist)
+*    <published rest.path>                       (metadata-driven REST facade)
 ```
 
 To serve a documentation UI, mount a Hono renderer on `plane.app` against `/openapi.json` — see [OpenAPI and MCP: Docs UI](openapi-mcp.md#docs-ui).
@@ -51,7 +59,7 @@ flowchart TD
   Catalog --> STS["Issue scoped capability tokens"]
   Authority --> STS
   Catalog --> OpenAPI["Build /openapi.json"]
-  Catalog --> MCP["Build /rpc/mcp tool list"]
+  Catalog --> MCP["Build /mcp tool list"]
 ```
 
 The plane does not implement Asana, ClickUp, or Moco logic. It only knows how to discover those services, validate grants, issue tokens, and project published metadata.
@@ -67,7 +75,11 @@ JWKS hangs off the signing authority alone: it needs no discovery, so services c
 their verification keys while a target service is down. Everything on the catalog path fails closed
 when discovery cannot be completed. See [auth.md](auth.md#signing-authority-and-authorization-catalog).
 
-Every inbound request gets an `X-Request-Id` (adopted from the caller or generated), and the broker and MCP surfaces forward it to services on every brokered call. Broker connects, MCP tool calls, and configuration errors are logged as structured JSON events; pass `log` to redirect them to your own sink or `log: false` to silence them. See the logging section in [the reference](reference.md).
+Every inbound request gets an `X-Request-Id` (adopted from the caller or generated), and the REST,
+broker, and MCP surfaces forward it to services on every brokered call. REST calls, broker connects,
+MCP calls, and configuration errors are logged as structured JSON events; pass `log` to redirect
+them to your own sink or `log: false` to silence them. See the logging section in [the
+reference](reference.md).
 
 ## Service-Plane Ingress
 
@@ -167,12 +179,19 @@ const plane = new ServicePlaneControlPlane({
   openapi: {
     cache: env.OPENAPI_CACHE,
     cacheTtlSeconds: 300,
+    security: [{ ProductApiKey: [] }],
+    securitySchemes: {
+      ProductApiKey: { type: 'apiKey', in: 'header', name: 'X-API-Key' },
+    },
   },
   // ...
 });
 ```
 
-The document is derived from published ability metadata. Individual services do not serve OpenAPI files.
+The document is derived from published ability metadata. Individual services do not serve OpenAPI
+files. Because `invocationMiddleware` owns public authentication, OpenAPI security is explicit too:
+`security` and `securitySchemes` must describe what that middleware actually accepts. Omitting them
+makes no authentication claim in the generated document.
 
 ## Signing Material
 
@@ -187,32 +206,89 @@ The memo is per instance, in memory. On Cloudflare that means per isolate: a pla
 
 `npm run bench` tracks the ratio these numbers rest on.
 
-## Optional Broker
+## Invocation Caller And Optional RPC Broker
 
-The broker lets a caller discover and connect to abilities through the plane. The broker and MCP endpoints are **fail closed**: you must supply a `caller` resolver that authenticates the request and returns the caller identity. A request with no configured resolver returns `500`; returning `undefined` refuses the request with `403`. For retryable authentication failures, return a Hono `401` response with the authentication scheme's `WWW-Authenticate` challenge. Nothing is brokered without an authenticated caller.
+REST, MCP, and the optional RPC broker are **fail closed**: their Hono context must contain a
+`servicePlaneCaller` before an invocation proceeds. The simplest setup is one top-level
+`invocationMiddleware`. It is an ordinary Hono middleware handler, runs only after a real invocation
+route has matched, and is shared by all three surfaces. Unknown REST paths remain `404` without
+running it.
+
+The RPC broker is not mounted by default. `rpc: {}` enables its Cap'n Web endpoint at `/rpc`;
+omitting `rpc` leaves that route absent. The MCP dispatcher is automatic, but `/mcp` behaves as
+absent (`404`) when the current request's discovery snapshot has no published MCP tool, resource, or
+prompt. When MCP projections exist, calls are not anonymous: like REST and an enabled broker, they
+still require `servicePlaneCaller` in the Hono context.
+
+`invocationMiddleware` is intentionally separate from `authenticateCaller`: that option protects
+the capability-token endpoint and admits service-class callers, while invocation middleware handles
+product users, API keys, or services invoking REST, MCP, or the broker.
 
 ```ts
 new ServicePlaneControlPlane({
-  broker: {
-    path: '/rpc/broker',
-    // Use your deployment's verifier here. The resolver owns the exact challenge.
-    caller: async (c) => {
-      const serviceId = await authenticateBrokerRequest(c);
-      if (!serviceId) {
-        return c.json({ error: 'Unauthorized' }, 401, {
-          'WWW-Authenticate': 'Bearer realm="service-plane"',
-        });
-      }
-      return { id: serviceId, kind: 'service' };
-    },
+  invocationMiddleware: async (c, next) => {
+    const serviceId = await authenticateBrokerRequest(c);
+    if (!serviceId) {
+      return c.json({ error: 'Unauthorized' }, 401, {
+        'WWW-Authenticate': 'Bearer realm="service-plane"',
+      });
+    }
+    c.set('servicePlaneCaller', { id: serviceId, kind: 'service' });
+    c.set('servicePlaneConnInfo', getConnInfo(c));
+    await next();
+    audit(c.get('servicePlaneInvocation'), c.res.status);
   },
+  rpc: {},
   // ...
 });
 ```
 
-Both mounts also accept `connInfo`, an opt-in resolver that forwards the original client's connection to the target service (`connInfo: (c) => getConnInfo(c)`, importing `getConnInfo` from your runtime's Hono adapter). It reaches handlers only on brokered calls into ingress-protected services and is advisory — see [Forwarded Connection Info](auth.md#forwarded-connection-info).
+The middleware may also set `servicePlaneConnInfo` using the `getConnInfo` implementation from the
+runtime's Hono adapter. It reaches handlers only on brokered calls into ingress-protected services
+and is advisory — see [Forwarded Connection Info](auth.md#forwarded-connection-info).
 
-`caller` returns a `BrokerCaller` — `{ id, kind: 'service' | 'user', orgId?, principalKind? }` — or an application-owned `Response`. Existing Hono authentication middleware is the preferred place to generate a challenge when it already owns that policy. Service callers (`kind: 'service'`) can reach `access: 'service'` abilities and are brokered under their own service id; other callers are brokered under the control-plane identity for `access: 'plane'` abilities. For an API key, automation, anonymous session, or other plane-class principal, keep `kind: 'user'` and set an application-owned `principalKind`; the service receives it as signed `identity.subject.kind`. `principalKind` never changes access. The resolver's `kind` is what the plane attests in the token's [`spa` claim](reference.md#capability-token-claims), so returning `kind: 'service'` for a caller the plane did not actually authenticate as a service hands it service-only abilities at every service in the fleet. To intentionally allow anonymous access, return a fixed caller from the resolver — it is always an explicit choice, never a default.
+The context writes are the contract, not an optional observation hook. If middleware calls `next()`
+without setting `servicePlaneCaller`, the matched invocation fails with `500`. Middleware may
+instead short-circuit with its own `401` or `403` response, including the appropriate
+`WWW-Authenticate` challenge. After `await next()`, it can inspect `servicePlaneInvocation` and
+`c.res` for auditing. REST metadata includes service, ability, method, scopes, and path; MCP metadata
+is enriched once the protocol operation resolves; a broker session exposes only `surface: 'broker'`
+because one session may invoke many abilities later.
+
+Existing global Hono middleware is equally valid when it already owns the routing policy. It can
+populate the same variables on the `app` passed to the plane; in that case `invocationMiddleware`
+may be omitted:
+
+```ts
+type PlaneEnv = { Variables: ServicePlaneControlPlaneVariables };
+const app = new Hono<PlaneEnv>();
+
+app.use('*', async (c, next) => {
+  const caller = await resolveCallerIfPresent(c);
+  if (caller) c.set('servicePlaneCaller', caller);
+  c.set('servicePlaneConnInfo', getConnInfo(c));
+  await next();
+  audit(c.get('servicePlaneInvocation'));
+});
+
+new ServicePlaneControlPlane<PlaneEnv>({ app, services, signingKeys });
+```
+
+`servicePlaneCaller` is a `BrokerCaller` —
+`{ id, kind: 'service' | 'user', orgId?, principalKind? }`. Service callers
+(`kind: 'service'`) can reach `access: 'service'` abilities and are brokered under their own service
+id; other callers are brokered under the control-plane identity for `access: 'plane'` abilities. For
+an API key, automation, anonymous session, or other plane-class principal, keep `kind: 'user'` and
+set an application-owned `principalKind`; the service receives it as signed
+`identity.subject.kind`. `principalKind` never changes access. The caller's `kind` is what the plane
+attests in the token's [`spa` claim](reference.md#capability-token-claims),
+so setting `kind: 'service'` for a caller the middleware did not actually authenticate as a service
+hands it service-only abilities across the fleet. To intentionally allow anonymous access, set a
+fixed caller in middleware — it is always an explicit choice, never a default.
+
+Use scopes, grants, and ability `access` for method authorization. A broker WebSocket can invoke many
+methods after its original HTTP middleware has completed, so Hono middleware cannot reliably act as
+a per-ability policy hook for every protocol.
 
 The broker connects by ability:
 

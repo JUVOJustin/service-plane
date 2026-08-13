@@ -267,16 +267,17 @@ export async function demoApp(options: DemoAppOptions): Promise<DemoApp> {
         // Caller authentication has dedicated coverage; an application test should not re-prove it
         // on every request. Override `authenticateCaller` through `plane` when that is the subject.
         authenticateCaller: () => callerServiceId,
-        broker: {
-          caller: () => options.brokerCaller ?? { id: 'gateway', kind: 'user' },
-        },
+        rpc: {},
         // Explicit either way: a fixture that silently cached discovery would make `redeploy()`
         // and grant changes land a TTL later, which is the opposite of what most tests are about.
         discoveryCache: spec.registryCache ?? false,
         issuer: spec.issuer ?? issuer,
+        invocationMiddleware: async (context, next) => {
+          context.set('servicePlaneCaller', options.brokerCaller ?? { id: 'gateway', kind: 'user' });
+          await next();
+        },
         log: options.log ?? ((event) => events.push(event as ServicePlaneLoggableEvent)),
         mcp: {
-          caller: () => options.brokerCaller ?? { id: 'gateway', kind: 'user' },
           ...(options.mcp?.serverInfo ? { serverInfo: options.mcp.serverInfo } : {}),
         },
         ...(spec.openapi ? { openapi: spec.openapi } : {}),
@@ -300,7 +301,7 @@ export async function demoApp(options: DemoAppOptions): Promise<DemoApp> {
   const replicas: DemoReplica[] = planes.map((plane, index) => ({
     brokerRoot<TApi>() {
       wire();
-      return newHttpBatchRpcSession<Record<string, never>>(`${demoReplicaOrigin(index)}/rpc/broker`) as unknown as DemoBrokerRoot<TApi>;
+      return newHttpBatchRpcSession<Record<string, never>>(`${demoReplicaOrigin(index)}/rpc`) as unknown as DemoBrokerRoot<TApi>;
     },
     index,
     async jwks() {
@@ -342,7 +343,7 @@ export async function demoApp(options: DemoAppOptions): Promise<DemoApp> {
   return {
     brokerRoot<TApi>() {
       wire();
-      return newHttpBatchRpcSession<Record<string, never>>(`${DEMO_PLANE_ORIGIN}/rpc/broker`) as unknown as DemoBrokerRoot<TApi>;
+      return newHttpBatchRpcSession<Record<string, never>>(`${DEMO_PLANE_ORIGIN}/rpc`) as unknown as DemoBrokerRoot<TApi>;
     },
 
     close,

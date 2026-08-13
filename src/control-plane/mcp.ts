@@ -1,7 +1,6 @@
-import { abilitySession, disposeAbilitySession } from '../service/index.js';
 import type { ConnInfo } from '../shared/conn-info.js';
-import { remainingTimeoutMs } from '../shared/deadline.js';
-import { CapabilityAuthError, ServicePlaneTimeoutError } from '../shared/errors.js';
+import { CapabilityAuthError } from '../shared/errors.js';
+import { inlineJsonSchemaRoot as inlineSchemaRoot } from '../shared/json-schema.js';
 import type { ServicePlaneBrokerLogEvent } from '../shared/logging.js';
 import {
   type DiscoveredServiceAbility,
@@ -18,15 +17,9 @@ import {
   type ServiceRegistry,
   type ServiceRegistrySnapshot,
 } from '../shared/types.js';
-import {
-  type BrokerCaller,
-  brokerCallerAccess,
-  brokerCallerLogFields,
-  brokerCallerSubject,
-  brokerRequestToken,
-  transportForAbility,
-} from './broker.js';
+import { type BrokerCaller, brokerCallerLogFields } from './broker.js';
 import type { CapabilityIssuer } from './capabilities.js';
+import { invokeControlPlaneMethod, openControlPlaneMethodSession } from './invocation.js';
 
 export type ControlPlaneMcpServerInfo = {
   name: string;
@@ -51,6 +44,8 @@ export type ControlPlaneMcpHandlerOptions = {
   idempotencyKey?: string;
   issuer: CapabilityIssuer;
   log?: (event: ServicePlaneBrokerLogEvent) => void;
+  /** Receives the projected target once a tool, resource, or prompt resolves to an ability method. */
+  onInvocation?: (invocation: { abilityId: string; method: string; scopes: string[]; serviceId: string }) => void;
   /**
    * When the request reached the plane, for deadline accounting: the budget forwarded to a service
    * is what is left of `timeoutMs` after everything since this instant — JSON-RPC parsing, the
@@ -366,7 +361,8 @@ async function streamToolCall(
 ): Promise<Response> {
   const startedAt = Date.now();
   const limits = resolveMcpStreamLimits(options.streamLimits);
-  const { api, dispose } = await openMethodSession(match, options);
+  notifyInvocation(match, options);
+  const { api, dispose } = await openControlPlaneMethodSession(match, options);
   let stream: ReadableStream<unknown>;
   try {
     const method = api[match.method];
@@ -514,47 +510,6 @@ function mcpToolOutputSchema(method: DiscoveredServiceAbility['methods'][string]
   return schema.type === 'object' ? schema : undefined;
 }
 
-// Some validation libraries root their JSON Schema at a local `$ref` into `$defs` instead of an
-// inlined object. The refs are valid — MCP clients treat each tool schema as its own document —
-// but a `$ref` root hides `type` and `properties` from anything that reads the schema without a
-// full resolver, including this file's own object-sniffing and prompt-argument derivation. Copy
-// the referenced content up to the root; `$defs` stays, so internal refs keep resolving.
-function inlineSchemaRoot(schema: OpenApiObject): OpenApiObject {
-  const target = resolveLocalRefTarget(schema);
-  if (!target) return schema;
-  const { $ref, ...rootExtras } = schema;
-  return { ...target, ...rootExtras };
-}
-
-function resolveLocalRefTarget(schema: OpenApiObject): OpenApiObject | undefined {
-  const seen = new Set<string>();
-  let current: OpenApiObject = schema;
-  while (typeof current.$ref === 'string' && current.$ref.startsWith('#/')) {
-    if (seen.has(current.$ref)) return undefined;
-    seen.add(current.$ref);
-    const resolved = resolveJsonPointer(schema, current.$ref.slice(2));
-    if (!isRecord(resolved)) return undefined;
-    current = resolved as OpenApiObject;
-  }
-  return current === schema ? undefined : current;
-}
-
-function resolveJsonPointer(document: OpenApiObject, pointer: string): unknown {
-  let current: unknown = document;
-  for (const rawSegment of pointer.split('/')) {
-    // JSON Pointer unescaping per RFC 6901, after URI fragment decoding.
-    const segment = decodeURIComponent(rawSegment).replaceAll('~1', '/').replaceAll('~0', '~');
-    if (Array.isArray(current)) {
-      current = current[Number(segment)];
-    } else if (isRecord(current)) {
-      current = current[segment];
-    } else {
-      return undefined;
-    }
-  }
-  return current;
-}
-
 function streamToolOutputSchema(itemSchema: OpenApiObject): OpenApiObject {
   // Root-relative $refs ("#...") would re-anchor to the aggregate wrapper once the item schema
   // is nested — unless the item declares `$id`, which keeps it a schema resource of its own
@@ -668,58 +623,19 @@ async function getPrompt(id: JsonRpcId, params: unknown, options: ControlPlaneMc
   }
 }
 
-// One shared brokered-invocation path for tools, resources, and prompts: authorize the caller for
-// the ability, mint the scoped (or brokered) token, and open the session over the service's RPC
-// transport. The caller MUST dispose the session so its transport socket is released.
-async function openMethodSession(
-  match: McpMethodMatch,
-  options: ControlPlaneMcpHandlerOptions,
-): Promise<{ api: Record<string, (methodInput: unknown) => Promise<unknown>>; dispose: () => Promise<void> }> {
-  authorizePublishedAbility(match.ability, options.caller);
-  const subject = brokerCallerSubject(options.caller);
-  // Decremented here, beside the session it bounds, so everything the plane did since request entry
-  // — parse, discovery fan-out, token mint — is charged to the caller. Mirrors the broker's
-  // decrement in BrokeredAbility.connect; registry-local requests (initialize, tools/list) never
-  // reach this point and are not refused by an exhausted forwarding budget.
-  const timeoutMs = remainingTimeoutMs(options.timeoutMs, Date.now() - (options.receivedAt ?? Date.now()));
-  if (timeoutMs === 0) {
-    throw new ServicePlaneTimeoutError(
-      `Service-Plane exhausted the caller's deadline before reaching the service: ${match.ability.serviceId}/${match.ability.id}`,
-    );
-  }
-  const api = await abilitySession<Record<string, (methodInput: unknown) => Promise<unknown>>>({
-    abilityId: match.ability.id,
-    callerServiceId: options.caller?.kind === 'service' ? options.caller.id : options.controlPlaneServiceId,
-    ...(options.connInfo ? { connInfo: options.connInfo } : {}),
-    ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-    ...(subject ? { subject } : {}),
-    ...(options.requestId ? { requestId: options.requestId } : {}),
-    requestToken: brokerRequestToken({
-      ability: match.ability,
-      brokerServiceId: options.controlPlaneServiceId,
-      caller: options.caller,
-      issuer: options.issuer,
-    }),
-    scopes: match.scopes,
-    targetServiceId: match.ability.serviceId,
-    ...(timeoutMs === undefined ? {} : { timeoutMs }),
-    transport: transportForAbility(match.ability, {
-      requiresStreaming: match.ability.methods[match.method]?.stream === true,
-    }),
-  });
-  return { api, dispose: () => disposeAbilitySession(api) };
-}
-
 // Unary invocation: the session is closed as soon as the single result resolves.
 async function invokeMethod(match: McpMethodMatch, input: unknown, options: ControlPlaneMcpHandlerOptions): Promise<unknown> {
-  const { api, dispose } = await openMethodSession(match, options);
-  try {
-    const method = api[match.method];
-    if (!method) throw new CapabilityAuthError(`Service-Plane MCP method not found: ${match.method}`, 500);
-    return await method(input);
-  } finally {
-    await dispose();
-  }
+  notifyInvocation(match, options);
+  return invokeControlPlaneMethod(match, input, options);
+}
+
+function notifyInvocation(match: McpMethodMatch, options: ControlPlaneMcpHandlerOptions): void {
+  options.onInvocation?.({
+    abilityId: match.ability.id,
+    method: match.method,
+    scopes: match.scopes,
+    serviceId: match.ability.serviceId,
+  });
 }
 
 function findMcpMethod(
@@ -859,14 +775,6 @@ function logMcpFailed(
     ...(error instanceof CapabilityAuthError ? { status: error.status } : {}),
     ...subject,
   });
-}
-
-// Same catalog-based check as the broker, and likewise not the last word: the caller class rides the
-// token and the service re-checks it against its own definition.
-function authorizePublishedAbility(ability: DiscoveredServiceAbility, caller: BrokerCaller | undefined): void {
-  if (ability.access === 'plane') return;
-  if (ability.access === 'service' && brokerCallerAccess(caller) === 'service') return;
-  throw new CapabilityAuthError('Service-Plane MCP call requires service access', 403);
 }
 
 function jsonRpcIdOf(message: Record<string, unknown>): JsonRpcId | undefined {

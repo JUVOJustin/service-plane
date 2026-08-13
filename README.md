@@ -123,6 +123,13 @@ import {
 
 export default new ServicePlaneControlPlane({
   signingKeys: (env) => [{ kid: '2026-07', secret: env.STS_SIGNING_SECRET }],
+  invocationMiddleware: async (c, next) => {
+    if (c.req.header('authorization') !== `Bearer ${c.env.PRODUCT_API_TOKEN}`) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    c.set('servicePlaneCaller', { id: 'product-api', kind: 'user' });
+    await next();
+  },
   authenticateCaller: (c) =>
     hmacServiceClientAuth({
       clients: [{ clientId: 'workflow-runner', secret: c.env.WORKFLOW_RUNNER_SECRET }],
@@ -143,8 +150,16 @@ The control plane mounts:
 POST /.well-known/service-plane/capability-token
 GET  /.well-known/service-plane/jwks.json
 GET  /openapi.json
-POST /rpc/mcp                                    (MCP streamable HTTP)
+POST /mcp                                        (when published MCP projections exist)
+*    <published rest.path>                       (metadata-driven REST facade)
 ```
+
+`invocationMiddleware` is ordinary Hono middleware shared by product-facing REST, MCP, and optional
+RPC broker traffic. It authenticates the request and must place its `BrokerCaller` in
+`servicePlaneCaller` before calling `next()`. It is separate from `authenticateCaller`, which
+authenticates services asking the capability-token endpoint for a token. A method's
+`rest: { method, path, status? }` metadata drives both OpenAPI and the live route; no per-route Hono
+handler is required.
 
 The plane serves the OpenAPI document; to render it, mount a Hono UI extension (e.g. `@hono/swagger-ui` or `@scalar/hono-api-reference`) on `plane.app` pointed at `/openapi.json`.
 

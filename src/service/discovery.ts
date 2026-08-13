@@ -12,7 +12,8 @@ import {
   ServicePlaneTimeoutError,
   servicePlaneErrorInfo,
 } from '../shared/errors.js';
-import { isOriginRelativePath } from '../shared/paths.js';
+import { jsonSchemaRootProperties } from '../shared/json-schema.js';
+import { isOriginRelativePath, pathTemplateVariables } from '../shared/paths.js';
 import {
   type AbilityAccess,
   type AbilityExposure,
@@ -757,7 +758,13 @@ function normalizeMethods(
       // the service-wide ceiling. Validated like every other definition mistake — an invalid value
       // must not silently drop the ceiling (or worse: an unvalidated 0 once enforced as a 0ms limit).
       const timeoutMs = method.stream ? undefined : resolveMethodTimeoutMs(abilityId, name, method.timeoutMs, defaultMethodTimeoutMs);
-      const rest = method.rest ? normalizeRestProjection(abilityId, name, method.rest) : undefined;
+      const inputSchema = abilityJsonSchema(
+        method.input,
+        'input',
+        `${abilityId}/${name}`,
+        schemaResourceId(serviceId, abilityId, name, 'input'),
+      );
+      const rest = method.rest ? normalizeRestProjection(serviceId, abilityId, name, method.rest, inputSchema) : undefined;
       const mcp = method.mcp ? normalizeMcpProjection(abilityId, name, method.mcp) : undefined;
       const mcpPrompt = method.mcpPrompt ? normalizeMcpPromptProjection(abilityId, name, method.mcpPrompt) : undefined;
       const mcpResource = method.mcpResource ? normalizeMcpResourceProjection(abilityId, name, method.mcpResource) : undefined;
@@ -769,12 +776,7 @@ function normalizeMethods(
         name,
         {
           ...methodWithoutTimeout,
-          inputSchema: abilityJsonSchema(
-            method.input,
-            'input',
-            `${abilityId}/${name}`,
-            schemaResourceId(serviceId, abilityId, name, 'input'),
-          ),
+          inputSchema,
           ...(mcp ? { mcp } : {}),
           ...(mcpPrompt ? { mcpPrompt } : {}),
           ...(mcpResource ? { mcpResource } : {}),
@@ -879,16 +881,55 @@ function abilityDiscovery<TEnv extends Env>(ability: NormalizedServiceAbility<TE
   };
 }
 
-function normalizeRestProjection(abilityId: string, methodName: string, rest: ServiceAbilityRestProjection): ServiceAbilityRestProjection {
+function normalizeRestProjection(
+  serviceId: string,
+  abilityId: string,
+  methodName: string,
+  rest: ServiceAbilityRestProjection,
+  inputSchema: OpenApiObject,
+): ServiceAbilityRestProjection {
+  const path = normalizePath(rest.path, `${abilityId}/${methodName}`);
+  const pathVariables = validateRestPathTemplate(path, abilityId, methodName);
+  validateRestPathInputFields(inputSchema, pathVariables, abilityId, methodName);
   return {
     ...rest,
     method: normalizeHttpMethod(rest.method),
     operationId: rest.operationId
       ? normalizeValue(rest.operationId, `REST operation id for ${abilityId}/${methodName}`)
-      : `${abilityId}.${methodName}`,
-    path: normalizePath(rest.path, `${abilityId}/${methodName}`),
+      : `${serviceId}.${abilityId}.${methodName}`,
+    path,
+    ...(rest.status === undefined ? {} : { status: normalizeRestStatus(rest.status, abilityId, methodName) }),
     ...(rest.tags ? { tags: normalizeTags(rest.tags, `${abilityId}/${methodName}`) } : {}),
   };
+}
+
+function validateRestPathTemplate(path: string, abilityId: string, methodName: string): string[] {
+  const variables = pathTemplateVariables(path);
+  if (!variables) {
+    throw new CapabilityAuthError(`Service-Plane REST path has an invalid or duplicate template variable: ${abilityId}/${methodName}`, 500);
+  }
+  return variables;
+}
+
+function validateRestPathInputFields(inputSchema: OpenApiObject, pathVariables: string[], abilityId: string, methodName: string): void {
+  const properties = jsonSchemaRootProperties(inputSchema);
+  const missing = pathVariables.find((name) => !properties || !Object.hasOwn(properties, name));
+  if (missing) {
+    throw new CapabilityAuthError(
+      `Service-Plane REST path template variable must name a top-level input field: ${abilityId}/${methodName} -> ${missing}`,
+      500,
+    );
+  }
+}
+
+function normalizeRestStatus(status: number, abilityId: string, methodName: string): number {
+  if (!Number.isInteger(status) || status < 200 || status > 299) {
+    throw new CapabilityAuthError(
+      `Service-Plane REST success status must be an integer from 200 through 299: ${abilityId}/${methodName}`,
+      500,
+    );
+  }
+  return status;
 }
 
 function normalizeMcpProjection(abilityId: string, methodName: string, mcp: ServiceAbilityMcpProjection): ServiceAbilityMcpProjection {

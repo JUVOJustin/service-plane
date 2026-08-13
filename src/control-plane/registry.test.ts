@@ -142,6 +142,136 @@ describe('service registry', () => {
     expect(snapshot.services.map((service) => service.id)).toEqual(['example']);
   });
 
+  it('omits discovery documents whose REST path variables are absent from the input schema', async () => {
+    const ability = document.abilities.at(0);
+    if (!ability) throw new Error('missing test ability');
+    const method = ability.methods.runSync;
+    if (!method) throw new Error('missing test method');
+    const registry = createServiceRegistry({
+      services: [
+        httpsService({
+          baseUrl: 'https://example.internal',
+          discovery: {
+            ...document,
+            abilities: [
+              {
+                ...ability,
+                exposure: 'published',
+                methods: {
+                  runSync: {
+                    ...method,
+                    inputSchema: { properties: { id: { type: 'string' } }, type: 'object' },
+                    rest: { method: 'post', path: '/examples/{connectionId}' },
+                  },
+                },
+              },
+            ],
+          },
+          id: 'example',
+        }),
+      ],
+    });
+
+    await expect(registry.discover()).resolves.toMatchObject({ abilities: [], services: [] });
+  });
+
+  it('omits discovery documents whose REST projections collide with built-in control-plane paths', async () => {
+    const ability = document.abilities.at(0);
+    if (!ability) throw new Error('missing test ability');
+    const method = ability.methods.runSync;
+    if (!method) throw new Error('missing test method');
+    const registry = createServiceRegistry({
+      reservedRestPaths: ['/mcp'],
+      services: [
+        httpsService({
+          baseUrl: 'https://example.internal',
+          discovery: {
+            ...document,
+            abilities: [
+              {
+                ...ability,
+                exposure: 'published',
+                methods: {
+                  runSync: {
+                    ...method,
+                    rest: { method: 'get', path: '/mcp' },
+                  },
+                },
+              },
+            ],
+          },
+          id: 'example',
+        }),
+      ],
+    });
+
+    await expect(registry.discover()).resolves.toMatchObject({ abilities: [], services: [] });
+  });
+
+  it.each([199, 300, 201.5, '201'])('omits discovery documents with invalid REST status $status', async (status) => {
+    const ability = document.abilities.at(0);
+    if (!ability) throw new Error('missing test ability');
+    const method = ability.methods.runSync;
+    if (!method) throw new Error('missing test method');
+    const registry = createServiceRegistry({
+      services: [
+        httpsService({
+          baseUrl: 'https://example.internal',
+          discovery: {
+            ...document,
+            abilities: [
+              {
+                ...ability,
+                exposure: 'published',
+                methods: {
+                  runSync: {
+                    ...method,
+                    rest: { method: 'post', path: '/examples', status: status as number },
+                  },
+                },
+              },
+            ],
+          },
+          id: 'example',
+        }),
+      ],
+    });
+
+    await expect(registry.discover()).resolves.toMatchObject({ abilities: [], services: [] });
+  });
+
+  it.each([{ length: 1 }, ['valid', 42], 'invalid'])('omits discovery documents with malformed REST tags %#', async (tags) => {
+    const ability = document.abilities.at(0);
+    if (!ability) throw new Error('missing test ability');
+    const method = ability.methods.runSync;
+    if (!method) throw new Error('missing test method');
+    const registry = createServiceRegistry({
+      services: [
+        httpsService({
+          baseUrl: 'https://example.internal',
+          discovery: {
+            ...document,
+            abilities: [
+              {
+                ...ability,
+                exposure: 'published',
+                methods: {
+                  runSync: {
+                    ...method,
+                    rest: { method: 'post', path: '/examples', tags: tags as string[] },
+                  },
+                },
+              },
+            ],
+          },
+          id: 'example',
+        }),
+      ],
+    });
+
+    await expect(registry.discover()).resolves.toMatchObject({ abilities: [], services: [] });
+  });
+
   it('rejects discovery documents that claim another configured endpoint id', async () => {
     const victimDocument: ServiceDiscoveryDocument = {
       ...document,
@@ -237,6 +367,12 @@ describe('service registry', () => {
   });
 
   it('versions the derived cache namespace when discovery trust rules change', () => {
-    expect(serviceRegistryCacheKey([])).toContain('"namespace":"service-plane:registry:v2"');
+    expect(serviceRegistryCacheKey([])).toContain('"namespace":"service-plane:registry:v3"');
+  });
+
+  it('namespaces the cache by reserved control-plane REST paths', () => {
+    expect(serviceRegistryCacheKey([], SERVICE_DISCOVERY_PATH, ['/custom-mcp'])).not.toBe(
+      serviceRegistryCacheKey([], SERVICE_DISCOVERY_PATH),
+    );
   });
 });

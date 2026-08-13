@@ -126,7 +126,7 @@ async function createFixture(options: FixtureOptions = {}) {
 
   const mcpRequest = (body: unknown, headers: Record<string, string> = {}) =>
     handleControlPlaneMcpRequest(
-      new Request('https://plane.internal/rpc/mcp', {
+      new Request('https://plane.internal/mcp', {
         body: JSON.stringify(body),
         headers: { 'content-type': 'application/json', ...headers },
         method: 'POST',

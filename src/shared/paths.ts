@@ -13,6 +13,18 @@ export function normalizePath(path: string): string {
   return withLeadingSlash.length > 1 ? withLeadingSlash.replace(/\/+$/u, '') : withLeadingSlash;
 }
 
+/** Returns unique whole-segment `{name}` variables, or `undefined` for an invalid template. */
+export function pathTemplateVariables(path: string): string[] | undefined {
+  const names = new Set<string>();
+  for (const segment of path.split('/')) {
+    if (!segment.includes('{') && !segment.includes('}')) continue;
+    const match = /^\{([A-Za-z_]\w*)\}$/u.exec(segment);
+    if (!match?.[1] || names.has(match[1])) return undefined;
+    names.add(match[1]);
+  }
+  return [...names];
+}
+
 // The WHATWG URL parser strips tab/CR/LF from anywhere in the input and trims C0 controls and
 // spaces at both ends, so a value like '/\t/attacker.example' passes a naive '//' check and then
 // resolves to a foreign origin. Route paths never contain these bytes unencoded.

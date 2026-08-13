@@ -249,7 +249,7 @@ new ServicePlaneControlPlane({
 
 ## Caching Metadata At The Edge
 
-Cloudflare [Workers Cache](https://blog.cloudflare.com/workers-cache/) puts the cache in front of the Worker: on a hit the Worker does not execute at all. Service Plane's metadata GET routes are the natural fit — the service discovery document, the aggregated `/openapi.json`, and the JWKS document. Ability RPC (POST), the broker, and MCP sessions are never cache-eligible.
+Cloudflare [Workers Cache](https://blog.cloudflare.com/workers-cache/) puts the cache in front of the Worker: on a hit the Worker does not execute at all. Service Plane's metadata GET routes are the natural fit — the service discovery document, the aggregated `/openapi.json`, and the JWKS document. Ability RPC, REST facade responses, the broker, and MCP sessions are never cache-eligible.
 
 Enable the cache in the Worker config and turn on the `httpCache` flag:
 

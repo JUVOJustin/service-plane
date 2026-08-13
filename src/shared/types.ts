@@ -4,7 +4,7 @@ export const SERVICE_DISCOVERY_PATH = '/.well-known/service-plane/service.json';
 export const SERVICE_PLANE_OPENAPI_PATH = '/openapi.json';
 export const SERVICE_PLANE_CAPABILITY_JWKS_PATH = '/.well-known/service-plane/jwks.json';
 export const SERVICE_PLANE_CAPABILITY_TOKEN_PATH = '/.well-known/service-plane/capability-token';
-export const SERVICE_PLANE_MCP_PATH = '/rpc/mcp';
+export const SERVICE_PLANE_MCP_PATH = '/mcp';
 
 export const DEFAULT_REGISTRY_CACHE_TTL_SECONDS = 30;
 export const DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS = 120;
@@ -60,6 +60,11 @@ export type ServiceAbilityRestProjection = {
   method: ServiceHttpMethod;
   operationId?: string;
   path: string;
+  /**
+   * Successful HTTP response status. Defaults to 200; it is never inferred from the method because
+   * action-style POST operations legitimately return 200, 201, or 202.
+   */
+  status?: number;
   summary?: string;
   tags?: string[];
 };
@@ -244,6 +249,8 @@ export type OpenApiDocument = {
   };
   openapi: '3.2.0';
   paths: Record<string, Record<string, OpenApiObject>>;
+  /** Application-authored security requirements for the public REST facade. */
+  security?: OpenApiObject[];
   servers?: OpenApiObject[];
   tags?: Array<{ description?: string; name: string }>;
 };

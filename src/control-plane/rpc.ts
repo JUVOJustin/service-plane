@@ -13,7 +13,7 @@ export type RpcIssuedCapabilityToken = {
 };
 
 /**
- * Subject delegation is asserted by control-plane code (broker caller resolver or direct issuer
+ * Subject delegation is asserted by control-plane code (invocation middleware or direct issuer
  * calls), never by an authenticated caller. One guard for every caller-facing token surface so the
  * rule and its wire-facing error cannot drift between endpoints.
  */

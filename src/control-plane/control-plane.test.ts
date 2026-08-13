@@ -23,7 +23,7 @@ import {
   type ServiceDiscoveryDocument,
 } from '../shared/types.js';
 import { hmacServiceClientAuth, jwkServiceClientAuth } from './caller-auth.js';
-import { type BrokerCallerResolver, ServicePlaneControlPlane } from './control-plane.js';
+import { ServicePlaneControlPlane } from './control-plane.js';
 import { cloudflareServiceBinding } from './endpoints.js';
 import { generateCapabilitySigningSecret } from './signing-keys.js';
 
@@ -309,6 +309,8 @@ describe('ServicePlaneControlPlane', () => {
     const plane = new ServicePlaneControlPlane({
       openapi: {
         cache,
+        security: [{ ProductApiKey: [] }],
+        securitySchemes: { ProductApiKey: { in: 'header', name: 'X-API-Key', type: 'apiKey' } },
         title: 'Control Plane APIs',
         version: '2026.05.23',
       },
@@ -331,11 +333,12 @@ describe('ServicePlaneControlPlane', () => {
     await expect(response.json()).resolves.toMatchObject({
       info: { title: 'Control Plane APIs', version: '2026.05.23' },
       openapi: '3.2.0',
+      security: [{ ProductApiKey: [] }],
+      components: { securitySchemes: { ProductApiKey: { in: 'header', name: 'X-API-Key', type: 'apiKey' } } },
       paths: {
         '/examples/search': {
           post: {
             operationId: 'searchExamples',
-            security: [{ ServicePlane: [] }],
             'x-service-plane': {
               abilityId: 'example.search',
               method: 'search',
@@ -350,6 +353,62 @@ describe('ServicePlaneControlPlane', () => {
     const cached = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`));
     expect(cached.status).toBe(200);
     expect(discoveryFetches).toBe(1);
+  });
+
+  it('omits REST projections that collide with configured control-plane routes', async () => {
+    const collidingDiscovery = structuredClone(discovery);
+    const search = collidingDiscovery.abilities[1]?.methods.search;
+    if (!search?.rest) throw new Error('missing REST projection');
+    search.rest.path = '/protocol';
+    const plane = new ServicePlaneControlPlane({
+      log: false,
+      mcp: { path: '/protocol' },
+      services: () => [
+        cloudflareServiceBinding({
+          binding: { fetch: async () => Response.json(collidingDiscovery) },
+          id: 'example',
+        }),
+      ],
+      signingKeys: () => [],
+    });
+
+    const response = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`));
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ paths: {} });
+  });
+
+  it('does not share cached OpenAPI documents across different reserved routes', async () => {
+    const collidingDiscovery = structuredClone(discovery);
+    const search = collidingDiscovery.abilities[1]?.methods.search;
+    if (!search?.rest) throw new Error('missing REST projection');
+    search.rest.path = SERVICE_PLANE_MCP_PATH;
+    const cache = memoryOpenApiDocumentCache();
+    const services = () => [
+      cloudflareServiceBinding({
+        binding: { fetch: async () => Response.json(collidingDiscovery) },
+        id: 'example',
+      }),
+    ];
+    const withoutMcp = new ServicePlaneControlPlane({
+      log: false,
+      mcp: false,
+      openapi: { cache },
+      services,
+      signingKeys: () => [],
+    });
+    const withMcp = new ServicePlaneControlPlane({
+      log: false,
+      openapi: { cache },
+      services,
+      signingKeys: () => [],
+    });
+
+    const available = await withoutMcp.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`));
+    await expect(available.json()).resolves.toMatchObject({ paths: { [SERVICE_PLANE_MCP_PATH]: { post: {} } } });
+
+    const reserved = await withMcp.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`));
+    await expect(reserved.json()).resolves.toMatchObject({ paths: {} });
   });
 
   it('emits cache headers on OpenAPI and JWKS when httpCache is enabled and never caches token responses', async () => {
@@ -424,7 +483,7 @@ describe('ServicePlaneControlPlane', () => {
 
   it('fails closed on broker and MCP endpoints until caller authentication is configured', async () => {
     const plane = new ServicePlaneControlPlane({
-      broker: {},
+      rpc: {},
       services: () => [serviceEndpoint()],
       signingKeys: async () => [{ kid: 'test-key', secret: await generateCapabilitySigningSecret() }],
     });
@@ -432,18 +491,69 @@ describe('ServicePlaneControlPlane', () => {
     const mcp = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_MCP_PATH}`, { method: 'POST' }));
     expect(mcp.status).toBe(500);
 
-    const broker = await plane.fetch(new Request('https://plane.internal/rpc/broker', { method: 'POST' }));
+    const broker = await plane.fetch(new Request('https://plane.internal/rpc', { method: 'POST' }));
     expect(broker.status).toBe(500);
+
+    const legacyMcp = await plane.fetch(new Request('https://plane.internal/rpc/mcp', { method: 'POST' }));
+    const legacyBroker = await plane.fetch(new Request('https://plane.internal/rpc/broker', { method: 'POST' }));
+    expect(legacyMcp.status).toBe(404);
+    expect(legacyBroker.status).toBe(404);
   });
 
-  it('preserves caller-resolver authentication challenges before service or issuer work', async () => {
+  it('does not mount the default /rpc broker route unless rpc is enabled', async () => {
+    const plane = new ServicePlaneControlPlane({
+      mcp: false,
+      services: () => [serviceEndpoint()],
+      signingKeys: async () => [{ kid: 'test-key', secret: await generateCapabilitySigningSecret() }],
+    });
+
+    const response = await plane.fetch(new Request('https://plane.internal/rpc', { method: 'POST' }));
+    expect(response.status).toBe(404);
+  });
+
+  it('treats /mcp as absent when discovery has no published MCP projections', async () => {
+    const restOnlyDiscovery = structuredClone(discovery);
+    delete restOnlyDiscovery.abilities[1]?.methods.search?.mcp;
+    let callerCalls = 0;
+    let signingKeyCalls = 0;
+    const plane = new ServicePlaneControlPlane({
+      invocationMiddleware: async (context, next) => {
+        callerCalls += 1;
+        context.set('servicePlaneCaller', { id: 'gateway', kind: 'user' });
+        await next();
+      },
+      services: () => [
+        cloudflareServiceBinding({
+          binding: { fetch: async () => Response.json(restOnlyDiscovery) },
+          id: 'example',
+        }),
+      ],
+      signingKeys: async () => {
+        signingKeyCalls += 1;
+        return [{ kid: 'test-key', secret: await generateCapabilitySigningSecret() }];
+      },
+    });
+
+    const response = await plane.fetch(
+      new Request(`https://plane.internal${SERVICE_PLANE_MCP_PATH}`, {
+        body: JSON.stringify({ id: 1, jsonrpc: '2.0', method: 'ping' }),
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
+      }),
+    );
+
+    expect(response.status).toBe(404);
+    expect(callerCalls).toBe(0);
+    expect(signingKeyCalls).toBe(0);
+  });
+
+  it('preserves invocation-middleware authentication challenges before service or issuer work', async () => {
     let issuerCalls = 0;
     let serviceCalls = 0;
-    const reject: BrokerCallerResolver = (context) =>
-      context.json({ error: 'Unauthorized' }, 401, { 'WWW-Authenticate': 'Bearer realm="service-plane"' });
     const plane = new ServicePlaneControlPlane({
-      broker: { caller: reject },
-      mcp: { caller: reject },
+      rpc: {},
+      invocationMiddleware: async (context) =>
+        context.json({ error: 'Unauthorized' }, 401, { 'WWW-Authenticate': 'Bearer realm="service-plane"' }),
       services: () => {
         serviceCalls += 1;
         return [serviceEndpoint()];
@@ -455,23 +565,24 @@ describe('ServicePlaneControlPlane', () => {
     });
 
     const mcp = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_MCP_PATH}`, { method: 'POST' }));
-    const broker = await plane.fetch(new Request('https://plane.internal/rpc/broker', { method: 'POST' }));
+    const broker = await plane.fetch(new Request('https://plane.internal/rpc', { method: 'POST' }));
 
     for (const response of [mcp, broker]) {
       expect(response.status).toBe(401);
       expect(response.headers.get('www-authenticate')).toBe('Bearer realm="service-plane"');
       await expect(response.json()).resolves.toEqual({ error: 'Unauthorized' });
     }
-    expect(serviceCalls).toBe(0);
+    // MCP resolves discovery first to decide whether the route exists; the broker still rejects
+    // before discovery. Neither rejected request allocates signing material.
+    expect(serviceCalls).toBe(1);
     expect(issuerCalls).toBe(0);
   });
 
-  it('treats an undefined caller as a forbidden refusal without inventing an auth scheme', async () => {
+  it('lets invocation middleware refuse a caller without inventing an auth scheme', async () => {
     let serviceCalls = 0;
-    const refuse: BrokerCallerResolver = () => undefined;
     const plane = new ServicePlaneControlPlane({
-      broker: { caller: refuse },
-      mcp: { caller: refuse },
+      rpc: {},
+      invocationMiddleware: async (context) => context.json({ error: 'Forbidden' }, 403),
       services: () => {
         serviceCalls += 1;
         return [serviceEndpoint()];
@@ -480,19 +591,24 @@ describe('ServicePlaneControlPlane', () => {
     });
 
     const mcp = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_MCP_PATH}`, { method: 'POST' }));
-    const broker = await plane.fetch(new Request('https://plane.internal/rpc/broker', { method: 'POST' }));
+    const broker = await plane.fetch(new Request('https://plane.internal/rpc', { method: 'POST' }));
 
     for (const response of [mcp, broker]) {
       expect(response.status).toBe(403);
       expect(response.headers.get('www-authenticate')).toBeNull();
       await expect(response.json()).resolves.toEqual({ error: 'Forbidden' });
     }
-    expect(serviceCalls).toBe(0);
+    // MCP resolves discovery first to decide whether the route exists; the broker still refuses
+    // before discovery.
+    expect(serviceCalls).toBe(1);
   });
 
-  it('speaks the MCP streamable-HTTP protocol once a caller resolver is configured', async () => {
+  it('speaks the MCP streamable-HTTP protocol once invocation middleware authenticates a caller', async () => {
     const plane = new ServicePlaneControlPlane({
-      mcp: { caller: () => ({ id: 'gateway', kind: 'user' }) },
+      invocationMiddleware: async (context, next) => {
+        context.set('servicePlaneCaller', { id: 'gateway', kind: 'user' });
+        await next();
+      },
       services: () => [serviceEndpoint()],
       signingKeys: async () => [{ kid: 'test-key', secret: await generateCapabilitySigningSecret() }],
     });
@@ -584,7 +700,10 @@ describe('ServicePlaneControlPlane', () => {
     const signingSecret = await generateCapabilitySigningSecret();
     plane = new ServicePlaneControlPlane({
       issuer: 'https://issuer.example',
-      mcp: { caller: () => ({ id: 'gateway', kind: 'user' }) },
+      invocationMiddleware: async (context, next) => {
+        context.set('servicePlaneCaller', { id: 'gateway', kind: 'user' });
+        await next();
+      },
       services: () => [
         cloudflareServiceBinding({
           binding: { fetch: async (request) => service.fetch(request) },
@@ -654,8 +773,11 @@ describe('ServicePlaneControlPlane', () => {
     const signingSecret = await generateCapabilitySigningSecret();
     plane = new ServicePlaneControlPlane({
       issuer: 'https://issuer.example',
+      invocationMiddleware: async (context, next) => {
+        context.set('servicePlaneCaller', { id: 'gateway', kind: 'user' });
+        await next();
+      },
       log: false,
-      mcp: { caller: () => ({ id: 'gateway', kind: 'user' }) },
       services: () => [
         cloudflareServiceBinding({
           binding: {

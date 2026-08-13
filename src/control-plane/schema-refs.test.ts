@@ -43,7 +43,7 @@ function plainSchema(): AbilitySchema {
 
 const capabilities = defineCapabilities({ scopes: [{ id: 'example.search' }], serviceId: 'example' });
 
-function serviceWith(input: AbilitySchema, output: AbilitySchema) {
+function serviceWith(input: AbilitySchema, output: AbilitySchema, restPath = '/examples/search') {
   return defineAbilityService({
     abilities: [
       defineAbility({
@@ -55,7 +55,7 @@ function serviceWith(input: AbilitySchema, output: AbilitySchema) {
             mcp: { name: 'example_search' },
             mcpPrompt: { name: 'example_search_prompt' },
             output,
-            rest: { method: 'post', path: '/examples/search', summary: 'Search' },
+            rest: { method: 'post', path: restPath, summary: 'Search' },
             scopes: ['example.search'],
           }),
         },
@@ -158,6 +158,15 @@ function assertLocalRefsResolve(document: OpenApiObject): void {
 }
 
 describe('schema resource ids at setup', () => {
+  it('resolves REST path variables through a ref-rooted input schema', () => {
+    const method = serviceWith(refRootedSchema(), plainSchema(), '/examples/{name}').abilities[0]?.methods.search;
+
+    expect(method?.rest?.path).toBe('/examples/{name}');
+    expect(() => serviceWith(refRootedSchema(), plainSchema(), '/examples/{id}')).toThrow(
+      'REST path template variable must name a top-level input field: example.search/search -> id',
+    );
+  });
+
   it('assigns $id to schemas with local refs and leaves plain schemas untouched', () => {
     const method = serviceWith(refRootedSchema(), plainSchema()).abilities[0]?.methods.search;
 

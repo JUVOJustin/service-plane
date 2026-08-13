@@ -100,9 +100,10 @@ them:
 - **Do** use the simplest caller auth that matches the boundary: service
   bindings on same-account Cloudflare, JWK for external callers holding a
   private key, HMAC only as a shared-secret fallback.
-- **Do** configure a `caller` resolver for the broker and MCP endpoints. They
-  fail closed: no resolver → 500, resolver returns nothing → 401. Anonymous
-  access is only ever an explicit fixed caller, never a default.
+- **Do** configure `invocationMiddleware` for REST, MCP, and an enabled RPC broker (`rpc: {}`).
+  It must authenticate the request, set `servicePlaneCaller`, and then call
+  `next()`, or short-circuit with its own response. Anonymous access is only
+  ever an explicit fixed caller in middleware, never a default.
 - **Do** keep code runtime-agnostic: the same ability definitions run on
   Cloudflare Workers and Node 20+ (`@hono/node-server`); only transports and
   JWKS sourcing differ.

@@ -283,7 +283,11 @@ describe('discovery cache on the token path', () => {
     let fetches = 0;
     const plane = new ServicePlaneControlPlane({
       authenticateCaller: () => 'worker-a',
-      broker: { caller: () => ({ id: 'gateway', kind: 'user' }) },
+      rpc: {},
+      invocationMiddleware: async (context, next) => {
+        context.set('servicePlaneCaller', { id: 'gateway', kind: 'user' });
+        await next();
+      },
       log: false,
       services: () => [
         cloudflareServiceBinding({
@@ -301,7 +305,7 @@ describe('discovery cache on the token path', () => {
     });
 
     const brokerRequest = () =>
-      new Request('https://plane.internal/rpc/broker', {
+      new Request('https://plane.internal/rpc', {
         body: JSON.stringify([]),
         headers: { 'content-type': 'application/json' },
         method: 'POST',

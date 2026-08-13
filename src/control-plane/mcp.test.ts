@@ -689,15 +689,15 @@ describe('handleControlPlaneMcpRequest protocol plumbing', () => {
   }
 
   function post(body: string, headers?: HeadersInit) {
-    return new Request('https://plane.internal/rpc/mcp', { body, ...(headers ? { headers } : {}), method: 'POST' });
+    return new Request('https://plane.internal/mcp', { body, ...(headers ? { headers } : {}), method: 'POST' });
   }
 
   it('only accepts POST', async () => {
-    const get = await handleControlPlaneMcpRequest(new Request('https://plane.internal/rpc/mcp'), handlerOptions());
+    const get = await handleControlPlaneMcpRequest(new Request('https://plane.internal/mcp'), handlerOptions());
     expect(get.status).toBe(405);
     expect(get.headers.get('allow')).toBe('POST');
 
-    const del = await handleControlPlaneMcpRequest(new Request('https://plane.internal/rpc/mcp', { method: 'DELETE' }), handlerOptions());
+    const del = await handleControlPlaneMcpRequest(new Request('https://plane.internal/mcp', { method: 'DELETE' }), handlerOptions());
     expect(del.status).toBe(405);
   });
 

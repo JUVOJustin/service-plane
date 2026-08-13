@@ -59,9 +59,13 @@ describe('key derivation overlaps catalog resolution after authentication', () =
     const service = buildService();
     return new ServicePlaneControlPlane({
       ...(extra.authenticateCaller ? { authenticateCaller: extra.authenticateCaller } : {}),
-      broker: { caller: () => ({ id: 'gateway', kind: 'service' as const }) },
+      rpc: {},
       discoveryCache: false,
       issuer: PLANE_ORIGIN,
+      invocationMiddleware: async (context, next) => {
+        context.set('servicePlaneCaller', { id: 'gateway', kind: 'service' });
+        await next();
+      },
       log: false,
       services: () => [
         cloudflareServiceBinding({
@@ -90,7 +94,7 @@ describe('key derivation overlaps catalog resolution after authentication', () =
     const plane = interlockedPlane(secret);
     // The interlock sits inside issuerFor, which resolveBrokeredRequest awaits before the RPC body
     // is parsed — so any POST that completes proves the two halves ran together.
-    const response = await plane.fetch(new Request(`${PLANE_ORIGIN}/rpc/broker`, { body: '[]', method: 'POST' }));
+    const response = await plane.fetch(new Request(`${PLANE_ORIGIN}/rpc`, { body: '[]', method: 'POST' }));
     expect(response.status).toBeGreaterThan(0);
   });
 
@@ -115,7 +119,7 @@ describe('key derivation overlaps catalog resolution after authentication', () =
     let releaseCatalog!: () => void;
     const plane = new ServicePlaneControlPlane({
       authenticateCaller: () => 'worker-a',
-      broker: false,
+      rpc: false,
       discoveryCache: false,
       issuer: PLANE_ORIGIN,
       log: false,
@@ -144,7 +148,7 @@ describe('key derivation overlaps catalog resolution after authentication', () =
     let releaseKeys!: () => void;
     const plane = new ServicePlaneControlPlane({
       authenticateCaller: () => 'worker-a',
-      broker: false,
+      rpc: false,
       discoveryCache: false,
       issuer: PLANE_ORIGIN,
       log: false,
