@@ -56,6 +56,13 @@ flowchart TD
 
 The plane does not implement Asana, ClickUp, or Moco logic. It only knows how to discover those services, validate grants, issue tokens, and project published metadata.
 
+A control-plane instance has one logical service catalog. Its `services(context)` callback may use
+the request context to resolve runtime bindings or deployment configuration, but it must return the
+same logical endpoints and discovery metadata for every caller and organization. Organization-specific
+data scoping happens inside each service, using the verified subject or validated ability input; it
+does not change which services or abilities the plane discovers. If an application truly needs a
+different catalog, run it as a separate control-plane instance with its own discovery cache.
+
 JWKS hangs off the signing authority alone: it needs no discovery, so services can keep refreshing
 their verification keys while a target service is down. Everything on the catalog path fails closed
 when discovery cannot be completed. See [auth.md](auth.md#signing-authority-and-authorization-catalog).
@@ -130,7 +137,11 @@ const plane = new ServicePlaneControlPlane({
 
 On Cloudflare, see [layering a shared store behind the in-memory one](cloudflare.md#sharing-the-discovery-cache-across-isolates) before reaching for KV or a Durable Object.
 
-The registry derives distinct cache keys from the configured service ids and origins, so one instance is safe to share across routes and replicas. This is separate from `openapi.cache`, which caches the generated document rather than the catalog behind it.
+The registry derives distinct cache keys from the configured service ids and origins, so one cache
+instance is safe to share across routes, replicas, and different control-plane instances whose
+endpoint sets differ. A single control plane must not vary those endpoints or their discovery
+catalog by caller or organization. This is separate from `openapi.cache`, which caches the generated
+document rather than the catalog behind it.
 
 A discovery that could not reach every service is never cached — an unreachable service is simply absent from the snapshot, and storing that would keep the plane refusing it for the rest of the TTL after it recovers.
 
