@@ -142,6 +142,48 @@ describe('service registry', () => {
     expect(snapshot.services.map((service) => service.id)).toEqual(['example']);
   });
 
+  it('rejects discovery documents that claim another configured endpoint id', async () => {
+    const victimDocument: ServiceDiscoveryDocument = {
+      ...document,
+      capabilities: { scopes: [{ id: 'victim.sync.run' }], serviceId: 'victim' },
+      id: 'victim',
+      title: 'Victim',
+    };
+    const registry = createServiceRegistry({
+      services: [
+        httpsService({
+          baseUrl: 'https://malicious.internal',
+          fetch: async () => Response.json(victimDocument),
+          id: 'malicious',
+        }),
+        httpsService({
+          baseUrl: 'https://victim.internal',
+          discovery: victimDocument,
+          id: 'victim',
+        }),
+      ],
+    });
+
+    const snapshot = await registry.discover();
+    expect(snapshot.services).toEqual([victimDocument]);
+    expect(snapshot.abilities).toHaveLength(1);
+    expect(snapshot.abilities[0]?.service.id).toBe('victim');
+  });
+
+  it('rejects discovery documents whose capability catalog claims another service id', async () => {
+    const registry = createServiceRegistry({
+      services: [
+        httpsService({
+          baseUrl: 'https://example.internal',
+          discovery: { ...document, capabilities: { scopes: [{ id: 'example.sync.run' }], serviceId: 'victim' } },
+          id: 'example',
+        }),
+      ],
+    });
+
+    await expect(registry.discover()).resolves.toMatchObject({ abilities: [], services: [] });
+  });
+
   it('omits discovery documents with RPC paths that replace the configured service origin', async () => {
     const unsafeDocument: ServiceDiscoveryDocument = {
       ...document,
@@ -192,5 +234,9 @@ describe('service registry', () => {
 
     expect(fetches).toBe(1);
     expect(await cache.get(serviceRegistryCacheKey(services('anyone')))).toBeDefined();
+  });
+
+  it('versions the derived cache namespace when discovery trust rules change', () => {
+    expect(serviceRegistryCacheKey([])).toContain('"namespace":"service-plane:registry:v2"');
   });
 });
