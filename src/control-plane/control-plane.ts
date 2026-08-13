@@ -2,6 +2,7 @@ import { newRpcResponse } from '@hono/capnweb';
 import { Context, type Env, Hono, type MiddlewareHandler } from 'hono';
 import { etag } from 'hono/etag';
 import { type RequestIdVariables, requestId } from 'hono/request-id';
+import { matchedRoutes } from 'hono/route';
 import type { UpgradeWebSocket } from 'hono/ws';
 import type { AbilitySession } from '../service/capabilities.js';
 import { type ConnInfo, normalizeConnInfo } from '../shared/conn-info.js';
@@ -440,6 +441,10 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
 
   private mountRest(restOptions: ControlPlaneRestOptions): void {
     this.app.all('*', async (context, next) => {
+      if (hasLaterApplicationRoute(context)) {
+        await next();
+        return context.res;
+      }
       const receivedAt = Date.now();
       const typedContext = context as Context<TEnv>;
       const services = await this.options.services(typedContext);
@@ -460,8 +465,8 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
         runInvocationMiddleware: (next) => this.runInvocationMiddleware(context, next),
         receivedAt,
         registry,
-        resolveInvocation: async () => {
-          const resolved = await this.resolveBrokeredRequest(typedContext, services);
+        resolveInvocation: async (snapshot) => {
+          const resolved = await this.resolveBrokeredRequest(typedContext, services, registryFromSnapshot(registry, snapshot));
           if (resolved instanceof Response) return resolved;
           return {
             caller: resolved.caller,
@@ -529,7 +534,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       caller,
       // Normalized at the boundary so the plane never forwards a value the service would reject.
       connInfo: normalizeConnInfo(controlPlaneConnInfo(context)),
-      issuer: await this.issuerFor(context, services),
+      issuer: await this.issuerFor(context, services, knownRegistry),
       registry:
         knownRegistry ??
         createServiceRegistry({
@@ -605,7 +610,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
 
   // Authorization catalog plus signing authority: needs discovered capabilities and grants, so it
   // can fail while a target service is down. Only token issuance and brokering depend on it.
-  private async issuerFor(context: Context<TEnv>, services?: ServiceEndpoint[]): Promise<CapabilityIssuer> {
+  private async issuerFor(context: Context<TEnv>, services?: ServiceEndpoint[], registry?: ServiceRegistry): Promise<CapabilityIssuer> {
     // Key-material derivation and catalog resolution are independent, and each is the slow half on
     // its own cold path — the P-256 derivation plus proof round-trip (~9.5ms) on one side, the
     // discovery fan-out on the other. Started together, a cold request pays the slower of the two
@@ -619,12 +624,9 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     resolvingMaterial.catch(() => undefined);
     const resolvingCatalog = (async () => {
       const resolvedServices = services ?? (await this.options.services(context));
-      const capabilities = await discoverServiceCapabilities(
-        resolvedServices,
-        this.discoveryCaches.token,
-        undefined,
-        this.reservedRestPaths,
-      );
+      const capabilities = registry
+        ? (await registry.discover()).services.flatMap((service) => (service.capabilities ? [service.capabilities] : []))
+        : await discoverServiceCapabilities(resolvedServices, this.discoveryCaches.token, undefined, this.reservedRestPaths);
       return { capabilities, resolvedServices };
     })();
     resolvingCatalog.catch(() => undefined);
@@ -733,6 +735,12 @@ function registryFromSnapshot(registry: ServiceRegistry, snapshot: ServiceRegist
     discover: async () => snapshot,
     endpoint: (id) => registry.endpoint(id),
   };
+}
+
+function hasLaterApplicationRoute(context: Context): boolean {
+  return matchedRoutes(context)
+    .slice(context.req.routeIndex + 1)
+    .some((route) => (route.path !== '*' && route.path !== '/*') || route.handler.length < 2);
 }
 
 async function discoverServiceCapabilities(

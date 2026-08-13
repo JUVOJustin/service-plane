@@ -157,8 +157,12 @@ a known path with the wrong verb returns `405` plus `Allow`, JSON bodies are bou
 default (`rest.maxBodyBytes` changes the bound), and ambiguous equally specific templates fail
 closed. Paths mounted by the control plane are reserved and cannot also be used by REST projections:
 the capability-token and JWKS routes are always reserved, and enabled OpenAPI, MCP, and RPC routes
-reserve their configured paths. The service remains the authoritative schema validator: every
-facade call still passes through the generated ability wrapper before its handler runs.
+reserve their configured paths. Explicit application routes registered on `plane.app` after the
+plane is constructed take precedence over matching REST projections, so documentation UIs, OAuth
+callbacks, and other application-owned endpoints remain authoritative. The service remains the
+authoritative schema validator: every facade call still passes through the generated ability
+wrapper before its handler runs. A matched invocation reuses one discovery snapshot for routing and
+token issuance, including when discovery caching is disabled.
 
 ## MCP
 

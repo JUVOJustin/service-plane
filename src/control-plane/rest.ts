@@ -42,8 +42,8 @@ export type ControlPlaneRestHandlerOptions = {
   receivedAt?: number;
   /** Registry used to resolve published REST metadata. */
   registry: ServiceRegistry;
-  /** Lazily resolves authenticated invocation facts after a published route has matched. */
-  resolveInvocation: () => Promise<ControlPlaneInvocationOptions | Response>;
+  /** Lazily resolves authenticated invocation facts from the snapshot that matched the route. */
+  resolveInvocation: (snapshot: ServiceRegistrySnapshot) => Promise<ControlPlaneInvocationOptions | Response>;
   /** Runs invocation-only Hono middleware around a matched REST operation. */
   runInvocationMiddleware?: (next: () => Promise<Response>) => Promise<Response>;
 };
@@ -100,7 +100,7 @@ export async function handleControlPlaneRestRequest(request: Request, options: C
     });
     const invoke = async () => {
       try {
-        const resolved = await options.resolveInvocation();
+        const resolved = await options.resolveInvocation(snapshot);
         if (resolved instanceof Response) return resolved;
         invocationOptions = resolved;
         const input = await restInput(

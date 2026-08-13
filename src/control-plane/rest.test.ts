@@ -5,6 +5,7 @@ import * as z from 'zod';
 import { abilityMethod, defineAbility, defineCapabilities, ServicePlaneService } from '../service/index.js';
 import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
 import type { ConnInfo } from '../shared/conn-info.js';
+import { SERVICE_DISCOVERY_PATH } from '../shared/types.js';
 import {
   ServicePlaneControlPlane,
   type ServicePlaneControlPlaneInvocation,
@@ -78,21 +79,80 @@ describe('control-plane REST facade', () => {
     expect(prefix.status).toBe(404);
   });
 
-  it('falls through unmatched projections to application routes registered later', async () => {
+  it('prefers application routes registered later over colliding REST projections', async () => {
+    const observed: Array<{ input: unknown; subject: unknown; connInfo: ConnInfo | undefined }> = [];
+    const { endpoint, signingKey } = await restService(observed);
+    let invocationMiddlewareCalls = 0;
     const plane = new ServicePlaneControlPlane({
       rpc: false,
+      invocationMiddleware: async (context, next) => {
+        invocationMiddlewareCalls += 1;
+        context.set('servicePlaneCaller', { id: 'user-7', kind: 'user' });
+        await next();
+      },
+      issuer: PLANE_ORIGIN,
       log: false,
       mcp: false,
       openapi: false,
-      services: () => [],
-      signingKeys: () => [],
+      services: () => [endpoint],
+      signingKeys: () => [signingKey],
     });
-    plane.app.get('/ui', (context) => context.text('docs'));
+    plane.app.get('/connections/:connectionId/snapshots', (context) => context.text('application route'));
 
-    const response = await plane.fetch(new Request(`${PLANE_ORIGIN}/ui`));
+    const applicationResponse = await plane.fetch(new Request(`${PLANE_ORIGIN}/connections/conn-1/snapshots`));
 
-    expect(response.status).toBe(200);
-    expect(await response.text()).toBe('docs');
+    expect(applicationResponse.status).toBe(200);
+    expect(await applicationResponse.text()).toBe('application route');
+    expect(invocationMiddlewareCalls).toBe(0);
+
+    const restResponse = await plane.fetch(
+      new Request(`${PLANE_ORIGIN}/connections/conn-1/snapshots`, {
+        body: JSON.stringify({ dryRun: 'false', name: 'Nightly' }),
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
+      }),
+    );
+
+    expect(restResponse.status).toBe(202);
+    expect(invocationMiddlewareCalls).toBe(1);
+    expect(observed).toHaveLength(1);
+  });
+
+  it('reuses the matched discovery snapshot for token issuance', async () => {
+    const { endpoint, signingKey } = await restService([]);
+    let discoveryFetches = 0;
+    const countedEndpoint = {
+      ...endpoint,
+      fetch: async (request: Request) => {
+        if (new URL(request.url).pathname === SERVICE_DISCOVERY_PATH) discoveryFetches += 1;
+        return endpoint.fetch(request);
+      },
+    };
+    const plane = new ServicePlaneControlPlane({
+      discoveryCache: false,
+      invocationMiddleware: async (context, next) => {
+        context.set('servicePlaneCaller', { id: 'user-7', kind: 'user' });
+        await next();
+      },
+      issuer: PLANE_ORIGIN,
+      log: false,
+      mcp: false,
+      openapi: false,
+      rpc: false,
+      services: () => [countedEndpoint],
+      signingKeys: () => [signingKey],
+    });
+
+    const response = await plane.fetch(
+      new Request(`${PLANE_ORIGIN}/connections/conn-1/snapshots`, {
+        body: JSON.stringify({ dryRun: 'false', name: 'Nightly' }),
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
+      }),
+    );
+
+    expect(response.status).toBe(202);
+    expect(discoveryFetches).toBe(1);
   });
 
   it('runs invocation middleware only for an exact match and exposes metadata plus the final response', async () => {
