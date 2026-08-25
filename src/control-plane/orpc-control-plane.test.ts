@@ -7,6 +7,7 @@ import { createAbilityClient, createBrokeredAbilityClient } from '../service/cli
 import { defineAbility } from '../service/discovery.js';
 import { createAbilityBuilder } from '../service/orpc.js';
 import { ServicePlaneService } from '../service/service.js';
+import { memoryWebSocketPair } from '../test-support/index.js';
 import type { CapabilityJwks } from '../shared/types.js';
 import { SERVICE_PLANE_CAPABILITY_JWKS_PATH } from '../shared/types.js';
 import { ServicePlaneControlPlane } from './control-plane.js';
@@ -186,20 +187,3 @@ describe('oRPC control-plane broker', () => {
     expect(events).toContain('"items":[{"sequence":31},{"sequence":32}]');
   });
 });
-
-class MemoryWebSocket extends EventTarget {
-  peer?: MemoryWebSocket;
-  readyState = 1 as const;
-
-  send(data: string | ArrayBuffer | Uint8Array<ArrayBuffer>): void {
-    queueMicrotask(() => this.peer?.dispatchEvent(new MessageEvent('message', { data })));
-  }
-}
-
-function memoryWebSocketPair(): [MemoryWebSocket, MemoryWebSocket] {
-  const left = new MemoryWebSocket();
-  const right = new MemoryWebSocket();
-  left.peer = right;
-  right.peer = left;
-  return [left, right];
-}

@@ -9,7 +9,7 @@ import { z } from 'zod';
 import { createControlPlaneRpcBroker } from '../control-plane/broker.js';
 import { createCapabilityIssuer, defineServiceGrants } from '../control-plane/capabilities.js';
 import { servicePlaneAuthorization } from '../shared/capability-tokens.js';
-import { testKeys } from '../test-support/index.js';
+import { memoryWebSocketPair, testKeys } from '../test-support/index.js';
 import { defineCapabilities } from './capabilities.js';
 import { createAbilityClient } from './client.js';
 import { type AbilityRpc, defineAbility } from './discovery.js';
@@ -257,29 +257,3 @@ describe('ServicePlaneService oRPC runtime', () => {
     expect(brokeredValues).toEqual([{ sequence: 7 }, { sequence: 8 }]);
   });
 });
-
-class MemoryWebSocket extends EventTarget {
-  attachment?: unknown;
-  peer?: MemoryWebSocket;
-  readyState = 1 as const;
-
-  deserializeAttachment(): unknown {
-    return this.attachment;
-  }
-
-  send(data: string | ArrayBuffer | Uint8Array<ArrayBuffer>): void {
-    queueMicrotask(() => this.peer?.dispatchEvent(new MessageEvent('message', { data })));
-  }
-
-  serializeAttachment(attachment: unknown): void {
-    this.attachment = attachment;
-  }
-}
-
-function memoryWebSocketPair(): [MemoryWebSocket, MemoryWebSocket] {
-  const left = new MemoryWebSocket();
-  const right = new MemoryWebSocket();
-  left.peer = right;
-  right.peer = left;
-  return [left, right];
-}
