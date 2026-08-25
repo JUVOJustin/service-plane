@@ -35,7 +35,7 @@ const discovery: ServiceDiscoveryDocument = {
       exposure: 'private',
       id: 'example.sync',
       methods: { runSync: { inputSchema: { type: 'object' }, outputSchema: { type: 'object' }, scopes: ['example.sync.run'] } },
-      rpc: { path: '/rpc/example.sync', transports: ['http-batch'] },
+      rpc: { path: '/rpc/example.sync', transports: ['fetch'] },
       scopes: ['example.sync.run'],
     },
   ],

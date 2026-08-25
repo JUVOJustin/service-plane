@@ -9,21 +9,24 @@ Services do not generate full OpenAPI documents. Services define abilities and e
 Only published abilities can become user-facing projections.
 
 ```ts
+const ability = createAbilityBuilder();
+
 const asanaTasks = defineAbility({
   id: 'asana.tasks',
   exposure: 'published',
   access: 'plane',
   scopes: ['asana.tasks.write'],
   methods: {
-    createTask: abilityMethod({
-      input: CreateTaskInput,
-      output: CreateTaskOutput,
-      scopes: ['asana.tasks.write'],
-      rest: { method: 'post', path: '/asana/tasks', summary: 'Create an Asana task' },
-      mcp: { name: 'asana_create_task', description: 'Create a task in Asana' },
-    }),
+    createTask: ability
+      .procedure({
+        scopes: ['asana.tasks.write'],
+        rest: { method: 'post', path: '/asana/tasks', summary: 'Create an Asana task' },
+        mcp: { name: 'asana_create_task', description: 'Create a task in Asana' },
+      })
+      .input(CreateTaskInput)
+      .output(CreateTaskOutput)
+      .handler(({ context, input }) => context.env.ASANA.createTask(input)),
   },
-  handler: ({ context, identity }) => new AsanaTasksHandler(context.env, identity),
 });
 ```
 
@@ -117,7 +120,10 @@ plane.app.post('/asana/tasks', sValidator('json', CreateTaskInput), async (conte
 });
 ```
 
-Service Plane's own HTTP routes are protocol endpoints — the Cap'n Web batch at `/rpc/<abilityId>`, the MCP JSON-RPC mount, STS — not schema-shaped REST bodies, so no request validator is applied to them. Caller-auth routes deliberately read the raw request bytes, because HMAC and JWK signatures cover the exact bytes rather than a re-serialized parse.
+Service Plane's own HTTP routes are protocol endpoints — oRPC procedures, the MCP JSON-RPC mount,
+and STS — not schema-shaped REST bodies, so no request validator is applied to them. Caller-auth
+routes deliberately read the raw request bytes, because HMAC and JWK signatures cover the exact
+bytes rather than a re-serialized parse.
 
 ## MCP
 
@@ -135,13 +141,18 @@ Every projected entry carries its Service Plane routing metadata (service, abili
 
 `mcp: { name, description? }` projects a method as a tool. The tool's input schema comes from the method's input schema; if the converter rooted it at a local `$ref` (ArkType and Valibot do this for referenced or recursive types), the referenced content is inlined at the root so clients that read `type` and `properties` without a resolver still see the object shape, with `$defs` kept for internal refs. Object-shaped outputs — including ref-rooted ones — also advertise `outputSchema` and return the validated object as `structuredContent`, with serialized JSON in a `text` block for compatibility. Primitive and array outputs omit `outputSchema` and return serialized text only. Handler failures are reported in-band with `isError: true`; unknown tools and authorization failures are JSON-RPC errors.
 
-Streaming methods (`stream: true`) can project tools too. Because SSE is the only shape such a call can answer in, the request must accept it: an explicit `Accept` header that excludes `text/event-stream` (and `text/*`/`*/*`) gets `406` before any ability session is opened, while a missing `Accept` is treated as accepting anything. Unary tools, resources, and prompts stay usable for JSON-only clients. The plane opens the backing ability over a session transport (the endpoint's native ability RPC binding, then WebSocket) and answers `tools/call` over SSE per MCP streamable HTTP: while items arrive, it emits `notifications/progress` events (when the client sent `_meta.progressToken`), and the final response aggregates the items as `structuredContent: { items }` — MCP defines exactly one response per request, so the tool schema advertises the aggregated `{ items }` shape and `_meta.servicePlane.stream` marks the tool. Unbuffered transfer of very large streams belongs on a direct or brokered Cap'n Web session, not on MCP: the plane aggregates at most 10,000 items / 1 MiB of serialized items per streaming tool call (configurable via `mcp.streamLimits`) and fails the call in-band beyond that. `maxBytes` also gives optional progress notifications an independent cumulative byte budget; because every notification consumes that budget, it bounds how many can be emitted during a call. When that progress budget is exhausted, the plane stops sending notifications but continues building the separately bounded final result. Streaming methods cannot project resources or prompts (single-response surfaces); the service rejects such definitions at setup. See [Streaming](streaming.md).
+Streaming procedures can project tools too. Because SSE is the only shape such a call can answer in,
+the request must accept it. The plane proxies the backing oRPC async iterator and emits progress
+notifications while items arrive; the final response aggregates `structuredContent: { items }`.
+Unbuffered transfer of a large or unbounded stream belongs on the typed oRPC client, not MCP. The
+plane aggregates at most 10,000 items / 1 MiB by default, configurable through `mcp.streamLimits`.
+Streaming procedures cannot project resources or prompts. See [Streaming](streaming.md).
 
 This endpoint is request-scoped and non-resumable. If its SSE response delivery is abandoned, it
-aborts the backing stream and disposes the request's ability session to bound serverless resource
+aborts the backing stream to bound serverless resource
 lifetime. This is an intentional tradeoff from MCP's recommendation that disconnect alone should
 not imply cancellation. `notifications/cancelled` is acknowledged but not correlated across
-requests or isolates. Use a direct/brokered Cap'n Web session or a stateful MCP adapter for work
+requests or isolates. Use the typed oRPC stream or a stateful MCP adapter for work
 that must survive reconnects or requires protocol-level cancellation.
 
 ### Resources
@@ -151,12 +162,14 @@ that must survive reconnects or requires protocol-level cancellation.
 The read result is derived from the method output: a string is served as text (`mimeType` defaults to `text/plain`), an object with a string `blob` property passes through as binary (`mimeType` from the result, then the declaration, then `application/octet-stream`), and anything else is serialized as JSON text (`application/json`). Unknown URIs return the MCP resource-not-found error `-32002`.
 
 ```ts
-readDocument: abilityMethod({
-  input: z.object({ documentId: z.string() }),
-  mcpResource: { name: 'document', uri: 'docs://documents/{documentId}', mimeType: 'text/markdown' },
-  output: z.string(),
-  scopes: ['docs.read'],
-}),
+readDocument: ability
+  .procedure({
+    mcpResource: { name: 'document', uri: 'docs://documents/{documentId}', mimeType: 'text/markdown' },
+    scopes: ['docs.read'],
+  })
+  .input(z.object({ documentId: z.string() }))
+  .output(z.string())
+  .handler(({ input }) => readDocument(input.documentId)),
 ```
 
 ### Prompts

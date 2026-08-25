@@ -94,6 +94,7 @@ export {
   SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
   SERVICE_PLANE_MCP_PATH,
   SERVICE_PLANE_OPENAPI_PATH,
+  SERVICE_PLANE_PROOF_HEADER,
   SERVICE_PLANE_REQUEST_ID_HEADER,
   SERVICE_PLANE_REQUEST_ID_QUERY_PARAM,
 } from '../shared/types.js';
@@ -101,11 +102,12 @@ export {
   type BrokerCaller,
   brokerCallerAccess,
   brokerCallerSubject,
+  type ControlPlaneBrokerProcedureContext,
+  type ControlPlaneBrokerProcedureInput,
   type ControlPlaneRpcBroker,
-  type ControlPlaneRpcBrokerAbilityInput,
+  type ControlPlaneRpcBrokerCallInput,
   type CreateControlPlaneRpcBrokerOptions,
   createControlPlaneRpcBroker,
-  type RootCapabilityOptions,
 } from './broker.js';
 export {
   generateHmacClientSecret,
@@ -147,7 +149,6 @@ export {
 export {
   type BrokerCallerResolver,
   type ConnInfoResolver,
-  type ControlPlaneAbilitySessionOptions,
   type DiscoveryCacheRoute,
   ServicePlaneControlPlane,
   type ServicePlaneControlPlaneOptions,

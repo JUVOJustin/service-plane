@@ -1,11 +1,15 @@
-import { newRpcResponse } from '@hono/capnweb';
+import type { StandardHeaders, StandardLazyRequest } from '@orpc/server';
+import { RPCHandler as FetchRpcHandler } from '@orpc/server/fetch';
+import type { StandardHandlerPlugin } from '@orpc/server/standard';
+import { RPCHandler as WebSocketRpcHandler } from '@orpc/server/websocket';
 import { Context, type Env, Hono } from 'hono';
 import { etag } from 'hono/etag';
 import { type RequestIdVariables, requestId } from 'hono/request-id';
 import type { UpgradeWebSocket } from 'hono/ws';
-import type { AbilitySession } from '../service/capabilities.js';
+import { orpcErrorFromServicePlane } from '../service/orpc.js';
 import { type ConnInfo, normalizeConnInfo } from '../shared/conn-info.js';
 import { resolveTimeoutMs, type ServicePlaneTimeoutPolicy, timeoutMsFromRequest, validateTimeoutPolicy } from '../shared/deadline.js';
+import { CapabilityAuthError } from '../shared/errors.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
 import { idempotencyKeyFromRequest } from '../shared/idempotency.js';
 import { defaultServicePlaneLogSink, type ServicePlaneControlPlaneLogEvent, type ServicePlaneLogSink } from '../shared/logging.js';
@@ -19,7 +23,7 @@ import {
   type ServiceGrant,
   type ServiceRegistry,
 } from '../shared/types.js';
-import { type BrokerCaller, createControlPlaneRpcBroker } from './broker.js';
+import { type BrokerCaller, controlPlaneBrokerRouter, createControlPlaneRpcBroker } from './broker.js';
 import {
   type CapabilityIssuer,
   type CapabilitySigningAuthority,
@@ -71,31 +75,6 @@ export type BrokerCallerResolver<TEnv extends Env = Env> = (
  * application picks the right one: `connInfo: (c) => getConnInfo(c)`.
  */
 export type ConnInfoResolver<TEnv extends Env = Env> = (context: Context<TEnv>) => ConnInfo | undefined;
-
-/**
- * Describes one trusted in-process ability session opened by the control plane.
- */
-export type ControlPlaneAbilitySessionOptions = {
-  /** Ability id from the target service discovery document. */
-  abilityId: string;
-  /**
-   * Identity the plane has already authenticated. A user becomes the delegated subject; a service
-   * remains a service-class caller. Omit for a plane-owned call with no delegated subject.
-   */
-  caller?: BrokerCaller;
-  /** Advisory original-client connection info, surfaced only by ingress-protected services. */
-  connInfo?: ConnInfo;
-  /** Caller-owned key identifying one logical attempt across retries. */
-  idempotencyKey?: string;
-  /** Correlation id forwarded to the target service; a generated id is used when omitted. */
-  requestId?: string;
-  /** Scopes the returned session may exercise. */
-  scopes: string[];
-  /** Service that owns the ability. */
-  targetServiceId: string;
-  /** End-to-end budget in milliseconds, including discovery and token issuance. */
-  timeoutMs?: number;
-};
 
 type BrokeredRequest = {
   caller: BrokerCaller;
@@ -156,6 +135,9 @@ export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
         caller?: BrokerCallerResolver<TEnv>;
         connInfo?: ConnInfoResolver<TEnv>;
         path?: string;
+        /** oRPC plugins for the procedure-first broker endpoint. */
+        plugins?: StandardHandlerPlugin<Record<PropertyKey, unknown>>[];
+        /** Runtime-specific Hono WebSocket upgrade adapter for the public broker. */
         upgradeWebSocket?: UpgradeWebSocket;
       };
   controlPlaneServiceId?: string;
@@ -224,7 +206,7 @@ export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
 };
 
 /**
- * ServicePlaneControlPlane is now only STS/JWKS plus an optional Cap'n Web broker.
+ * ServicePlaneControlPlane serves STS/JWKS, oRPC brokering, MCP, and API projections.
  */
 export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   readonly app: Hono<ServicePlaneControlPlaneEnv<TEnv>>;
@@ -281,41 +263,6 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
 
   fetch: Hono<ServicePlaneControlPlaneEnv<TEnv>>['fetch'] = (request, env, executionCtx) => this.app.fetch(request, env, executionCtx);
 
-  /**
-   * Opens a trusted in-process ability session through the plane-owned broker path. The caller must
-   * already be authenticated by application code: passing a user here asserts subject delegation.
-   * External token surfaces remain unable to assert subjects.
-   */
-  async abilitySession<Scoped>(input: ControlPlaneAbilitySessionOptions, bindings: TEnv['Bindings']): Promise<AbilitySession<Scoped>> {
-    const receivedAt = Date.now();
-    const context = nativeControlPlaneContext<TEnv>(bindings);
-    const services = await this.options.services(context);
-    const cache = this.discoveryCaches.token;
-    const connInfo = normalizeConnInfo(input.connInfo);
-    const requestId = input.requestId?.trim() || brokerRequestId(context);
-    const log = this.log;
-    const broker = createControlPlaneRpcBroker({
-      ...(connInfo ? { connInfo } : {}),
-      controlPlaneServiceId: this.options.controlPlaneServiceId ?? 'control-plane',
-      ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
-      issuer: await this.issuerFor(context, services),
-      ...(log ? { log: (event) => log(event, context) } : {}),
-      receivedAt,
-      registry: createServiceRegistry({
-        ...(cache ? { cache } : {}),
-        services,
-      }),
-      ...(requestId ? { requestId } : {}),
-      ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
-    });
-    return broker.abilitySession<Scoped>({
-      abilityId: input.abilityId,
-      ...(input.caller ? { caller: input.caller } : {}),
-      scopes: input.scopes,
-      targetServiceId: input.targetServiceId,
-    });
-  }
-
   async issueCapabilityTokenForCaller(
     callerServiceId: string,
     input: IssueCapabilityTokenForCallerInput,
@@ -327,10 +274,58 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
 
   private mountBroker(brokerOptions: Exclude<ServicePlaneControlPlaneOptions<TEnv>['broker'], false | undefined>): void {
     const path = brokerOptions.path ?? '/rpc/broker';
-    this.app.all(path, async (context) => {
-      // Before caller resolution and catalog resolution, not after: resolving the catalog is a
-      // fan-out across every service, and on a cold cache it is the most expensive thing the plane
-      // does. Stamping later would hand the service a budget the caller has already partly spent.
+    const handlerOptions = brokerOptions.plugins ? { plugins: brokerOptions.plugins } : {};
+    const orpcHandler = new FetchRpcHandler(controlPlaneBrokerRouter, handlerOptions);
+    const websocketHandler = new WebSocketRpcHandler(controlPlaneBrokerRouter, handlerOptions);
+    if (brokerOptions.upgradeWebSocket) {
+      this.app.all(`${path}/ws`, async (context) => {
+        if (context.req.header('upgrade')?.toLowerCase() !== 'websocket') {
+          return new Response('Service-Plane broker WebSocket upgrade required', { status: 426 });
+        }
+        return brokerOptions.upgradeWebSocket?.(context, {
+          onClose: (_event, socket) => {
+            void websocketHandler.close(socket);
+          },
+          onMessage: async (event, socket) => {
+            const data =
+              event.data instanceof Blob
+                ? await event.data.arrayBuffer()
+                : typeof event.data === 'string' || event.data instanceof ArrayBuffer
+                  ? event.data
+                  : new Uint8Array(event.data).slice();
+            await websocketHandler.message(socket, data, {
+              context: async (request: StandardLazyRequest) => {
+                const receivedAt = Date.now();
+                const callContext = controlPlaneRpcMessageContext(context as unknown as Context<TEnv>, request);
+                const resolved = await this.resolveBrokeredRequest(callContext, brokerOptions);
+                if (resolved instanceof Response) {
+                  throw orpcErrorFromServicePlane(
+                    new CapabilityAuthError('Service-Plane broker caller authentication failed', resolved.status),
+                  );
+                }
+                const log = this.log;
+                return {
+                  broker: createControlPlaneRpcBroker({
+                    ...(resolved.connInfo ? { connInfo: resolved.connInfo } : {}),
+                    controlPlaneServiceId: this.options.controlPlaneServiceId ?? 'control-plane',
+                    ...(resolved.idempotencyKey ? { idempotencyKey: resolved.idempotencyKey } : {}),
+                    issuer: resolved.issuer,
+                    ...(log ? { log: (event) => log(event, callContext) } : {}),
+                    receivedAt,
+                    registry: resolved.registry,
+                    ...(resolved.requestId ? { requestId: resolved.requestId } : {}),
+                    ...(resolved.timeoutMs === undefined ? {} : { timeoutMs: resolved.timeoutMs }),
+                  }),
+                  ...(resolved.caller ? { caller: resolved.caller } : {}),
+                };
+              },
+              prefix: path as `/${string}`,
+            });
+          },
+        });
+      });
+    }
+    this.app.all(`${path}/*`, async (context) => {
       const receivedAt = Date.now();
       const resolved = await this.resolveBrokeredRequest(context as Context<TEnv>, brokerOptions);
       if (resolved instanceof Response) return resolved;
@@ -346,14 +341,11 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
         ...(resolved.requestId ? { requestId: resolved.requestId } : {}),
         ...(resolved.timeoutMs === undefined ? {} : { timeoutMs: resolved.timeoutMs }),
       });
-      // Only a WebSocket-upgraded caller leg can carry a returned stream back; over HTTP-batch
-      // the broker rejects streaming methods with a clear 405 instead of a dangling stub.
-      const allowStreaming = context.req.header('upgrade')?.toLowerCase() === 'websocket';
-      return newRpcResponse(
-        context,
-        broker.rootCapability(resolved.caller, { allowStreaming }),
-        brokerOptions.upgradeWebSocket ? { upgradeWebSocket: brokerOptions.upgradeWebSocket } : undefined,
-      );
+      const handled = await orpcHandler.handle(context.req.raw, {
+        context: { broker, ...(resolved.caller ? { caller: resolved.caller } : {}) },
+        prefix: path as `/${string}`,
+      });
+      return handled.matched ? handled.response : new Response('oRPC broker procedure not found', { status: 404 });
     });
   }
 
@@ -552,6 +544,31 @@ function nativeControlPlaneContext<TEnv extends Env>(bindings: TEnv['Bindings'])
   const context = new Context<ServicePlaneControlPlaneEnv<TEnv>>(request, { env: bindings, path });
   context.set('requestId', requestId);
   return context as unknown as Context<TEnv>;
+}
+
+function controlPlaneRpcMessageContext<TEnv extends Env>(base: Context<TEnv>, message: StandardLazyRequest): Context<TEnv> {
+  const headers = new Headers(base.req.raw.headers);
+  applyStandardHeaders(headers, message.headers);
+  const requestId = headers.get(SERVICE_PLANE_REQUEST_ID_HEADER)?.trim() || brokerRequestId(base);
+  if (requestId) headers.set(SERVICE_PLANE_REQUEST_ID_HEADER, requestId);
+  const request = new Request(base.req.url, {
+    headers,
+    method: message.method,
+    ...(message.signal ? { signal: message.signal } : {}),
+  });
+  const context = new Context<ServicePlaneControlPlaneEnv<TEnv>>(request, {
+    env: base.env,
+    path: base.req.path,
+  });
+  if (requestId) context.set('requestId', requestId);
+  return context as unknown as Context<TEnv>;
+}
+
+function applyStandardHeaders(target: Headers, source: StandardHeaders): void {
+  for (const [name, value] of Object.entries(source)) {
+    if (value === undefined) continue;
+    target.set(name, Array.isArray(value) ? value.join(', ') : String(value));
+  }
 }
 
 function missingAuthenticateCaller(context: Context, log: ServicePlaneLogSink | undefined): Response {

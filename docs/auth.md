@@ -5,8 +5,8 @@ Goal: understand how callers are authenticated, how tokens are issued, and where
 Service Plane uses three layers:
 
 - Hono middleware handles HTTP policy: CORS, logging, request ids, rate limits, and deployment-specific sessions.
-- `authenticate(token)` verifies a ServicePlane token inside Cap'n Web.
-- The ability wrapper validates method input, checks scopes, calls the handler, and validates output.
+- Service Plane oRPC middleware verifies the token, ingress, access class, and scopes before input validation.
+- oRPC validates procedure input and output around the handler.
 
 ## Token Flow
 
@@ -16,13 +16,13 @@ sequenceDiagram
   participant Plane as Control Plane
   participant Service
 
-  Caller->>Plane: Request token<br/>caller, targetServiceId, scopes
-  Plane->>Plane: Authenticate caller and check grants
-  Plane-->>Caller: ServicePlane token
-  Caller->>Service: authenticate(token)
+  Caller->>Plane: Typed broker call
+  Plane->>Plane: Authenticate caller, discover ability, check grants
+  Plane->>Plane: Mint brokered ServicePlane token
+  Plane->>Service: oRPC call + token
   Service->>Service: Verify token against JWKS
-  Caller->>Service: ability method(input)
-  Service->>Service: Validate input and scopes
+  Service->>Service: Check ingress, access, scopes
+  Service->>Service: Validate input and execute procedure
 ```
 
 Tokens are short-lived ES256 JWS tokens. The control plane signs them. Services verify them with the control-plane JWKS.
@@ -307,25 +307,25 @@ stamps the thumbprint of the key that actually authenticated:
 { "iss": "control-plane", "sub": "workflow-runner", "aud": "asana", "cnf": { "jkt": "NzbLsXh8..." } }
 ```
 
-The caller signs a short-lived proof when it opens a session — and with a shipped requester that is
-automatic, because the requester already holds the key:
+The direct caller signs a short-lived proof for each procedure call. With a shipped requester this is
+automatic because the requester already holds the key:
 
 ```ts
-const api = await abilitySession<AbilityRpc<typeof asanaTasks>>({
-  abilityId: 'asana.tasks',
+const api = createAbilityClient({
+  ability: asanaTasks,
   callerServiceId: 'workflow-runner',
   targetServiceId: 'asana',
   scopes: ['asana.tasks.write'],
-  // Carries the prover for its own key; the session picks it up.
+  // Carries the prover for its own key; the client picks it up.
   requestToken: controlPlaneJwkTokenRequester({ clientId, controlPlaneUrl, keyId, privateJwk }),
-  transport: websocketRpc('wss://asana.example.com/rpc/asana.tasks'),
+  transport: { type: 'websocket', url: 'wss://asana.example.com/rpc/asana.tasks' },
 });
 ```
 
-Pass `proveTokenPossession: jwkCapabilityProofSigner({ privateJwk })` explicitly only if the session
+Pass `proveTokenPossession: jwkCapabilityProofSigner({ privateJwk })` explicitly only if the client
 does not use a shipped requester, or signs with a different key.
 
-Unbound tokens cost nothing: the session checks for `cnf` before signing, so callers that are not
+Unbound tokens cost nothing: the client checks for `cnf` before signing, so callers that are not
 sender-constrained never pay for a signature.
 
 ### Where It Applies
@@ -339,9 +339,8 @@ sender-constrained never pay for a signature.
 
 ### Limits
 
-The proof is **session-scoped**, not per-call: Cap'n Web sessions are long-lived, so one proof is signed
-when the session opens. The guarantee is "the caller held the key when this session opened", not "on
-every method call".
+The proof is per logical oRPC call, including calls carried over one long-lived WebSocket. A refreshed
+token therefore receives a fresh proof without rebuilding the typed client.
 
 Rotating a caller key needs both keys registered on the plane until cached tokens expire: a token
 bound to the old key cannot be proved with the new one. `jwkCapabilityProofSigner` detects that
@@ -453,53 +452,39 @@ is an application-owned, non-empty string of at most 512 characters. Older token
 that needs a default may treat an absent kind as the legacy user principal. Malformed signed `spk`
 claims are rejected rather than silently discarded.
 
-### Delegate an in-process plane call
+### Delegate Through The Broker
 
-Use `ServicePlaneControlPlane.abilitySession()` when trusted control-plane code needs to call an
-ability on behalf of an already authenticated principal without making a round trip through
-`/rpc/broker`:
+A trusted control plane delegates a principal by returning it from `broker.caller` or `mcp.caller` after
+application authentication:
 
 ```ts
-import { disposeAbilitySession } from 'service-plane/service';
-
-const asana = await plane.abilitySession<AsanaTasksApi>(
-  {
-    abilityId: 'asana.tasks',
-    caller: { id: apiKey.id, kind: 'user', orgId: apiKey.orgId, principalKind: 'api-key' },
-    scopes: ['asana.tasks.write'],
-    targetServiceId: 'asana',
+const plane = new ServicePlaneControlPlane({
+  broker: {
+    caller: (context) => ({
+      id: context.get('apiKey').id,
+      kind: 'user',
+      orgId: context.get('apiKey').orgId,
+      principalKind: 'api-key',
+    }),
   },
-  context.env,
-);
-
-try {
-  await asana.createTask({ name: 'Review delegated call' });
-} finally {
-  await disposeAbilitySession(asana);
-}
+  // ...
+});
 ```
 
-Authenticate the principal before calling this method. There is deliberately no resolver on an
-in-process API: passing `kind: 'user'` is trusted plane code asserting the delegated subject, while
-`principalKind` preserves the principal's application-owned category. The method resolves the
-configured catalog and grants, chooses the service transport, and uses the same token-selection path
-as the broker. A target advertising required ingress therefore receives a brokered token
-automatically; a target without required ingress receives a plain plane-class token.
-
-Passing `kind: 'service'` preserves the caller as a service-class identity with no delegated subject.
-Omitting `caller` creates a plane-class call under `controlPlaneServiceId`, also with no subject.
-The returned session is disposable in the same way as `abilitySession()` on the service-side caller
-API; use `using` when available or `disposeAbilitySession()` in `finally`.
+The broker stamps the delegated subject into the short-lived service token, checks grants, and mints
+an ingress-qualified token when the target requires it. Application code should call the same broker
+with `createBrokeredAbilityClient()`; there is no separate in-process session API with different
+semantics.
 
 Boundaries to keep in mind:
 
-- The subject is delegation the control plane vouches for. It rides the same issuer/JWKS trust chain as every other claim, so services may rely on it for auditing and per-user decisions.
+- The subject is delegation the control plane vouches for. It rides the issuer/JWKS trust chain, so services may rely on it for auditing and per-user decisions.
 - The subject does not replace scope or grant checks. Ability authorization stays with scopes, grants, and ingress. Tenancy authorization stays with the service that owns the data.
-- Only control-plane code asserts subjects: `ServicePlaneControlPlane.abilitySession()`, the broker caller resolver, or a low-level direct `issueCapabilityToken({ subject, callerAccess: 'plane', ... })` call. The HTTP token endpoint rejects caller-supplied `subject` fields, and the shipped token requesters (`controlPlaneHmacTokenRequester`, `controlPlaneJwkTokenRequester`, `controlPlaneRpcTokenRequester`) refuse to send one, so an authenticated service cannot claim it acts for an arbitrary user. The `subject` option on `createCapabilityTokenProvider` therefore only works with a `requestToken` that calls the issuer in-process.
-- A delegated subject is always plane-class. The issuer requires `callerAccess` on every direct mint and refuses `subject` together with `callerAccess: 'service'` — that pair would hand a fronted principal the service-only reach that [`access: 'service'`](reference.md#capability-token-claims) exists to withhold.
-- Direct `issueCapabilityToken({ subject, ... })` mints a non-brokered token. For an in-process call, prefer `ServicePlaneControlPlane.abilitySession()`; remote callers should delegate through the broker. Both select `issueBrokeredCapabilityToken` automatically when the target requires ingress, while a directly issued token is rejected by that ingress check.
-- Tokens delegated to a subject are cached per complete subject identity, including principal kind. `capabilityTokenCacheKey` therefore never shares tokens across subjects or across kinds with the same id and org.
-- The cache key does **not** include the caller's access class — that is decided by the requester, which the key never sees. Plane-side code that shares one `CapabilityTokenCache` between in-process requesters minting different classes for the same caller id, target, and scopes must give them distinct `cacheKey`s, or a cached `spa: 'service'` token can be served to a plane-class flow. The shipped requesters all mint service-class, so this only arises with hand-built requesters.
+- Only control-plane code asserts subjects: the broker/MCP caller resolver or a low-level direct `issueCapabilityToken({ subject, callerAccess: 'plane', ... })` call. HTTP token endpoints and shipped service-side requesters reject caller-supplied subjects.
+- A delegated subject is always plane-class. The issuer refuses `subject` together with `callerAccess: 'service'`.
+- A direct `issueCapabilityToken({ subject, ... })` call mints a non-brokered token. Prefer the broker for ingress-protected targets so it selects `issueBrokeredCapabilityToken` automatically.
+- Tokens delegated to a subject are cached per complete subject identity, including principal kind.
+- A custom plane-side cache shared between requesters that mint different access classes must use distinct `cacheKey` values. Shipped service-side requesters all mint service-class tokens.
 
 ## Forwarded Connection Info
 
@@ -517,12 +502,13 @@ new ServicePlaneControlPlane({
 });
 ```
 
-The plane then forwards it on every outbound call, exactly where it forwards the request id: the `X-Service-Plane-Conn-Info` header for HTTP-batch and service-binding transports, the `conn_info` query parameter for WebSocket, and the `connInfo` field on `connectAbility(...)` for native binding RPC.
+The plane forwards it on every outbound call: the `X-Service-Plane-Conn-Info` header for Fetch and
+WebSocket logical requests, and the `connInfo` field on native `invokeAbility(...)` calls.
 
-Services receive it as `connInfo` on the ability handler factory input:
+Procedures receive it as `context.connInfo`:
 
 ```ts
-handler: ({ connInfo, identity }) => new TasksHandler(identity, connInfo?.remote.address),
+.handler(({ context, input }) => writeAudit(input, context.identity, context.connInfo?.remote.address))
 ```
 
 Rules the package enforces:
@@ -538,22 +524,20 @@ Treat it as advisory, for audit records and logs. It is not signature-verified, 
 Method scopes are enforced automatically by the generated ability wrapper.
 
 ```ts
-abilityMethod({
-  input: CreateTaskInput,
-  output: CreateTaskOutput,
-  scopes: ['asana.tasks.write'],
-});
+ability
+  .procedure({ scopes: ['asana.tasks.write'] })
+  .input(CreateTaskInput)
+  .output(CreateTaskOutput)
+  .handler(createTask);
 ```
 
-Handlers may still call `requireScopes(...)` when they need the identity object inside custom logic.
+The handler reads the already-authorized identity from `context.identity`. It can make narrower
+domain decisions, but it does not need to repeat the declared method-scope check.
 
 ```ts
-import { requireScopes } from 'service-plane/service';
-
-async createTask(input: CreateTaskInput) {
-  const identity = requireScopes(this, 'asana.tasks.write');
-  // use identity.serviceId or identity.scopes for Service Plane decisions
-}
+.handler(({ context, input }) => {
+  return createTaskForCaller(context.identity.serviceId, input);
+})
 ```
 
 Next: [create a service](service-creation.md), [create a control plane](plane-creation.md), and [reference](reference.md).

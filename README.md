@@ -6,19 +6,24 @@ Ability-first service APIs for TypeScript services.
 
 - Services define schema-backed abilities.
 - The control plane issues short-lived capability tokens.
-- Cap'n Web carries RPC method calls over HTTP-batch, WebSocket, or Cloudflare bindings.
+- oRPC carries typed procedure calls over Fetch, WebSocket, or Cloudflare service bindings.
 - Schemas validate inputs and outputs, using the validation library you already use.
 - Published abilities can become OpenAPI or MCP tools from the control plane.
 - Request ids and structured JSON logs correlate plane and service calls out of the box.
 
-Service authors define abilities. Hono stays the HTTP shell for middleware, discovery, and adapter routes.
+Service authors define oRPC procedures. Hono remains the composition shell for middleware,
+discovery, STS/JWKS, MCP, OpenAPI, and adapter routes; procedure code can normally use the
+transport-neutral `context.env` and `context.request` fields without importing Hono.
 
-The library is written against web-standard globals only (`crypto.subtle`, `fetch`/`Request`, `TextEncoder`, timers) and runs on Node 20+, Cloudflare Workers, Deno, and Bun. That claim is exercised in CI on every push: the full test suite runs on Node 20/22/24 **and inside real workerd isolates** (via `@cloudflare/vitest-pool-workers`), and a bundled smoke — HTTP-batch end to end, streaming over a session transport, token verification accepting and rejecting — runs on Deno and Bun.
+The library is written against web-standard globals only (`crypto.subtle`, `fetch`/`Request`,
+`TextEncoder`, timers) and runs on Node 20+, Cloudflare Workers, Deno, and Bun. The procedure-first
+runtime is currently built on the pinned oRPC 2.0 beta line; see [Architecture](docs/architecture.md#why-orpc-and-what-it-costs)
+for the maturity trade-off.
 
 ## Install
 
 ```sh
-npm install service-plane hono @hono/capnweb capnweb
+npm install service-plane hono
 ```
 
 Ability schemas come from a validation library you choose; `service-plane` does not bundle or require any particular one. Add whichever you already use — anything implementing [Standard Schema](https://standardschema.dev) and its [Standard JSON Schema](https://standardschema.dev/json-schema) companion:
@@ -32,11 +37,10 @@ See [Choosing A Validation Library](docs/service-creation.md#choosing-a-validati
 ## Minimal Service
 
 ```ts
-import { RpcTarget } from 'capnweb';
 import * as z from 'zod';
 import {
   ServicePlaneService,
-  abilityMethod,
+  createAbilityBuilder,
   defineAbility,
   defineCapabilities,
   jwksFromServiceBinding,
@@ -52,6 +56,8 @@ const capabilities = defineCapabilities({
   scopes: [{ id: 'asana.tasks.write', title: 'Create Asana tasks' }],
 });
 
+const ability = createAbilityBuilder<{ Bindings: Env }>();
+
 const asanaTasks = defineAbility({
   id: 'asana.tasks',
   title: 'Asana Tasks',
@@ -59,38 +65,29 @@ const asanaTasks = defineAbility({
   access: 'plane',
   scopes: ['asana.tasks.write'],
   methods: {
-    createTask: abilityMethod({
-      input: z.object({
+    createTask: ability
+      .procedure({
+        scopes: ['asana.tasks.write'],
+        rest: { method: 'post', path: '/asana/tasks', summary: 'Create an Asana task' },
+        mcp: { name: 'asana_create_task', description: 'Create a task in Asana' },
+      })
+      .input(z.object({
         connectionId: z.string(),
         name: z.string().min(1),
         projectId: z.string(),
-      }),
-      output: z.object({
+      }))
+      .output(z.object({
         id: z.string(),
         url: z.string().url(),
+      }))
+      .handler(async ({ context, input }) => {
+        const name = `${context.identity.serviceId}:${input.connectionId}`;
+        const id = context.env.ASANA_CONNECTIONS.idFromName(name);
+        return context.env.ASANA_CONNECTIONS.get(id).createTask(input);
       }),
-      scopes: ['asana.tasks.write'],
-      rest: { method: 'post', path: '/asana/tasks', summary: 'Create an Asana task' },
-      mcp: { name: 'asana_create_task', description: 'Create a task in Asana' },
-    }),
   },
-  handler: ({ context, identity }) => new AsanaTasksHandler(context.env, identity),
+  rpc: { transports: ['fetch', 'cloudflare-service-binding'] },
 });
-
-class AsanaTasksHandler extends RpcTarget {
-  constructor(
-    private readonly env: Env,
-    private readonly identity: { serviceId: string },
-  ) {
-    super();
-  }
-
-  async createTask(input: { connectionId: string; name: string; projectId: string }) {
-    const id = this.env.ASANA_CONNECTIONS.idFromName(`${this.identity.serviceId}:${input.connectionId}`);
-    const connection = this.env.ASANA_CONNECTIONS.get(id);
-    return connection.createTask(input);
-  }
-}
 
 export default new ServicePlaneService<{ Bindings: Env }>({
   id: 'asana',
@@ -102,6 +99,7 @@ export default new ServicePlaneService<{ Bindings: Env }>({
   },
   capabilities,
   abilities: [asanaTasks],
+  ingress: {},
 });
 ```
 
@@ -109,7 +107,7 @@ This service mounts:
 
 ```txt
 GET /.well-known/service-plane/service.json
-ALL /rpc/asana.tasks
+ALL /rpc/asana.tasks/createTask
 ```
 
 ## Minimal Control Plane
@@ -122,6 +120,9 @@ import {
 } from 'service-plane/control-plane';
 
 export default new ServicePlaneControlPlane({
+  broker: {
+    caller: (c) => ({ id: c.req.header('x-service-id') ?? 'headless-front', kind: 'service' }),
+  },
   signingKeys: (env) => [{ kid: '2026-07', secret: env.STS_SIGNING_SECRET }],
   authenticateCaller: (c) =>
     hmacServiceClientAuth({
@@ -131,6 +132,9 @@ export default new ServicePlaneControlPlane({
     cloudflareServiceBinding({
       id: 'asana',
       binding: c.env.ASANA,
+      abilityRpc: {
+        invokeAbility: (input) => c.env.ASANA.invokeAbility(input),
+      },
       grants: [{ caller: 'workflow-runner', scopes: ['asana.tasks.write'] }],
     }),
   ],
@@ -143,41 +147,30 @@ The control plane mounts:
 POST /.well-known/service-plane/capability-token
 GET  /.well-known/service-plane/jwks.json
 GET  /openapi.json
+POST /rpc/broker/call                           (typed unary broker)
+POST /rpc/broker/stream                         (typed streaming broker)
 POST /rpc/mcp                                    (MCP streamable HTTP)
 ```
 
 The plane serves the OpenAPI document; to render it, mount a Hono UI extension (e.g. `@hono/swagger-ui` or `@scalar/hono-api-reference`) on `plane.app` pointed at `/openapi.json`.
 
-For this compact local-development walkthrough, the service above leaves `ingress` disabled so the caller below can connect directly. Do not use this direct topology as the production boundary. Production services should enable `ingress: {}` and route ability calls through the control-plane broker; direct non-brokered tokens are then rejected with `403` before handler creation. See [Service-Plane Ingress](docs/plane-creation.md#service-plane-ingress).
+The caller below knows the ability contract but only connects to the control plane. It never receives
+a service capability token or private service address.
 
-## Minimal Local Caller
+## Minimal Caller
 
 ```ts
-import {
-  abilitySession,
-  cloudflareServiceBindingRpc,
-  controlPlaneHmacTokenRequester,
-  type AbilityRpc,
-} from 'service-plane/service';
+import { createBrokeredAbilityClient } from 'service-plane/service';
+import { asanaTasks } from './asana-tasks';
 
-declare const env: {
-  ASANA: Fetcher;
-  CONTROL_PLANE: Fetcher;
-  WORKFLOW_RUNNER_SECRET: string;
-};
-
-const asana = await abilitySession<AbilityRpc<typeof asanaTasks>>({
-  abilityId: 'asana.tasks',
-  callerServiceId: 'workflow-runner',
+const asana = createBrokeredAbilityClient({
+  ability: asanaTasks,
   targetServiceId: 'asana',
   scopes: ['asana.tasks.write'],
-  requestToken: controlPlaneHmacTokenRequester({
-    clientId: 'workflow-runner',
-    clientSecret: env.WORKFLOW_RUNNER_SECRET,
-    controlPlaneUrl: 'https://control-plane.internal',
-    fetch: env.CONTROL_PLANE,
-  }),
-  transport: cloudflareServiceBindingRpc(env.ASANA),
+  transport: {
+    origin: 'https://api.example.com',
+    headers: { 'x-service-id': 'workflow-runner' },
+  },
 });
 
 await asana.createTask({
@@ -186,6 +179,20 @@ await asana.createTask({
   projectId: 'proj_456',
 });
 ```
+
+The returned value is an ordinary typed oRPC client. It therefore works directly with oRPC's
+TanStack Query integration:
+
+```ts
+import { createTanstackQueryUtils } from '@orpc/tanstack-query';
+
+const queries = createTanstackQueryUtils(asana);
+const options = queries.createTask.mutationOptions();
+```
+
+Install `@orpc/tanstack-query` at the same pinned oRPC version and the TanStack adapter for your UI
+framework. The public topology does not change: TanStack Query still calls the control plane, and
+the control plane discovers, authorizes, mints, and routes to the private service.
 
 ## Agent Skill
 

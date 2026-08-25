@@ -17,7 +17,7 @@ const discovery = (id: string): ServiceDiscoveryDocument => ({
       exposure: 'published',
       id: `${id}.run`,
       methods: { go: { inputSchema: { type: 'object' }, outputSchema: { type: 'object' }, scopes: [`${id}.use`] } },
-      rpc: { path: `/rpc/${id}.run`, transports: ['http-batch'] },
+      rpc: { path: `/rpc/${id}.run`, transports: ['fetch'] },
       scopes: [`${id}.use`],
     },
   ],
@@ -379,7 +379,7 @@ describe('discovery cache on the token path', () => {
                       methods: {
                         go: { inputSchema: { type: 'object' }, outputSchema: { type: 'object' }, scopes: [`svc0.${tenant}`] },
                       },
-                      rpc: { path: '/rpc/svc0.run', transports: ['http-batch' as const] },
+                      rpc: { path: '/rpc/svc0.run', transports: ['fetch' as const] },
                       scopes: [`svc0.${tenant}`],
                     },
                   ],

@@ -82,12 +82,19 @@ Both halves of the contract are checked when the service is defined, not on the 
 
 ## 3. Define An Ability
 
-An ability is the service API surface. A method is one callable operation.
+An ability is the service API surface. Each method is an implemented oRPC procedure.
 
 ```ts
-import { abilityMethod, defineAbility } from 'service-plane/service';
+import { createAbilityBuilder, defineAbility } from 'service-plane/service';
 import { CreateTaskInput, CreateTaskOutput } from './schemas';
-import { AsanaTasksHandler } from './tasks.handler';
+
+type Env = {
+  Bindings: {
+    ASANA_CONNECTIONS: DurableObjectNamespace;
+  };
+};
+
+const ability = createAbilityBuilder<Env>();
 
 export const asanaTasks = defineAbility({
   id: 'asana.tasks',
@@ -96,76 +103,72 @@ export const asanaTasks = defineAbility({
   access: 'plane',
   scopes: ['asana.tasks.write'],
   methods: {
-    createTask: abilityMethod({
-      input: CreateTaskInput,
-      output: CreateTaskOutput,
-      scopes: ['asana.tasks.write'],
-      rest: { method: 'post', path: '/asana/tasks', summary: 'Create an Asana task' },
-      mcp: { name: 'asana_create_task', description: 'Create a task in Asana' },
-    }),
+    createTask: ability
+      .procedure({
+        scopes: ['asana.tasks.write'],
+        rest: { method: 'post', path: '/asana/tasks', summary: 'Create an Asana task' },
+        mcp: { name: 'asana_create_task', description: 'Create a task in Asana' },
+      })
+      .input(CreateTaskInput)
+      .output(CreateTaskOutput)
+      .handler(async ({ context, input }) => {
+        const connectionName = `${context.identity.serviceId}:${input.connectionId}`;
+        const id = context.env.ASANA_CONNECTIONS.idFromName(connectionName);
+        return context.env.ASANA_CONNECTIONS.get(id).createTask(input);
+      }),
   },
-  handler: ({ context, identity }) => new AsanaTasksHandler(context.env, identity),
+  rpc: { transports: ['fetch', 'cloudflare-service-binding'] },
 });
 ```
 
-`handler` returns the implementation object. The object can implement many methods, but only methods declared in `ability.methods` are callable through Service Plane.
+The procedure is the implementation. Its metadata also drives discovery, REST/OpenAPI, and MCP, so
+there is no second handler class or method map to keep synchronized. oRPC middleware and typed error
+maps can be added with the normal procedure builder API.
 
 `access: 'plane'` is the default Service Plane path: the control plane or gateway decides whether an upstream product user, API key, or anonymous request may invoke the ability. Use `access: 'service'` only for abilities that should be brokered for authenticated service callers.
 
 The service enforces this itself. Every capability token names the access class the control plane authenticated for the caller ([`identity.callerAccess`](auth.md#context-and-identity)), and an `access: 'service'` ability rejects a `plane` caller with 403 before the handler is created. The check reads the ability definition in front of you, not the plane's discovered catalog, so tightening an ability takes effect the moment the service deploys.
 
-## 4. Implement The Handler
+## 4. Use The Authorized Context
 
-The handler receives already-validated input. Service Plane validates input before the method call and validates output after the method returns.
+The handler receives validated input only after Service Plane has verified the token, ingress claim,
+access class, and method scopes. Its output is validated before it crosses the RPC boundary.
 
 ```ts
-import { RpcTarget } from 'capnweb';
-import type { CapabilityIdentity } from 'service-plane/service';
+.handler(async ({ context, input }) => {
+  context.signal?.throwIfAborted();
+  const remaining = context.remainingTimeoutMs?.();
 
-type Env = {
-  ASANA_CONNECTIONS: DurableObjectNamespace;
-};
-
-export class AsanaTasksHandler extends RpcTarget {
-  constructor(
-    private readonly env: Env,
-    private readonly identity: CapabilityIdentity,
-  ) {
-    super();
-  }
-
-  async createTask(input: { connectionId: string; name: string; projectId: string }) {
-    const connectionName = `${this.identity.serviceId}:${input.connectionId}`;
-    const id = this.env.ASANA_CONNECTIONS.idFromName(connectionName);
-    const connection = this.env.ASANA_CONNECTIONS.get(id);
-
-    return connection.createTask(input);
-  }
-}
+  return context.env.ASANA_CONNECTIONS.get(
+    context.env.ASANA_CONNECTIONS.idFromName(input.connectionId),
+  ).createTask(input, { signal: context.signal, timeoutMs: remaining });
+})
 ```
+
+Use `context.env` for runtime bindings and `context.request` for headers. The verified caller is in
+`context.identity`. `context.context` exposes the underlying Hono context when a procedure genuinely
+needs a middleware variable or another Hono-specific feature; ordinary domain code need not import
+Hono.
 
 ### Streaming Methods
 
-Some operations produce many results over time — large file transfers, long exports. Declare them with `stream: true`; the `output` schema then validates each streamed item and the handler method returns an async generator (or any iterable / `ReadableStream`):
+Some operations produce many results over time. Start them with `ability.stream(itemSchema, metadata)`;
+the item schema validates each value yielded by the async iterator:
 
 ```ts
-readFile: abilityMethod({
-  input: z.object({ path: z.string() }),
-  output: z.object({ chunk: z.string() }),
-  scopes: ['hub.files.read'],
-  stream: true,
-}),
+readFile: ability
+  .stream(z.object({ chunk: z.string() }), { scopes: ['hub.files.read'] })
+  .input(z.object({ path: z.string() }))
+  .handler(async function* ({ context, input }) {
+    for await (const chunk of context.env.STORAGE.read(input.path)) {
+      yield { chunk };
+    }
+  }),
 ```
 
-```ts
-async *readFile(input: { path: string }) {
-  for await (const chunk of this.storage.read(input.path)) {
-    yield { chunk };
-  }
-}
-```
-
-Callers receive a native Cap'n Web `ReadableStream` of validated items from the ordinary `abilitySession` call. Streams need an ongoing session, so the ability must enable a session transport (`websocket` or `cloudflare-binding-rpc`); HTTP-batch calls to streaming methods fail with 405. See [Streaming](streaming.md).
+Callers receive a typed async iterator. Fetch and WebSocket carry it directly. A Cloudflare
+service-binding client uses native RPC for unary procedures and `binding.fetch` for streams. See
+[Streaming](streaming.md).
 
 `context` is runtime access, such as Hono context, environment bindings, storage, and execution context.
 
@@ -210,7 +213,7 @@ This mounts discovery and an ingress-protected RPC endpoint:
 
 ```txt
 GET /.well-known/service-plane/service.json
-ALL /rpc/asana.tasks
+ALL /rpc/asana.tasks/createTask
 ```
 
 When `ingress` is configured, ability RPC requests must use a brokered capability token issued by the control plane. Normal capability tokens still verify cryptographically, but they are rejected before input validation or handler creation.

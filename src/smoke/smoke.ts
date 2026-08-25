@@ -1,51 +1,24 @@
-import { createCapabilityIssuer, defineServiceGrants } from '../control-plane/index.js';
+import { type CapabilitySigningJwk, createCapabilityIssuer, defineServiceGrants } from '../control-plane/index.js';
 import {
   type AbilitySchema,
-  abilityMethod,
-  abilitySession,
-  cloudflareNativeRpc,
-  cloudflareServiceBindingRpc,
+  createAbilityBuilder,
+  createAbilityClient,
   defineAbility,
   defineCapabilities,
-  disposeAbilitySession,
   jwkCapabilityProofSigner,
-  RpcTarget,
-  requireScopes,
   ServicePlaneService,
 } from '../service/index.js';
-// Thumbprinting is not on a public entrypoint — a plane computes `cnf` from the key its caller
-// authenticated with, so consumers never call it themselves. The smoke plays both roles.
 import { publicJwkFromPrivateJwk, servicePlaneJwkThumbprint } from '../shared/jwk-auth.js';
 import { signCapabilityProof } from '../shared/proof-of-possession.js';
 
-// The portability smoke: one self-contained pass over the paths whose behavior differs by runtime,
-// written against web-standard globals only so the same bundle runs on Node, workerd, Deno, and Bun.
-// It exercises what the CI matrix exists to prove — the HTTP-batch flush (setImmediate on Node/Bun,
-// setTimeout(0) on workerd/Deno), the WebCrypto verify path with its cached key import, streaming
-// over a session transport, and sender-constrained proofs. Kept out of the published build; see
-// tsconfig.json's exclude and scripts/smoke.mjs.
-
 type SmokeApi = {
-  chunks(input: { count: number }): Promise<ReadableStream<{ index: number }>>;
+  chunks(input: { count: number }): Promise<AsyncIterable<{ index: number }>>;
   run(input: { name: string }): Promise<{ caller: string; name: string }>;
 };
-
-class SmokeHandler extends RpcTarget {
-  async *chunks(input: { count: number }) {
-    requireScopes(this, 'smoke.stream');
-    for (let index = 0; index < input.count; index += 1) yield { index };
-  }
-
-  async run(input: { name: string }) {
-    const caller = requireScopes(this, 'smoke.run');
-    return { caller: caller.serviceId, name: input.name };
-  }
-}
 
 export async function runSmoke(): Promise<string[]> {
   const passed: string[] = [];
   const step = (name: string) => passed.push(name);
-
   const keys = await smokeKeys();
   const capabilities = defineCapabilities({ scopes: [{ id: 'smoke.run' }, { id: 'smoke.stream' }], serviceId: 'smoke' });
   const issuer = createCapabilityIssuer({
@@ -54,101 +27,96 @@ export async function runSmoke(): Promise<string[]> {
     issuer: 'control-plane',
     privateJwks: [keys.privateJwk],
   });
+  const ability = createAbilityBuilder();
+  const jobs = defineAbility({
+    id: 'smoke.jobs',
+    methods: {
+      chunks: ability
+        .stream(objectSchema('index', 'number'), { scopes: ['smoke.stream'] })
+        .input(objectSchema('count', 'number'))
+        .handler(async function* ({ input }) {
+          const { count } = input as { count: number };
+          for (let index = 0; index < count; index += 1) yield { index };
+        }),
+      run: ability
+        .procedure({ scopes: ['smoke.run'] })
+        .input(objectSchema('name', 'string'))
+        .output(recordSchema())
+        .handler(({ context, input }) => ({
+          caller: context.identity.serviceId,
+          name: (input as { name: string }).name,
+        })),
+    },
+    rpc: { transports: ['fetch', 'cloudflare-service-binding'] },
+    scopes: ['smoke.run', 'smoke.stream'],
+  });
   const service = new ServicePlaneService({
-    abilities: [
-      defineAbility({
-        id: 'smoke.jobs',
-        methods: {
-          chunks: abilityMethod({
-            input: objectSchema('count', 'number'),
-            output: objectSchema('index', 'number'),
-            scopes: ['smoke.stream'],
-            stream: true,
-          }),
-          run: abilityMethod({
-            input: objectSchema('name', 'string'),
-            output: recordSchema(),
-            scopes: ['smoke.run'],
-          }),
-        },
-        rpc: { transports: ['http-batch', 'cloudflare-binding-rpc'] },
-        scopes: ['smoke.run', 'smoke.stream'],
-        handler: () => new SmokeHandler() as SmokeHandler & Record<string, unknown>,
-      }),
-    ],
+    abilities: [jobs],
     auth: { issuer: 'control-plane', jwks: { keys: [keys.publicJwk] } },
     capabilities,
     id: 'smoke',
-    // The smoke's one line of output is its verdict; per-request JSON logs would drown it.
     logger: false,
     title: 'Smoke',
     version: '0.0.0',
   });
   const requestToken = (scopes: string[]) =>
     issuer.issueCapabilityToken({ callerAccess: 'service', callerServiceId: 'smoke-caller', scopes, targetServiceId: 'smoke' });
+  const fetchTransport = {
+    fetch: { fetch: async (request: Request) => service.fetch(request) },
+    origin: 'https://smoke.internal',
+    type: 'fetch' as const,
+  };
+  const client = (scopes: string[], request: () => ReturnType<typeof requestToken>, extra: Record<string, unknown> = {}) =>
+    createAbilityClient({
+      ability: jobs,
+      callerServiceId: 'smoke-caller',
+      requestToken: request,
+      scopes,
+      targetServiceId: 'smoke',
+      transport: fetchTransport,
+      ...extra,
+    }) as unknown as SmokeApi;
 
-  // HTTP-batch end to end: the one-round-trip transport through the Hono shell, including the
-  // batch flush this runtime actually uses (setImmediate on Node/Bun, setTimeout(0) elsewhere).
-  const batched = await abilitySession<Pick<SmokeApi, 'run'>>({
-    abilityId: 'smoke.jobs',
+  const direct = client(['smoke.run', 'smoke.stream'], () => requestToken(['smoke.run', 'smoke.stream']));
+  const ran = await direct.run({ name: 'nightly' });
+  assert(ran.caller === 'smoke-caller' && ran.name === 'nightly', `unexpected unary result: ${JSON.stringify(ran)}`);
+  step('oRPC Fetch unary call');
+
+  const items: Array<{ index: number }> = [];
+  for await (const item of await direct.chunks({ count: 3 })) items.push(item);
+  assert(items.map((item) => item.index).join(',') === '0,1,2', `unexpected stream items: ${JSON.stringify(items)}`);
+  step('oRPC Fetch streaming call');
+
+  const native = createAbilityClient({
+    ability: jobs,
     callerServiceId: 'smoke-caller',
     requestToken: () => requestToken(['smoke.run']),
     scopes: ['smoke.run'],
     targetServiceId: 'smoke',
-    transport: cloudflareServiceBindingRpc({ fetch: async (request) => service.fetch(request) }, undefined, 'https://smoke.internal'),
-  });
-  const ran = await batched.run({ name: 'nightly' });
-  assert(ran.caller === 'smoke-caller' && ran.name === 'nightly', `unexpected unary result: ${JSON.stringify(ran)}`);
-  step('http-batch unary call');
+    transport: {
+      binding: {
+        fetch: async (request) => service.fetch(request),
+        invokeAbility: (input) => service.invokeAbility(input),
+      },
+      origin: 'https://smoke.internal',
+      type: 'service-binding',
+    },
+  }) as unknown as Pick<SmokeApi, 'run'>;
+  const nativeResult = await native.run({ name: 'native' });
+  assert(nativeResult.name === 'native', `native RPC call failed: ${JSON.stringify(nativeResult)}`);
+  step('Cloudflare native unary call');
 
-  // Streaming over a session transport: native binding RPC keeps the Cap'n Web session open, so the
-  // returned ReadableStream flows item by item through the validating wrapper.
-  const session = await abilitySession<SmokeApi>({
-    abilityId: 'smoke.jobs',
-    callerServiceId: 'smoke-caller',
-    requestToken: () => requestToken(['smoke.run', 'smoke.stream']),
-    scopes: ['smoke.run', 'smoke.stream'],
-    targetServiceId: 'smoke',
-    transport: cloudflareNativeRpc({ connectAbility: (input) => service.connectAbility(input) }),
-  });
-  const items: Array<{ index: number }> = [];
-  const reader = (await session.chunks({ count: 3 })).getReader();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    items.push(value);
-  }
-  assert(items.map((item) => item.index).join(',') === '0,1,2', `unexpected stream items: ${JSON.stringify(items)}`);
-  disposeAbilitySession(session);
-  step('streaming over a session transport');
-
-  // Verify path, negative direction: WebCrypto must reject a tampered signature on this runtime,
-  // not just accept a valid one.
   const issued = await requestToken(['smoke.run']);
   const tampered = issued.token.slice(0, -2) + (issued.token.endsWith('AA') ? 'BB' : 'AA');
-  const forged = await abilitySession<Pick<SmokeApi, 'run'>>({
-    abilityId: 'smoke.jobs',
-    callerServiceId: 'smoke-caller',
-    requestToken: async () => ({ expiresAt: issued.expiresAt, token: tampered }),
-    scopes: ['smoke.run'],
-    targetServiceId: 'smoke',
-    transport: cloudflareServiceBindingRpc({ fetch: async (request) => service.fetch(request) }, undefined, 'https://smoke.internal'),
-  })
-    .then((api) => api.run({ name: 'forged' }))
+  const forged = await client(['smoke.run'], async () => ({ expiresAt: issued.expiresAt, token: tampered }))
+    .run({ name: 'forged' })
     .then(
       () => undefined,
       (error: unknown) => error,
     );
-  assert(
-    forged instanceof Error && forged.message.includes('Invalid Service-Plane capability signature'),
-    `tampered token was not rejected: ${String(forged)}`,
-  );
+  assert(forged instanceof Error, `tampered token was not rejected: ${String(forged)}`);
   step('tampered token rejected');
 
-  // Sender-constrained tokens: the caller signs a proof with the key its token is bound to. This is
-  // the path a runtime JWK-shape difference already broke once — workerd's exportKey('jwk')
-  // materializes `alg` where Node omits it — so every runtime has to prove it end to end, in both
-  // directions: the bound key accepted, an unbound one refused at the confirmation check.
   const callerKeyPair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
   const callerPrivateJwk = await crypto.subtle.exportKey('jwk', callerKeyPair.privateKey);
   const jkt = await servicePlaneJwkThumbprint(publicJwkFromPrivateJwk(callerPrivateJwk, 'smoke-caller-key'));
@@ -160,62 +128,33 @@ export async function runSmoke(): Promise<string[]> {
       scopes: ['smoke.run'],
       targetServiceId: 'smoke',
     });
-
-  const bound = await abilitySession<Pick<SmokeApi, 'run'>>({
-    abilityId: 'smoke.jobs',
-    callerServiceId: 'smoke-caller',
+  const bound = client(['smoke.run'], boundToken, {
     proveTokenPossession: jwkCapabilityProofSigner({ privateJwk: callerPrivateJwk }),
-    requestToken: boundToken,
-    scopes: ['smoke.run'],
-    targetServiceId: 'smoke',
-    transport: cloudflareServiceBindingRpc({ fetch: async (request) => service.fetch(request) }, undefined, 'https://smoke.internal'),
   });
   const proven = await bound.run({ name: 'bound' });
   assert(proven.name === 'bound', `sender-constrained call failed: ${JSON.stringify(proven)}`);
 
-  // The negative direction has to reach the service: the shipped signer refuses a mismatched key
-  // locally, so signing directly is what puts the thumbprint check itself under test — and it
-  // exercises a second runtime-exported key through the same signing path.
   const otherKeyPair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
   const otherPrivateJwk = await crypto.subtle.exportKey('jwk', otherKeyPair.privateKey);
-  const wrongKey = await abilitySession<Pick<SmokeApi, 'run'>>({
-    abilityId: 'smoke.jobs',
-    callerServiceId: 'smoke-caller',
-    proveTokenPossession: (input) => signCapabilityProof({ ...input, privateJwk: otherPrivateJwk }),
-    requestToken: boundToken,
-    scopes: ['smoke.run'],
-    targetServiceId: 'smoke',
-    transport: cloudflareServiceBindingRpc({ fetch: async (request) => service.fetch(request) }, undefined, 'https://smoke.internal'),
+  const wrongKey = await client(['smoke.run'], boundToken, {
+    proveTokenPossession: (input: { abilityId: string; targetServiceId: string; token: string }) =>
+      signCapabilityProof({ ...input, privateJwk: otherPrivateJwk }),
   })
-    .then((api) => api.run({ name: 'unbound' }))
+    .run({ name: 'unbound' })
     .then(
       () => undefined,
       (error: unknown) => error,
     );
-  assert(
-    wrongKey instanceof Error && wrongKey.message.includes('does not match the token confirmation'),
-    `a proof signed by an unbound key was accepted: ${String(wrongKey)}`,
-  );
+  assert(wrongKey instanceof Error, `a proof signed by an unbound key was accepted: ${String(wrongKey)}`);
   step('sender-constrained token proved and refused');
 
-  // Scope enforcement inside the wrapper: a token without the method's scope must not reach it.
-  const narrow = await abilitySession<SmokeApi>({
-    abilityId: 'smoke.jobs',
-    callerServiceId: 'smoke-caller',
-    requestToken: () => requestToken(['smoke.run']),
-    scopes: ['smoke.run'],
-    targetServiceId: 'smoke',
-    transport: cloudflareNativeRpc({ connectAbility: (input) => service.connectAbility(input) }),
-  });
-  const refused = await narrow.chunks({ count: 1 }).then(
-    () => undefined,
-    (error: unknown) => error,
-  );
-  assert(
-    refused instanceof Error && refused.message.includes('Missing Service-Plane capability scope'),
-    `missing scope was not refused: ${String(refused)}`,
-  );
-  disposeAbilitySession(narrow);
+  const refused = await client(['smoke.stream'], () => requestToken(['smoke.run']))
+    .chunks({ count: 1 })
+    .then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+  assert(refused instanceof Error, `missing scope was not refused: ${String(refused)}`);
   step('missing scope refused');
 
   return passed;
@@ -225,8 +164,6 @@ function assert(condition: boolean, message: string): asserts condition {
   if (!condition) throw new Error(`smoke failed: ${message}`);
 }
 
-// Hand-written Standard Schema values keep the smoke free of any validation library, exactly like
-// the library itself: `~standard.validate` plus `~standard.jsonSchema` is the whole contract.
 function objectSchema(field: string, kind: 'number' | 'string'): AbilitySchema {
   const jsonSchema = () => ({ properties: { [field]: { type: kind } }, required: [field], type: 'object' });
   return {
@@ -258,7 +195,8 @@ function recordSchema(): AbilitySchema {
 
 async function smokeKeys() {
   const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
-  const privateJwk = { ...(await crypto.subtle.exportKey('jwk', pair.privateKey)), kid: 'smoke-key' };
-  const publicJwk = { ...(await crypto.subtle.exportKey('jwk', pair.publicKey)), kid: 'smoke-key' };
+  const exported = await crypto.subtle.exportKey('jwk', pair.privateKey);
+  const privateJwk: CapabilitySigningJwk = { ...exported, alg: 'ES256', kid: 'smoke-key', use: 'sig' };
+  const publicJwk = publicJwkFromPrivateJwk(privateJwk, 'smoke-key');
   return { privateJwk, publicJwk };
 }

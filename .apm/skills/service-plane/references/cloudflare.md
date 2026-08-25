@@ -2,24 +2,21 @@
 
 Goal: use Service Plane with Workers, Service Bindings, Durable Objects, and Dynamic Workers.
 
-Cloudflare-to-Cloudflare calls should use bindings when possible. Use HTTP-batch for self-hosted services and WebSocket for explicit long-lived sessions.
+Keep the control plane as the public Worker and use service bindings for private calls to auxiliary
+Workers. The broker uses native Cloudflare RPC for unary procedures and binding Fetch for streams.
 
 ## Local Worker-To-Worker Calls
 
-For local development, the caller can request a token through a private binding and call the service
-binding directly. Production services should enable ingress and route the caller through the broker.
+For local development, a trusted service can request a token and call a service binding directly.
+Production application traffic should use `createBrokeredAbilityClient` so the caller connects only
+to the control plane.
 
 ```ts
-import {
-  abilitySession,
-  cloudflareServiceBindingRpc,
-  controlPlaneRpcTokenRequester,
-  type AbilityRpc,
-} from 'service-plane/service';
+import { createAbilityClient, controlPlaneRpcTokenRequester } from 'service-plane/service';
 import { asanaTasks } from './abilities';
 
-const asana = await abilitySession<AbilityRpc<typeof asanaTasks>>({
-  abilityId: 'asana.tasks',
+const asana = createAbilityClient({
+  ability: asanaTasks,
   callerServiceId: 'workflow-runner',
   targetServiceId: 'asana',
   scopes: ['asana.tasks.write'],
@@ -27,19 +24,25 @@ const asana = await abilitySession<AbilityRpc<typeof asanaTasks>>({
     binding: env.CONTROL_PLANE,
     callerServiceId: 'workflow-runner',
   }),
-  transport: cloudflareServiceBindingRpc(env.ASANA),
+  transport: {
+    type: 'service-binding',
+    binding: {
+      fetch: (request) => env.ASANA.fetch(request),
+      invokeAbility: (input) => env.ASANA.invokeAbility(input),
+    },
+  },
 });
 ```
 
-`cloudflareServiceBindingRpc(...)` sends HTTP-batch RPC through the binding and defaults to
-`/rpc/<abilityId>`. This direct transport is for ingress-disabled local/development setups;
-production ingress routes through the broker.
+The client resolves lazily. It calls `invokeAbility` for unary procedures and `fetch` for streaming
+procedures. This direct client is for service-to-service or ingress-disabled development; the
+production browser/headless-front path goes through the broker.
 
 ## Native Binding RPC
 
-When the service binding exposes `connectAbility(...)`, native binding RPC is the lowest-overhead
-session transport. Direct caller use is for ingress-disabled local/development setups; in production,
-the control-plane broker can use the same binding with a brokered token.
+When the service binding exposes `invokeAbility(...)`, the control plane can call a unary procedure
+without an HTTP serialization hop. It still mints a brokered token, and the service still performs
+the full issuer, audience, expiry, ingress, access, and scope checks before input validation.
 
 Expose both Hono HTTP routes and the native method from a `WorkerEntrypoint`:
 
@@ -55,33 +58,30 @@ export default class AsanaService extends WorkerEntrypoint<Env> {
     return service.fetch(request, this.env, this.ctx);
   }
 
-  connectAbility(input: { abilityId: string; requestId?: string; token: string }) {
-    return service.connectAbility(input, this.env);
+  invokeAbility(input: Parameters<typeof service.invokeAbility>[0]) {
+    return service.invokeAbility(input, this.env);
   }
 }
 ```
 
-```ts
-transport: cloudflareNativeRpc(env.ASANA)
-```
-
-Wrap a direct native `abilitySession` in `using`, or call `disposeAbilitySession` in `finally`; the
-session caches its `connectAbility` target and disposal releases that target.
-
 For the control plane to use the same path, register the binding as the endpoint's `abilityRpc`:
 
 ```ts
-cloudflareServiceBinding({ abilityRpc: env.ASANA, binding: env.ASANA, id: 'asana' });
+cloudflareServiceBinding({
+  abilityRpc: { invokeAbility: (input) => env.ASANA.invokeAbility(input) },
+  binding: env.ASANA,
+  id: 'asana',
+});
 ```
 
 This is always explicit — a service-binding stub answers any property access with a callable RPC
-proxy, so the presence of `connectAbility` proves nothing about the target.
+proxy, so the presence of `invokeAbility` proves nothing about the target.
 
 Both transports use the same ability wrapper: token verification, method scopes, input validation, handler call, and output validation.
 
-Native binding calls do not traverse the Hono middleware chain, but the ability handler still
-receives a real Hono `Context` with the ability's POST path, supplied bindings, and propagated
-request id. No HTTP execution context is fabricated for the RPC call.
+Native binding calls do not traverse the Hono middleware chain. Procedure handlers still receive
+`context.env`, `context.request`, the verified identity, deadline signal, and an advanced Hono
+context escape hatch with the propagated request id.
 
 Ingress-protected services reject native binding RPC when the caller uses a normal non-brokered capability token.
 
@@ -154,8 +154,8 @@ await env.ASANA.createTask({
 Behind that binding:
 
 1. The loader fixes the application-level tenant, user, connection, and allowed scopes.
-2. The binding requests a ServicePlane token.
-3. The binding opens an ability session to `asana.tasks`.
+2. The binding requests a ServicePlane token when its lazy client needs one.
+3. The binding calls the typed `asana.tasks` procedure client.
 4. The Asana service routes the call to the right Durable Object.
 
 This keeps workflow code simple and keeps credentials outside user-authored workflow code. Service Plane secures the plane-to-service call and can delegate it to an end-user subject per RFC 8693; the implementor owns any further user and tenant context in the validated input.
@@ -295,8 +295,14 @@ Keep JWKS key rotation overlapping: publish a new key alongside the old one for 
 
 ## When To Use WebSockets
 
-Use WebSocket for long-lived or interactive sessions, such as MCP-style tool sessions or realtime updates. Streaming ability methods also need a session transport — on Cloudflare prefer native binding RPC, which streams without a WebSocket (see [Streaming](streaming.md)).
+Use WebSocket for long-lived or interactive sessions, such as realtime updates. On Cloudflare,
+service-to-service streams use oRPC over the service binding's Fetch interface; native binding RPC
+is the unary fast path (see [Streaming](streaming.md)).
 
-Do not use WebSocket as the default Worker-to-Worker transport. Bindings are simpler for request/response work and do not need connection lifecycle handling. Note that Durable Objects holding Cap'n Web sessions bill duration for the whole connection — Cap'n Web cannot use the WebSocket Hibernation API yet (capnweb#36). Full decision guide: [Choosing A Transport](transports.md).
+Do not use WebSocket as the default Worker-to-Worker transport. Bindings are simpler for ordinary
+calls and need no connection lifecycle. When a Durable Object genuinely owns a long-lived socket,
+oRPC hibernation is available through `HibernationHandlerPlugin`, `rpc.manualWebSocket`, and the
+service's `webSocketMessage`/`webSocketClose` entrypoints. Full decision guide:
+[Choosing A Transport](transports.md).
 
 Next: [architecture](architecture.md), [auth](auth.md), and [Node.js](nodejs.md).

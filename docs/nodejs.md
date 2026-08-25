@@ -33,24 +33,19 @@ The service exposes:
 
 ```txt
 GET  /.well-known/service-plane/service.json
-POST /rpc/asana.tasks
+POST /rpc/asana.tasks/createTask
 ```
 
-## Local Caller Over HTTP-Batch
+## Local Caller Over Fetch
 
-HTTP-batch is the default self-hosted request/response transport.
+Fetch is the default self-hosted transport and supports both unary and streaming procedures.
 
 ```ts
-import {
-  abilitySession,
-  controlPlaneJwkTokenRequester,
-  httpBatchRpc,
-  type AbilityRpc,
-} from 'service-plane/service';
+import { createAbilityClient, controlPlaneJwkTokenRequester } from 'service-plane/service';
 import { asanaTasks } from './abilities';
 
-const asana = await abilitySession<AbilityRpc<typeof asanaTasks>>({
-  abilityId: 'asana.tasks',
+const asana = createAbilityClient({
+  ability: asanaTasks,
   callerServiceId: 'workflow-runner',
   targetServiceId: 'asana',
   scopes: ['asana.tasks.write'],
@@ -60,7 +55,7 @@ const asana = await abilitySession<AbilityRpc<typeof asanaTasks>>({
     keyId: 'workflow-runner-2026-01',
     privateJwk,
   }),
-  transport: httpBatchRpc('https://asana.example.com'),
+  transport: { type: 'fetch', origin: 'https://asana.example.com' },
 });
 
 await asana.createTask({
@@ -72,7 +67,7 @@ await asana.createTask({
 
 This local-development example deliberately leaves `ingress` disabled. Production services should
 enable `ingress: {}` and expose the ability through the control-plane broker instead of calling the
-service URL directly. Direct HTTP-batch calls with ordinary tokens are rejected when ingress is
+service URL directly. Direct Fetch calls with ordinary tokens are rejected when ingress is
 enabled.
 
 ## HMAC Fallback
@@ -89,41 +84,28 @@ controlPlaneHmacTokenRequester({
 
 JWK is preferable for distributed services because the private key stays with the caller and the public key can be discovered or configured by the plane.
 
-## WebSocket Sessions
+## WebSocket Clients
 
-Use WebSocket only when the session is long-lived, interactive, or chatty.
+Use WebSocket only when the connection is long-lived, interactive, or chatty.
 
 ```ts
-transport: websocketRpc('wss://asana.example.com/rpc/asana.tasks')
+const api = createAbilityClient({
+  // ...
+  transport: {
+    type: 'websocket',
+    url: 'wss://asana.example.com/rpc/asana.tasks',
+    createWebSocket,
+  },
+});
 ```
 
 If the Node runtime does not provide a global `WebSocket`, inject the standards-compatible client
-you already use. The factory receives the final URL, including Service Plane's propagated request
-id:
+you already use through `createWebSocket`. The same option exists on
+`createBrokeredAbilityClient`, whose public URL normally ends in `/rpc/broker/ws`. This keeps
+WebSocket construction runtime-owned and does not require a persistent global.
 
-```ts
-transport: websocketRpc('wss://asana.example.com/rpc/asana.tasks', {
-  createWebSocket, // (url: string) => WebSocket from your client adapter
-});
-```
-
-The control-plane broker and MCP projection use the same factory through the service endpoint:
-
-```ts
-import { httpsService } from 'service-plane/control-plane';
-
-httpsService({
-  id: 'asana',
-  baseUrl: 'https://asana.example.com',
-  createWebSocket,
-});
-```
-
-This keeps WebSocket construction runtime-owned and does not require application code to install a
-persistent global. Cap'n Web still reads `WebSocket.CONNECTING` from the runtime global when a
-socket instance is supplied, so Service Plane temporarily supplies that constant only during
-synchronous session construction and restores the previous global immediately.
-
-For normal request/response calls, prefer HTTP-batch. It is easier to deploy, cache, observe, and retry. Streaming ability methods require a session transport; wire `upgradeWebSocket` from `@hono/node-ws` into the service shell as shown in [Streaming](streaming.md#serve-websocket-sessions). On long-running Node processes WebSockets are essentially free, so chatty service pairs should hold a session — the full decision guide is [Choosing A Transport](transports.md).
+For ordinary calls and streams, prefer Fetch. It is easier to deploy, observe, and retry. Wire
+`upgradeWebSocket` from `@hono/node-ws` when an interactive or high-frequency client benefits from
+a persistent connection. The full decision guide is [Choosing A Transport](transports.md).
 
 Next: [auth](auth.md), [OpenAPI and MCP](openapi-mcp.md), and [reference](reference.md).

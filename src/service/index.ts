@@ -1,3 +1,32 @@
+export { isDefinedError, ORPCError, safe } from '@orpc/client';
+export type {
+  BatchLinkPluginOptions,
+  DedupeLinkPluginOptions,
+  RequestCompressionLinkPluginOptions,
+  ResponseCompressionLinkPluginOptions,
+  RetryLinkPluginOptions,
+} from '@orpc/client/plugins';
+export {
+  BatchLinkPlugin,
+  DedupeLinkPlugin,
+  RequestCompressionLinkPlugin,
+  ResponseCompressionLinkPlugin,
+  RetryLinkPlugin,
+} from '@orpc/client/plugins';
+export type { EncodeHibernationRPCEventOptions } from '@orpc/hibernation';
+export {
+  HibernationAsyncIteratorClass,
+  HibernationHandlerPlugin,
+} from '@orpc/hibernation';
+export type {
+  BatchHandlerPluginOptions,
+  ResponseCompressionHandlerPluginOptions,
+} from '@orpc/server/plugins';
+export {
+  BatchHandlerPlugin,
+  RequestCompressionHandlerPlugin,
+  ResponseCompressionHandlerPlugin,
+} from '@orpc/server/plugins';
 export { type ConnInfo, SERVICE_PLANE_CONN_INFO_HEADER, SERVICE_PLANE_CONN_INFO_QUERY_PARAM } from '../shared/conn-info.js';
 export {
   DEFAULT_ABILITY_TIMEOUT_MS,
@@ -85,6 +114,7 @@ export {
   SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
   SERVICE_PLANE_MCP_PATH,
   SERVICE_PLANE_OPENAPI_PATH,
+  SERVICE_PLANE_PROOF_HEADER,
   SERVICE_PLANE_REQUEST_ID_HEADER,
   SERVICE_PLANE_REQUEST_ID_QUERY_PARAM,
 } from '../shared/types.js';
@@ -94,78 +124,60 @@ export {
   publicJwkFromServiceCallerSigningJwk,
 } from './caller-auth.js';
 export type {
-  AbilitySession,
-  AbilitySessionOptions,
-  AuthenticatedRoot,
   CapabilityProofSigner,
-  CapabilityRpcTransport,
-  CloudflareAbilityRpcBinding,
+  CapabilityTokenRequester,
   ControlPlaneHmacTokenRequesterOptions,
   ControlPlaneJwkTokenRequesterOptions,
   ControlPlaneRpcCallerTokenBinding,
   ControlPlaneRpcTokenBinding,
   ControlPlaneRpcTokenRequesterOptions,
   CreateCapabilityTokenProviderOptions,
+  JwkCapabilityProofSignerOptions,
   JwksFromServiceBindingOptions,
   JwksFromUrlOptions,
   RemoteJwksFetch,
-  RpcCompatible,
-  RpcSessionOptions,
-  RpcStub,
-  RpcTransport,
-  WebSocketRpcOptions,
 } from './capabilities.js';
 export {
-  abilitySession,
-  bindCapabilityIdentity,
-  capabilityIdentity,
   capabilityTokenCacheKey,
-  cloudflareNativeRpc,
-  cloudflareServiceBindingRpc,
   controlPlaneHmacTokenRequester,
   controlPlaneJwkTokenRequester,
   controlPlaneRpcTokenRequester,
   createCapabilityTokenProvider,
-  customRpcTransport,
   defineCapabilities,
-  disposeAbilitySession,
-  httpBatchRpc,
-  type JwkCapabilityProofSignerOptions,
   jwkCapabilityProofSigner,
   jwksFromServiceBinding,
   jwksFromUrl,
-  RpcTarget,
-  requireScopes,
   tokenExpiresAt,
   verifyAuthenticationToken,
-  websocketRpc,
 } from './capabilities.js';
 export type {
-  AbilityImplementation,
-  AbilityMethodDefinition,
-  AbilityMethodDefinitions,
+  AbilityClientTransport,
+  AbilityNativeBinding,
+  BrokeredAbilityTransport,
+  CreateAbilityClientOptions,
+  CreateBrokeredAbilityClientOptions,
+  NativeAbilityCall,
+} from './client.js';
+export { createAbilityClient, createBrokeredAbilityClient } from './client.js';
+export type {
+  AbilityProcedureDefinitions,
   AbilityRpc,
   AbilitySchema,
-  AbilityStreamSource,
   AnyServiceAbilityDefinition,
   DefineServiceInput,
   DefineServiceOptions,
   NormalizedAbilityMethodDefinition,
   NormalizedServiceAbility,
+  OrpcServiceAbilityDefinition,
   ServiceAbilityDefinition,
-  ServiceAbilityHandlerFactory,
-  ServiceAbilityHandlerFactoryInput,
+  ServiceAbilityWebSocket,
   ServiceDefinition,
 } from './discovery.js';
 export {
-  abilityMethod,
-  type CreateValidatingAbilityHandlerOptions,
-  createValidatingAbilityHandler,
   defaultAbilityRpcPath,
   defineAbility,
   defineAbilityService,
   serviceDiscoveryDocument,
-  verifyAbilityAccess,
 } from './discovery.js';
 export {
   type ServicePlaneLogEvent,
@@ -175,6 +187,13 @@ export {
   servicePlaneLogEvents,
   servicePlaneLogger,
 } from './logger.js';
+export type {
+  AbilityHibernationStream,
+  AbilityProcedureContext,
+  AbilityProcedureMetadata,
+  AuthorizeAbilityProcedureInput,
+} from './orpc.js';
+export { createAbilityBuilder, encodeAbilityHibernationEvent } from './orpc.js';
 export {
   ServicePlaneService,
   type ServicePlaneServiceAuthOptions,

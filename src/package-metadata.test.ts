@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 describe('package metadata', () => {
   it('requires Hono versions with current security patches', async () => {
     const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')) as {
+      dependencies?: Record<string, string>;
       peerDependencies?: Record<string, string>;
     };
 
@@ -12,5 +13,9 @@ describe('package metadata', () => {
     expect(packageJson.peerDependencies?.hono).toBe('>=4.13.0 <5.0.0');
     // Validation is Standard Schema based, so no validation library is a peer dependency.
     expect(packageJson.peerDependencies?.zod).toBeUndefined();
+    expect(Object.keys(packageJson.dependencies ?? {})).toEqual(
+      expect.arrayContaining(['@orpc/client', '@orpc/contract', '@orpc/hibernation', '@orpc/server']),
+    );
+    expect(Object.keys(packageJson.dependencies ?? {}).some((name) => name.includes('capn'))).toBe(false);
   });
 });

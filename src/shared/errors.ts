@@ -1,10 +1,7 @@
 /**
- * What kind of failure this is, independent of the HTTP-style status. Cap'n Web reconstructs a
- * received error as a plain `Error` — its class table holds only built-ins and the sent `name` is
- * used to pick that class, not restored onto the result — so the class a service threw is gone by
- * the time a caller catches it. Own enumerable properties do survive, which is why the taxonomy
- * lives in `code`, `status`, and `retryable` rather than in the constructor name. Read them with
- * {@link servicePlaneErrorInfo} instead of `instanceof`.
+ * What kind of failure this is, independent of the HTTP-style status. oRPC carries this taxonomy in
+ * typed error data; the legacy runtime carries it as enumerable error properties. Read both with
+ * {@link servicePlaneErrorInfo} instead of relying on an error class surviving a remote hop.
  */
 export type ServicePlaneErrorCode =
   /** Input or output did not satisfy the method's schema. */
@@ -44,9 +41,9 @@ export class ServicePlaneError extends Error {
   /** @see ServicePlaneErrorOptions.retryable */
   readonly retryable: boolean;
   /**
-   * HTTP-style classification of the failure, not the HTTP status of the response that carried it:
-   * an RPC-level failure travels inside a 200 batch. The number is for gateways mapping the failure
-   * onto their own responses, and for the shells where they answer HTTP directly.
+   * HTTP-style classification of the failure, not necessarily the status of the response that
+   * carried it. The number lets gateways and alternate transports map one error taxonomy onto their
+   * own response model.
    */
   readonly status: number;
 
@@ -137,6 +134,8 @@ export type AbilityValidationIssue = {
 export type ServicePlaneErrorInfo = {
   /** @see ServicePlaneErrorCode */
   code: ServicePlaneErrorCode;
+  /** Structured schema issues, present for validation failures when safe to return to the caller. */
+  issues?: ReadonlyArray<AbilityValidationIssue>;
   /**
    * The error message, empty when the peer sent none.
    */
@@ -167,20 +166,30 @@ const SERVICE_PLANE_ERROR_CODE_ROWS: Record<ServicePlaneErrorCode, true> = {
 const SERVICE_PLANE_ERROR_CODES: ReadonlySet<string> = new Set(Object.keys(SERVICE_PLANE_ERROR_CODE_ROWS));
 
 /**
- * Reads the Service Plane taxonomy off a caught value, whether it is still a real
- * {@link ServicePlaneError} or the plain `Error` a peer's was rebuilt as. Returns undefined for
- * anything that does not carry the taxonomy, so an unrelated failure is never mistaken for one.
+ * Reads the Service Plane taxonomy off a caught value, whether it is a local
+ * {@link ServicePlaneError}, typed oRPC error data, or a legacy peer's reconstructed error. Returns
+ * undefined for anything that does not carry the taxonomy.
  *
  * Every field is re-checked rather than trusted: these values arrive from a peer, and a hostile or
  * buggy one must not be able to make a caller treat a refusal as retryable.
  */
 export function servicePlaneErrorInfo(error: unknown): ServicePlaneErrorInfo | undefined {
   if (typeof error !== 'object' || error === null) return undefined;
-  const { code, message, reason, retryable, status } = error as Record<string, unknown>;
+  // oRPC carries library classification under `data.servicePlane`; in-process and legacy callers
+  // still carry it directly on the Error. Reading both keeps one branching helper for every link.
+  const data = (error as { data?: unknown }).data;
+  const nested =
+    data && typeof data === 'object' && (data as { servicePlane?: unknown }).servicePlane
+      ? (data as { servicePlane: unknown }).servicePlane
+      : error;
+  if (typeof nested !== 'object' || nested === null) return undefined;
+  const { code, issues: rawIssues, message, reason, retryable, status } = nested as Record<string, unknown>;
   if (typeof code !== 'string' || !SERVICE_PLANE_ERROR_CODES.has(code)) return undefined;
   if (typeof status !== 'number' || !Number.isInteger(status) || typeof retryable !== 'boolean') return undefined;
+  const issues = servicePlaneValidationIssues(rawIssues);
   return {
     code: code as ServicePlaneErrorCode,
+    ...(issues ? { issues } : {}),
     message: typeof message === 'string' ? message : '',
     ...(typeof reason === 'string' ? { reason } : {}),
     retryable,
@@ -188,8 +197,23 @@ export function servicePlaneErrorInfo(error: unknown): ServicePlaneErrorInfo | u
   };
 }
 
-// Held beside the error rather than on it. Cap'n Web serializes `cause` unconditionally — it checks
-// `"cause" in e`, so even a non-enumerable one crosses — and the whole point of replacing a handler
+function servicePlaneValidationIssues(value: unknown): AbilityValidationIssue[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const issues: AbilityValidationIssue[] = [];
+  for (const valueIssue of value) {
+    if (!valueIssue || typeof valueIssue !== 'object') return undefined;
+    const { message, path } = valueIssue as { message?: unknown; path?: unknown };
+    if (typeof message !== 'string') return undefined;
+    if (path !== undefined && (!Array.isArray(path) || !path.every((segment) => ['number', 'string', 'symbol'].includes(typeof segment)))) {
+      return undefined;
+    }
+    issues.push({ message, ...(path === undefined ? {} : { path: path as PropertyKey[] }) });
+  }
+  return issues;
+}
+
+// Held beside the error rather than on it. RPC serializers may expose `cause` even when it is
+// non-enumerable, and the whole point of replacing a handler
 // failure is that its original must not reach the caller. A WeakMap keeps it available in-process
 // for logging and debugging and nowhere else.
 const handlerFailureCauses = new WeakMap<object, unknown>();

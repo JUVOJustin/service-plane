@@ -13,6 +13,8 @@ export const DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS = 300;
 
 export const SERVICE_PLANE_AUTHORIZATION_SCHEME = 'ServicePlane';
 export const SERVICE_PLANE_REQUEST_ID_HEADER = 'X-Request-Id';
+/** Proof-of-possession JWS paired with a sender-constrained capability token. */
+export const SERVICE_PLANE_PROOF_HEADER = 'X-Service-Plane-Proof';
 /**
  * WebSocket upgrades cannot carry custom headers portably, so request ids ride a query parameter there.
  */
@@ -29,7 +31,7 @@ export function isAbilityAccess(value: unknown): value is AbilityAccess {
   return value === 'plane' || value === 'service';
 }
 export type AbilityExposure = 'private' | 'published';
-export type AbilityTransport = 'cloudflare-binding-rpc' | 'http-batch' | 'websocket';
+export type AbilityTransport = 'cloudflare-service-binding' | 'fetch' | 'websocket';
 /**
  * `query` is the HTTP QUERY method (RFC 10008): a safe, idempotent request that carries its
  * parameters in a body. OpenAPI 3.2 gives it a fixed `query` field on the Path Item Object,
@@ -111,7 +113,7 @@ export type ServiceAbilityMethodDiscovery = {
   idempotent?: true;
   scopes: string[];
   /**
-   * Streaming methods return a ReadableStream of output items over a Cap'n Web session
+   * Streaming procedures return an async iterator of output items over oRPC
    * transport; `outputSchema` then describes one streamed item, not the whole response.
    */
   stream?: true;
@@ -166,32 +168,36 @@ export type ServiceGrantDefinition = {
   grants: ServiceGrant[];
 };
 
-/**
- * Native ability RPC surface a service can expose next to `fetch` (e.g. a Cloudflare
- * WorkerEntrypoint forwarding to ServicePlaneService.connectAbility). Session-shaped, so
- * streaming method returns flow through it natively.
- */
+/** One procedure-first unary invocation sent through a Cloudflare native service binding. */
+export type ServiceAbilityNativeCall = {
+  /** Ability that owns the procedure. */
+  abilityId: string;
+  /** Authenticated control-plane connection metadata. */
+  connInfo?: ConnInfo;
+  /** Caller key identifying this logical attempt. */
+  idempotencyKey?: string;
+  /** Procedure input. */
+  input: unknown;
+  /** Procedure name inside the ability router. */
+  method: string;
+  /** Optional proof of capability-token possession. */
+  proof?: string;
+  /** Correlation id forwarded across the plane. */
+  requestId?: string;
+  /** Remaining caller deadline in milliseconds. */
+  timeoutMs?: number;
+  /** Broker-issued capability token. */
+  token: string;
+};
+
+/** Native ability surface advertised by a Cloudflare service endpoint. */
 export type ServiceAbilityNativeRpcBinding = {
-  connectAbility(input: {
-    abilityId: string;
-    connInfo?: ConnInfo;
-    /**
-     * The caller's key for this attempt, surfaced to handlers as `idempotencyKey`.
-     */
-    idempotencyKey?: string;
-    requestId?: string;
-    /**
-     * Milliseconds of the caller's budget. Native binding sessions are opened once and cached, so
-     * this bounds the whole session, not each call on it.
-     */
-    timeoutMs?: number;
-    token: string;
-  }): Promise<object> | object;
+  /** Calls one unary oRPC procedure without HTTP serialization. */
+  invokeAbility(input: ServiceAbilityNativeCall): Promise<unknown> | unknown;
 };
 
 export type ServiceEndpoint = {
   abilityRpc?: ServiceAbilityNativeRpcBinding;
-  createWebSocket?: (url: string) => WebSocket;
   discovery?: ServiceDiscoveryDocument | (() => Promise<ServiceDiscoveryDocument> | ServiceDiscoveryDocument);
   fetch(request: Request): Promise<Response>;
   grants?: ServiceEndpointGrant[];
@@ -408,8 +414,8 @@ export type CapabilityJwksCache = {
 
 export type VerifyCapabilityTokenOptions = {
   /**
-   * Required to check a proof of possession, because a proof is bound to the ability whose session it
-   * opens. A sender-constrained token presented without both of these is rejected.
+   * Required to check a proof of possession, because a proof is bound to the ability being called.
+   * A sender-constrained token presented without both of these is rejected.
    */
   abilityId?: string;
   expectedAudience: string;

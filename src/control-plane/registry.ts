@@ -306,7 +306,7 @@ function isAbilityExposure(value: unknown): value is AbilityExposure {
 }
 
 function isAbilityTransport(value: unknown): value is AbilityTransport {
-  return value === 'cloudflare-binding-rpc' || value === 'http-batch' || value === 'websocket';
+  return value === 'cloudflare-service-binding' || value === 'fetch' || value === 'websocket';
 }
 
 function isHttpMethod(value: unknown): value is ServiceHttpMethod {

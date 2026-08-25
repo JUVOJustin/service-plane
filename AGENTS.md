@@ -5,7 +5,7 @@
 This package is `service-plane`: a TypeScript library for ability-first service APIs. It provides primitives for:
 
 - Service-owned ability definitions with Standard Schema input and output schemas.
-- Cap'n Web RPC sessions over HTTP-batch, WebSocket, Cloudflare service bindings, and custom transports.
+- oRPC procedures over Fetch and WebSocket, with Cloudflare native RPC for unary service-binding calls.
 - Control-plane issued capability tokens and JWKS verification.
 - Service discovery documents.
 - OpenAPI, Swagger, and MCP projections from published ability metadata.

@@ -1,18 +1,13 @@
-import { type RpcStub, RpcTarget } from 'capnweb';
-import {
-  type AbilitySession,
-  abilitySession,
-  cloudflareNativeRpc,
-  cloudflareServiceBindingRpc,
-  websocketRpc,
-} from '../service/capabilities.js';
-import { normalizeCapabilitySubject } from '../shared/capability-tokens.js';
-import type { ConnInfo } from '../shared/conn-info.js';
-import { normalizeTimeoutMs, remainingTimeoutMs } from '../shared/deadline.js';
-import { CapabilityAuthError, ServicePlaneTimeoutError } from '../shared/errors.js';
-import { normalizeIdempotencyKey } from '../shared/idempotency.js';
+import { RPCLink } from '@orpc/client/fetch';
+import { asyncIteratorObject, type as typeSchema } from '@orpc/contract';
+import { ORPCError, os } from '@orpc/server';
+import { orpcErrorFromServicePlane } from '../service/orpc.js';
+import { normalizeCapabilitySubject, servicePlaneAuthorization } from '../shared/capability-tokens.js';
+import { type ConnInfo, SERVICE_PLANE_CONN_INFO_HEADER, serializeConnInfo } from '../shared/conn-info.js';
+import { normalizeTimeoutMs, remainingTimeoutMs, SERVICE_PLANE_TIMEOUT_HEADER, serializeTimeoutMs } from '../shared/deadline.js';
+import { CapabilityAuthError, ServicePlaneTimeoutError, servicePlaneErrorInfo } from '../shared/errors.js';
+import { normalizeIdempotencyKey, SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER } from '../shared/idempotency.js';
 import type { ServicePlaneBrokerLogEvent } from '../shared/logging.js';
-import { isOriginRelativePath } from '../shared/paths.js';
 import type {
   AbilityAccess,
   CapabilitySubject,
@@ -22,12 +17,16 @@ import type {
   ServiceEndpoint,
   ServiceRegistry,
 } from '../shared/types.js';
+import { SERVICE_PLANE_REQUEST_ID_HEADER } from '../shared/types.js';
 import type { CapabilityIssuer } from './capabilities.js';
 import { createServiceRegistry } from './registry.js';
 
 export type BrokerCaller = {
+  /** Stable authenticated caller identifier. */
   id: string;
+  /** Security-sensitive caller access classification. */
   kind: 'service' | 'user';
+  /** Optional organization attached to a delegated plane-class subject. */
   orgId?: string;
   /**
    * Application-owned category for a plane-class principal, signed into delegated tokens without
@@ -64,14 +63,18 @@ export function brokerCallerAccess(caller: BrokerCaller | undefined): AbilityAcc
 
 /**
  * One token requester for broker and MCP so the brokered-vs-plain fork and the caller-class stamp
- * cannot drift between the two mounts — the same anti-drift contract as `transportForAbility` and
- * `brokerCallerLogFields`. Minting brokered tokens for ingress-required targets and stamping the
+ * cannot drift between the two mounts — the same anti-drift contract as `brokerCallerLogFields`.
+ * Minting brokered tokens for ingress-required targets and stamping the
  * resolver's caller class are both security-relevant, so they live in exactly one place.
  */
 export function brokerRequestToken(options: {
+  /** Discovered ability that determines ingress token shape. */
   ability: DiscoveredServiceAbility;
+  /** Service id stamped into brokered capability tokens. */
   brokerServiceId: string;
+  /** Authenticated caller that determines delegation and access class. */
   caller: BrokerCaller | undefined;
+  /** Request-scoped capability issuer. */
   issuer: CapabilityIssuer;
 }): (input: IssueCapabilityTokenInput) => Promise<IssuedCapabilityToken> {
   const callerAccess = brokerCallerAccess(options.caller);
@@ -87,9 +90,13 @@ export function brokerRequestToken(options: {
  * One projection for caller audit fields so broker and MCP log events cannot drift.
  */
 export function brokerCallerLogFields(caller: BrokerCaller | undefined): {
+  /** Authenticated caller identifier. */
   callerId?: string;
+  /** Authenticated caller access category. */
   callerKind?: BrokerCaller['kind'];
+  /** Delegated caller organization. */
   callerOrgId?: string;
+  /** Application-owned delegated principal category. */
   callerPrincipalKind?: string;
 } {
   if (!caller) return {};
@@ -108,13 +115,16 @@ export type CreateControlPlaneRpcBrokerOptions = {
    * surface it to handlers only for brokered calls with ingress enabled.
    */
   connInfo?: ConnInfo;
+  /** Service id stamped as the broker on ingress-protected tokens. */
   controlPlaneServiceId: string;
   /**
    * The caller's key for this attempt, forwarded to the target service so a retry through the plane
    * is recognizable as one. The plane never generates it and never deduplicates on it.
    */
   idempotencyKey?: string;
+  /** Capability issuer used after catalog authorization succeeds. */
   issuer: CapabilityIssuer;
+  /** Receives structured broker call events. */
   log?: (event: ServicePlaneBrokerLogEvent) => void;
   /**
    * Reads the current time for deadline accounting. Both readings happen on this machine, so the
@@ -123,15 +133,15 @@ export type CreateControlPlaneRpcBrokerOptions = {
    */
   now?: () => number;
   /**
-   * When this request reached the plane. Defaults to the moment `rootCapability` is called — a
-   * shell that authenticates the caller or resolves its catalog before that must pass its own entry
-   * timestamp, or that work is not charged to the caller's budget. The remaining budget is then
-   * snapshotted once per `connect`: calls on a stub held long after connecting are bounded by the
-   * connect-time remainder, not a re-depleted one.
+   * When this request reached the plane. A shell that authenticates the caller or resolves its
+   * catalog first should pass its own entry timestamp so that work is charged to the caller budget.
    */
   receivedAt?: number;
+  /** Prebuilt registry; preferred when the shell already resolved a request-scoped catalog. */
   registry?: ServiceRegistry;
+  /** Correlation id forwarded to the target service. */
   requestId?: string;
+  /** Endpoints used to build a registry when `registry` is omitted. */
   services?: ServiceEndpoint[];
   /**
    * The caller's remaining budget in milliseconds when this request reached the plane. What is left
@@ -141,233 +151,254 @@ export type CreateControlPlaneRpcBrokerOptions = {
   timeoutMs?: number;
 };
 
-export type RootCapabilityOptions = {
-  /**
-   * Enable only when the caller's own leg to the broker is a session transport that can carry a
-   * returned stream. The default is false so custom shells cannot accidentally return dangling
-   * stream stubs over HTTP-batch.
-   */
-  allowStreaming?: boolean;
-};
-
-/**
- * Selects one ability for a trusted in-process broker session.
- */
-export type ControlPlaneRpcBrokerAbilityInput = {
+/** One procedure call through the control plane's authorization and routing boundary. */
+export type ControlPlaneRpcBrokerCallInput = {
   /** Ability id from the target service discovery document. */
   abilityId: string;
-  /** Authenticated caller, or no caller for a plane-owned session. */
+  /** Authenticated caller, or no caller for a plane-owned call. */
   caller?: BrokerCaller;
-  /** Scopes the returned session may exercise. */
+  /** Procedure input encoded by oRPC. */
+  input: unknown;
+  /** Method from the discovered ability catalog. */
+  method: string;
+  /** Scopes authorized for this call. */
   scopes: string[];
   /** Service that owns the ability. */
   targetServiceId: string;
 };
 
 export type ControlPlaneRpcBroker = {
-  /**
-   * Opens a local session through the same authorization, ingress, and transport path as a remote
-   * broker caller. In-process callers can carry streams, so no methods are hidden from the session.
-   */
-  abilitySession<Scoped>(input: ControlPlaneRpcBrokerAbilityInput): Promise<AbilitySession<Scoped>>;
-  rootCapability(caller?: BrokerCaller, options?: RootCapabilityOptions): RpcTarget;
+  /** Calls one ability procedure through discovery, authorization, token minting, and routing. */
+  callAbility(input: ControlPlaneRpcBrokerCallInput): Promise<unknown>;
 };
+
+/** Wire input for the control plane's stable, generic oRPC broker procedures. */
+export type ControlPlaneBrokerProcedureInput = {
+  /** Ability selected inside the target service. */
+  abilityId: string;
+  /** Opaque procedure input validated authoritatively by the target service. */
+  input: unknown;
+  /** Procedure name from the discovered catalog. */
+  method: string;
+  /** Scopes requested from the broker. */
+  scopes: string[];
+  /** Service that owns the ability. */
+  targetServiceId: string;
+};
+
+/** Request-owned context injected after the control plane authenticates the external caller. */
+export type ControlPlaneBrokerProcedureContext = {
+  /** Request-scoped authorized broker. */
+  broker: ControlPlaneRpcBroker;
+  /** Authenticated external caller, when present. */
+  caller?: BrokerCaller;
+};
+
+const controlPlaneBrokerProcedureInputSchema = {
+  '~standard': {
+    validate(value: unknown) {
+      return isControlPlaneBrokerProcedureInput(value)
+        ? { value }
+        : { issues: [{ message: 'Invalid Service Plane broker call envelope' }] };
+    },
+    vendor: 'service-plane',
+    version: 1,
+  },
+} satisfies import('@standard-schema/spec').StandardSchemaV1<ControlPlaneBrokerProcedureInput>;
+
+/**
+ * Generic public broker router. Typed ability clients adapt their method calls to `call` or
+ * `stream`, while the control plane keeps service discovery and token minting server-side.
+ */
+export const controlPlaneBrokerRouter = {
+  call: os
+    .$context<ControlPlaneBrokerProcedureContext>()
+    .input(controlPlaneBrokerProcedureInputSchema)
+    .output(typeSchema<unknown>())
+    .handler(async ({ context, input }) => {
+      const output = await callBrokerProcedure(context, input);
+      if (isAsyncIterable(output)) {
+        throw new ORPCError('METHOD_NOT_SUPPORTED', {
+          message: `Service-Plane streaming method must use the broker stream procedure: ${input.method}`,
+        });
+      }
+      return output;
+    }),
+  stream: os
+    .$context<ControlPlaneBrokerProcedureContext>()
+    .input(controlPlaneBrokerProcedureInputSchema)
+    .output(asyncIteratorObject(typeSchema<unknown>()))
+    .handler(async ({ context, input }) => {
+      const output = await callBrokerProcedure(context, input);
+      if (!isAsyncIterable(output)) {
+        throw new ORPCError('METHOD_NOT_SUPPORTED', {
+          message: `Service-Plane unary method must use the broker call procedure: ${input.method}`,
+        });
+      }
+      return output as never;
+    }),
+};
+
+async function callBrokerProcedure(context: ControlPlaneBrokerProcedureContext, input: ControlPlaneBrokerProcedureInput): Promise<unknown> {
+  try {
+    return await context.broker.callAbility({ ...input, ...(context.caller ? { caller: context.caller } : {}) });
+  } catch (error) {
+    if (error instanceof ORPCError) throw error;
+    throw orpcErrorFromServicePlane(error) ?? new ORPCError('INTERNAL_SERVER_ERROR', { data: undefined });
+  }
+}
+
+function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
+  return Boolean(value && typeof value === 'object' && Symbol.asyncIterator in value);
+}
+
+function isControlPlaneBrokerProcedureInput(value: unknown): value is ControlPlaneBrokerProcedureInput {
+  if (!value || typeof value !== 'object') return false;
+  const input = value as Record<string, unknown>;
+  return (
+    typeof input.abilityId === 'string' &&
+    input.abilityId.trim().length > 0 &&
+    Object.hasOwn(input, 'input') &&
+    typeof input.method === 'string' &&
+    input.method.trim().length > 0 &&
+    Array.isArray(input.scopes) &&
+    input.scopes.every((scope) => typeof scope === 'string') &&
+    typeof input.targetServiceId === 'string' &&
+    input.targetServiceId.trim().length > 0
+  );
+}
 
 export function createControlPlaneRpcBroker(options: CreateControlPlaneRpcBrokerOptions): ControlPlaneRpcBroker {
   const registry = options.registry ?? createServiceRegistry({ services: options.services ?? [] });
   const now = options.now ?? (() => Date.now());
   const timeoutMs = normalizeTimeoutMs(options.timeoutMs);
   const idempotencyKey = normalizeIdempotencyKey(options.idempotencyKey);
-  const rootCapability = (caller?: BrokerCaller, rootOptions?: RootCapabilityOptions) => {
-    // Stamped per root, not per broker: a broker held at module scope would otherwise measure
-    // process uptime as elapsed budget and refuse every connect once uptime exceeds it. A shell
-    // that did real work before building the broker still passes its own receivedAt.
-    const receivedAt = options.receivedAt ?? now();
-    return new BrokerRoot(
-      {
-        allowStreaming: rootOptions?.allowStreaming ?? false,
-        ...(options.connInfo ? { connInfo: options.connInfo } : {}),
-        controlPlaneServiceId: options.controlPlaneServiceId,
-        ...(idempotencyKey ? { idempotencyKey } : {}),
-        issuer: options.issuer,
-        ...(options.log ? { log: options.log } : {}),
-        now,
-        receivedAt,
-        registry,
-        ...(options.requestId ? { requestId: options.requestId } : {}),
-        ...(timeoutMs === undefined ? {} : { timeoutMs }),
-      },
-      caller,
-    );
-  };
   return {
-    async abilitySession<Scoped>(input: ControlPlaneRpcBrokerAbilityInput) {
-      const root = rootCapability(input.caller, { allowStreaming: true });
-      const ability = await root.ability(input.targetServiceId, input.abilityId);
-      return (await ability.connect(input.scopes)) as unknown as AbilitySession<Scoped>;
-    },
-    rootCapability,
-  };
-}
-
-class BrokerRoot extends RpcTarget {
-  constructor(
-    private readonly options: {
-      allowStreaming: boolean;
-      connInfo?: ConnInfo;
-      controlPlaneServiceId: string;
-      idempotencyKey?: string;
-      issuer: CapabilityIssuer;
-      log?: (event: ServicePlaneBrokerLogEvent) => void;
-      now: () => number;
-      receivedAt: number;
-      registry: ServiceRegistry;
-      requestId?: string;
-      timeoutMs?: number;
-    },
-    private readonly caller: BrokerCaller | undefined,
-  ) {
-    super();
-  }
-
-  async ability(serviceId: string, abilityId: string): Promise<BrokeredAbility> {
-    try {
-      const ability = await this.options.registry.ability(serviceId, abilityId);
-      if (!ability) {
-        throw new CapabilityAuthError(`Service-Plane broker has no ability: ${serviceId}/${abilityId}`, 404);
-      }
-      authorizeAbility(ability, this.caller);
-      return new BrokeredAbility({
-        allowStreaming: this.options.allowStreaming,
-        brokerServiceId: this.options.controlPlaneServiceId,
-        ...(this.options.connInfo ? { connInfo: this.options.connInfo } : {}),
-        caller: this.caller,
-        callerServiceId: this.caller?.kind === 'service' ? this.caller.id : this.options.controlPlaneServiceId,
-        ...(this.options.idempotencyKey ? { idempotencyKey: this.options.idempotencyKey } : {}),
-        issuer: this.options.issuer,
-        ability,
-        ...(this.options.log ? { log: this.options.log } : {}),
-        now: this.options.now,
-        receivedAt: this.options.receivedAt,
-        ...(this.options.requestId ? { requestId: this.options.requestId } : {}),
-        ...(this.options.timeoutMs === undefined ? {} : { timeoutMs: this.options.timeoutMs }),
-      });
-    } catch (error) {
-      this.options.log?.(brokerConnectFailedEvent(error, { abilityId, caller: this.caller, requestId: this.options.requestId, serviceId }));
-      throw error;
-    }
-  }
-}
-
-class BrokeredAbility extends RpcTarget {
-  constructor(
-    private readonly input: {
-      ability: DiscoveredServiceAbility;
-      allowStreaming: boolean;
-      brokerServiceId: string;
-      caller: BrokerCaller | undefined;
-      connInfo?: ConnInfo;
-      callerServiceId: string;
-      idempotencyKey?: string;
-      issuer: CapabilityIssuer;
-      log?: (event: ServicePlaneBrokerLogEvent) => void;
-      now: () => number;
-      receivedAt: number;
-      requestId?: string;
-      timeoutMs?: number;
-    },
-  ) {
-    super();
-  }
-
-  async connect(scopes: string[]): Promise<RpcStub<unknown>> {
-    const context = {
-      abilityId: this.input.ability.id,
-      caller: this.input.caller,
-      requestId: this.input.requestId,
-      serviceId: this.input.ability.serviceId,
-    };
-    try {
-      const requested = [...new Set(scopes.map((scope) => scope.trim()).filter(Boolean))];
-      if (requested.length === 0) throw new CapabilityAuthError('Service-Plane broker connect requires at least one scope', 400);
-      for (const scope of requested) {
-        if (!this.input.ability.scopes.includes(scope)) {
-          throw new CapabilityAuthError(`Service-Plane broker ability does not declare scope: ${scope}`, 403);
+    async callAbility(input) {
+      const callReceivedAt = options.receivedAt ?? now();
+      try {
+        const ability = await registry.ability(input.targetServiceId, input.abilityId);
+        if (!ability) {
+          throw new CapabilityAuthError(`Service-Plane broker has no ability: ${input.targetServiceId}/${input.abilityId}`, 404);
         }
+        authorizeAbility(ability, input.caller);
+        const method = ability.methods[input.method];
+        if (!method) {
+          throw new CapabilityAuthError(
+            `Service-Plane broker has no ability method: ${input.targetServiceId}/${input.abilityId}/${input.method}`,
+            404,
+          );
+        }
+        const scopes = validateBrokerScopes(ability, input.scopes);
+        const callerServiceId = input.caller?.kind === 'service' ? input.caller.id : options.controlPlaneServiceId;
+        const subject = brokerCallerSubject(input.caller);
+        const issued = await brokerRequestToken({
+          ability,
+          brokerServiceId: options.controlPlaneServiceId,
+          caller: input.caller,
+          issuer: options.issuer,
+        })({
+          callerServiceId,
+          scopes,
+          ...(subject ? { subject } : {}),
+          targetServiceId: ability.serviceId,
+        });
+        const remaining = remainingTimeoutMs(timeoutMs, now() - callReceivedAt);
+        if (remaining === 0) {
+          throw new ServicePlaneTimeoutError(
+            `Service-Plane broker exhausted the caller's deadline before reaching the service: ${ability.serviceId}/${ability.id}`,
+          );
+        }
+        const output = await callDiscoveredAbility(ability, input.method, input.input, issued.token, {
+          ...(options.connInfo ? { connInfo: options.connInfo } : {}),
+          ...(idempotencyKey ? { idempotencyKey } : {}),
+          ...(options.requestId ? { requestId: options.requestId } : {}),
+          ...(remaining === undefined ? {} : { timeoutMs: remaining }),
+        });
+        options.log?.({
+          abilityId: ability.id,
+          brokered: Boolean(ability.serviceIngress?.required),
+          ...brokerCallerLogFields(input.caller),
+          durationMs: now() - callReceivedAt,
+          event: 'service_plane.broker.call.completed',
+          level: 'info',
+          method: input.method,
+          ...(options.requestId ? { requestId: options.requestId } : {}),
+          scopes,
+          serviceId: ability.serviceId,
+        });
+        return output;
+      } catch (error) {
+        const info = servicePlaneErrorInfo(error);
+        options.log?.({
+          abilityId: input.abilityId,
+          ...brokerCallerLogFields(input.caller),
+          durationMs: now() - callReceivedAt,
+          error: error instanceof Error ? { message: error.message, name: error.name } : { message: String(error), name: 'Error' },
+          event: 'service_plane.broker.call.failed',
+          level: 'warn',
+          method: input.method,
+          ...(options.requestId ? { requestId: options.requestId } : {}),
+          scopes: input.scopes,
+          serviceId: input.targetServiceId,
+          ...(info ? { status: info.status } : {}),
+        });
+        throw error;
       }
-
-      const brokered = Boolean(this.input.ability.serviceIngress?.required);
-      const subject = brokerCallerSubject(this.input.caller);
-      // What the caller has left after the plane's own work. Measured against the plane's own clock
-      // on both ends, so no clock agreement with the service is assumed. A budget already spent here
-      // fails now rather than opening a session the caller has stopped waiting for.
-      const timeoutMs = remainingTimeoutMs(this.input.timeoutMs, this.input.now() - this.input.receivedAt);
-      if (timeoutMs === 0) {
-        throw new ServicePlaneTimeoutError(
-          `Service-Plane broker exhausted the caller's deadline before reaching the service: ${this.input.ability.serviceId}/${this.input.ability.id}`,
-        );
-      }
-      // If the caller's own leg to the broker cannot carry a stream (HTTP-batch), reject the
-      // ability's streaming methods with a clear 405 rather than returning a stream that fails
-      // to serialize back to the caller and leaks the plane→service session.
-      const rejectStreamMethods = this.input.allowStreaming
-        ? undefined
-        : Object.entries(this.input.ability.methods)
-            .filter(([, method]) => method.stream)
-            .map(([name]) => name);
-      const session = (await abilitySession<unknown>({
-        abilityId: this.input.ability.id,
-        callerServiceId: this.input.callerServiceId,
-        ...(this.input.connInfo ? { connInfo: this.input.connInfo } : {}),
-        ...(this.input.idempotencyKey ? { idempotencyKey: this.input.idempotencyKey } : {}),
-        ...(subject ? { subject } : {}),
-        ...(rejectStreamMethods && rejectStreamMethods.length > 0 ? { rejectStreamMethods } : {}),
-        ...(this.input.requestId ? { requestId: this.input.requestId } : {}),
-        requestToken: brokerRequestToken({
-          ability: this.input.ability,
-          brokerServiceId: this.input.brokerServiceId,
-          caller: this.input.caller,
-          issuer: this.input.issuer,
-        }),
-        scopes: requested,
-        targetServiceId: this.input.ability.serviceId,
-        ...(timeoutMs === undefined ? {} : { timeoutMs }),
-        // Streaming methods are rejected outright when the caller's leg cannot carry a stream, so
-        // the plane→service leg must not escalate to a persistent WebSocket it would never use.
-        transport: transportForAbility(this.input.ability, this.input.allowStreaming ? {} : { requiresStreaming: false }),
-      })) as RpcStub<unknown>;
-      this.input.log?.({
-        abilityId: this.input.ability.id,
-        brokered,
-        ...brokerCallerLogFields(this.input.caller),
-        event: 'service_plane.broker.connect.completed',
-        level: 'info',
-        ...(this.input.requestId ? { requestId: this.input.requestId } : {}),
-        scopes: requested,
-        serviceId: this.input.ability.serviceId,
-      });
-      return session;
-    } catch (error) {
-      this.input.log?.(brokerConnectFailedEvent(error, context));
-      throw error;
-    }
-  }
+    },
+  };
 }
 
-function brokerConnectFailedEvent(
-  error: unknown,
-  context: { abilityId: string; caller: BrokerCaller | undefined; requestId?: string | undefined; serviceId: string },
-): ServicePlaneBrokerLogEvent {
-  return {
-    abilityId: context.abilityId,
-    ...brokerCallerLogFields(context.caller),
-    error: error instanceof Error ? { message: error.message, name: error.name } : { message: String(error), name: 'Error' },
-    event: 'service_plane.broker.connect.failed',
-    level: 'warn',
-    ...(context.requestId ? { requestId: context.requestId } : {}),
-    serviceId: context.serviceId,
-    ...(error instanceof CapabilityAuthError ? { status: error.status } : {}),
-  };
+function validateBrokerScopes(ability: DiscoveredServiceAbility, scopes: string[]): string[] {
+  const requested = [...new Set(scopes.map((scope) => scope.trim()).filter(Boolean))];
+  if (requested.length === 0) throw new CapabilityAuthError('Service-Plane broker call requires at least one scope', 400);
+  for (const scope of requested) {
+    if (!ability.scopes.includes(scope)) {
+      throw new CapabilityAuthError(`Service-Plane broker ability does not declare scope: ${scope}`, 403);
+    }
+  }
+  return requested;
+}
+
+async function callDiscoveredAbility(
+  ability: DiscoveredServiceAbility,
+  method: string,
+  input: unknown,
+  token: string,
+  forwarded: { connInfo?: ConnInfo; idempotencyKey?: string; requestId?: string; timeoutMs?: number },
+): Promise<unknown> {
+  const nativeBinding = ability.service.abilityRpc;
+  const streams = ability.methods[method]?.stream === true;
+  if (nativeBinding?.invokeAbility && !streams && ability.rpc.transports.includes('cloudflare-service-binding')) {
+    return nativeBinding.invokeAbility({
+      abilityId: ability.id,
+      ...(forwarded.connInfo ? { connInfo: forwarded.connInfo } : {}),
+      ...(forwarded.idempotencyKey ? { idempotencyKey: forwarded.idempotencyKey } : {}),
+      input,
+      method,
+      ...(forwarded.requestId ? { requestId: forwarded.requestId } : {}),
+      ...(forwarded.timeoutMs === undefined ? {} : { timeoutMs: forwarded.timeoutMs }),
+      token,
+    });
+  }
+
+  if (!ability.rpc.transports.includes('fetch') && !ability.rpc.transports.includes('cloudflare-service-binding')) {
+    throw new CapabilityAuthError(`Service-Plane oRPC ability has no Fetch transport: ${ability.serviceId}/${ability.id}`, 500);
+  }
+  const headers = new Headers({ authorization: servicePlaneAuthorization(token) });
+  const connInfo = serializeConnInfo(forwarded.connInfo);
+  const timeout = serializeTimeoutMs(forwarded.timeoutMs);
+  if (connInfo) headers.set(SERVICE_PLANE_CONN_INFO_HEADER, connInfo);
+  if (forwarded.idempotencyKey) headers.set(SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER, forwarded.idempotencyKey);
+  if (forwarded.requestId) headers.set(SERVICE_PLANE_REQUEST_ID_HEADER, forwarded.requestId);
+  if (timeout) headers.set(SERVICE_PLANE_TIMEOUT_HEADER, timeout);
+  const link = new RPCLink({
+    fetch: async (url, init) => ability.service.fetch(new Request(url, init)),
+    headers,
+    origin: ability.service.origin,
+    url: ability.rpc.path as `/${string}`,
+  });
+  return link.call([method], input, { context: {} });
 }
 
 // Decided from the discovered catalog, which the plane caches, so this is the earlier and more
@@ -378,44 +409,4 @@ function authorizeAbility(ability: DiscoveredServiceAbility, caller: BrokerCalle
   if (ability.access === 'plane') return;
   if (ability.access === 'service' && brokerCallerAccess(caller) === 'service') return;
   throw new CapabilityAuthError('Service-Plane broker ability requires service access', 403);
-}
-
-/**
- * Shared transport selection for broker and MCP so the two cannot drift. The broker opens the
- * whole ability and uses its default all-methods view; single-method projections such as MCP can
- * request a session transport only for the method that needs one.
- */
-export function transportForAbility(ability: DiscoveredServiceAbility, options: { requiresStreaming?: boolean } = {}) {
-  const requiresStreaming = options.requiresStreaming ?? Object.values(ability.methods).some((method) => method.stream);
-  // Native Workers RPC is session-shaped without holding a WebSocket and is the cheapest
-  // same-account path for both unary and streaming methods.
-  if (ability.service.abilityRpc && ability.rpc.transports.includes('cloudflare-binding-rpc')) {
-    return cloudflareNativeRpc(ability.service.abilityRpc);
-  }
-  if (requiresStreaming) {
-    if (ability.rpc.transports.includes('websocket')) {
-      return abilityWebSocketTransport(ability);
-    }
-  }
-  if (ability.rpc.transports.includes('http-batch')) {
-    return cloudflareServiceBindingRpc(ability.service, ability.rpc.path, ability.service.origin);
-  }
-  if (ability.rpc.transports.includes('websocket')) {
-    return abilityWebSocketTransport(ability);
-  }
-  throw new CapabilityAuthError(`Service-Plane ability has no supported RPC transport: ${ability.serviceId}/${ability.id}`, 500);
-}
-
-function abilityWebSocketTransport(ability: DiscoveredServiceAbility) {
-  const url = abilityWebSocketUrl(ability);
-  return websocketRpc(url, ability.service.createWebSocket ? { createWebSocket: ability.service.createWebSocket } : {});
-}
-
-function abilityWebSocketUrl(ability: DiscoveredServiceAbility): string {
-  // Registry discovery applies the same check, but custom ServiceRegistry implementations can
-  // supply abilities directly. Keep transport construction on the configured service origin.
-  if (!isOriginRelativePath(ability.rpc.path)) {
-    throw new CapabilityAuthError(`Service-Plane ability RPC path must be origin-relative: ${ability.serviceId}/${ability.id}`, 500);
-  }
-  return new URL(ability.rpc.path, ability.service.origin.replace(/^http/u, 'ws')).toString();
 }

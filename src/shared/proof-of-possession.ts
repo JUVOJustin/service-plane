@@ -16,7 +16,7 @@ import type { CapabilityConfirmation } from './types.js';
 //   cnk  the caller's public key, thumbprinted against the token's confirmation
 //   ath  hash of the capability token it accompanies
 //   aud  target service id
-//   abl  ability id the session is being opened for
+//   abl  ability id the proof authorizes
 //   jti/iat/exp  freshness
 const DEFAULT_PROOF_TTL_SECONDS = 60;
 const MAX_PROOF_TTL_SECONDS = 300;

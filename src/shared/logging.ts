@@ -26,6 +26,8 @@ export type ServicePlaneBrokerLogEvent = {
   event:
     | 'service_plane.broker.connect.completed'
     | 'service_plane.broker.connect.failed'
+    | 'service_plane.broker.call.completed'
+    | 'service_plane.broker.call.failed'
     | 'service_plane.mcp.prompt.completed'
     | 'service_plane.mcp.prompt.failed'
     | 'service_plane.mcp.resource.completed'

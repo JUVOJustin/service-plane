@@ -28,9 +28,9 @@ export const MAX_SERVICE_PLANE_TIMEOUT_MS = 10 * 60 * 1000;
  * Envoy routes time out at 15s, Armeria's server request timeout is 10s. 10s matches the closest
  * analogue, a server bounding its own request handling.
  *
- * Per call and per method, never per session, for the reason Envoy documents about its route
+ * Per call and per method, never per stream, for the reason Envoy documents about its route
  * timeout: a bound that suits a request is wrong for a stream. Streaming methods are exempt, and
- * session lifetime is untouched.
+ * stream lifetime is untouched.
  */
 export const DEFAULT_ABILITY_TIMEOUT_MS = 10_000;
 
@@ -119,8 +119,8 @@ export type RaceDeadlineOptions = {
   deadlineAt?: number;
   deadlineError: () => Error;
   /**
-   * Called with a result that arrived after the race was lost, so a disposable value — a Cap'n Web
-   * stub, a ReadableStream — is released instead of pinning its remote resource on a live session.
+   * Called with a result that arrived after the race was lost, so a disposable iterator or stream
+   * is released instead of pinning its remote resource on a live transport.
    */
   discardLateValue?: (value: unknown) => void;
 };
@@ -170,8 +170,8 @@ export function raceDeadline<T>(call: Promise<T>, options: RaceDeadlineOptions):
 }
 
 /**
- * Best-effort release of a value nobody will consume: Cap'n Web stubs expose the platform dispose
- * hooks, and a streaming method's ReadableStream must be cancelled or its source stays pinned.
+ * Best-effort release of a value nobody will consume: resources may expose platform disposal
+ * hooks, while a stream must be cancelled or its source stays pinned.
  */
 export function discardDisposableValue(value: unknown): void {
   try {

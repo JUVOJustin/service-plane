@@ -1,7 +1,5 @@
-import { abilitySession, disposeAbilitySession } from '../service/index.js';
 import type { ConnInfo } from '../shared/conn-info.js';
-import { remainingTimeoutMs } from '../shared/deadline.js';
-import { CapabilityAuthError, ServicePlaneTimeoutError } from '../shared/errors.js';
+import { CapabilityAuthError } from '../shared/errors.js';
 import type { ServicePlaneBrokerLogEvent } from '../shared/logging.js';
 import {
   type DiscoveredServiceAbility,
@@ -18,14 +16,7 @@ import {
   type ServiceRegistry,
   type ServiceRegistrySnapshot,
 } from '../shared/types.js';
-import {
-  type BrokerCaller,
-  brokerCallerAccess,
-  brokerCallerLogFields,
-  brokerCallerSubject,
-  brokerRequestToken,
-  transportForAbility,
-} from './broker.js';
+import { type BrokerCaller, brokerCallerAccess, brokerCallerLogFields, createControlPlaneRpcBroker } from './broker.js';
 import type { CapabilityIssuer } from './capabilities.js';
 
 export type ControlPlaneMcpServerInfo = {
@@ -352,10 +343,8 @@ async function callTool(
   }
 }
 
-// Streaming tools answer over MCP Streamable HTTP (SSE). The plane opens the backing ability
-// over a session transport and forwards items as progress notifications while they arrive
-// (when the client sent a progressToken); the final tools/call result aggregates the items,
-// because MCP defines exactly one response per request.
+// Streaming tools answer over MCP Streamable HTTP (SSE). oRPC yields an async iterator;
+// the final tools/call result aggregates its bounded items because MCP defines one response.
 async function streamToolCall(
   id: JsonRpcId,
   name: string,
@@ -366,40 +355,24 @@ async function streamToolCall(
 ): Promise<Response> {
   const startedAt = Date.now();
   const limits = resolveMcpStreamLimits(options.streamLimits);
-  const { api, dispose } = await openMethodSession(match, options);
-  let stream: ReadableStream<unknown>;
+  let iterator: AsyncIterator<unknown>;
   try {
-    const method = api[match.method];
-    if (!method) throw new CapabilityAuthError(`Service-Plane MCP method not found: ${match.method}`, 500);
-    const result = await method(input);
-    if (!(result instanceof ReadableStream)) {
-      throw new Error(`Service-Plane streaming tool did not return a stream: ${name}`);
-    }
-    stream = result;
+    const result = await invokeMethod(match, input, options);
+    if (!isAsyncIterable(result)) throw new Error(`Service-Plane streaming tool did not return an async iterable: ${name}`);
+    iterator = result[Symbol.asyncIterator]();
   } catch (error) {
-    // The session must be closed on every early-exit path; only the happy path hands ownership
-    // to streamToolEvents (which disposes after the stream drains).
-    await dispose();
     if (error instanceof CapabilityAuthError) throw error;
-    // Tool execution failures are reported in-band per the MCP spec, not as protocol errors.
     logMcpFailed(options, 'service_plane.mcp.tool.failed', { tool: name }, error, startedAt);
     return jsonRpcResult(id, {
       content: [{ text: error instanceof Error ? error.message : String(error), type: 'text' }],
       isError: true,
     });
   }
-  const reader = stream.getReader();
   const state = { deliveryAborted: false };
-  return sseResponse(
-    streamToolEvents(id, name, match, options, limits, reader, dispose, state, progressTokenOf(params), startedAt),
-    (reason) => {
-      // This stateless endpoint has no resumable response path after SSE delivery is abandoned.
-      // Abort the request-owned upstream reader promptly so serverless work and its session do
-      // not leak; the flag distinguishes delivery abandonment from natural completion.
-      state.deliveryAborted = true;
-      void reader.cancel(reason).catch(() => undefined);
-    },
-  );
+  return sseResponse(streamToolEvents(id, name, match, options, limits, iterator, state, progressTokenOf(params), startedAt), (reason) => {
+    state.deliveryAborted = true;
+    void Promise.resolve(iterator.return?.(reason)).catch(() => undefined);
+  });
 }
 
 async function* streamToolEvents(
@@ -408,8 +381,7 @@ async function* streamToolEvents(
   match: McpMethodMatch,
   options: ControlPlaneMcpHandlerOptions,
   limits: { maxBytes: number; maxItems: number },
-  reader: ReadableStreamDefaultReader<unknown>,
-  dispose: () => Promise<void>,
+  iterator: AsyncIterator<unknown>,
   state: { deliveryAborted: boolean },
   progressToken: string | number | undefined,
   startedAt: number,
@@ -422,9 +394,7 @@ async function* streamToolEvents(
   let sendProgress = progressToken !== undefined;
   try {
     while (true) {
-      const { done, value } = await reader.read();
-      // Abandoning SSE delivery resolves the pending read as done via reader.cancel; treat it as
-      // an aborted delivery, not a successful completion, and skip pointless aggregation.
+      const { done, value } = await iterator.next();
       if (state.deliveryAborted) {
         logMcpFailed(
           options,
@@ -437,13 +407,9 @@ async function* streamToolEvents(
       }
       if (done) break;
       items.push(value);
-      // Measure UTF-8 bytes (not UTF-16 code units) so multibyte items count against the cap
-      // at their true wire cost.
       aggregatedBytes += encoder.encode(JSON.stringify(value) ?? 'null').length;
       if (items.length > maxItems || aggregatedBytes > maxBytes) {
-        // MCP defines exactly one response per request, so the full stream must be held in
-        // memory here; unbounded or caller-inflated streams are cut off in-band instead.
-        const message = `Service-Plane MCP tool stream exceeded aggregation limits (${maxItems} items / ${maxBytes} bytes); use a session transport for large streams`;
+        const message = `Service-Plane MCP tool stream exceeded aggregation limits (${maxItems} items / ${maxBytes} bytes); use an oRPC streaming client for large streams`;
         logMcpFailed(options, 'service_plane.mcp.tool.failed', { tool: name }, new CapabilityAuthError(message, 413), startedAt);
         yield sseEvent({ id, jsonrpc: '2.0', result: { content: [{ text: message, type: 'text' }], isError: true } });
         return;
@@ -455,8 +421,6 @@ async function* streamToolEvents(
           progressBytes += eventBytes;
           yield event;
         } else {
-          // Progress is optional in MCP. Stop emitting it once its independent wire budget is
-          // exhausted, while still returning the complete, bounded tool result.
           sendProgress = false;
         }
       }
@@ -479,8 +443,7 @@ async function* streamToolEvents(
       result: { content: [{ text: error instanceof Error ? error.message : String(error), type: 'text' }], isError: true },
     });
   } finally {
-    void reader.cancel().catch(() => undefined);
-    await dispose();
+    await iterator.return?.(undefined);
   }
 }
 
@@ -668,58 +631,32 @@ async function getPrompt(id: JsonRpcId, params: unknown, options: ControlPlaneMc
   }
 }
 
-// One shared brokered-invocation path for tools, resources, and prompts: authorize the caller for
-// the ability, mint the scoped (or brokered) token, and open the session over the service's RPC
-// transport. The caller MUST dispose the session so its transport socket is released.
-async function openMethodSession(
-  match: McpMethodMatch,
-  options: ControlPlaneMcpHandlerOptions,
-): Promise<{ api: Record<string, (methodInput: unknown) => Promise<unknown>>; dispose: () => Promise<void> }> {
+// One shared brokered invocation path for tools, resources, and prompts.
+async function invokeMethod(match: McpMethodMatch, input: unknown, options: ControlPlaneMcpHandlerOptions): Promise<unknown> {
   authorizePublishedAbility(match.ability, options.caller);
-  const subject = brokerCallerSubject(options.caller);
-  // Decremented here, beside the session it bounds, so everything the plane did since request entry
-  // — parse, discovery fan-out, token mint — is charged to the caller. Mirrors the broker's
-  // decrement in BrokeredAbility.connect; registry-local requests (initialize, tools/list) never
-  // reach this point and are not refused by an exhausted forwarding budget.
-  const timeoutMs = remainingTimeoutMs(options.timeoutMs, Date.now() - (options.receivedAt ?? Date.now()));
-  if (timeoutMs === 0) {
-    throw new ServicePlaneTimeoutError(
-      `Service-Plane exhausted the caller's deadline before reaching the service: ${match.ability.serviceId}/${match.ability.id}`,
-    );
-  }
-  const api = await abilitySession<Record<string, (methodInput: unknown) => Promise<unknown>>>({
-    abilityId: match.ability.id,
-    callerServiceId: options.caller?.kind === 'service' ? options.caller.id : options.controlPlaneServiceId,
+  const broker = createControlPlaneRpcBroker({
     ...(options.connInfo ? { connInfo: options.connInfo } : {}),
+    controlPlaneServiceId: options.controlPlaneServiceId,
     ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-    ...(subject ? { subject } : {}),
+    issuer: options.issuer,
+    ...(options.log ? { log: options.log } : {}),
+    registry: options.registry,
+    ...(options.receivedAt === undefined ? {} : { receivedAt: options.receivedAt }),
     ...(options.requestId ? { requestId: options.requestId } : {}),
-    requestToken: brokerRequestToken({
-      ability: match.ability,
-      brokerServiceId: options.controlPlaneServiceId,
-      caller: options.caller,
-      issuer: options.issuer,
-    }),
+    ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+  });
+  return broker.callAbility({
+    abilityId: match.ability.id,
+    ...(options.caller ? { caller: options.caller } : {}),
+    input,
+    method: match.method,
     scopes: match.scopes,
     targetServiceId: match.ability.serviceId,
-    ...(timeoutMs === undefined ? {} : { timeoutMs }),
-    transport: transportForAbility(match.ability, {
-      requiresStreaming: match.ability.methods[match.method]?.stream === true,
-    }),
   });
-  return { api, dispose: () => disposeAbilitySession(api) };
 }
 
-// Unary invocation: the session is closed as soon as the single result resolves.
-async function invokeMethod(match: McpMethodMatch, input: unknown, options: ControlPlaneMcpHandlerOptions): Promise<unknown> {
-  const { api, dispose } = await openMethodSession(match, options);
-  try {
-    const method = api[match.method];
-    if (!method) throw new CapabilityAuthError(`Service-Plane MCP method not found: ${match.method}`, 500);
-    return await method(input);
-  } finally {
-    await dispose();
-  }
+function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
+  return Boolean(value && typeof value === 'object' && Symbol.asyncIterator in value);
 }
 
 function findMcpMethod(

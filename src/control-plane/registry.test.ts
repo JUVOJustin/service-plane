@@ -17,7 +17,7 @@ describe('service registry', () => {
             scopes: ['example.sync.run'],
           },
         },
-        rpc: { path: '/rpc/example.sync', transports: ['http-batch'] },
+        rpc: { path: '/rpc/example.sync', transports: ['fetch'] },
         scopes: ['example.sync.run'],
       },
     ],

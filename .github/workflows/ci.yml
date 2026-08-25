@@ -61,10 +61,8 @@ jobs:
 
   # The portability claim, exercised for real. workerd — the deployment runtime — runs the full
   # vitest suite inside actual isolates via vitest-pool-workers. Deno and Bun run a bundled smoke
-  # (HTTP-batch end to end, streaming over a session transport, token verify both ways): neither
-  # has a supported vitest path, and for them the claim is portability, not deployment. workerd
-  # and Deno take the setTimeout(0) batch-flush fallback; Bun proves the setImmediate fast path
-  # outside Node.
+  # (oRPC Fetch unary and streaming calls, native unary RPC, and token verification): neither has a
+  # supported vitest path, and for them the claim is portability, not deployment.
   test-workerd:
     needs: quality
     runs-on: ubuntu-latest
