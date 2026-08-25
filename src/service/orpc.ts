@@ -207,23 +207,82 @@ export function createAbilityBuilder<TEnv extends Env = Env>() {
   return {
     /** Starts a unary procedure whose handler, schemas, scopes, and projections stay together. */
     procedure(metadata: AbilityProcedureMetadata = {}) {
-      return base.meta(abilityProcedureMetadata(metadata));
+      return failClosedBuilderChain(base.meta(abilityProcedureMetadata(metadata)));
     },
     /** Starts a streaming procedure and validates every yielded item with `output`. */
     stream<TOutput extends AbilitySchema>(output: TOutput, metadata: AbilityProcedureMetadata = {}) {
-      return base.meta(abilityProcedureMetadata({ ...metadata, stream: true })).output(asyncIteratorObject(output));
+      return failClosedBuilderChain(
+        base.meta(abilityProcedureMetadata({ ...metadata, stream: true })).output(asyncIteratorObject(failClosedSchema(output))),
+      );
     },
     /**
      * Starts a Durable Object hibernation stream. Later message events must be encoded with
      * {@link encodeAbilityHibernationEvent}, because they occur after this procedure has returned.
      */
     hibernationStream<TOutput extends AbilitySchema>(output: TOutput, metadata: AbilityProcedureMetadata = {}) {
-      return base
-        .meta(abilityProcedureMetadata({ ...metadata, stream: true }))
-        .meta(hibernationOutputMetadata(output))
-        .output(hibernationIteratorSchema<TOutput>());
+      return failClosedBuilderChain(
+        base
+          .meta(abilityProcedureMetadata({ ...metadata, stream: true }))
+          .meta(hibernationOutputMetadata(output))
+          .output(hibernationIteratorSchema<TOutput>()),
+      );
     },
   };
+}
+
+// oRPC treats any Standard Schema result without `issues` as success, so a validator that returns
+// neither a value nor issues would count as valid and hand the handler raw input. Refuse that
+// degenerate shape instead of letting validation silently pass.
+function failClosedValidationResult(result: unknown): StandardSchemaV1.Result<unknown> {
+  if (result && typeof result === 'object' && ('value' in result || (result as { issues?: unknown }).issues)) {
+    return result as StandardSchemaV1.Result<unknown>;
+  }
+  return { issues: [{ message: 'Standard Schema validator returned neither a value nor issues' }] };
+}
+
+// Remembers each guard's original schema so discovery keeps projecting exactly what authors declared.
+const declaredSchemas = new WeakMap<object, AbilitySchema>();
+
+function failClosedSchema<TSchema extends AbilitySchema>(schema: TSchema): TSchema {
+  const standard = schema['~standard'];
+  const validate = async (value: unknown) => failClosedValidationResult(await standard.validate(value));
+  const guardedStandard = new Proxy(standard, {
+    get: (target, property) => (property === 'validate' ? validate : Reflect.get(target, property)),
+  });
+  const guarded = new Proxy(schema, {
+    get: (target, property) => (property === '~standard' ? guardedStandard : Reflect.get(target, property)),
+  });
+  declaredSchemas.set(guarded, schema);
+  return guarded;
+}
+
+function declaredSchema(schema: AnySchema | undefined): AnySchema | undefined {
+  return schema ? ((declaredSchemas.get(schema) as AnySchema | undefined) ?? schema) : undefined;
+}
+
+// Author-supplied schemas enter oRPC only through `.input(...)` and `.output(...)`, so the builder
+// chain is proxied to guard each schema on the way in. Iterator schemas installed by
+// createAbilityBuilder stay untouched: their items are already guarded, and wrapping the iterator
+// schema itself would break oRPC's identity-based stream detection.
+function failClosedBuilderChain<TBuilder extends object>(builder: TBuilder): TBuilder {
+  return new Proxy(builder, {
+    get(target, property) {
+      const member = Reflect.get(target, property) as unknown;
+      if (typeof member !== 'function') return member;
+      return (...args: unknown[]) => {
+        if (property === 'input' || property === 'output') {
+          const schema = args[0] as AbilitySchema | undefined;
+          if (schema && getAsyncIteratorObjectSchemaDetails(schema as AnySchema) === undefined) {
+            args = [failClosedSchema(schema), ...args.slice(1)];
+          }
+        }
+        const result = (member as (...rest: unknown[]) => unknown).apply(target, args);
+        return result && typeof result === 'object' && !(result instanceof Procedure)
+          ? failClosedBuilderChain(result)
+          : result;
+      };
+    },
+  }) as TBuilder;
 }
 
 /**
@@ -253,7 +312,9 @@ export async function encodeAbilityHibernationEvent<TOutput extends AbilitySchem
   if (options.event === undefined || options.event === 'message') {
     let result: StandardSchemaV1.Result<StandardSchemaV1.InferOutput<TOutput>>;
     try {
-      result = await output['~standard'].validate(payload);
+      result = failClosedValidationResult(
+        await output['~standard'].validate(payload),
+      ) as StandardSchemaV1.Result<StandardSchemaV1.InferOutput<TOutput>>;
     } catch {
       throw new AbilityValidationError('Service-Plane hibernation event output validation failed', 500);
     }
@@ -293,22 +354,29 @@ export function abilityProcedureDefinition(procedure: AnyProcedure): StoredAbili
 
 /** Extracts the single portable input schema declared by an ability procedure. */
 export function abilityProcedureInputSchema(procedure: AnyProcedure): AnySchema | undefined {
-  return onlySchema(procedure['~orpc'].inputSchemas);
+  return declaredSchema(onlySchema(orpcProcedureInternals(procedure).inputSchemas));
 }
 
 /** Extracts the unary output schema or the yielded-item schema for a streaming procedure. */
 export function abilityProcedureOutputSchema(procedure: AnyProcedure): AnySchema | undefined {
   const hibernationOutput = getHibernationOutputMetadata(procedure);
   if (hibernationOutput) return hibernationOutput;
-  const output = onlySchema(procedure['~orpc'].outputSchemas);
-  return output ? (getAsyncIteratorObjectSchemaDetails(output)?.yieldSchema ?? output) : undefined;
+  const output = onlySchema(orpcProcedureInternals(procedure).outputSchemas);
+  return declaredSchema(output ? (getAsyncIteratorObjectSchemaDetails(output)?.yieldSchema ?? output) : undefined);
 }
 
 /** Returns whether the procedure's output uses oRPC's validated async-iterator schema. */
 export function abilityProcedureStreams(procedure: AnyProcedure): boolean {
   if (getAbilityProcedureMetadata(procedure)?.stream === true) return true;
-  const output = onlySchema(procedure['~orpc'].outputSchemas);
+  const output = onlySchema(orpcProcedureInternals(procedure).outputSchemas);
   return output !== undefined && getAsyncIteratorObjectSchemaDetails(output) !== undefined;
+}
+
+// oRPC has no public accessor for a built procedure's declared schemas, so discovery must read the
+// undocumented '~orpc' definition storage. Keep this the only place that touches it: the shape is
+// internal to oRPC and was last verified against 2.0.0-beta.29 — re-audit on every @orpc bump.
+function orpcProcedureInternals(procedure: AnyProcedure): AnyProcedure['~orpc'] {
+  return procedure['~orpc'];
 }
 
 function hibernationIteratorSchema<TOutput extends AbilitySchema>(): StandardSchemaV1<
