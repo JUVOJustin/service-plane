@@ -214,7 +214,7 @@ Both mounts also accept `connInfo`, an opt-in resolver that forwards the origina
 
 `caller` returns a `BrokerCaller` — `{ id, kind: 'service' | 'user', orgId?, principalKind? }` — or an application-owned `Response`. Existing Hono authentication middleware is the preferred place to generate a challenge when it already owns that policy. Service callers (`kind: 'service'`) can reach `access: 'service'` abilities and are brokered under their own service id; other callers are brokered under the control-plane identity for `access: 'plane'` abilities. For an API key, automation, anonymous session, or other plane-class principal, keep `kind: 'user'` and set an application-owned `principalKind`; the service receives it as signed `identity.subject.kind`. `principalKind` never changes access. The resolver's `kind` is what the plane attests in the token's [`spa` claim](reference.md#capability-token-claims), so returning `kind: 'service'` for a caller the plane did not actually authenticate as a service hands it service-only abilities at every service in the fleet. To intentionally allow anonymous access, return a fixed caller from the resolver — it is always an explicit choice, never a default.
 
-Application callers use the typed ability client; the generic `call`/`stream` broker procedures are
+Application callers use the typed ability client; the generic `call`/`stream` broker methods are
 an internal routing envelope:
 
 ```ts
@@ -228,7 +228,7 @@ const asana = createBrokeredAbilityClient({
 
 When service-plane ingress protection is enabled, callers must use the broker or another approved service-plane component that can mint brokered capability tokens.
 
-Streaming procedures proxy as oRPC async iterators over Fetch or the broker WebSocket at
+Streaming methods proxy as typed async iterators over Fetch or the broker WebSocket at
 `/rpc/broker/ws`. For a same-account Cloudflare service, the private stream uses binding Fetch while
 unary calls use `abilityRpc.invokeAbility`. See [Streaming](streaming.md).
 

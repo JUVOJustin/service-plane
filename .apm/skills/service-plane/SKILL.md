@@ -7,7 +7,7 @@ description: >-
   ability clients, issuing or verifying capability tokens, configuring ingress or the
   broker, or projecting abilities to OpenAPI, Swagger, or MCP. Also activate
   when a repo depends on the service-plane npm package and the task touches
-  service-to-service auth, oRPC, service discovery, or tool metadata,
+  service-to-service auth, RPC transports, service discovery, or tool metadata,
   even if the user does not name the library explicitly.
 ---
 
@@ -41,19 +41,20 @@ this library come from blurring them.
 | --- | --- | --- |
 | **Service** | Defines abilities, verifies tokens, validates input/output, enforces scopes | `service-plane/service` |
 | **Control plane** | Discovers services, checks grants, issues short-lived capability tokens, brokers calls, projects OpenAPI/MCP | `service-plane/control-plane` |
-| **Caller** | Requests a token, creates a typed ability client, invokes procedures | `service-plane/service` (client + transports) |
+| **Caller** | Requests a token, creates a typed ability client, invokes methods | `service-plane/service` (client + transports) |
 
 The control plane is the **only** component that issues capability tokens
 (short-lived ES256 JWS). Services verify issuer, audience, expiry, signature,
 and scopes against the plane's JWKS before any handler runs. Only the control
 plane should call services — no direct ingress.
 
-Hono is the HTTP shell (middleware, discovery, request ids); oRPC owns typed
-procedures, validation, serialization, Fetch/WebSocket transport, batching,
-compression, and Durable Object hibernation. Cloudflare native RPC bypasses
-serialization for unary service-binding calls. Method auth and Service Plane
-policy live in the procedure runtime, **not** in Hono middleware — Hono sees
-the HTTP request, while oRPC sees the logical procedure call.
+Hono is the public HTTP shell (middleware, discovery, request ids). Service
+Plane owns typed method contracts, validation, errors, batching, compression,
+and hibernation; its private RPC engine owns Fetch/WebSocket serialization.
+Cloudflare native RPC bypasses serialization for unary service-binding calls.
+Method auth and Service Plane policy live in the method runtime, **not** in
+Hono middleware. Do not import or configure the private engine from consumer
+code.
 
 ## The four knobs
 
@@ -120,14 +121,14 @@ them:
 - **Don't** weaken scope checks, grant checks, token validation, replay
   protection, or ingress protection to make tests pass. The security model is
   core package behavior.
-- **Don't** call an ingress-protected service directly (oRPC Fetch or native
+- **Don't** call an ingress-protected service directly (Service Plane Fetch or native
   binding RPC) with an ordinary token — it will 403 by design. Go through the
   broker so the token carries the signed broker claim.
 - **Don't** generate OpenAPI in services. Services expose discovery at
   `/.well-known/service-plane/service.json`; the plane builds `/openapi.json`
   and the MCP tool list from published metadata.
 - **Don't** default to WebSocket for worker-to-worker calls. Prefer native
-  service bindings for unary calls on Cloudflare and oRPC Fetch elsewhere;
+  service bindings for unary calls on Cloudflare and Service Plane Fetch elsewhere;
   reserve WebSocket for long-lived, interactive streams.
 - **Don't** invent new secrets when an existing signed token claim or
   caller-auth mechanism can express the boundary safely.
@@ -146,7 +147,7 @@ those within `references/` as needed.
   LOAD references/plane-creation.md
 - Token flow, caller auth options, identity vs. context, scope checks:
   LOAD references/auth.md
-- Streaming ability procedures, hibernation, broker/MCP streaming:
+- Streaming ability methods, hibernation, broker/MCP streaming:
   LOAD references/streaming.md
 - Which transport to use between services (environment, performance, cost):
   LOAD references/transports.md
@@ -157,6 +158,8 @@ those within `references/` as needed.
 - Cloudflare Workers, bindings, Durable Objects, edge caching:
   LOAD references/cloudflare.md
 - Node.js and self-hosted services: LOAD references/nodejs.md
+- Updating consumers from the former public oRPC surface:
+  LOAD references/migration-rpc-boundary.md
 
 When working inside the service-plane repository itself (not a consumer),
 `docs/` is the source of truth for these files (synced via

@@ -1,32 +1,3 @@
-export { isDefinedError, ORPCError, safe } from '@orpc/client';
-export type {
-  BatchLinkPluginOptions,
-  DedupeLinkPluginOptions,
-  RequestCompressionLinkPluginOptions,
-  ResponseCompressionLinkPluginOptions,
-  RetryLinkPluginOptions,
-} from '@orpc/client/plugins';
-export {
-  BatchLinkPlugin,
-  DedupeLinkPlugin,
-  RequestCompressionLinkPlugin,
-  ResponseCompressionLinkPlugin,
-  RetryLinkPlugin,
-} from '@orpc/client/plugins';
-export type { EncodeHibernationRPCEventOptions } from '@orpc/hibernation';
-export {
-  HibernationAsyncIteratorClass,
-  HibernationHandlerPlugin,
-} from '@orpc/hibernation';
-export type {
-  BatchHandlerPluginOptions,
-  ResponseCompressionHandlerPluginOptions,
-} from '@orpc/server/plugins';
-export {
-  BatchHandlerPlugin,
-  RequestCompressionHandlerPlugin,
-  ResponseCompressionHandlerPlugin,
-} from '@orpc/server/plugins';
 export { type ConnInfo, SERVICE_PLANE_CONN_INFO_HEADER, SERVICE_PLANE_CONN_INFO_QUERY_PARAM } from '../shared/conn-info.js';
 export {
   DEFAULT_ABILITY_TIMEOUT_MS,
@@ -43,6 +14,7 @@ export {
   type AbilityValidationIssue,
   CapabilityAuthError,
   handlerFailureCause,
+  ServicePlaneClientError,
   ServicePlaneError,
   type ServicePlaneErrorCode,
   type ServicePlaneErrorInfo,
@@ -118,6 +90,17 @@ export {
   SERVICE_PLANE_REQUEST_ID_HEADER,
   SERVICE_PLANE_REQUEST_ID_QUERY_PARAM,
 } from '../shared/types.js';
+export type {
+  AbilityMethodContext,
+  AbilityMethodDefinition,
+  AbilityMethodKind,
+  AbilityMethodMetadata,
+  AbilitySchema,
+  AbilityStream,
+  AnyAbilityMethodDefinition,
+  ServiceAbilityWebSocket,
+} from './ability.js';
+export { AbilityHibernationStream, createAbilityBuilder } from './ability.js';
 export {
   type GenerateServiceCallerSigningJwkOptions,
   generateServiceCallerSigningJwk,
@@ -157,20 +140,19 @@ export type {
   CreateAbilityClientOptions,
   CreateBrokeredAbilityClientOptions,
   NativeAbilityCall,
+  ServicePlaneWebSocketReconnectOptions,
 } from './client.js';
 export { createAbilityClient, createBrokeredAbilityClient } from './client.js';
 export type {
-  AbilityProcedureDefinitions,
-  AbilityRpc,
-  AbilitySchema,
+  AbilityCallOptions,
+  AbilityClient,
+  AbilityMethodDefinitions,
   AnyServiceAbilityDefinition,
   DefineServiceInput,
   DefineServiceOptions,
   NormalizedAbilityMethodDefinition,
   NormalizedServiceAbility,
-  OrpcServiceAbilityDefinition,
   ServiceAbilityDefinition,
-  ServiceAbilityWebSocket,
   ServiceDefinition,
 } from './discovery.js';
 export {
@@ -179,6 +161,8 @@ export {
   defineAbilityService,
   serviceDiscoveryDocument,
 } from './discovery.js';
+export type { AbilityHibernationEventOptions } from './hibernation.js';
+export { encodeAbilityHibernationEvent } from './hibernation.js';
 export {
   type ServicePlaneLogEvent,
   type ServicePlaneLoggerOptions,
@@ -187,16 +171,17 @@ export {
   servicePlaneLogEvents,
   servicePlaneLogger,
 } from './logger.js';
-export type {
-  AbilityHibernationStream,
-  AbilityProcedureContext,
-  AbilityProcedureMetadata,
-  AuthorizeAbilityProcedureInput,
-} from './orpc.js';
-export { createAbilityBuilder, encodeAbilityHibernationEvent } from './orpc.js';
 export {
   ServicePlaneService,
   type ServicePlaneServiceAuthOptions,
   type ServicePlaneServiceIngressOptions,
   type ServicePlaneServiceOptions,
 } from './service.js';
+export type {
+  ServicePlaneBatchOptions,
+  ServicePlaneClientCompressionOptions,
+  ServicePlaneClientWireOptions,
+  ServicePlaneCompressionEncoding,
+  ServicePlaneServerCompressionOptions,
+  ServicePlaneServerWireOptions,
+} from './wire-options.js';

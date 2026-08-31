@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
+import { createAbilityBuilder } from '../service/ability.js';
 import { defineCapabilities } from '../service/capabilities.js';
 import { createAbilityClient, createBrokeredAbilityClient } from '../service/client.js';
 import { defineAbility } from '../service/discovery.js';
-import { createAbilityBuilder } from '../service/orpc.js';
 import { ServicePlaneService } from '../service/service.js';
 import type { CapabilityJwks } from '../shared/types.js';
 import { SERVICE_PLANE_CAPABILITY_JWKS_PATH } from '../shared/types.js';
@@ -28,7 +28,7 @@ function defineSyncAbility(onHandlerRun?: () => void) {
     id: 'internal.sync',
     methods: {
       run: ability
-        .procedure({ mcp: { name: 'internal_sync_run' }, scopes: ['internal.sync.run'] })
+        .method({ mcp: { name: 'internal_sync_run' }, scopes: ['internal.sync.run'] })
         .input(z.object({ since: z.string() }))
         .output(z.object({ caller: z.string(), since: z.string() }))
         .handler(({ context, input }) => {
@@ -232,7 +232,7 @@ describe('access: service enforcement at the service', () => {
     const error = await directClient(issued)
       .run({ since: SINCE })
       .catch((cause: unknown) => cause);
-    expect(error).toMatchObject({ code: 'FORBIDDEN' });
+    expect(error).toMatchObject({ code: 'capability_auth', status: 403 });
     expect((error as Error).message).toContain('callable by services only');
     expect(handlerRuns()).toBe(0);
   });
@@ -253,7 +253,7 @@ describe('access: service enforcement at the service', () => {
 describe('access: service enforcement at the control-plane mounts', () => {
   it('refuses a non-service caller on the mounted broker endpoint', async () => {
     const { brokeredClient } = await createPlaneFixture({ id: 'user-1', kind: 'user' });
-    await expect(brokeredClient.run({ since: SINCE })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(brokeredClient.run({ since: SINCE })).rejects.toMatchObject({ code: 'capability_auth', status: 403 });
   });
 
   it('refuses an MCP tool backed by a service-access ability for a non-service caller', async () => {

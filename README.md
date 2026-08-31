@@ -6,19 +6,19 @@ Ability-first service APIs for TypeScript services.
 
 - Services define schema-backed abilities.
 - The control plane issues short-lived capability tokens.
-- oRPC carries typed procedure calls over Fetch, WebSocket, or Cloudflare service bindings.
+- Typed methods run over Fetch, WebSocket, or Cloudflare service bindings.
 - Schemas validate inputs and outputs, using the validation library you already use.
 - Published abilities can become OpenAPI or MCP tools from the control plane.
 - Request ids and structured JSON logs correlate plane and service calls out of the box.
 
-Service authors define oRPC procedures. Hono remains the composition shell for middleware,
-discovery, STS/JWKS, MCP, OpenAPI, and adapter routes; procedure code can normally use the
+Service authors define transport-neutral methods. Hono remains the composition shell for middleware,
+discovery, STS/JWKS, MCP, OpenAPI, and adapter routes; method code can normally use the
 transport-neutral `context.env` and `context.request` fields without importing Hono.
 
 The library is written against web-standard globals only (`crypto.subtle`, `fetch`/`Request`,
-`TextEncoder`, timers) and runs on Node 20+, Cloudflare Workers, Deno, and Bun. The procedure-first
-runtime is currently built on the pinned oRPC 2.0 beta line; see [Architecture](docs/architecture.md#why-orpc-and-what-it-costs)
-for the maturity trade-off.
+`TextEncoder`, timers) and runs on Node 20+, Cloudflare Workers, Deno, and Bun. Its RPC engine is an
+internal dependency: consumers use Service Plane builders, clients, errors, and wire options rather
+than framework-specific procedures or plugins. See [Architecture](docs/architecture.md#why-the-engine-is-internal).
 
 ## Install
 
@@ -66,7 +66,7 @@ const asanaTasks = defineAbility({
   scopes: ['asana.tasks.write'],
   methods: {
     createTask: ability
-      .procedure({
+      .method({
         scopes: ['asana.tasks.write'],
         rest: { method: 'post', path: '/asana/tasks', summary: 'Create an Asana task' },
         mcp: { name: 'asana_create_task', description: 'Create a task in Asana' },
@@ -180,19 +180,19 @@ await asana.createTask({
 });
 ```
 
-The returned value is an ordinary typed oRPC client. It therefore works directly with oRPC's
-TanStack Query integration:
+The returned value is a typed Service Plane client whose methods return promises, so it works with
+TanStack Query without an RPC-specific adapter:
 
 ```ts
-import { createTanstackQueryUtils } from '@orpc/tanstack-query';
+import { useMutation } from '@tanstack/react-query';
 
-const queries = createTanstackQueryUtils(asana);
-const options = queries.createTask.mutationOptions();
+const createTask = useMutation({
+  mutationFn: asana.createTask,
+});
 ```
 
-Install `@orpc/tanstack-query` at the same pinned oRPC version and the TanStack adapter for your UI
-framework. The public topology does not change: TanStack Query still calls the control plane, and
-the control plane discovers, authorizes, mints, and routes to the private service.
+The public topology does not change: TanStack Query still calls the control plane, and the control
+plane discovers, authorizes, mints, and routes to the private service.
 
 ## Agent Skill
 
@@ -237,6 +237,7 @@ references are synced copies of [`docs/`](docs/).
 - [Create A Control Plane](docs/plane-creation.md)
 - [Streaming](docs/streaming.md)
 - [Choosing A Transport](docs/transports.md)
+- [Migrate From The Public oRPC Surface](docs/migration-rpc-boundary.md)
 - [Auth](docs/auth.md)
 - [Cloudflare](docs/cloudflare.md)
 - [Node.js And Self-Hosted Services](docs/nodejs.md)

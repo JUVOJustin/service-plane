@@ -157,7 +157,7 @@ export type ControlPlaneRpcBrokerCallInput = {
   abilityId: string;
   /** Authenticated caller, or no caller for a plane-owned call. */
   caller?: BrokerCaller;
-  /** Procedure input encoded by oRPC. */
+  /** Method input carried by the broker. */
   input: unknown;
   /** Method from the discovered ability catalog. */
   method: string;
@@ -168,17 +168,17 @@ export type ControlPlaneRpcBrokerCallInput = {
 };
 
 export type ControlPlaneRpcBroker = {
-  /** Calls one ability procedure through discovery, authorization, token minting, and routing. */
+  /** Calls one ability method through discovery, authorization, token minting, and routing. */
   callAbility(input: ControlPlaneRpcBrokerCallInput): Promise<unknown>;
 };
 
-/** Wire input for the control plane's stable, generic oRPC broker procedures. */
+/** Private wire envelope for the control plane's generic broker methods. */
 export type ControlPlaneBrokerProcedureInput = {
   /** Ability selected inside the target service. */
   abilityId: string;
-  /** Opaque procedure input validated authoritatively by the target service. */
+  /** Opaque method input validated authoritatively by the target service. */
   input: unknown;
-  /** Procedure name from the discovered catalog. */
+  /** Method name from the discovered catalog. */
   method: string;
   /** Scopes requested from the broker. */
   scopes: string[];
@@ -219,7 +219,7 @@ export const controlPlaneBrokerRouter = {
       const output = await callBrokerProcedure(context, input);
       if (isAsyncIterable(output)) {
         throw new ORPCError('METHOD_NOT_SUPPORTED', {
-          message: `Service-Plane streaming method must use the broker stream procedure: ${input.method}`,
+          message: `Service-Plane streaming method must use the broker stream endpoint: ${input.method}`,
         });
       }
       return output;
@@ -232,7 +232,7 @@ export const controlPlaneBrokerRouter = {
       const output = await callBrokerProcedure(context, input);
       if (!isAsyncIterable(output)) {
         throw new ORPCError('METHOD_NOT_SUPPORTED', {
-          message: `Service-Plane unary method must use the broker call procedure: ${input.method}`,
+          message: `Service-Plane unary method must use the broker call endpoint: ${input.method}`,
         });
       }
       return output as never;

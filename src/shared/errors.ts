@@ -1,6 +1,6 @@
 /**
- * What kind of failure this is, independent of the HTTP-style status. oRPC carries this taxonomy in
- * typed error data; the legacy runtime carries it as enumerable error properties. Read both with
+ * What kind of failure this is, independent of the HTTP-style status. Wire transports carry this
+ * taxonomy in typed error data; local calls carry it as enumerable error properties. Read both with
  * {@link servicePlaneErrorInfo} instead of relying on an error class surviving a remote hop.
  */
 export type ServicePlaneErrorCode =
@@ -119,6 +119,24 @@ export class AbilityValidationError extends ServicePlaneError {
 }
 
 /**
+ * Stable error received by an ability client. Wire adapters translate their private error objects
+ * into this class so callers never need to import or inspect the underlying RPC engine.
+ */
+export class ServicePlaneClientError extends ServicePlaneError {
+  /** Structured validation failures safe for the caller. */
+  readonly issues?: ReadonlyArray<AbilityValidationIssue>;
+  /** Application-owned discriminator attached by an ability handler. */
+  readonly reason?: string;
+
+  constructor(info: ServicePlaneErrorInfo) {
+    super(info.message, info.status, { code: info.code, retryable: info.retryable });
+    this.name = 'ServicePlaneClientError';
+    if (info.issues) this.issues = info.issues;
+    if (info.reason !== undefined) this.reason = info.reason;
+  }
+}
+
+/**
  * Structurally the Standard Schema issue shape, restated so consumers reading `issues` do not
  * need the spec package and so a malformed vendor issue cannot widen the type.
  */
@@ -167,7 +185,7 @@ const SERVICE_PLANE_ERROR_CODES: ReadonlySet<string> = new Set(Object.keys(SERVI
 
 /**
  * Reads the Service Plane taxonomy off a caught value, whether it is a local
- * {@link ServicePlaneError}, typed oRPC error data, or a legacy peer's reconstructed error. Returns
+ * {@link ServicePlaneError}, typed wire error data, or a peer's reconstructed error. Returns
  * undefined for anything that does not carry the taxonomy.
  *
  * Every field is re-checked rather than trusted: these values arrive from a peer, and a hostile or
@@ -175,8 +193,8 @@ const SERVICE_PLANE_ERROR_CODES: ReadonlySet<string> = new Set(Object.keys(SERVI
  */
 export function servicePlaneErrorInfo(error: unknown): ServicePlaneErrorInfo | undefined {
   if (typeof error !== 'object' || error === null) return undefined;
-  // oRPC carries library classification under `data.servicePlane`; in-process and legacy callers
-  // still carry it directly on the Error. Reading both keeps one branching helper for every link.
+  // The private wire runtime carries classification under `data.servicePlane`; in-process callers
+  // carry it directly on the Error. Reading both keeps one branching helper for every link.
   const data = (error as { data?: unknown }).data;
   const nested =
     data && typeof data === 'object' && (data as { servicePlane?: unknown }).servicePlane
@@ -195,6 +213,25 @@ export function servicePlaneErrorInfo(error: unknown): ServicePlaneErrorInfo | u
     retryable,
     status,
   };
+}
+
+/** Converts a private transport error into the stable error exposed by ability clients. */
+export function servicePlaneClientError(error: unknown): ServicePlaneClientError {
+  if (error instanceof ServicePlaneClientError) return error;
+  const info = servicePlaneErrorInfo(error);
+  if (info) return new ServicePlaneClientError(info);
+  return new ServicePlaneClientError({
+    code: 'internal',
+    message: error instanceof Error ? error.message : 'Service Plane call failed',
+    retryable: false,
+    status: transportErrorStatus(error),
+  });
+}
+
+function transportErrorStatus(error: unknown): number {
+  if (!error || typeof error !== 'object') return 500;
+  const status = (error as { status?: unknown }).status;
+  return typeof status === 'number' && Number.isInteger(status) && status >= 400 && status <= 599 ? status : 500;
 }
 
 function servicePlaneValidationIssues(value: unknown): AbilityValidationIssue[] | undefined {

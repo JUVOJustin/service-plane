@@ -2,11 +2,11 @@
 
 Goal: return validated results over time without adding a service-specific wire protocol.
 
-Service Plane uses oRPC async iterator objects. The service validates every yielded item; Fetch and
+Service Plane exposes typed async iterators. The service validates every yielded item; Fetch and
 WebSocket preserve backpressure; the control-plane broker proxies the iterator; and MCP tools expose
-the same procedure over SSE.
+the same method over SSE.
 
-## Declare A Streaming Procedure
+## Declare A Streaming Method
 
 Pass the yielded-item schema to `ability.stream()`:
 
@@ -35,7 +35,7 @@ export const hubFiles = defineAbility({
 ```
 
 The item schema drives runtime validation, discovery, and the aggregated MCP tool schema. Streaming
-procedures cannot project REST operations, MCP resources, or MCP prompts because those surfaces have
+methods cannot project REST operations, MCP resources, or MCP prompts because those surfaces have
 one response value. MCP tools are supported.
 
 ## Call A Stream
@@ -56,9 +56,15 @@ for await (const item of stream) {
 }
 ```
 
-Breaking out of the loop closes the iterator. Pass an `AbortSignal` in oRPC call options when the
-consumer has an explicit cancellation lifecycle. The service combines transport cancellation with
-the forwarded Service Plane deadline and exposes it as `context.signal`.
+Breaking out of the loop closes the iterator. Pass an `AbortSignal` as the second method argument
+when the consumer has an explicit cancellation lifecycle:
+
+```ts
+await files.readFile({ path: '/large.ndjson' }, { signal });
+```
+
+The service combines transport cancellation with the forwarded Service Plane deadline and exposes
+it as `context.signal`.
 
 ## Choose The Transport
 
@@ -71,7 +77,7 @@ the forwarded Service Plane deadline and exposes it as `context.signal`.
 | Durable Object that must sleep between messages | WebSocket Hibernation |
 
 Cloudflare native RPC remains the unary fast path. `createAbilityClient({ transport: { type:
-'service-binding' } })` and the control-plane broker inspect the procedure definition: unary calls use
+'service-binding' } })` and the control-plane broker inspect the method definition: unary calls use
 `invokeAbility`, while streaming calls use `binding.fetch`. The application still uses one client.
 
 ## Serve WebSocket Streams
@@ -104,15 +110,13 @@ service callers or an application-owned control-plane handoff. The shipped
 `createBrokeredAbilityClient()` path supports live Fetch and WebSocket streams, but does not turn a
 private service's hibernating socket into an end-to-end hibernating broker stream.
 
-Hibernation requires the oRPC plugin and manual platform events:
+Hibernation support is installed automatically when an ability contains a hibernating method. The
+Durable Object only enables manual platform events:
 
 ```ts
 const service = new ServicePlaneService({
   // ...
-  rpc: {
-    manualWebSocket: true,
-    plugins: [new HibernationHandlerPlugin()],
-  },
+  rpc: { manualWebSocket: true },
 });
 
 export class FileEvents extends DurableObject<Env> {
@@ -132,14 +136,15 @@ export class FileEvents extends DurableObject<Env> {
 }
 ```
 
-A hibernating subscription procedure stores the generated iterator id on the current socket:
+A hibernating method stores the generated iterator id on the current socket using Service Plane's
+own subscription class:
 
 ```ts
 events: ability
   .hibernationStream(EventSchema, { scopes: ['hub.events.read'] })
   .input(z.object({ channel: z.string() }))
   .handler(({ context }) =>
-    new HibernationAsyncIteratorClass((id) => {
+    new AbilityHibernationStream((id) => {
       context.webSocket?.serializeAttachment?.({ id });
     }),
   ),
@@ -155,13 +160,12 @@ async sendEvent(ws: WebSocket, event: z.input<typeof EventSchema>) {
 ```
 
 Use `{ event: 'error' }` or `{ event: 'close' }` for protocol errors and completion. Ordinary
-`ability.stream()` procedures validate yielded values as the handler is consumed. A hibernating
+`ability.stream()` methods validate yielded values as the handler is consumed. A hibernating
 handler has already returned before an awakened Durable Object produces a value, so
-`encodeAbilityHibernationEvent()` is the validation boundary instead. Raw oRPC event encoding is not
-exported from Service Plane because it would bypass that output-schema check.
+`encodeAbilityHibernationEvent()` is the validation boundary instead. Raw engine encoding is not
+exported because it would bypass that output-schema check.
 
-Do not route that procedure through `BatchLinkPlugin`; hibernating iterators cannot survive inside a
-finite batch response.
+Hibernating methods use the WebSocket transport and are never placed in a finite Fetch batch.
 
 A forwarded request deadline bounds creation of the hibernating subscription, not its lifetime. The
 Durable Object may sleep past an in-memory timer, so store any subscription expiry in durable state
@@ -198,10 +202,10 @@ streamCompletion: ability
 
 ## MCP Streaming Tools
 
-Published streaming procedures with `mcp` metadata answer `tools/call` over MCP streamable HTTP.
+Published streaming methods with `mcp` metadata answer `tools/call` over MCP streamable HTTP.
 Progress notifications may be emitted while items arrive; the final response aggregates
 `structuredContent: { items }`. MCP limits protect the control plane from unbounded aggregation; use
-the typed oRPC client for a truly unbounded stream.
+the typed Service Plane client for a truly unbounded stream.
 
 Next: [Choosing A Transport](transports.md), [Cloudflare](cloudflare.md), and the
 [reference](reference.md#streaming-methods).

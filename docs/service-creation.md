@@ -2,7 +2,7 @@
 
 Goal: create one service that exposes schema-backed abilities through Service Plane.
 
-The smallest useful service defines capabilities, abilities, handler classes, and `ServicePlaneService`.
+The smallest useful service defines capabilities, abilities, handlers, and `ServicePlaneService`.
 
 ## 1. Define Scopes
 
@@ -82,7 +82,7 @@ Both halves of the contract are checked when the service is defined, not on the 
 
 ## 3. Define An Ability
 
-An ability is the service API surface. Each method is an implemented oRPC procedure.
+An ability is the service API surface. Each method is a transport-neutral Service Plane contract.
 
 ```ts
 import { createAbilityBuilder, defineAbility } from 'service-plane/service';
@@ -104,7 +104,7 @@ export const asanaTasks = defineAbility({
   scopes: ['asana.tasks.write'],
   methods: {
     createTask: ability
-      .procedure({
+      .method({
         scopes: ['asana.tasks.write'],
         rest: { method: 'post', path: '/asana/tasks', summary: 'Create an Asana task' },
         mcp: { name: 'asana_create_task', description: 'Create a task in Asana' },
@@ -121,9 +121,10 @@ export const asanaTasks = defineAbility({
 });
 ```
 
-The procedure is the implementation. Its metadata also drives discovery, REST/OpenAPI, and MCP, so
-there is no second handler class or method map to keep synchronized. oRPC middleware and typed error
-maps can be added with the normal procedure builder API.
+The method is the implementation. Its metadata also drives discovery, REST/OpenAPI, and MCP, so
+there is no second handler class or method map to keep synchronized. The RPC engine is private; add
+cross-cutting HTTP concerns through Hono middleware and shape intentional application failures with
+`AbilityHandlerError`.
 
 `access: 'plane'` is the default Service Plane path: the control plane or gateway decides whether an upstream product user, API key, or anonymous request may invoke the ability. Use `access: 'service'` only for abilities that should be brokered for authenticated service callers.
 
@@ -146,7 +147,7 @@ access class, and method scopes. Its output is validated before it crosses the R
 ```
 
 Use `context.env` for runtime bindings and `context.request` for headers. The verified caller is in
-`context.identity`. `context.context` exposes the underlying Hono context when a procedure genuinely
+`context.identity`. `context.context` exposes the underlying Hono context when a method genuinely
 needs a middleware variable or another Hono-specific feature; ordinary domain code need not import
 Hono.
 
@@ -167,7 +168,7 @@ readFile: ability
 ```
 
 Callers receive a typed async iterator. Fetch and WebSocket carry it directly. A Cloudflare
-service-binding client uses native RPC for unary procedures and `binding.fetch` for streams. See
+service-binding client uses native RPC for unary methods and `binding.fetch` for streams. See
 [Streaming](streaming.md).
 
 `context` is runtime access, such as Hono context, environment bindings, storage, and execution context.

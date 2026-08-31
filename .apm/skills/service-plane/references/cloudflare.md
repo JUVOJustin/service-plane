@@ -3,7 +3,7 @@
 Goal: use Service Plane with Workers, Service Bindings, Durable Objects, and Dynamic Workers.
 
 Keep the control plane as the public Worker and use service bindings for private calls to auxiliary
-Workers. The broker uses native Cloudflare RPC for unary procedures and binding Fetch for streams.
+Workers. The broker uses native Cloudflare RPC for unary methods and binding Fetch for streams.
 
 ## Local Worker-To-Worker Calls
 
@@ -34,13 +34,13 @@ const asana = createAbilityClient({
 });
 ```
 
-The client resolves lazily. It calls `invokeAbility` for unary procedures and `fetch` for streaming
-procedures. This direct client is for service-to-service or ingress-disabled development; the
+The client resolves lazily. It calls `invokeAbility` for unary methods and `fetch` for streaming
+methods. This direct client is for service-to-service or ingress-disabled development; the
 production browser/headless-front path goes through the broker.
 
 ## Native Binding RPC
 
-When the service binding exposes `invokeAbility(...)`, the control plane can call a unary procedure
+When the service binding exposes `invokeAbility(...)`, the control plane can call a unary method
 without an HTTP serialization hop. It still mints a brokered token, and the service still performs
 the full issuer, audience, expiry, ingress, access, and scope checks before input validation.
 
@@ -79,7 +79,7 @@ proxy, so the presence of `invokeAbility` proves nothing about the target.
 
 Both transports use the same ability wrapper: token verification, method scopes, input validation, handler call, and output validation.
 
-Native binding calls do not traverse the Hono middleware chain. Procedure handlers still receive
+Native binding calls do not traverse the Hono middleware chain. Method handlers still receive
 `context.env`, `context.request`, the verified identity, deadline signal, and an advanced Hono
 context escape hatch with the propagated request id.
 
@@ -155,7 +155,7 @@ Behind that binding:
 
 1. The loader fixes the application-level tenant, user, connection, and allowed scopes.
 2. The binding requests a ServicePlane token when its lazy client needs one.
-3. The binding calls the typed `asana.tasks` procedure client.
+3. The binding calls the typed `asana.tasks` ability client.
 4. The Asana service routes the call to the right Durable Object.
 
 This keeps workflow code simple and keeps credentials outside user-authored workflow code. Service Plane secures the plane-to-service call and can delegate it to an end-user subject per RFC 8693; the implementor owns any further user and tenant context in the validated input.
@@ -296,13 +296,13 @@ Keep JWKS key rotation overlapping: publish a new key alongside the old one for 
 ## When To Use WebSockets
 
 Use WebSocket for long-lived or interactive sessions, such as realtime updates. On Cloudflare,
-service-to-service streams use oRPC over the service binding's Fetch interface; native binding RPC
+service-to-service streams use Service Plane streaming over the binding's Fetch interface; native binding RPC
 is the unary fast path (see [Streaming](streaming.md)).
 
 Do not use WebSocket as the default Worker-to-Worker transport. Bindings are simpler for ordinary
 calls and need no connection lifecycle. When a Durable Object genuinely owns a long-lived socket,
-oRPC hibernation is available through `HibernationHandlerPlugin`, `rpc.manualWebSocket`, and the
-service's `webSocketMessage`/`webSocketClose` entrypoints. Full decision guide:
+hibernation is available through `ability.hibernationStream()`, `AbilityHibernationStream`,
+`rpc.manualWebSocket`, and the service's `webSocketMessage`/`webSocketClose` entrypoints. Full decision guide:
 [Choosing A Transport](transports.md).
 
 Next: [architecture](architecture.md), [auth](auth.md), and [Node.js](nodejs.md).

@@ -1,4 +1,3 @@
-import type { AnyProcedure, RouterClient } from '@orpc/server';
 import type { StandardJSONSchemaV1, StandardSchemaV1 } from '@standard-schema/spec';
 import type { Env } from 'hono';
 import { DEFAULT_ABILITY_TIMEOUT_MS } from '../shared/deadline.js';
@@ -23,111 +22,152 @@ import {
   type ServiceHttpMethod,
 } from '../shared/types.js';
 import {
-  abilityProcedureDefinition,
-  abilityProcedureInputSchema,
-  abilityProcedureOutputSchema,
-  abilityProcedureStreams,
-  isServicePlaneAbilityProcedure,
-} from './orpc.js';
+  type AbilityMethodDefinition,
+  type AbilityMethodKind,
+  type AbilitySchema,
+  type AbilityStream,
+  type AnyAbilityMethodDefinition,
+  isAbilityMethodDefinition,
+} from './ability.js';
 
 /**
  * Abilities accept any Standard Schema value, so services pick their own validation library.
  * The JSON Schema half of the spec is required rather than optional: every ability method is
  * projected into the discovery document, and OpenAPI/MCP projections read those schemas.
  */
-export type AbilitySchema = StandardSchemaV1 & StandardJSONSchemaV1;
-
 // Discovery documents have always carried draft-2020-12 JSON Schema; naming the target keeps
 // that stable across validation libraries instead of inheriting each vendor's default.
 const ABILITY_JSON_SCHEMA_TARGET: StandardJSONSchemaV1.Target = 'draft-2020-12';
 
-/** Implemented oRPC procedures forming one ability router. */
-export type AbilityProcedureDefinitions = Record<string, AnyProcedure>;
+/** Transport-neutral method contracts forming one ability. */
+export type AbilityMethodDefinitions<TEnv extends Env = Env> = Record<string, AnyAbilityMethodDefinition<TEnv>>;
 
-/** WebSocket capabilities exposed to a procedure, including optional Durable Object attachments. */
-export type ServiceAbilityWebSocket = {
-  /** Reads a Durable Object Hibernation attachment when the runtime supports it. */
-  deserializeAttachment?: () => unknown;
-  /** Sends a WebSocket frame. */
-  send(data: string | ArrayBuffer | Uint8Array<ArrayBuffer>): unknown;
-  /** Stores a Durable Object Hibernation attachment when the runtime supports it. */
-  serializeAttachment?: (attachment: unknown) => void;
-};
-
-/** Procedure-first ability definition used by the oRPC runtime. */
-export type OrpcServiceAbilityDefinition<
+/** Ability definition consumed by Service Plane independently of its private RPC engine. */
+export type ServiceAbilityDefinition<
   _TEnv extends Env = Env,
-  TMethods extends AbilityProcedureDefinitions = AbilityProcedureDefinitions,
+  TMethods extends AbilityMethodDefinitions<_TEnv> = AbilityMethodDefinitions<_TEnv>,
 > = {
+  /** Which authenticated caller class may invoke the ability. */
   access?: AbilityAccess;
+  /** Human-readable ability description used by projections. */
   description?: string;
+  /** Whether user-facing projections may publish the ability. */
   exposure?: AbilityExposure;
+  /** Stable ability identifier within the service. */
   id: string;
-  /** Implemented oRPC procedures; schemas, metadata, middleware, errors, and handlers stay together. */
+  /** Implemented Service Plane methods; schemas, metadata, policy, and handlers stay together. */
   methods: TMethods;
+  /** Wire path and transports implemented by the owning service. */
   rpc?: {
+    /** Origin-relative path prefix for this ability. */
     path?: string;
+    /** Transports the deployed service accepts. */
     transports?: AbilityTransport[];
   };
+  /** Maximum capability scope surface available to methods in this ability. */
   scopes?: string[];
+  /** Human-readable ability title used by projections. */
   title?: string;
 };
 
 /** The only supported ability definition shape. */
-export type ServiceAbilityDefinition<
-  TEnv extends Env = Env,
-  TMethods extends AbilityProcedureDefinitions = AbilityProcedureDefinitions,
-> = OrpcServiceAbilityDefinition<TEnv, TMethods>;
+export type AnyServiceAbilityDefinition<TEnv extends Env = Env> = ServiceAbilityDefinition<TEnv>;
 
-/** The only supported ability definition shape. */
-export type AnyServiceAbilityDefinition<TEnv extends Env = Env> = OrpcServiceAbilityDefinition<TEnv>;
+/** Per-call controls shared by every generated ability client. */
+export type AbilityCallOptions = {
+  /** Cancels the local transport call when the selected runtime supports cancellation. */
+  signal?: AbortSignal;
+};
 
-/** Fully typed client shape derived from an ability router. */
-export type AbilityRpc<TAbility extends OrpcServiceAbilityDefinition> = RouterClient<TAbility['methods']>;
+type AbilityClientMethod<TMethod extends AnyAbilityMethodDefinition> = (
+  input: StandardSchemaV1.InferInput<TMethod['input']>,
+  options?: AbilityCallOptions,
+) => Promise<
+  TMethod['kind'] extends 'unary'
+    ? StandardSchemaV1.InferOutput<TMethod['output']>
+    : AbilityStream<StandardSchemaV1.InferOutput<TMethod['output']>>
+>;
+
+/** Fully typed client shape derived only from the portable ability contract. */
+export type AbilityClient<TAbility extends ServiceAbilityDefinition> = {
+  [TMethod in keyof TAbility['methods']]: TAbility['methods'][TMethod] extends AnyAbilityMethodDefinition
+    ? AbilityClientMethod<TAbility['methods'][TMethod]>
+    : never;
+};
 
 export type NormalizedAbilityMethodDefinition<
   TInput extends AbilitySchema = AbilitySchema,
   TOutput extends AbilitySchema = AbilitySchema,
 > = {
+  /** Whether retrying the same logical operation is declared safe. */
   idempotent?: true;
+  /** Runtime input schema. */
   input: TInput;
+  /** Projected input JSON Schema. */
   inputSchema: OpenApiObject;
+  /** Optional MCP tool projection. */
   mcp?: ServiceAbilityMcpProjection;
+  /** Optional MCP prompt projection. */
   mcpPrompt?: ServiceAbilityMcpPromptProjection;
+  /** Optional MCP resource projection. */
   mcpResource?: ServiceAbilityMcpResourceProjection;
+  /** Portable method contract compiled by the private runtime. */
+  method: AbilityMethodDefinition<Env, TInput, TOutput, AbilityMethodKind>;
+  /** Runtime output or yielded-item schema. */
   output: TOutput;
+  /** Projected output JSON Schema. */
   outputSchema: OpenApiObject;
-  procedure: AnyProcedure;
+  /** Optional REST projection. */
   rest?: ServiceAbilityRestProjection;
+  /** Minimum capability scopes required by the method. */
   scopes: string[];
+  /** Present when the method returns a stream. */
   stream?: true;
+  /** Effective unary execution ceiling in milliseconds. */
   timeoutMs?: number;
 };
 
 export type NormalizedServiceAbility<_TEnv extends Env = Env> = {
+  /** Normalized caller access class. */
   access: AbilityAccess;
+  /** Human-readable ability description. */
   description?: string;
+  /** Normalized projection visibility. */
   exposure: AbilityExposure;
+  /** Stable ability identifier. */
   id: string;
+  /** Normalized methods keyed by their public names. */
   methods: Record<string, NormalizedAbilityMethodDefinition>;
+  /** Normalized path and transport declarations. */
   rpc: {
+    /** Origin-relative ability path prefix. */
     path: string;
+    /** Enabled transports with duplicates removed. */
     transports: AbilityTransport[];
   };
+  /** Normalized maximum scope surface. */
   scopes: string[];
+  /** Human-readable ability title. */
   title?: string;
 };
 
 export type ServiceDefinition<TEnv extends Env = Env> = {
+  /** Validated and normalized abilities owned by the service. */
   abilities: NormalizedServiceAbility<TEnv>[];
+  /** Optional caller-auth capabilities advertised in discovery. */
   callerAuth?: ServiceCallerAuthDiscovery;
+  /** Capability scopes issued for this service. */
   capabilities?: CapabilityCatalog;
+  /** Stable service identifier. */
   id: string;
+  /** Human-readable service title. */
   title: string;
+  /** Deployed service contract version. */
   version: string;
 };
 
 export type DefineServiceInput<TEnv extends Env = Env> = Omit<ServiceDefinition<TEnv>, 'abilities'> & {
+  /** Portable ability definitions to validate and normalize. */
   abilities: Array<AnyServiceAbilityDefinition<TEnv>>;
 };
 
@@ -136,13 +176,14 @@ export type DefineServiceOptions = {
    * Ceiling applied to every unary method that does not set its own `timeoutMs`. `false` removes it.
    */
   defaultMethodTimeoutMs?: false | number;
+  /** Requires non-empty scopes on every ability and method when true. */
   requireAbilityScopes?: boolean;
 };
 
-/** Returns the definition's exact router type for typed client inference. */
-export function defineAbility<TEnv extends Env = Env, TMethods extends AbilityProcedureDefinitions = AbilityProcedureDefinitions>(
-  definition: OrpcServiceAbilityDefinition<TEnv, TMethods>,
-): OrpcServiceAbilityDefinition<TEnv, TMethods> {
+/** Returns the definition's exact method contract for typed client inference. */
+export function defineAbility<TEnv extends Env = Env, TMethods extends AbilityMethodDefinitions<TEnv> = AbilityMethodDefinitions<TEnv>>(
+  definition: ServiceAbilityDefinition<TEnv, TMethods>,
+): ServiceAbilityDefinition<TEnv, TMethods> {
   return definition;
 }
 
@@ -210,7 +251,7 @@ function normalizeAbilities<TEnv extends Env>(
       throw new CapabilityAuthError(`Service-Plane ability is missing required scopes: ${id}`, 500);
     }
     validateKnownScopes(scopes, knownScopes, capabilities, 'Service-Plane ability requires unknown scope');
-    const methods = normalizeProcedureMethods(
+    const methods = normalizeAbilityMethods(
       serviceId,
       id,
       ability.methods,
@@ -239,10 +280,10 @@ function normalizeAbilities<TEnv extends Env>(
   });
 }
 
-function normalizeProcedureMethods(
+function normalizeAbilityMethods(
   serviceId: string,
   abilityId: string,
-  methods: AbilityProcedureDefinitions,
+  methods: AbilityMethodDefinitions,
   abilityScopes: string[],
   knownScopes: Set<string>,
   capabilities: CapabilityCatalog | undefined,
@@ -260,24 +301,15 @@ function normalizeProcedureMethods(
         throw new CapabilityAuthError(`Service-Plane ability method name is duplicated: ${abilityId}/${name}`, 500);
       }
       seenNames.add(name);
-      const procedure = methods[methodName];
-      if (!procedure || !isServicePlaneAbilityProcedure(procedure)) {
-        throw new CapabilityAuthError(
-          `Service-Plane ability procedure must be created with createAbilityBuilder: ${abilityId}/${name}`,
-          500,
-        );
+      const method = methods[methodName];
+      if (!method || !isAbilityMethodDefinition(method)) {
+        throw new CapabilityAuthError(`Service-Plane ability method must be created with createAbilityBuilder: ${abilityId}/${name}`, 500);
       }
 
-      const definition = abilityProcedureDefinition(procedure);
-      const input = abilityProcedureInputSchema(procedure);
-      const output = abilityProcedureOutputSchema(procedure);
-      if (!input || !output) {
-        throw new CapabilityAuthError(
-          `Service-Plane ability procedure requires exactly one input and one output schema: ${abilityId}/${name}`,
-          500,
-        );
-      }
-      const stream = abilityProcedureStreams(procedure);
+      const definition = method.metadata;
+      const input = method.input;
+      const output = method.output;
+      const stream = method.kind !== 'unary';
       const scopes = normalizeScopes(definition.scopes ?? []);
       if (requireAbilityScopes && scopes.length === 0) {
         throw new CapabilityAuthError(`Service-Plane ability method is missing required scopes: ${abilityId}/${name}`, 500);
@@ -311,6 +343,7 @@ function normalizeProcedureMethods(
           ...(mcp ? { mcp } : {}),
           ...(mcpPrompt ? { mcpPrompt } : {}),
           ...(mcpResource ? { mcpResource } : {}),
+          method: method as AbilityMethodDefinition<Env, AbilitySchema, AbilitySchema, AbilityMethodKind>,
           output: output as AbilitySchema,
           outputSchema: abilityJsonSchema(
             output as AbilitySchema,
@@ -318,7 +351,6 @@ function normalizeProcedureMethods(
             `${abilityId}/${name}`,
             schemaResourceId(serviceId, abilityId, name, 'output'),
           ),
-          procedure,
           ...(rest ? { rest } : {}),
           scopes,
           ...(stream ? { stream: true as const } : {}),

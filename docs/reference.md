@@ -18,7 +18,7 @@ defineAbility({
   scopes: ['asana.tasks.write'],
   methods: {
     createTask: ability
-      .procedure({
+      .method({
         scopes: ['asana.tasks.write'],
         rest: { method: 'post', path: '/asana/tasks' },
         mcp: { name: 'asana_create_task', description: 'Create a task in Asana' },
@@ -39,7 +39,7 @@ Defaults:
 - `exposure: 'private'`
 - `access: 'plane'`
 - `rpc.path: /rpc/<abilityId>`
-- `rpc.transports: ['fetch']` for procedure-first abilities
+- `rpc.transports: ['fetch']`
 
 `access: 'plane'` means the control plane or gateway owns any upstream product auth decision before calling the service. `access: 'service'` restricts the ability to authenticated service callers, and is enforced at both ends: the broker refuses it for a non-service caller from the discovered catalog, and the service refuses it from its own definition using the token's [`spa` claim](#capability-token-claims). Tightening an ability therefore takes effect when the service deploys, not when the plane's [discovery cache](plane-creation.md#discovery-cache) catches up.
 
@@ -47,7 +47,7 @@ Defaults:
 
 ```ts
 ability
-  .procedure({ scopes: ['asana.tasks.write'] })
+  .method({ scopes: ['asana.tasks.write'] })
   .input(z.object({ name: z.string() }))
   .output(z.object({ id: z.string() }))
   .handler(({ input }) => ({ id: createId(input.name) }));
@@ -77,7 +77,7 @@ ability
   });
 ```
 
-The typed client returns an async iterator with oRPC flow control:
+The typed client returns an async iterator with transport flow control:
 
 ```ts
 const api = createBrokeredAbilityClient({ ability: hubFiles, /* ... */ });
@@ -88,17 +88,17 @@ for await (const item of stream) {
 ```
 
 Fetch and WebSocket carry streams. A Cloudflare service-binding transport uses native RPC for unary
-procedures and binding Fetch for streams. Through the broker, the iterator crosses both hops while
+methods and binding Fetch for streams. Through the broker, the iterator crosses both hops while
 the application still connects only to the control plane. Streaming methods cannot project MCP
 prompts, resources, or REST operations; MCP tools are supported.
 
 For high-frequency streams (LLM token deltas), batch deltas in the handler and declare the batch as the item (`output: z.array(...)`) — see the coalescing recipe in [Streaming](streaming.md#high-frequency-streams).
 
 Durable Object hibernation uses `ability.hibernationStream(itemSchema)`,
-`HibernationAsyncIteratorClass`, and `HibernationHandlerPlugin`. Because later values are produced
-after the original procedure has returned, send them with
+`AbilityHibernationStream`, and `rpc.manualWebSocket`. Private runtime support is installed
+automatically. Because later values are produced after the original method has returned, send them with
 `encodeAbilityHibernationEvent(itemSchema, iteratorId, value)` so the item schema remains enforced.
-Do not include a hibernating procedure in an oRPC batch.
+Hibernating methods use WebSocket and are not included in a finite Fetch batch.
 
 Full guide, including per-runtime WebSocket and hibernation wiring: [Streaming](streaming.md).
 
@@ -136,7 +136,7 @@ Mounted routes:
 
 ```txt
 GET /.well-known/service-plane/service.json
-ALL /rpc/<abilityId>/<procedure>
+ALL /rpc/<abilityId>/<method>
 ALL /rpc/<abilityId>                              (WebSocket upgrade)
 ```
 
@@ -164,9 +164,9 @@ POST /.well-known/service-plane/capability-token
 GET  /.well-known/service-plane/jwks.json
 GET  /openapi.json
 POST /rpc/mcp                                    (MCP streamable HTTP)
-POST /rpc/broker/call                            (oRPC unary broker)
-POST /rpc/broker/stream                          (oRPC streaming broker)
-ALL  /rpc/broker/ws                              (oRPC WebSocket, when configured)
+POST /rpc/broker/call                            (unary broker)
+POST /rpc/broker/stream                          (streaming broker)
+ALL  /rpc/broker/ws                              (WebSocket broker, when configured)
 ```
 
 The plane serves the OpenAPI document only. Mount a documentation UI yourself on `plane.app` (e.g. `@hono/swagger-ui` or `@scalar/hono-api-reference`) pointed at `/openapi.json`.
@@ -232,13 +232,12 @@ const api = createAbilityClient({
 
 Transports:
 
-- `{ type: 'fetch', fetch?, origin?, plugins? }`
-- `{ type: 'service-binding', binding, plugins? }` — native unary plus binding Fetch streams
-- `{ type: 'websocket', url, createWebSocket?, reconnect?, plugins? }`
-- `{ type: 'custom', link }`
+- `{ type: 'fetch', fetch?, origin?, batch?, compression? }`
+- `{ type: 'service-binding', binding, batch?, compression? }` — native unary plus binding Fetch streams
+- `{ type: 'websocket', url, createWebSocket?, reconnect? }`
 
 `createBrokeredAbilityClient` accepts Fetch or WebSocket. Its WebSocket endpoint is
-`/rpc/broker/ws`; `path` remains the logical `/rpc/broker` oRPC prefix.
+`/rpc/broker/ws`; `path` remains the logical `/rpc/broker` prefix.
 
 `ServiceEndpoint.abilityRpc` is likewise explicit: pass an object forwarding `invokeAbility(...)`
 for the native unary fast path. The endpoint's binding still supplies `fetch` for streams. Native
@@ -332,8 +331,8 @@ new ServicePlaneService({
   timeout: { methodMs: 2_500 },     // service-wide ceiling; `false` removes it
 });
 
-bigExport: ability.procedure({ timeoutMs: 120_000, ... });  // the one slow method
-bigMigration: ability.procedure({ timeoutMs: 0, ... });     // opt this one out entirely
+bigExport: ability.method({ timeoutMs: 120_000, ... });  // the one slow method
+bigMigration: ability.method({ timeoutMs: 0, ... });     // opt this one out entirely
 ```
 
 Method values are validated at definition time — a negative, fractional, or absurdly large value refuses the service instead of silently dropping or clamping the ceiling — and a method's own ceiling is deliberately **not** clamped to the 10-minute wire limit: that limit bounds what a *caller* may ask for, not how long a service allows its own export to run.
@@ -399,8 +398,8 @@ Only the plane's decrement does clock arithmetic — `Date.now()` at request ent
 It does **not**:
 
 - **guarantee transport cancellation from the local timeout race.** The forwarded budget is what
-  guarantees the service stops. An explicit oRPC call `signal` can additionally abort supported transports.
-- **close a WebSocket.** The deadline fails a *procedure call*. A WebSocket stays open, so on Cloudflare a Durable Object holding one keeps billing duration — see [Transports](transports.md). Use an idle timeout to bound that, not a deadline.
+  guarantees the service stops. An explicit method-call `signal` can additionally abort supported transports.
+- **close a WebSocket.** The deadline fails a *method call*. A WebSocket stays open, so on Cloudflare a Durable Object holding one keeps billing duration — see [Transports](transports.md). Use an idle timeout to bound that, not a deadline.
 - **bound a stream's lifetime.** It bounds the call that returns the stream, not consumption of its items.
 
 ### On Cloudflare
@@ -422,7 +421,7 @@ new ServicePlaneControlPlane({ timeout: { defaultMs: 10_000, maxMs: 60_000 } });
 new ServicePlaneService({ timeout: { defaultMs: 5_000, maxMs: 30_000 } });
 ```
 
-`defaultMs` supplies a budget when the caller sent none. It is resolved for each logical oRPC call,
+`defaultMs` supplies a budget when the caller sent none. It is resolved for each logical Service Plane call,
 including calls carried over a WebSocket. `maxMs` clamps an explicit or defaulted budget. The plane
 has no built-in default; the service's unary ceiling is the always-present bound.
 
@@ -432,7 +431,7 @@ A caller's own local wait is set slightly **above** the budget it forwards (`SER
 
 | | This package | gRPC | Envoy | Armeria |
 | --- | --- | --- | --- | --- |
-| Caller sees | `ORPCError` plus Service Plane `code: 'timeout'`, `status: 504` data | `DEADLINE_EXCEEDED` (maps to 504) | 504 Gateway Timeout | `ResponseTimeoutException` |
+| Caller sees | `ServicePlaneClientError` with `code: 'timeout'`, `status: 504` | `DEADLINE_EXCEEDED` (maps to 504) | 504 Gateway Timeout | `ResponseTimeoutException` |
 | Service sees | The method rejects; `signal` is aborted | Context cancelled (`CANCELLED`) | Upstream stream reset | `RequestTimeoutException`, work cancelled |
 | Peer is told | Forwarded deadline; explicit call signals may also abort transport | Yes | Yes | Yes (RST_STREAM / close) |
 
@@ -441,12 +440,12 @@ runtime propagated transport cancellation before the service began work.
 
 `retryable` is `true` for a timeout, matching Envoy's treatment of 504 as a `gateway-error` worth retrying — but only retry when the method is also `idempotent`. See [Idempotency](#idempotency).
 
-**`status` is a classification, not necessarily the outer HTTP status.** oRPC carries the typed error
-inside its protocol response. Read the Service Plane classification with `servicePlaneErrorInfo`.
+**`status` is a classification, not necessarily the outer HTTP status.** Read the stable Service
+Plane classification directly from `ServicePlaneClientError` or with `servicePlaneErrorInfo`.
 
 Unlike forwarded connection info, a deadline is honoured from **any** caller without requiring ingress. It is not an authorization input: a caller shortening its own budget can only cut itself off, and a long one is clamped.
 
-The budget is per logical procedure call on Fetch, WebSocket, and native service-binding RPC.
+The budget is per logical method call on Fetch, WebSocket, and native service-binding RPC.
 
 ## Idempotency
 
@@ -456,7 +455,7 @@ Deadlines create ambiguous failures — a call that timed out may or may not hav
 
 ```ts
 lookupTask: ability
-  .procedure({ idempotent: true, scopes: ['asana.tasks.read'] })
+  .method({ idempotent: true, scopes: ['asana.tasks.read'] })
   .input(TaskQuery)
   .output(Task)
   .handler(lookupTask);
@@ -466,8 +465,8 @@ It is projected into the discovery document so callers and gateways can read it.
 
 Combined with `retryable` from the error taxonomy, the decision is: retry only when the failure was transient **and** the method is idempotent.
 
-**The caller says which attempt this is.** Pass a key and it travels as an oRPC header or the
-`idempotencyKey` field on native `invokeAbility(...)`, reaching the procedure context:
+**The caller says which attempt this is.** Pass a key and it travels with Fetch/WebSocket calls or in the
+`idempotencyKey` field on native `invokeAbility(...)`, reaching the method context:
 
 ```ts
 const api = createBrokeredAbilityClient({ /* ... */ idempotencyKey: 'attempt-7f3a' });
@@ -538,8 +537,9 @@ Token cache keys include caller id, target service id, ability id, normalized sc
 - Invalid service output or streamed item: `AbilityValidationError` with 500-style status — the handler broke its own declared contract.
 - Deadline elapsed: `ServicePlaneTimeoutError` with 504-style status, thrown by whichever hop notices first. See [Deadlines](#deadlines).
 
-Validation details are carried under the Service Plane data nested in the received `ORPCError`. Use
-`servicePlaneErrorInfo` for a transport-independent view:
+Ability clients throw `ServicePlaneClientError`, which exposes `code`, `status`, `retryable`, optional
+`issues`, and optional handler `reason` without exposing the installed RPC engine. Use
+`servicePlaneErrorInfo` when code also handles local Service Plane errors:
 
 ```ts
 import { servicePlaneErrorInfo } from 'service-plane/service';
@@ -557,9 +557,8 @@ try {
 
 ### Reading An Error A Caller Received
 
-oRPC callers receive `ORPCError`. Service Plane keeps its cross-transport taxonomy under
-`error.data.servicePlane`; `servicePlaneErrorInfo` reads that shape as well as an in-process Service
-Plane error:
+Ability callers receive `ServicePlaneClientError`. `servicePlaneErrorInfo` reads that shape as well
+as an in-process Service Plane error:
 
 ```ts
 import { servicePlaneErrorInfo } from 'service-plane/service';
@@ -608,7 +607,7 @@ throw new AbilityHandlerError('Monthly export quota is used up', {
 ```
 
 The original failure is not lost — it is held beside the replacement in-process and sent to the
-service logger. It is deliberately not exposed as the oRPC error cause.
+service logger. It is deliberately not exposed as a client error cause.
 
 A schema that deviates from the Standard Schema contract fails closed: a validator that throws, or returns neither a value nor issues, raises `AbilityValidationError` rather than letting the value through. A schema missing `~standard.validate` or `~standard.jsonSchema` is rejected when the service is defined, not on the first call.
 

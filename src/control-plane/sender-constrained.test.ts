@@ -1,7 +1,7 @@
-import { ORPCError } from '@orpc/client';
 import { Hono } from 'hono';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
+import { createAbilityBuilder } from '../service/ability.js';
 import {
   type CapabilityProofSigner,
   controlPlaneJwkTokenRequester,
@@ -11,9 +11,9 @@ import {
 } from '../service/capabilities.js';
 import { createAbilityClient } from '../service/client.js';
 import { defineAbility } from '../service/discovery.js';
-import { createAbilityBuilder } from '../service/orpc.js';
 import { ServicePlaneService } from '../service/service.js';
 import { decodeCapabilityTokenPayload, publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
+import { ServicePlaneClientError } from '../shared/errors.js';
 import { servicePlaneJwkThumbprint } from '../shared/jwk-auth.js';
 import { signCapabilityProof } from '../shared/proof-of-possession.js';
 import { type CapabilityTokenCacheEntry, SERVICE_PLANE_CAPABILITY_JWKS_PATH } from '../shared/types.js';
@@ -45,8 +45,8 @@ describe('sender-constrained capability tokens', () => {
     // response, the plane's logs, or the plane itself would be holding.
     const stolen = tokenClient(ability, service, { token: issued.token });
     const error = await stolen.run({}).catch((caught: unknown) => caught);
-    expect(error).toBeInstanceOf(ORPCError);
-    expect(error).toMatchObject({ code: 'UNAUTHORIZED', message: expect.stringContaining('requires a proof of possession') });
+    expect(error).toBeInstanceOf(ServicePlaneClientError);
+    expect(error).toMatchObject({ code: 'capability_auth', message: expect.stringContaining('requires a proof of possession') });
   });
 
   it('accepts the token with no proof wiring when the shipped requester is used', async () => {
@@ -86,7 +86,7 @@ describe('sender-constrained capability tokens', () => {
     });
 
     await expect(forged.run({})).rejects.toMatchObject({
-      code: 'UNAUTHORIZED',
+      code: 'capability_auth',
       message: expect.stringContaining('does not match the token confirmation'),
     });
   });
@@ -106,7 +106,7 @@ describe('sender-constrained capability tokens', () => {
     });
 
     await expect(mismatched.run({})).rejects.toMatchObject({
-      code: 'UNAUTHORIZED',
+      code: 'capability_auth',
       message: expect.stringContaining('bound to a different token'),
     });
   });
@@ -214,7 +214,7 @@ async function deployment(caller: Awaited<ReturnType<typeof callerKeys>>) {
     id: 'example.sync',
     methods: {
       run: builder
-        .procedure({ scopes: [SCOPE] })
+        .method({ scopes: [SCOPE] })
         .input(z.object({}))
         .output(z.object({ boundTo: z.string().nullable(), caller: z.string() }))
         .handler(({ context }) => ({

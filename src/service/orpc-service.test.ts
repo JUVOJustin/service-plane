@@ -1,26 +1,24 @@
-import { createORPCClient, ORPCError } from '@orpc/client';
+import { type AnyNestedClient, createORPCClient, ORPCError } from '@orpc/client';
 import { RPCLink } from '@orpc/client/fetch';
-import { BatchLinkPlugin } from '@orpc/client/plugins';
 import { RPCLink as WebSocketRpcLink } from '@orpc/client/websocket';
-import { HibernationAsyncIteratorClass, HibernationHandlerPlugin } from '@orpc/hibernation';
-import { BatchHandlerPlugin } from '@orpc/server/plugins';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { createControlPlaneRpcBroker } from '../control-plane/broker.js';
 import { createCapabilityIssuer, defineServiceGrants } from '../control-plane/capabilities.js';
 import { servicePlaneAuthorization } from '../shared/capability-tokens.js';
 import { memoryWebSocketPair, testKeys } from '../test-support/index.js';
+import { AbilityHibernationStream, createAbilityBuilder } from './ability.js';
 import { defineCapabilities } from './capabilities.js';
 import { createAbilityClient } from './client.js';
-import { type AbilityRpc, defineAbility } from './discovery.js';
-import { createAbilityBuilder, encodeAbilityHibernationEvent } from './orpc.js';
+import { type AbilityClient, defineAbility } from './discovery.js';
+import { encodeAbilityHibernationEvent } from './hibernation.js';
 import { ServicePlaneService } from './service.js';
 
 const ISSUED_AT = new Date('2026-05-09T12:00:00.000Z');
 const VERIFIED_AT = new Date('2026-05-09T12:00:01.000Z');
 
-describe('ServicePlaneService oRPC runtime', () => {
-  it('serves unary and streaming procedures over Fetch with capability checks before validation', async () => {
+describe('ServicePlaneService private RPC runtime', () => {
+  it('serves unary and streaming methods over Fetch with capability checks before validation', async () => {
     const keys = await testKeys();
     const capabilities = defineCapabilities({
       scopes: [{ id: 'tasks.read' }],
@@ -48,12 +46,12 @@ describe('ServicePlaneService oRPC runtime', () => {
       id: 'tasks.items',
       methods: {
         get: ability
-          .procedure({ scopes: ['tasks.read'] })
+          .method({ scopes: ['tasks.read'] })
           .input(z.object({ id: z.string() }))
           .output(z.object({ caller: z.string(), id: z.string() }))
           .handler(({ context, input }) => ({ caller: context.identity.serviceId, id: input.id })),
         inspect: ability
-          .procedure({ scopes: ['tasks.read'] })
+          .method({ scopes: ['tasks.read'] })
           .input(z.object({}))
           .output(
             z.object({
@@ -81,7 +79,7 @@ describe('ServicePlaneService oRPC runtime', () => {
           .input(z.object({}))
           .handler(
             ({ context }) =>
-              new HibernationAsyncIteratorClass<{ sequence: number }>((id) => {
+              new AbilityHibernationStream<{ sequence: number }>((id) => {
                 hibernationIteratorId = id;
                 context.webSocket?.serializeAttachment?.({ id });
               }),
@@ -100,7 +98,7 @@ describe('ServicePlaneService oRPC runtime', () => {
       capabilities,
       id: 'tasks',
       logger: false,
-      rpc: { manualWebSocket: true, plugins: [new HibernationHandlerPlugin(), new BatchHandlerPlugin()] },
+      rpc: { batch: true, compression: true, manualWebSocket: true },
       title: 'Tasks',
       version: '1.0.0',
     });
@@ -111,7 +109,7 @@ describe('ServicePlaneService oRPC runtime', () => {
         origin: 'https://tasks.internal',
         url: '/rpc/tasks.items',
       });
-      return createORPCClient<AbilityRpc<typeof tasks>>(link);
+      return createORPCClient<AnyNestedClient>(link) as unknown as AbilityClient<typeof tasks>;
     };
 
     const denied = createClient();
@@ -169,13 +167,13 @@ describe('ServicePlaneService oRPC runtime', () => {
       const message = (event as MessageEvent<string | ArrayBuffer>).data;
       void service.webSocketMessage('tasks.items', serviceSocket, message);
     });
-    const webSocketClient = createORPCClient<AbilityRpc<typeof tasks>>(
+    const webSocketClient = createORPCClient<AnyNestedClient>(
       new WebSocketRpcLink({
         connect: () => clientSocket,
         headers: { authorization: servicePlaneAuthorization(issued.token) },
         url: '/rpc/tasks.items',
       }),
-    );
+    ) as unknown as AbilityClient<typeof tasks>;
     await expect(webSocketClient.get({ id: 'task-ws' })).resolves.toEqual({ caller: 'headless-front', id: 'task-ws' });
     const webSocketStream = await webSocketClient.watch({ after: 10 });
     const webSocketValues = [];
@@ -206,11 +204,8 @@ describe('ServicePlaneService oRPC runtime', () => {
           },
         },
         origin: 'https://tasks.internal',
-        plugins: [
-          new BatchLinkPlugin({
-            groups: [{ condition: true, context: {} }],
-          }),
-        ],
+        batch: true,
+        compression: true,
         type: 'fetch',
       },
     });

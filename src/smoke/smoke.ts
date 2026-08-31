@@ -39,7 +39,7 @@ export async function runSmoke(): Promise<string[]> {
           for (let index = 0; index < count; index += 1) yield { index };
         }),
       run: ability
-        .procedure({ scopes: ['smoke.run'] })
+        .method({ scopes: ['smoke.run'] })
         .input(objectSchema('name', 'string'))
         .output(recordSchema())
         .handler(({ context, input }) => ({
@@ -80,12 +80,12 @@ export async function runSmoke(): Promise<string[]> {
   const direct = client(['smoke.run', 'smoke.stream'], () => requestToken(['smoke.run', 'smoke.stream']));
   const ran = await direct.run({ name: 'nightly' });
   assert(ran.caller === 'smoke-caller' && ran.name === 'nightly', `unexpected unary result: ${JSON.stringify(ran)}`);
-  step('oRPC Fetch unary call');
+  step('Service Plane Fetch unary call');
 
   const items: Array<{ index: number }> = [];
   for await (const item of await direct.chunks({ count: 3 })) items.push(item);
   assert(items.map((item) => item.index).join(',') === '0,1,2', `unexpected stream items: ${JSON.stringify(items)}`);
-  step('oRPC Fetch streaming call');
+  step('Service Plane Fetch streaming call');
 
   const native = createAbilityClient({
     ability: jobs,

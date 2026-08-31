@@ -1,6 +1,6 @@
 # Architecture
 
-Goal: understand what Service Plane adds, where oRPC fits, and which layer owns auth and validation.
+Goal: understand what Service Plane owns, what stays replaceable, and which layer owns auth and validation.
 
 The smallest useful setup has three pieces:
 
@@ -36,76 +36,84 @@ sequenceDiagram
   Caller->>Plane: getTask(input)<br/>authenticated application request
   Plane->>Plane: Discover ability and check grants
   Plane->>Plane: Mint short-lived brokered token
-  Plane->>Service: oRPC call<br/>native binding or Fetch/WebSocket
+  Plane->>Service: Service Plane RPC<br/>native binding or Fetch/WebSocket
   Service->>Service: Verify issuer, audience, expiry, signature
   Service->>Service: Check ingress, access, and method scopes
   Service->>Service: Validate input
-  Service->>Handler: procedure(validInput)
+  Service->>Handler: method(validInput)
   Handler-->>Service: result
   Service->>Service: Validate output
   Service-->>Plane: typed result or stream
   Plane-->>Caller: typed result or stream
 ```
 
-## What oRPC Does
+## Public Contract And Private RPC Engine
 
-oRPC is the procedure engine and wire protocol. A procedure keeps its input schema, output schema,
-handler, typed errors, middleware, and Service Plane metadata in one definition. The same router can
-run over Fetch or WebSocket, and its client type works with oRPC ecosystem adapters such as TanStack
-Query.
+Service authors define methods with `createAbilityBuilder()`. Those definitions contain schemas,
+metadata, policy, and the handler, but no type from the installed RPC engine. Clients are derived as
+`AbilityClient<TAbility>` and failures arrive as `ServicePlaneClientError`.
 
-Service Plane adds the distributed-service model around that procedure:
+The current private engine compiles those definitions to oRPC for Fetch and WebSocket execution.
+That choice is deliberately not a compatibility surface: Service Plane does not export oRPC
+procedures, routers, plugins, client types, or errors. A later engine migration may change private
+wire details while keeping the method builder, client shape, Hono shell, and security model stable.
+
+Service Plane adds the distributed-service model around that method:
 
 ```mermaid
 flowchart TD
   Hono["Hono shell"] --> Middleware["HTTP middleware<br/>CORS, request ids, logging, rate limits"]
   Middleware --> Endpoint["/rpc/<abilityId>"]
-  Endpoint --> ORPC["oRPC Fetch / WebSocket adapter"]
-  ORPC --> Auth["Service Plane authorization middleware"]
+  Endpoint --> RPC["Private Fetch / WebSocket runtime"]
+  RPC --> Auth["Service Plane authorization middleware"]
   Auth --> Scopes["Ingress, access, and scope checks"]
   Scopes --> SchemaIn["Input schema validation"]
-  SchemaIn --> Handler["Procedure handler"]
+  SchemaIn --> Handler["Method handler"]
   Handler --> SchemaOut["Output schema validation"]
 ```
 
-Authorization middleware is installed before a procedure's input schema, so an unauthenticated call
+Authorization middleware is installed before a method's input schema, so an unauthenticated call
 is refused before malformed input is parsed or a handler runs. Hono middleware still sees the outer
-HTTP request, but it is not the authority for procedure scopes.
+HTTP request, but it is not the authority for method scopes.
 
 Production services should enable service-plane ingress protection so only brokered traffic reaches ability handlers. In that mode, `/rpc/<abilityId>` rejects valid but non-brokered capability tokens before input validation or handler creation. The broker mints a signed broker claim with the same capability issuer and JWKS trust chain the service already uses.
 
 An `access: 'service'` ability is refused at the same point, and for the same reason: the caller's access class is a signed claim only the control plane can mint, so the service can decide from its own definition rather than from the catalog the plane discovered. Every authorization input a service acts on — scopes, ingress, access — is read from what the service currently declares, which is what keeps a plane's cached catalog unable to loosen anything.
 
-Streaming procedures return validated async iterators. oRPC carries them over Fetch streaming or
+Streaming methods return validated async iterators. The private runtime carries them over Fetch streaming or
 WebSocket; a Cloudflare service-binding client uses native RPC for unary calls and automatically
 falls back to that binding's `fetch` method for streams. The broker proxies the async iterator, and
-MCP tools backed by streaming procedures answer over SSE. See [Streaming](streaming.md).
+MCP tools backed by streaming methods answer over SSE. See [Streaming](streaming.md).
 
-## Why oRPC And What It Costs
+## Why The Engine Is Internal
 
-For a service author, the main improvement is locality. The old API separated method schemas,
-handler classes, and session lifecycle. The procedure-first API has one definition and returns a
-synchronous, lazy client:
+The important developer benefit is locality without framework lock-in. The method-first API has one
+definition and returns a synchronous, lazy client:
 
-- `createAbilityBuilder()` owns schemas, scopes, projections, errors, middleware, and the handler.
+- `createAbilityBuilder()` owns schemas, scopes, projections, timeouts, and the handler.
 - `createBrokeredAbilityClient()` is fully typed from that definition and does not expose token or
   service-discovery mechanics to the application developer.
 - `context.env`, `context.request`, `context.identity`, `context.signal`, and
-  `context.remainingTimeoutMs()` are available in the procedure. `context.context` remains an
+  `context.remainingTimeoutMs()` are available in the method. `context.context` remains an
   advanced Hono escape hatch.
-- Batch, compression, retry, dedupe, WebSocket reconnect, hibernation, and TanStack Query use the
-  upstream oRPC extension model instead of Service Plane-specific equivalents.
+- Batch and compression use small Service Plane-owned options. Hibernation is selected by
+  `ability.hibernationStream()` and installed automatically. WebSocket reconnect is configured on
+  the Service Plane transport. TanStack Query consumes the client like any promise-returning API.
 
-The costs are real:
+This keeps a framework update or replacement out of application source. It also creates deliberate
+limits:
 
-- The pinned oRPC 2.0 release is still beta. Service Plane pins all oRPC packages to one exact
-  version so a transitive minor update cannot silently change the protocol, but upgrading that pin
-  requires an explicit compatibility test.
-- oRPC is TypeScript-first, not a language-neutral IDL such as Protocol Buffers. A non-TypeScript
-  consumer should use the generated OpenAPI or MCP surface, or implement the oRPC wire protocol.
-- Procedure clients share TypeScript types, so contract packages must be versioned deliberately.
+- Engine-specific middleware, plugins, error classes, and ecosystem adapters are not exposed. A
+  feature intended for consumers must first become a Service Plane feature with stable semantics.
+- There is intentionally no general multi-engine adapter registry. Service Plane has one internal
+  compiler, which avoids forcing every engine's lowest common denominator into the public API.
+- The current engine and wire protocol remain TypeScript-first, not a language-neutral IDL such as
+  Protocol Buffers. A non-TypeScript consumer should use the generated OpenAPI or MCP surface.
+- Ability clients share TypeScript types, so contract packages must be versioned deliberately.
   Runtime discovery still prevents a stale control plane from authorizing a capability the deployed
   service no longer declares, but compile-time types cannot detect every rolling-deploy mismatch.
+- The internal oRPC 2.0 beta packages are pinned to one exact version and covered by compatibility
+  tests. Consumers neither install matching adapters nor import them directly.
 - WebSockets introduce connection ownership and reconnect behavior. Fetch remains the default for
   ordinary calls.
 - Hibernation is not automatic. A Durable Object must accept the socket with the platform's
@@ -115,21 +123,20 @@ The costs are real:
   deployment needs an application-owned Durable Object handoff for that case; Service Plane does
   not currently provide one.
 
-The security model does not move into oRPC. oRPC's `sign`/`unsign` helper signs an opaque string with
-one shared secret; it does not express issuer, audience, expiry, JWKS rotation, delegation, ingress,
-or method scopes. Service Plane capability tokens and proof-of-possession remain the authentication
-boundary.
+The security model never belongs to the private engine. Service Plane owns issuer, audience, expiry,
+JWKS rotation, delegation, ingress, access, method scopes, and proof-of-possession. Authentication
+and authorization therefore survive an engine change unchanged.
 
 ## Why Hono Remains
 
 Hono is still useful at the edge of both planes: middleware, request ids, logging, discovery,
 STS/JWKS, MCP, OpenAPI, and runtime-specific WebSocket upgrades are HTTP concerns. Replacing that
-shell with an internal router would remove useful composition without simplifying procedure code.
+shell with an internal router would remove useful composition without simplifying method code.
 
 The split is therefore deliberate: `fetch` stays the universal runtime interface, Hono owns HTTP
-composition, oRPC owns procedure execution and serialization, and Cloudflare native RPC bypasses
-HTTP only for the unary service-to-service hop. A future Fetch-native shell can be additive because
-ability procedures do not depend on Hono for their normal runtime data.
+composition, the private RPC runtime owns method execution and serialization, and Cloudflare native
+RPC bypasses HTTP only for the unary service-to-service hop. A future Fetch-native shell can be
+additive because ability methods do not depend on Hono for their normal runtime data.
 
 ## Observability
 
@@ -197,7 +204,7 @@ Only `exposure: 'published'` methods with REST metadata enter OpenAPI. Only publ
 
 - Ability: schema-backed API surface owned by a service.
 - Method: one callable operation on an ability.
-- Handler: function attached directly to an oRPC procedure.
+- Handler: function attached directly to a Service Plane method.
 - Context: runtime access such as Hono context, env, bindings, and execution context.
 - Identity: verified Service Plane caller and scope claims, plus the delegated principal subject on plane-brokered calls.
 - Subject: the plane principal (with optional org and principal kind) a delegated call is made on behalf of. The `sub` principal

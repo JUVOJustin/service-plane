@@ -343,7 +343,7 @@ async function callTool(
   }
 }
 
-// Streaming tools answer over MCP Streamable HTTP (SSE). oRPC yields an async iterator;
+// Streaming tools answer over MCP Streamable HTTP (SSE). The RPC runtime yields an async iterator;
 // the final tools/call result aggregates its bounded items because MCP defines one response.
 async function streamToolCall(
   id: JsonRpcId,
@@ -409,7 +409,7 @@ async function* streamToolEvents(
       items.push(value);
       aggregatedBytes += encoder.encode(JSON.stringify(value) ?? 'null').length;
       if (items.length > maxItems || aggregatedBytes > maxBytes) {
-        const message = `Service-Plane MCP tool stream exceeded aggregation limits (${maxItems} items / ${maxBytes} bytes); use an oRPC streaming client for large streams`;
+        const message = `Service-Plane MCP tool stream exceeded aggregation limits (${maxItems} items / ${maxBytes} bytes); use a typed ability client for large streams`;
         logMcpFailed(options, 'service_plane.mcp.tool.failed', { tool: name }, new CapabilityAuthError(message, 413), startedAt);
         yield sseEvent({ id, jsonrpc: '2.0', result: { content: [{ text: message, type: 'text' }], isError: true } });
         return;

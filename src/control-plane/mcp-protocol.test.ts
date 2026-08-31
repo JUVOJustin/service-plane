@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
+import { createAbilityBuilder } from '../service/ability.js';
 import { defineCapabilities } from '../service/capabilities.js';
 import { defineAbility } from '../service/discovery.js';
-import { createAbilityBuilder } from '../service/orpc.js';
 import { ServicePlaneService } from '../service/service.js';
 import type { CapabilityJwks } from '../shared/types.js';
 import { SERVICE_PLANE_CAPABILITY_JWKS_PATH } from '../shared/types.js';
@@ -32,19 +32,19 @@ async function createFixture(options: FixtureOptions = {}) {
     id: 'example.search',
     methods: {
       fail: ability
-        .procedure({ mcp: { name: 'example_fail' }, scopes: ['example.read'] })
+        .method({ mcp: { name: 'example_fail' }, scopes: ['example.read'] })
         .input(z.object({}))
         .output(z.object({ ok: z.boolean() }))
         .handler(() => {
           throw new Error('connection string leaked');
         }),
       quick: ability
-        .procedure({ mcpPrompt: { name: 'example_quick' }, scopes: ['example.read'] })
+        .method({ mcpPrompt: { name: 'example_quick' }, scopes: ['example.read'] })
         .input(z.object({}))
         .output(z.string())
         .handler(() => 'Say hello'),
       readme: ability
-        .procedure({
+        .method({
           mcpResource: { mimeType: 'text/markdown', name: 'readme', uri: 'example://docs/readme' },
           scopes: ['example.read'],
         })
@@ -52,13 +52,13 @@ async function createFixture(options: FixtureOptions = {}) {
         .output(z.string())
         .handler(() => '# Example readme'),
       search: ability
-        .procedure({ mcp: { name: 'example_search' }, scopes: ['example.read'] })
+        .method({ mcp: { name: 'example_search' }, scopes: ['example.read'] })
         .input(z.object({ query: z.string() }))
         .output(z.object({ caller: z.string(), results: z.array(z.string()) }))
         .handler(({ context, input }) => ({ caller: context.identity.serviceId, results: [input.query] })),
       // Published ability, but this method carries no MCP metadata, so no projection may list it.
       unprojected: ability
-        .procedure({ scopes: ['example.read'] })
+        .method({ scopes: ['example.read'] })
         .input(z.object({}))
         .output(z.object({ ok: z.boolean() }))
         .handler(() => ({ ok: true })),
@@ -73,7 +73,7 @@ async function createFixture(options: FixtureOptions = {}) {
     id: 'example.admin',
     methods: {
       purge: ability
-        .procedure({ mcp: { name: 'admin_purge' }, scopes: ['example.admin'] })
+        .method({ mcp: { name: 'admin_purge' }, scopes: ['example.admin'] })
         .input(z.object({}))
         .output(z.object({ ok: z.boolean() }))
         .handler(() => ({ ok: true })),
@@ -87,7 +87,7 @@ async function createFixture(options: FixtureOptions = {}) {
     id: 'example.internal',
     methods: {
       run: ability
-        .procedure({ mcp: { name: 'internal_tool' }, scopes: ['example.read'] })
+        .method({ mcp: { name: 'internal_tool' }, scopes: ['example.read'] })
         .input(z.object({}))
         .output(z.object({ ok: z.boolean() }))
         .handler(() => ({ ok: true })),
@@ -101,7 +101,7 @@ async function createFixture(options: FixtureOptions = {}) {
     id: 'example.hidden',
     methods: {
       peek: ability
-        .procedure({
+        .method({
           mcp: { name: 'hidden_tool' },
           mcpPrompt: { name: 'hidden_prompt' },
           mcpResource: { name: 'hidden', uri: 'example://hidden' },

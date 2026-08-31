@@ -1,10 +1,9 @@
 import { wrapAsyncIteratorPreservingEventMeta } from '@orpc/client';
-import { type AnySchema, asyncIteratorObject, defineMeta, getAsyncIteratorObjectSchemaDetails } from '@orpc/contract';
-import { type EncodeHibernationRPCEventOptions, encodeHibernationRPCEvent, HibernationAsyncIteratorClass } from '@orpc/hibernation';
-import { type AnyProcedure, ORPCError, os, Procedure, ValidationError } from '@orpc/server';
+import { asyncIteratorObject } from '@orpc/contract';
+import { HibernationAsyncIteratorClass } from '@orpc/hibernation';
+import { type AnyProcedure, ORPCError, os, ValidationError } from '@orpc/server';
 import type { StandardSchemaV1 } from '@standard-schema/spec';
-import type { Context, Env } from 'hono';
-import type { ConnInfo } from '../shared/conn-info.js';
+import type { Env } from 'hono';
 import { discardDisposableValue, raceDeadline } from '../shared/deadline.js';
 import {
   AbilityValidationError,
@@ -15,106 +14,19 @@ import {
   ServicePlaneTimeoutError,
   servicePlaneErrorInfo,
 } from '../shared/errors.js';
-import type {
-  CapabilityIdentity,
-  ServiceAbilityMcpProjection,
-  ServiceAbilityMcpPromptProjection,
-  ServiceAbilityMcpResourceProjection,
-  ServiceAbilityRestProjection,
-} from '../shared/types.js';
-import type { AbilitySchema, ServiceAbilityWebSocket } from './discovery.js';
+import {
+  AbilityHibernationStream,
+  type AbilityMethodContext,
+  type AbilitySchema,
+  type AbilityStream,
+  type AnyAbilityMethodDefinition,
+  abilityHibernationCallback,
+  abilityMethodHandler,
+} from './ability.js';
 
-/** Metadata Service Plane adds to an oRPC procedure for authorization and projections. */
-export type AbilityProcedureMetadata = {
-  /** Marks a method safe to retry after an ambiguous transport failure. */
-  idempotent?: true;
-  /** Publishes the procedure as an MCP tool. */
-  mcp?: ServiceAbilityMcpProjection;
-  /** Publishes the procedure as an MCP prompt. */
-  mcpPrompt?: ServiceAbilityMcpPromptProjection;
-  /** Publishes the procedure as an MCP resource. */
-  mcpResource?: ServiceAbilityMcpResourceProjection;
-  /** Publishes the procedure as a REST operation. */
-  rest?: ServiceAbilityRestProjection;
-  /** Minimum capability scopes required before input validation or handler execution. */
-  scopes?: string[];
-  /** Overrides the service-wide unary execution ceiling; zero disables the ceiling. */
-  timeoutMs?: number;
-};
-
-type StoredAbilityProcedureMetadata = AbilityProcedureMetadata & {
-  stream?: true;
-};
-
-const [abilityProcedureMetadata, getAbilityProcedureMetadata] = defineMeta<'service-plane:ability-method', StoredAbilityProcedureMetadata>(
-  'service-plane:ability-method',
-  (incoming, current) => ({ ...current, ...incoming }),
-);
-
-const [hibernationOutputMetadata, getHibernationOutputMetadata] = defineMeta<'service-plane:hibernation-output', AbilitySchema>(
-  'service-plane:hibernation-output',
-  (incoming) => incoming,
-);
-
-/** Async stream shape exposed to clients of a hibernating procedure. */
-export type AbilityHibernationStream<T> = AsyncIterable<T> & AsyncIterator<T, unknown, void>;
-
-/** Context injected only after Service Plane has authenticated and authorized the call. */
-export type AbilityProcedureContext<TEnv extends Env = Env> = {
-  /** The ability owning the running procedure. */
-  abilityId: string;
-  /** Advisory connection information forwarded by an authenticated control plane. */
-  connInfo?: ConnInfo;
-  /** Runtime bindings without requiring procedure code to depend on Hono. */
-  env: TEnv['Bindings'];
-  /** Raw transport request for headers and other request-local data. */
-  request: Request;
-  /** Advanced escape hatch for Hono-specific context features and middleware variables. */
-  context: Context<TEnv>;
-  /** The verified capability identity. */
-  identity: CapabilityIdentity;
-  /** Caller-provided key identifying this logical attempt. */
-  idempotencyKey?: string;
-  /** Reads the caller deadline budget remaining on this machine. */
-  remainingTimeoutMs?: () => number;
-  /** Aborts when the caller disconnects or its forwarded deadline elapses. */
-  signal?: AbortSignal;
-  /** Current socket for WebSocket procedures, including Durable Object attachment APIs. */
-  webSocket?: ServiceAbilityWebSocket;
-};
-
-/** Input supplied to the transport-owned authorization callback. */
-export type AuthorizeAbilityProcedureInput = {
-  /** Router path of the procedure being called. */
-  path: string[];
-  /** Procedure being called, including its Service Plane metadata. */
-  procedure: AnyProcedure;
-  /** Transport cancellation signal, when the adapter supplies one. */
-  signal?: AbortSignal;
-};
-
-/** Runtime policy shared by Fetch, WebSocket, and native service-binding calls. */
-export type AbilityProcedureRuntimeOptions<TEnv extends Env = Env> = {
-  /** Authenticates and authorizes one procedure before oRPC validates its input. */
-  authorize(input: AuthorizeAbilityProcedureInput): Promise<AbilityProcedureContext<TEnv>> | AbilityProcedureContext<TEnv>;
-  /** Absolute caller deadline measured with the current process clock. */
-  deadlineAt?: number;
-  /** Default per-procedure ceiling; false removes the service-wide ceiling. */
-  defaultMethodTimeoutMs?: false | number;
-  /** Receives handler failures that are replaced by an opaque RPC error. */
-  onHandlerFailure?: (cause: unknown, methodName: string) => void;
-};
-
-export type ServicePlaneRpcErrorData = {
-  /** Transport-safe Service Plane error classification. */
+type ServicePlaneRpcErrorData = {
   servicePlane: ServicePlaneErrorInfo;
 };
-
-type AbilityProcedureRuntimeContext<TEnv extends Env = Env> = {
-  [ABILITY_RUNTIME]: AbilityProcedureRuntimeOptions<TEnv>;
-};
-
-const ABILITY_RUNTIME = Symbol('service-plane.ability-runtime');
 
 const servicePlaneRpcErrorDataSchema = {
   '~standard': {
@@ -124,7 +36,18 @@ const servicePlaneRpcErrorDataSchema = {
     vendor: 'service-plane',
     version: 1,
   },
-} satisfies import('@standard-schema/spec').StandardSchemaV1<ServicePlaneRpcErrorData>;
+} satisfies StandardSchemaV1<ServicePlaneRpcErrorData>;
+
+// Streaming items are validated and transformed by the middleware wrapper so failures can be
+// normalized before the engine serializes them. The engine output schema must therefore only carry
+// the already-validated value; validating here again would double the hottest streaming cost.
+const validatedStreamItemSchema = {
+  '~standard': {
+    validate: (value: unknown) => ({ value }),
+    vendor: 'service-plane',
+    version: 1,
+  },
+} satisfies StandardSchemaV1<unknown>;
 
 const servicePlaneErrorMap = {
   BAD_REQUEST: { data: servicePlaneRpcErrorDataSchema },
@@ -140,15 +63,29 @@ const servicePlaneErrorMap = {
   UNPROCESSABLE_CONTENT: { data: servicePlaneRpcErrorDataSchema },
 } as const;
 
-/**
- * Creates the procedure builders used by one service. Procedures and streams share the same
- * authenticated context while oRPC owns validation, serialization, typed errors, and middleware.
- */
-export function createAbilityBuilder<TEnv extends Env = Env>() {
-  // This middleware is attached before authors add `.input(...)`, so capability checks execute
-  // before validation. It also wraps the whole procedure lifecycle for deadlines and opaque errors.
+type AuthorizeAbilityMethodInput = {
+  path: string[];
+  procedure: AnyProcedure;
+  signal?: AbortSignal;
+};
+
+type AbilityRpcRuntimeOptions<TEnv extends Env = Env> = {
+  authorize(input: AuthorizeAbilityMethodInput): Promise<AbilityMethodContext<TEnv>> | AbilityMethodContext<TEnv>;
+  deadlineAt?: number;
+  defaultMethodTimeoutMs?: false | number;
+  onHandlerFailure?: (cause: unknown, methodName: string) => void;
+};
+
+type AbilityRpcRuntimeContext<TEnv extends Env = Env> = {
+  [ABILITY_RUNTIME]: AbilityRpcRuntimeOptions<TEnv>;
+};
+
+const ABILITY_RUNTIME = Symbol('service-plane.ability-runtime');
+
+/** Compiles one transport-neutral method into the package's private oRPC execution engine. */
+export function compileAbilityMethod<TEnv extends Env>(method: AnyAbilityMethodDefinition<TEnv>): AnyProcedure {
   const base = os
-    .$context<AbilityProcedureRuntimeContext<TEnv>>()
+    .$context<AbilityRpcRuntimeContext<TEnv>>()
     .errors(servicePlaneErrorMap)
     .use(async ({ context, next, path, procedure, signal }) => {
       const runtime = context[ABILITY_RUNTIME];
@@ -156,11 +93,9 @@ export function createAbilityBuilder<TEnv extends Env = Env>() {
 
       try {
         const authorized = await runtime.authorize({ path, procedure, ...(signal ? { signal } : {}) });
-        const metadata = abilityProcedureDefinition(procedure);
-        const ceilingMs = abilityProcedureStreams(procedure)
-          ? undefined
-          : resolveProcedureTimeoutMs(metadata.timeoutMs, runtime.defaultMethodTimeoutMs);
-        const result = await raceDeadline<{ context: AbilityProcedureContext<TEnv>; output: unknown }>(
+        const ceilingMs =
+          method.kind === 'unary' ? resolveMethodTimeoutMs(method.metadata.timeoutMs, runtime.defaultMethodTimeoutMs) : undefined;
+        const result = await raceDeadline<{ context: AbilityMethodContext<TEnv>; output: unknown }>(
           Promise.resolve(next({ context: authorized })),
           {
             ...(ceilingMs === undefined ? {} : { ceilingMs }),
@@ -174,25 +109,21 @@ export function createAbilityBuilder<TEnv extends Env = Env>() {
           },
         );
 
-        if (
-          abilityProcedureStreams(procedure) &&
-          runtime.deadlineAt !== undefined &&
-          !(result.output instanceof HibernationAsyncIteratorClass)
-        ) {
+        if (method.kind === 'stream' && !(result.output instanceof HibernationAsyncIteratorClass)) {
           const iterator = result.output as AsyncIterator<unknown>;
           return {
             ...result,
             output: wrapAsyncIteratorPreservingEventMeta(iterator, {
-              mapError: (error) => normalizeProcedureError(error, methodName, runtime.onHandlerFailure),
-              mapResult: (item) => {
-                if (Date.now() >= (runtime.deadlineAt as number)) {
-                  throw normalizeProcedureError(
+              mapError: (error) => normalizeMethodError(error, methodName, runtime.onHandlerFailure),
+              mapResult: async (item) => {
+                if (runtime.deadlineAt !== undefined && Date.now() >= runtime.deadlineAt) {
+                  throw normalizeMethodError(
                     new ServicePlaneTimeoutError(`Service-Plane streaming method exceeded its caller's deadline: ${methodName}`),
                     methodName,
                     runtime.onHandlerFailure,
                   );
                 }
-                return item;
+                return validateStreamResult(item, method.output, methodName);
               },
             }),
           };
@@ -200,39 +131,49 @@ export function createAbilityBuilder<TEnv extends Env = Env>() {
 
         return result;
       } catch (error) {
-        throw normalizeProcedureError(error, methodName, runtime.onHandlerFailure);
+        throw normalizeMethodError(error, methodName, runtime.onHandlerFailure);
       }
     });
 
-  return {
-    /** Starts a unary procedure whose handler, schemas, scopes, and projections stay together. */
-    procedure(metadata: AbilityProcedureMetadata = {}) {
-      return failClosedBuilderChain(base.meta(abilityProcedureMetadata(metadata)));
-    },
-    /** Starts a streaming procedure and validates every yielded item with `output`. */
-    stream<TOutput extends AbilitySchema>(output: TOutput, metadata: AbilityProcedureMetadata = {}) {
-      return failClosedBuilderChain(
-        base.meta(abilityProcedureMetadata({ ...metadata, stream: true })).output(asyncIteratorObject(failClosedSchema(output))),
-      );
-    },
-    /**
-     * Starts a Durable Object hibernation stream. Later message events must be encoded with
-     * {@link encodeAbilityHibernationEvent}, because they occur after this procedure has returned.
-     */
-    hibernationStream<TOutput extends AbilitySchema>(output: TOutput, metadata: AbilityProcedureMetadata = {}) {
-      return failClosedBuilderChain(
-        base
-          .meta(abilityProcedureMetadata({ ...metadata, stream: true }))
-          .meta(hibernationOutputMetadata(output))
-          .output(hibernationIteratorSchema<TOutput>()),
-      );
-    },
-  };
+  const input = failClosedSchema(method.input);
+  const output = failClosedSchema(method.output);
+  const handler = abilityMethodHandler(method);
+
+  if (method.kind === 'stream') {
+    return base
+      .input(input)
+      .output(asyncIteratorObject(validatedStreamItemSchema))
+      .handler(
+        async ({ context, input: value }) =>
+          (await handler({ context: context as unknown as AbilityMethodContext, input: value })) as AbilityStream<unknown> as never,
+      ) as AnyProcedure;
+  }
+
+  if (method.kind === 'hibernation') {
+    return base
+      .input(input)
+      .output(hibernationIteratorSchema())
+      .handler(async ({ context, input: value }) => {
+        const subscription = await handler({ context: context as unknown as AbilityMethodContext, input: value });
+        if (!(subscription instanceof AbilityHibernationStream)) {
+          throw new AbilityValidationError('Service-Plane hibernation handler must return AbilityHibernationStream', 500);
+        }
+        const callback = abilityHibernationCallback(subscription);
+        return new HibernationAsyncIteratorClass(async (id) => callback(id));
+      }) as AnyProcedure;
+  }
+
+  return base
+    .input(input)
+    .output(output)
+    .handler(({ context, input: value }) => handler({ context: context as unknown as AbilityMethodContext, input: value })) as AnyProcedure;
 }
 
-// oRPC treats any Standard Schema result without `issues` as success, so a validator that returns
-// neither a value nor issues would count as valid and hand the handler raw input. Refuse that
-// degenerate shape instead of letting validation silently pass.
+/** Creates the private runtime context accepted by compiled ability methods. */
+export function createAbilityRpcRuntimeContext<TEnv extends Env>(options: AbilityRpcRuntimeOptions<TEnv>): AbilityRpcRuntimeContext<TEnv> {
+  return { [ABILITY_RUNTIME]: options };
+}
+
 function failClosedValidationResult(result: unknown): StandardSchemaV1.Result<unknown> {
   if (result && typeof result === 'object' && ('value' in result || (result as { issues?: unknown }).issues)) {
     return result as StandardSchemaV1.Result<unknown>;
@@ -240,8 +181,33 @@ function failClosedValidationResult(result: unknown): StandardSchemaV1.Result<un
   return { issues: [{ message: 'Standard Schema validator returned neither a value nor issues' }] };
 }
 
-// Remembers each guard's original schema so discovery keeps projecting exactly what authors declared.
-const declaredSchemas = new WeakMap<object, AbilitySchema>();
+async function validateStreamResult(
+  result: IteratorResult<unknown, unknown>,
+  output: AbilitySchema,
+  methodName: string,
+): Promise<IteratorResult<unknown, unknown>> {
+  if (result.done) return result;
+  let validated: StandardSchemaV1.Result<unknown>;
+  try {
+    validated = failClosedValidationResult(await output['~standard'].validate(result.value));
+  } catch {
+    throw servicePlaneOrpcError({
+      code: 'ability_validation',
+      message: `Service-Plane ability output for ${methodName} failed validation`,
+      retryable: false,
+      status: 500,
+    });
+  }
+  if (validated.issues) {
+    throw servicePlaneOrpcError({
+      code: 'ability_validation',
+      message: `Service-Plane ability output for ${methodName} failed validation`,
+      retryable: false,
+      status: 500,
+    });
+  }
+  return { done: false, value: validated.value };
+}
 
 function failClosedSchema<TSchema extends AbilitySchema>(schema: TSchema): TSchema {
   const standard = schema['~standard'];
@@ -249,149 +215,18 @@ function failClosedSchema<TSchema extends AbilitySchema>(schema: TSchema): TSche
   const guardedStandard = new Proxy(standard, {
     get: (target, property) => (property === 'validate' ? validate : Reflect.get(target, property)),
   });
-  const guarded = new Proxy(schema, {
+  return new Proxy(schema, {
     get: (target, property) => (property === '~standard' ? guardedStandard : Reflect.get(target, property)),
   });
-  declaredSchemas.set(guarded, schema);
-  return guarded;
 }
 
-function declaredSchema(schema: AnySchema | undefined): AnySchema | undefined {
-  return schema ? ((declaredSchemas.get(schema) as AnySchema | undefined) ?? schema) : undefined;
-}
-
-// Author-supplied schemas enter oRPC only through `.input(...)` and `.output(...)`, so the builder
-// chain is proxied to guard each schema on the way in. Iterator schemas installed by
-// createAbilityBuilder stay untouched: their items are already guarded, and wrapping the iterator
-// schema itself would break oRPC's identity-based stream detection.
-function failClosedBuilderChain<TBuilder extends object>(builder: TBuilder): TBuilder {
-  return new Proxy(builder, {
-    get(target, property) {
-      const member = Reflect.get(target, property) as unknown;
-      if (typeof member !== 'function') return member;
-      return (...args: unknown[]) => {
-        if (property === 'input' || property === 'output') {
-          const schema = args[0] as AbilitySchema | undefined;
-          if (schema && getAsyncIteratorObjectSchemaDetails(schema as AnySchema) === undefined) {
-            args = [failClosedSchema(schema), ...args.slice(1)];
-          }
-        }
-        const result = (member as (...rest: unknown[]) => unknown).apply(target, args);
-        return result && typeof result === 'object' && !(result instanceof Procedure)
-          ? failClosedBuilderChain(result)
-          : result;
-      };
-    },
-  }) as TBuilder;
-}
-
-/**
- * Validates and encodes one later yield for a hibernating procedure. Error and close events carry
- * protocol data rather than yielded items, so only message events are checked against `output`.
- */
-export function encodeAbilityHibernationEvent<TOutput extends AbilitySchema>(
-  output: TOutput,
-  id: string,
-  payload: StandardSchemaV1.InferInput<TOutput>,
-  options?: Omit<EncodeHibernationRPCEventOptions, 'event'> & { event?: 'message' },
-): Promise<string | Uint8Array<ArrayBuffer>>;
-/** Encodes a protocol error or close event for an existing hibernating procedure. */
-export function encodeAbilityHibernationEvent<TOutput extends AbilitySchema>(
-  output: TOutput,
-  id: string,
-  payload: unknown,
-  options: Omit<EncodeHibernationRPCEventOptions, 'event'> & { event: 'close' | 'error' },
-): Promise<string | Uint8Array<ArrayBuffer>>;
-export async function encodeAbilityHibernationEvent<TOutput extends AbilitySchema>(
-  output: TOutput,
-  id: string,
-  payload: unknown,
-  options: EncodeHibernationRPCEventOptions = {},
-): Promise<string | Uint8Array<ArrayBuffer>> {
-  let encodedPayload = payload;
-  if (options.event === undefined || options.event === 'message') {
-    let result: StandardSchemaV1.Result<StandardSchemaV1.InferOutput<TOutput>>;
-    try {
-      result = failClosedValidationResult(
-        await output['~standard'].validate(payload),
-      ) as StandardSchemaV1.Result<StandardSchemaV1.InferOutput<TOutput>>;
-    } catch {
-      throw new AbilityValidationError('Service-Plane hibernation event output validation failed', 500);
-    }
-    if (result.issues) {
-      throw new AbilityValidationError(
-        `Service-Plane hibernation event output failed validation: ${formatValidationIssues(normalizeValidationIssues(result.issues))}`,
-        500,
-        normalizeValidationIssues(result.issues),
-      );
-    }
-    encodedPayload = result.value;
-  }
-  return encodeHibernationRPCEvent(id, encodedPayload, options);
-}
-
-/** Creates the internal initial context accepted by every Service Plane procedure. */
-export function createAbilityProcedureRuntimeContext<TEnv extends Env>(
-  options: AbilityProcedureRuntimeOptions<TEnv>,
-): AbilityProcedureRuntimeContext<TEnv> {
-  return { [ABILITY_RUNTIME]: options };
-}
-
-/** Returns true only for an implemented oRPC procedure. */
-export function isAbilityProcedure(value: unknown): value is AnyProcedure {
-  return value instanceof Procedure;
-}
-
-/** Returns whether a procedure carries the runtime middleware installed by `createAbilityBuilder`. */
-export function isServicePlaneAbilityProcedure(procedure: AnyProcedure): boolean {
-  return getAbilityProcedureMetadata(procedure) !== undefined;
-}
-
-/** Reads Service Plane method metadata without exposing oRPC's internal metadata storage. */
-export function abilityProcedureDefinition(procedure: AnyProcedure): StoredAbilityProcedureMetadata {
-  return getAbilityProcedureMetadata(procedure) ?? {};
-}
-
-/** Extracts the single portable input schema declared by an ability procedure. */
-export function abilityProcedureInputSchema(procedure: AnyProcedure): AnySchema | undefined {
-  return declaredSchema(onlySchema(orpcProcedureInternals(procedure).inputSchemas));
-}
-
-/** Extracts the unary output schema or the yielded-item schema for a streaming procedure. */
-export function abilityProcedureOutputSchema(procedure: AnyProcedure): AnySchema | undefined {
-  const hibernationOutput = getHibernationOutputMetadata(procedure);
-  if (hibernationOutput) return hibernationOutput;
-  const output = onlySchema(orpcProcedureInternals(procedure).outputSchemas);
-  return declaredSchema(output ? (getAsyncIteratorObjectSchemaDetails(output)?.yieldSchema ?? output) : undefined);
-}
-
-/** Returns whether the procedure's output uses oRPC's validated async-iterator schema. */
-export function abilityProcedureStreams(procedure: AnyProcedure): boolean {
-  if (getAbilityProcedureMetadata(procedure)?.stream === true) return true;
-  const output = onlySchema(orpcProcedureInternals(procedure).outputSchemas);
-  return output !== undefined && getAsyncIteratorObjectSchemaDetails(output) !== undefined;
-}
-
-// oRPC has no public accessor for a built procedure's declared schemas, so discovery must read the
-// undocumented '~orpc' definition storage. Keep this the only place that touches it: the shape is
-// internal to oRPC and was last verified against 2.0.0-beta.29 — re-audit on every @orpc bump.
-function orpcProcedureInternals(procedure: AnyProcedure): AnyProcedure['~orpc'] {
-  return procedure['~orpc'];
-}
-
-function hibernationIteratorSchema<TOutput extends AbilitySchema>(): StandardSchemaV1<
-  AbilityHibernationStream<StandardSchemaV1.InferInput<TOutput>>,
-  AbilityHibernationStream<StandardSchemaV1.InferOutput<TOutput>>
-> {
+function hibernationIteratorSchema(): StandardSchemaV1<HibernationAsyncIteratorClass<unknown>> {
   return {
     '~standard': {
       validate(value) {
-        if (value instanceof HibernationAsyncIteratorClass) {
-          // A hibernation iterator has no values yet. Those are validated when an awakened Durable
-          // Object calls encodeAbilityHibernationEvent, so this validator must preserve its class.
-          return { value: value as AbilityHibernationStream<StandardSchemaV1.InferOutput<TOutput>> };
-        }
-        return { issues: [{ message: 'Expected a HibernationAsyncIteratorClass' }] };
+        return value instanceof HibernationAsyncIteratorClass
+          ? { value }
+          : { issues: [{ message: 'Expected a Service-Plane hibernation iterator' }] };
       },
       vendor: 'service-plane',
       version: 1,
@@ -399,19 +234,12 @@ function hibernationIteratorSchema<TOutput extends AbilitySchema>(): StandardSch
   };
 }
 
-/** Refuses stacked schemas because discovery must publish one transport-neutral JSON Schema. */
-function onlySchema(schemas: AnySchema | AnySchema[] | undefined): AnySchema | undefined {
-  if (!schemas) return undefined;
-  if (!Array.isArray(schemas)) return schemas;
-  return schemas.length === 1 ? schemas[0] : undefined;
-}
-
-function resolveProcedureTimeoutMs(declared: number | undefined, fallback: false | number | undefined): number | undefined {
+function resolveMethodTimeoutMs(declared: number | undefined, fallback: false | number | undefined): number | undefined {
   if (declared === 0) return undefined;
   return declared ?? (fallback === false ? undefined : fallback);
 }
 
-function normalizeProcedureError(
+function normalizeMethodError(
   error: unknown,
   methodName: string,
   onHandlerFailure: ((cause: unknown, methodName: string) => void) | undefined,
@@ -458,7 +286,7 @@ function servicePlaneOrpcError(info: ServicePlaneErrorInfo): ORPCError<string, S
   });
 }
 
-/** Converts a classified Service Plane failure into its transport-safe oRPC representation. */
+/** Converts a classified Service Plane failure into its private wire representation. */
 export function orpcErrorFromServicePlane(error: unknown): ORPCError<string, ServicePlaneRpcErrorData> | undefined {
   const info = servicePlaneErrorInfo(error);
   return info ? servicePlaneOrpcError(info) : undefined;
@@ -491,7 +319,7 @@ function orpcErrorCode(status: number): string {
   }
 }
 
-function normalizeValidationIssues(issues: readonly import('@standard-schema/spec').StandardSchemaV1.Issue[]): AbilityValidationIssue[] {
+function normalizeValidationIssues(issues: readonly StandardSchemaV1.Issue[]): AbilityValidationIssue[] {
   return issues.map((issue) => ({
     message: issue.message,
     ...(issue.path ? { path: issue.path.map((segment) => (typeof segment === 'object' ? segment.key : segment)) } : {}),

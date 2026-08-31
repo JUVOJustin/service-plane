@@ -38,7 +38,7 @@ POST /rpc/asana.tasks/createTask
 
 ## Local Caller Over Fetch
 
-Fetch is the default self-hosted transport and supports both unary and streaming procedures.
+Fetch is the default self-hosted transport and supports both unary and streaming methods.
 
 ```ts
 import { createAbilityClient, controlPlaneJwkTokenRequester } from 'service-plane/service';

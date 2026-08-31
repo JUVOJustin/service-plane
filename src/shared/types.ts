@@ -35,7 +35,8 @@ export type AbilityTransport = 'cloudflare-service-binding' | 'fetch' | 'websock
 /**
  * `query` is the HTTP QUERY method (RFC 10008): a safe, idempotent request that carries its
  * parameters in a body. OpenAPI 3.2 gives it a fixed `query` field on the Path Item Object,
- * and Hono 4.13+ routes it first-class (`app.query()`), which is why hono >=4.13 is the peer floor.
+ * and Hono 4.13+ routes it first-class (`app.query()`). The peer floor is 4.13.5 so consumers also
+ * receive the current query-parser and request-body security fixes.
  */
 export type ServiceHttpMethod = 'delete' | 'get' | 'patch' | 'post' | 'put' | 'query';
 
@@ -113,7 +114,7 @@ export type ServiceAbilityMethodDiscovery = {
   idempotent?: true;
   scopes: string[];
   /**
-   * Streaming procedures return an async iterator of output items over oRPC
+   * Streaming methods return an async iterator of output items over Service Plane RPC
    * transport; `outputSchema` then describes one streamed item, not the whole response.
    */
   stream?: true;
@@ -168,9 +169,9 @@ export type ServiceGrantDefinition = {
   grants: ServiceGrant[];
 };
 
-/** One procedure-first unary invocation sent through a Cloudflare native service binding. */
+/** One unary method invocation sent through a Cloudflare native service binding. */
 export type ServiceAbilityNativeCall = {
-  /** Ability that owns the procedure. */
+  /** Ability that owns the method. */
   abilityId: string;
   /** Authenticated control-plane connection metadata. */
   connInfo?: ConnInfo;
@@ -192,7 +193,7 @@ export type ServiceAbilityNativeCall = {
 
 /** Native ability surface advertised by a Cloudflare service endpoint. */
 export type ServiceAbilityNativeRpcBinding = {
-  /** Calls one unary oRPC procedure without HTTP serialization. */
+  /** Calls one unary Service Plane method without HTTP serialization. */
   invokeAbility(input: ServiceAbilityNativeCall): Promise<unknown> | unknown;
 };
 

@@ -1,22 +1,13 @@
-import { createORPCClient, ORPCError } from '@orpc/client';
-import { RPCLink } from '@orpc/client/fetch';
 import type { StandardJSONSchemaV1, StandardSchemaV1 } from '@standard-schema/spec';
-import type { Env } from 'hono';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { createCapabilityIssuer, defineServiceGrants } from '../control-plane/capabilities.js';
-import { servicePlaneAuthorization } from '../shared/capability-tokens.js';
+import { ServicePlaneClientError } from '../shared/errors.js';
 import { testKeys } from '../test-support/index.js';
+import { type AbilitySchema, createAbilityBuilder } from './ability.js';
 import { defineCapabilities } from './capabilities.js';
-import {
-  type AbilityProcedureDefinitions,
-  type AbilityRpc,
-  type AbilitySchema,
-  defineAbility,
-  type OrpcServiceAbilityDefinition,
-  serviceDiscoveryDocument,
-} from './discovery.js';
-import { createAbilityBuilder } from './orpc.js';
+import { createAbilityClient } from './client.js';
+import { type AbilityMethodDefinitions, defineAbility, serviceDiscoveryDocument } from './discovery.js';
 import { ServicePlaneService } from './service.js';
 
 const ISSUED_AT = new Date('2026-08-20T12:00:00.000Z');
@@ -54,7 +45,7 @@ function malformedSchema(validate: (value: unknown) => unknown): AbilitySchema {
 
 const ability = createAbilityBuilder();
 
-async function serve<TMethods extends AbilityProcedureDefinitions>(methods: TMethods) {
+async function serve<TMethods extends AbilityMethodDefinitions>(methods: TMethods) {
   const keys = await testKeys();
   const capabilities = defineCapabilities({ scopes: [{ id: 'notes.read' }], serviceId: 'notes' });
   const issuer = createCapabilityIssuer({
@@ -80,20 +71,26 @@ async function serve<TMethods extends AbilityProcedureDefinitions>(methods: TMet
     title: 'Notes',
     version: '1.0.0',
   });
-  const link = new RPCLink({
-    fetch: async (url, init) => service.fetch(new Request(url, init)),
-    headers: { authorization: servicePlaneAuthorization(issued.token) },
-    origin: 'https://notes.internal',
-    url: '/rpc/notes.items',
+  const client = createAbilityClient({
+    ability: notes,
+    callerServiceId: 'headless-front',
+    requestToken: async () => issued,
+    scopes: ['notes.read'],
+    targetServiceId: 'notes',
+    transport: {
+      fetch: async (url, init) => service.fetch(new Request(url, init)),
+      origin: 'https://notes.internal',
+      type: 'fetch',
+    },
   });
-  return { client: createORPCClient<AbilityRpc<OrpcServiceAbilityDefinition<Env, TMethods>>>(link), service };
+  return { client, service };
 }
 
-describe('standard schema abilities over oRPC', () => {
+describe('standard schema abilities over the Service Plane client', () => {
   it('runs a hand-rolled non-Zod Standard Schema end to end as input and output', async () => {
     const { client, service } = await serve({
       get: ability
-        .procedure({ scopes: ['notes.read'] })
+        .method({ scopes: ['notes.read'] })
         .input(stringField('query'))
         .output(stringField('result'))
         .handler(({ input }) => ({ result: input.query })),
@@ -119,7 +116,7 @@ describe('standard schema abilities over oRPC', () => {
     let handlerRan = false;
     const { client } = await serve({
       get: ability
-        .procedure({ scopes: ['notes.read'] })
+        .method({ scopes: ['notes.read'] })
         .input(stringField('query'))
         .output(stringField('result'))
         .handler(({ input }) => {
@@ -130,18 +127,13 @@ describe('standard schema abilities over oRPC', () => {
 
     const error = await client.get({ query: 7 } as never).catch((caught: unknown) => caught);
     expect(handlerRan).toBe(false);
-    expect(error).toBeInstanceOf(ORPCError);
+    expect(error).toBeInstanceOf(ServicePlaneClientError);
     expect(error).toMatchObject({
-      code: 'UNPROCESSABLE_CONTENT',
-      data: {
-        servicePlane: {
-          code: 'ability_validation',
-          issues: [{ message: 'Invalid input: expected string', path: ['query'] }],
-          retryable: false,
-          status: 422,
-        },
-      },
+      code: 'ability_validation',
+      issues: [{ message: 'Invalid input: expected string', path: ['query'] }],
       message: 'Service-Plane ability input for get: query: Invalid input: expected string',
+      retryable: false,
+      status: 422,
     });
   });
 
@@ -149,7 +141,7 @@ describe('standard schema abilities over oRPC', () => {
     let handlerRan = false;
     const { client } = await serve({
       get: ability
-        .procedure({ scopes: ['notes.read'] })
+        .method({ scopes: ['notes.read'] })
         .input(
           malformedSchema(() => {
             throw new Error('validator exploded: db=secret-internal');
@@ -164,17 +156,17 @@ describe('standard schema abilities over oRPC', () => {
 
     const error = await client.get({ query: 'hi' }).catch((caught: unknown) => caught);
     expect(handlerRan).toBe(false);
-    expect(error).toBeInstanceOf(ORPCError);
+    expect(error).toBeInstanceOf(ServicePlaneClientError);
     // The throw is replaced by the opaque handler-failure error: the caller learns nothing about
     // what the validator was doing when it blew up.
     expect(error).toMatchObject({
-      code: 'INTERNAL_SERVER_ERROR',
-      data: { servicePlane: { code: 'internal', retryable: false, status: 500 } },
+      code: 'internal',
       message: 'Service-Plane ability handler failed: get',
+      retryable: false,
+      status: 500,
     });
-    const orpcError = error as ORPCError<string, unknown>;
-    expect(orpcError.message).not.toContain('secret-internal');
-    expect(JSON.stringify(orpcError.data)).not.toContain('secret-internal');
+    expect((error as Error).message).not.toContain('secret-internal');
+    expect(JSON.stringify(error)).not.toContain('secret-internal');
   });
 
   // oRPC's own validateInput checks only `result.issues`, so without the fail-closed schema guard
@@ -184,7 +176,7 @@ describe('standard schema abilities over oRPC', () => {
     let handlerRan = false;
     const { client } = await serve({
       get: ability
-        .procedure({ scopes: ['notes.read'] })
+        .method({ scopes: ['notes.read'] })
         .input(malformedSchema(() => ({})))
         .output(z.object({ result: z.string() }))
         .handler(() => {
@@ -195,33 +187,34 @@ describe('standard schema abilities over oRPC', () => {
 
     const error = await client.get({ query: 'hi' }).catch((caught: unknown) => caught);
     expect(handlerRan).toBe(false);
-    expect(error).toBeInstanceOf(ORPCError);
+    expect(error).toBeInstanceOf(ServicePlaneClientError);
     expect(error).toMatchObject({
-      code: 'UNPROCESSABLE_CONTENT',
-      data: { servicePlane: { code: 'ability_validation', retryable: false, status: 422 } },
+      code: 'ability_validation',
+      retryable: false,
+      status: 422,
     });
-    expect((error as ORPCError<string, unknown>).message).toContain('neither a value nor issues');
+    expect((error as Error).message).toContain('neither a value nor issues');
   });
 
   it('replaces a handler output the schema rejects with an opaque 500', async () => {
     const { client } = await serve({
       get: ability
-        .procedure({ scopes: ['notes.read'] })
+        .method({ scopes: ['notes.read'] })
         .input(z.object({ query: z.string() }))
         .output(z.object({ result: z.number() }))
         .handler(() => ({ result: 'secret-row-data' as unknown as number })),
     });
 
     const error = await client.get({ query: 'hi' }).catch((caught: unknown) => caught);
-    expect(error).toBeInstanceOf(ORPCError);
+    expect(error).toBeInstanceOf(ServicePlaneClientError);
     expect(error).toMatchObject({
-      code: 'INTERNAL_SERVER_ERROR',
-      data: { servicePlane: { code: 'ability_validation', retryable: false, status: 500 } },
+      code: 'ability_validation',
       message: 'Service-Plane ability output for get failed validation',
+      retryable: false,
+      status: 500,
     });
-    const orpcError = error as ORPCError<string, unknown>;
-    expect(orpcError.message).not.toContain('secret-row-data');
-    expect(JSON.stringify(orpcError.data)).not.toContain('secret-row-data');
+    expect((error as Error).message).not.toContain('secret-row-data');
+    expect(JSON.stringify(error)).not.toContain('secret-row-data');
   });
 
   it('terminates a stream when a yielded item fails the per-item output schema', async () => {
@@ -240,7 +233,8 @@ describe('standard schema abilities over oRPC', () => {
     const iterator = stream[Symbol.asyncIterator]();
     await expect(iterator.next()).resolves.toEqual({ done: false, value: { result: 'ok' } });
     const error = await iterator.next().catch((caught: unknown) => caught);
-    expect(error).toBeInstanceOf(Error);
+    expect(error).toBeInstanceOf(ServicePlaneClientError);
+    expect(error).toMatchObject({ code: 'ability_validation', status: 500 });
     expect((error as Error).message).not.toContain('1729');
   });
 });

@@ -2,19 +2,19 @@ import { RPCLink } from '@orpc/client/fetch';
 import type { UpgradeWebSocket } from 'hono/ws';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
+import { createAbilityBuilder } from '../service/ability.js';
 import { defineCapabilities } from '../service/capabilities.js';
 import { createAbilityClient, createBrokeredAbilityClient } from '../service/client.js';
 import { defineAbility } from '../service/discovery.js';
-import { createAbilityBuilder } from '../service/orpc.js';
 import { ServicePlaneService } from '../service/service.js';
-import { memoryWebSocketPair } from '../test-support/index.js';
 import type { CapabilityJwks } from '../shared/types.js';
 import { SERVICE_PLANE_CAPABILITY_JWKS_PATH } from '../shared/types.js';
+import { memoryWebSocketPair } from '../test-support/index.js';
 import { ServicePlaneControlPlane } from './control-plane.js';
 import { cloudflareServiceBinding } from './endpoints.js';
 import { generateCapabilitySigningSecret } from './signing-keys.js';
 
-describe('oRPC control-plane broker', () => {
+describe('Service Plane control-plane broker', () => {
   it('keeps the control plane as the only public endpoint for typed unary and streaming calls', async () => {
     const capabilities = defineCapabilities({ scopes: [{ id: 'tasks.read' }], serviceId: 'tasks' });
     const ability = createAbilityBuilder();
@@ -24,7 +24,7 @@ describe('oRPC control-plane broker', () => {
       id: 'tasks.items',
       methods: {
         get: ability
-          .procedure({ mcp: { name: 'tasks_get' }, scopes: ['tasks.read'] })
+          .method({ mcp: { name: 'tasks_get' }, scopes: ['tasks.read'] })
           .input(z.object({ id: z.string() }))
           .output(z.object({ caller: z.string(), id: z.string() }))
           .handler(({ context, input }) => ({ caller: context.identity.serviceId, id: input.id })),
@@ -122,7 +122,7 @@ describe('oRPC control-plane broker', () => {
         type: 'fetch',
       },
     });
-    await expect(directClient.get({ id: 'bypass' })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(directClient.get({ id: 'bypass' })).rejects.toMatchObject({ code: 'capability_auth', status: 403 });
     const stream = await client.watch({ after: 8 });
     const values = [];
     for await (const value of stream) values.push(value);

@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
+import { createAbilityBuilder } from '../service/ability.js';
 import { defineCapabilities } from '../service/capabilities.js';
 import { createBrokeredAbilityClient } from '../service/client.js';
 import { defineAbility } from '../service/discovery.js';
-import { createAbilityBuilder } from '../service/orpc.js';
 import { ServicePlaneService } from '../service/service.js';
 import type { CapabilityJwks } from '../shared/types.js';
 import { SERVICE_PLANE_CAPABILITY_JWKS_PATH, SERVICE_PLANE_CAPABILITY_TOKEN_PATH, SERVICE_PLANE_MCP_PATH } from '../shared/types.js';
@@ -142,7 +142,7 @@ describe('fail-closed caller resolution', () => {
       id: 'tasks.items',
       methods: {
         get: ability
-          .procedure({ scopes: ['tasks.read'] })
+          .method({ scopes: ['tasks.read'] })
           .input(z.object({ id: z.string() }))
           .output(z.object({ caller: z.string(), id: z.string() }))
           .handler(({ context, input }) => ({ caller: context.identity.serviceId, id: input.id })),

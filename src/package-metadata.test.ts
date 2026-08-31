@@ -8,14 +8,27 @@ describe('package metadata', () => {
       peerDependencies?: Record<string, string>;
     };
 
-    // 4.13 is the first release with first-class HTTP QUERY routing, which `rest.method: 'query'`
-    // projections rely on; it also carries all current security patches.
-    expect(packageJson.peerDependencies?.hono).toBe('>=4.13.0 <5.0.0');
+    // 4.13 is the first release with first-class HTTP QUERY routing, while 4.13.5 closes the
+    // query-parser and request-body security issues that affect the public Hono shell.
+    expect(packageJson.peerDependencies?.hono).toBe('>=4.13.5 <5.0.0');
     // Validation is Standard Schema based, so no validation library is a peer dependency.
     expect(packageJson.peerDependencies?.zod).toBeUndefined();
     expect(Object.keys(packageJson.dependencies ?? {})).toEqual(
       expect.arrayContaining(['@orpc/client', '@orpc/contract', '@orpc/hibernation', '@orpc/server']),
     );
+    expect(Object.keys(packageJson.peerDependencies ?? {}).some((name) => name.startsWith('@orpc/'))).toBe(false);
     expect(Object.keys(packageJson.dependencies ?? {}).some((name) => name.includes('capn'))).toBe(false);
+  });
+
+  it('keeps the installed RPC engine out of the public service exports', async () => {
+    const serviceIndex = await readFile(new URL('./service/index.ts', import.meta.url), 'utf8');
+    const serviceApi = (await import('./service/index.js')) as Record<string, unknown>;
+
+    expect(serviceIndex).not.toContain('@orpc');
+    expect(serviceIndex).not.toMatch(/ORPC|Orpc/);
+    expect(serviceIndex).not.toContain('plugins');
+    expect(serviceApi).not.toHaveProperty('ORPCError');
+    expect(serviceApi).not.toHaveProperty('HibernationHandlerPlugin');
+    expect(serviceApi).not.toHaveProperty('BatchLinkPlugin');
   });
 });

@@ -1,14 +1,13 @@
-import { BatchLinkPlugin } from '@orpc/client/plugins';
 import { call, os } from '@orpc/server';
-import { BatchHandlerPlugin } from '@orpc/server/plugins';
 import { bench, describe } from 'vitest';
 import { z } from 'zod';
 import { createControlPlaneRpcBroker } from './control-plane/broker.js';
 import { createCapabilityIssuer, defineServiceGrants } from './control-plane/capabilities.js';
+import { createAbilityBuilder } from './service/ability.js';
 import { defineCapabilities } from './service/capabilities.js';
 import { createAbilityClient } from './service/client.js';
 import { defineAbility } from './service/discovery.js';
-import { createAbilityBuilder, createAbilityProcedureRuntimeContext } from './service/orpc.js';
+import { compileAbilityMethod, createAbilityRpcRuntimeContext } from './service/orpc.js';
 import { ServicePlaneService } from './service/service.js';
 import type { CapabilityIdentity } from './shared/types.js';
 import { testKeys } from './test-support/index.js';
@@ -55,7 +54,7 @@ const completion = defineAbility({
   id: 'llm.completion',
   methods: {
     complete: builder
-      .procedure({ scopes: ['llm.run'] })
+      .method({ scopes: ['llm.run'] })
       .input(inputSchema)
       .output(outputSchema)
       .handler(({ input: value }) => ({ text: value.prompt.toUpperCase() })),
@@ -75,11 +74,11 @@ const service = new ServicePlaneService({
   capabilities,
   id: 'llm',
   logger: false,
-  rpc: { plugins: [new BatchHandlerPlugin()] },
+  rpc: { batch: true },
   title: 'LLM',
   version: '1.0.0',
 });
-const runtime = createAbilityProcedureRuntimeContext({
+const runtime = createAbilityRpcRuntimeContext({
   authorize: () => ({
     abilityId: completion.id,
     context: {} as never,
@@ -92,6 +91,7 @@ const binding = {
   fetch: async (request: Request) => service.fetch(request),
   invokeAbility: (nativeInput: Parameters<ServicePlaneService['invokeAbility']>[0]) => service.invokeAbility(nativeInput),
 };
+const compiledCompletion = compileAbilityMethod(completion.methods.complete);
 const nativeClient = createAbilityClient({
   ability: completion,
   callerServiceId: 'frontend',
@@ -117,7 +117,7 @@ const batchClient = createAbilityClient({
   transport: {
     fetch: binding,
     origin: 'https://llm.internal',
-    plugins: [new BatchLinkPlugin({ groups: [{ condition: true, context: {} }] })],
+    batch: true,
     type: 'fetch',
   },
 });
@@ -160,13 +160,13 @@ function verifyCompletion(value: unknown): void {
   if ((value as { text?: string }).text !== output.text) throw new Error('benchmark call produced an invalid result');
 }
 
-describe('oRPC migration throughput', () => {
+describe('Service Plane RPC throughput', () => {
   bench('raw oRPC procedure call', async () => {
     verifyCompletion(await call(rawProcedure, input));
   });
 
-  bench('Service Plane procedure middleware + schemas', async () => {
-    verifyCompletion(await call(completion.methods.complete, input, { context: runtime }));
+  bench('Service Plane method middleware + schemas', async () => {
+    verifyCompletion(await call(compiledCompletion, input, { context: runtime }));
   });
 
   bench('ServicePlaneService native invokeAbility', async () => {
@@ -184,7 +184,7 @@ describe('oRPC migration throughput', () => {
     verifyCompletion(await nativeClient.complete(input));
   });
 
-  bench('typed client -> oRPC Fetch', async () => {
+  bench('typed client -> Service Plane Fetch', async () => {
     verifyCompletion(await fetchClient.complete(input));
   });
 
@@ -201,16 +201,16 @@ describe('oRPC migration throughput', () => {
     );
   });
 
-  bench('10 typed calls in one oRPC batch', async () => {
+  bench('10 typed calls in one Service Plane batch', async () => {
     const values = await Promise.all(Array.from({ length: 10 }, () => batchClient.complete(input)));
     if (values.length !== 10) throw new Error('benchmark batch produced no samples');
     for (const value of values) verifyCompletion(value);
   });
 });
 
-describe('oRPC streaming throughput', () => {
+describe('Service Plane streaming throughput', () => {
   bench(
-    '1,000 validated items over oRPC Fetch',
+    '1,000 validated items over Service Plane Fetch',
     async () => {
       const stream = await fetchClient.tokens({ count: 1_000 });
       let count = 0;

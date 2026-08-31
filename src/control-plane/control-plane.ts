@@ -1,12 +1,13 @@
 import type { StandardHeaders, StandardLazyRequest } from '@orpc/server';
 import { RPCHandler as FetchRpcHandler } from '@orpc/server/fetch';
-import type { StandardHandlerPlugin } from '@orpc/server/standard';
 import { RPCHandler as WebSocketRpcHandler } from '@orpc/server/websocket';
 import { Context, type Env, Hono } from 'hono';
 import { etag } from 'hono/etag';
 import { type RequestIdVariables, requestId } from 'hono/request-id';
 import type { UpgradeWebSocket } from 'hono/ws';
 import { orpcErrorFromServicePlane } from '../service/orpc.js';
+import { createRpcHandlerPlugins } from '../service/orpc-features.js';
+import type { ServicePlaneServerWireOptions } from '../service/wire-options.js';
 import { type ConnInfo, normalizeConnInfo } from '../shared/conn-info.js';
 import { resolveTimeoutMs, type ServicePlaneTimeoutPolicy, timeoutMsFromRequest, validateTimeoutPolicy } from '../shared/deadline.js';
 import { CapabilityAuthError } from '../shared/errors.js';
@@ -131,15 +132,13 @@ export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
   authenticateCaller?: MountCapabilityEndpointsOptions['authenticateCaller'];
   broker?:
     | false
-    | {
+    | (ServicePlaneServerWireOptions & {
         caller?: BrokerCallerResolver<TEnv>;
         connInfo?: ConnInfoResolver<TEnv>;
         path?: string;
-        /** oRPC plugins for the procedure-first broker endpoint. */
-        plugins?: StandardHandlerPlugin<Record<PropertyKey, unknown>>[];
         /** Runtime-specific Hono WebSocket upgrade adapter for the public broker. */
         upgradeWebSocket?: UpgradeWebSocket;
-      };
+      });
   controlPlaneServiceId?: string;
   /**
    * Caches the discovered service catalog. Resolving it is a fan-out — one request per configured
@@ -206,7 +205,7 @@ export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
 };
 
 /**
- * ServicePlaneControlPlane serves STS/JWKS, oRPC brokering, MCP, and API projections.
+ * ServicePlaneControlPlane serves STS/JWKS, ability brokering, MCP, and API projections.
  */
 export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   readonly app: Hono<ServicePlaneControlPlaneEnv<TEnv>>;
@@ -274,7 +273,8 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
 
   private mountBroker(brokerOptions: Exclude<ServicePlaneControlPlaneOptions<TEnv>['broker'], false | undefined>): void {
     const path = brokerOptions.path ?? '/rpc/broker';
-    const handlerOptions = brokerOptions.plugins ? { plugins: brokerOptions.plugins } : {};
+    const plugins = createRpcHandlerPlugins(brokerOptions, false);
+    const handlerOptions = plugins.length > 0 ? { plugins } : {};
     const orpcHandler = new FetchRpcHandler(controlPlaneBrokerRouter, handlerOptions);
     const websocketHandler = new WebSocketRpcHandler(controlPlaneBrokerRouter, handlerOptions);
     if (brokerOptions.upgradeWebSocket) {
@@ -345,7 +345,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
         context: { broker, ...(resolved.caller ? { caller: resolved.caller } : {}) },
         prefix: path as `/${string}`,
       });
-      return handled.matched ? handled.response : new Response('oRPC broker procedure not found', { status: 404 });
+      return handled.matched ? handled.response : new Response('Service-Plane broker method not found', { status: 404 });
     });
   }
 

@@ -1,8 +1,6 @@
-import { type ClientLink, createORPCClient, DynamicLink, ORPCError } from '@orpc/client';
+import { type AnyNestedClient, type ClientLink, createORPCClient, DynamicLink, wrapAsyncIteratorPreservingEventMeta } from '@orpc/client';
 import { RPCLink as FetchRpcLink } from '@orpc/client/fetch';
-import type { StandardLinkPlugin } from '@orpc/client/standard';
-import { type WebSocketLinkTransportReconnectOptions, RPCLink as WebSocketRpcLink } from '@orpc/client/websocket';
-import type { RouterClient } from '@orpc/server';
+import { RPCLink as WebSocketRpcLink } from '@orpc/client/websocket';
 import { decodeCapabilityTokenPayload, servicePlaneAuthorization } from '../shared/capability-tokens.js';
 import { normalizeConnInfo, SERVICE_PLANE_CONN_INFO_HEADER, serializeConnInfo } from '../shared/conn-info.js';
 import {
@@ -12,7 +10,7 @@ import {
   SERVICE_PLANE_TIMEOUT_HEADER,
   serializeTimeoutMs,
 } from '../shared/deadline.js';
-import { CapabilityAuthError, ServicePlaneTimeoutError } from '../shared/errors.js';
+import { CapabilityAuthError, ServicePlaneTimeoutError, servicePlaneClientError } from '../shared/errors.js';
 import { normalizeIdempotencyKey, SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER } from '../shared/idempotency.js';
 import type {
   CapabilitySubject,
@@ -23,56 +21,67 @@ import type {
 } from '../shared/types.js';
 import { SERVICE_PLANE_PROOF_HEADER, SERVICE_PLANE_REQUEST_ID_HEADER } from '../shared/types.js';
 import { type CapabilityProofSigner, type CapabilityTokenRequester, createCapabilityTokenProvider } from './capabilities.js';
-import type { AbilityProcedureDefinitions, OrpcServiceAbilityDefinition } from './discovery.js';
-import { abilityProcedureStreams } from './orpc.js';
+import type { AbilityClient, AbilityMethodDefinitions, ServiceAbilityDefinition } from './discovery.js';
+import { createRpcClientPlugins } from './orpc-features.js';
+import type { ServicePlaneClientWireOptions } from './wire-options.js';
 
-/** Service binding entrypoint used for zero-serialization unary oRPC calls. */
+/** Service binding entrypoint used for zero-serialization unary ability calls. */
 export type AbilityNativeBinding = {
-  /** Calls one authorized ability procedure inside the target Worker. */
+  /** Calls one authorized ability method inside the target Worker. */
   invokeAbility(input: NativeAbilityCall): Promise<unknown> | unknown;
-  /** Fetch fallback used for streaming procedures, which need oRPC's streaming codec. */
+  /** Fetch fallback used for streaming methods, which need the package's streaming codec. */
   fetch?(request: Request): Promise<Response>;
 };
 
 /** Serialized call envelope accepted by a Cloudflare native service binding. */
 export type NativeAbilityCall = ServiceAbilityNativeCall;
 
+/** Reconnect policy for a Service Plane WebSocket client. */
+export type ServicePlaneWebSocketReconnectOptions = {
+  /** Delay before a connection attempt. */
+  delay?: (info: {
+    /** Consecutive attempt count for the current outage. */
+    attempt: number;
+    /** Total connection attempts made by this client. */
+    totalAttempt: number;
+  }) => number;
+  /** Enables reconnection. */
+  enabled: boolean;
+  /** Maximum consecutive attempts before the call fails. */
+  maxAttempt?: number;
+  /** Proactively reconnects after a socket closes. */
+  onClose?: {
+    /** Delay before reconnecting after a close event. */
+    delay?: number;
+    /** Whether a close event starts reconnection. */
+    enabled: boolean;
+  };
+};
+
 /** Runtime transport choices for a typed ability client. */
 export type AbilityClientTransport =
-  | {
+  | (ServicePlaneClientWireOptions & {
       /** Ordinary Fetch, including `env.SERVICE.fetch` on Cloudflare service bindings. */
       fetch?: FetchLike | typeof fetch;
       /** Origin used to resolve the ability's RPC path. */
       origin?: string;
-      /** oRPC link plugins such as batching, compression, dedupe, or retry. */
-      plugins?: StandardLinkPlugin<object>[];
-      /** Selects ordinary oRPC Fetch. */
+      /** Selects ordinary Service Plane Fetch. */
       type: 'fetch';
-    }
-  | {
+    })
+  | (ServicePlaneClientWireOptions & {
       /** Cloudflare native RPC for unary calls, with binding Fetch for streams. */
       binding: AbilityNativeBinding;
       /** Synthetic origin used by the binding's Fetch streaming fallback. */
       origin?: string;
-      /** Plugins applied to the Fetch streaming fallback. */
-      plugins?: StandardLinkPlugin<object>[];
       /** Selects Cloudflare native unary RPC with binding Fetch streams. */
       type: 'service-binding';
-    }
+    })
   | {
-      /** Custom oRPC link for runtimes with their own transport. */
-      link: ClientLink<object>;
-      /** Selects a caller-supplied link. */
-      type: 'custom';
-    }
-  | {
-      /** Long-lived oRPC WebSocket with optional reconnect behavior. */
+      /** Long-lived WebSocket with optional reconnect behavior. */
       createWebSocket?: (url: string) => WebSocket;
-      /** oRPC plugins applied to WebSocket calls. */
-      plugins?: StandardLinkPlugin<object>[];
       /** Reconnect policy owned by the caller. */
-      reconnect?: WebSocketLinkTransportReconnectOptions;
-      /** Selects oRPC WebSocket. */
+      reconnect?: ServicePlaneWebSocketReconnectOptions;
+      /** Selects Service Plane WebSocket. */
       type: 'websocket';
       /** Physical WebSocket endpoint. */
       url: string;
@@ -100,9 +109,9 @@ type AbilityClientTokenOptions =
       ttlSeconds?: number;
     };
 
-/** Options for creating a typed oRPC client from an ability definition. */
-export type CreateAbilityClientOptions<TAbility extends OrpcServiceAbilityDefinition> = AbilityClientTokenOptions & {
-  /** Procedure-first ability definition; its id and router type drive the client. */
+/** Options for creating a typed client from an ability definition. */
+export type CreateAbilityClientOptions<TAbility extends ServiceAbilityDefinition> = AbilityClientTokenOptions & {
+  /** Portable ability definition; its id and method contracts drive the client. */
   ability: TAbility;
   /** Service identity requesting the target capability. */
   callerServiceId: string;
@@ -129,26 +138,24 @@ type BrokeredAbilityTransportCommon = {
   fetch?: FetchLike | typeof fetch;
   /** Caller authentication headers understood by the control plane. */
   headers?: HeadersInit | (() => HeadersInit | Promise<HeadersInit>);
-  /** Logical oRPC prefix, normally `/rpc/broker`. */
+  /** Logical broker prefix, normally `/rpc/broker`. */
   path?: string;
-  /** oRPC link plugins such as batching, compression, dedupe, or retry. */
-  plugins?: StandardLinkPlugin<object>[];
 };
 
 /** Transport from a public caller or headless front to the central control plane. */
 export type BrokeredAbilityTransport = BrokeredAbilityTransportCommon &
   (
-    | {
+    | (ServicePlaneClientWireOptions & {
         /** Public control-plane origin. */
         origin?: string;
         /** Selects ordinary Fetch when omitted or set to `fetch`. */
         type?: 'fetch';
-      }
+      })
     | {
         /** Creates the physical socket when no global WebSocket constructor is available. */
         createWebSocket?: (url: string) => WebSocket;
         /** Reconnect policy owned by the public caller. */
-        reconnect?: WebSocketLinkTransportReconnectOptions;
+        reconnect?: ServicePlaneWebSocketReconnectOptions;
         /** Selects the WebSocket broker endpoint. */
         type: 'websocket';
         /** Public WebSocket endpoint, normally `wss://host/rpc/broker/ws`. */
@@ -157,8 +164,8 @@ export type BrokeredAbilityTransport = BrokeredAbilityTransportCommon &
   );
 
 /** Options for a typed ability client whose calls all pass through the control plane. */
-export type CreateBrokeredAbilityClientOptions<TAbility extends OrpcServiceAbilityDefinition> = {
-  /** Procedure-first ability definition; its router drives the returned client type. */
+export type CreateBrokeredAbilityClientOptions<TAbility extends ServiceAbilityDefinition> = {
+  /** Portable ability definition; its methods drive the returned client type. */
   ability: TAbility;
   /** Advisory connection information forwarded by a trusted caller. */
   connInfo?: import('../shared/conn-info.js').ConnInfo;
@@ -177,12 +184,12 @@ export type CreateBrokeredAbilityClientOptions<TAbility extends OrpcServiceAbili
 };
 
 /**
- * Creates a synchronous, fully typed oRPC client. Tokens and sockets are resolved lazily on the
+ * Creates a synchronous, fully typed ability client. Tokens and sockets are resolved lazily on the
  * first call, so constructing a client has no network side effects.
  */
-export function createAbilityClient<TAbility extends OrpcServiceAbilityDefinition<import('hono').Env, AbilityProcedureDefinitions>>(
+export function createAbilityClient<TAbility extends ServiceAbilityDefinition<import('hono').Env, AbilityMethodDefinitions>>(
   options: CreateAbilityClientOptions<TAbility>,
-): RouterClient<TAbility['methods']> {
+): AbilityClient<TAbility> {
   const tokenProvider =
     options.tokenProvider ??
     createCapabilityTokenProvider({
@@ -215,7 +222,7 @@ export function createAbilityClient<TAbility extends OrpcServiceAbilityDefinitio
   const deadlineLink: ClientLink<object> = {
     async call(path, input, callOptions) {
       if (options.timeoutMs === 0) {
-        throw new ORPCError('TIMEOUT', { message: `Service-Plane caller deadline is already exhausted: ${path.join('.')}` });
+        throw new ServicePlaneTimeoutError(`Service-Plane caller deadline is already exhausted: ${path.join('.')}`);
       }
       const call = Promise.resolve(baseLink.call(path, input, callOptions));
       if (timeoutMs === undefined) return call;
@@ -225,7 +232,7 @@ export function createAbilityClient<TAbility extends OrpcServiceAbilityDefinitio
       });
     },
   };
-  return createORPCClient<RouterClient<TAbility['methods']>>(deadlineLink);
+  return createTypedAbilityClient<TAbility>(deadlineLink);
 }
 
 /**
@@ -233,9 +240,9 @@ export function createAbilityClient<TAbility extends OrpcServiceAbilityDefinitio
  * browser/headless-front path: callers know the ability contract but never see a service token or
  * a private service address.
  */
-export function createBrokeredAbilityClient<TAbility extends OrpcServiceAbilityDefinition<import('hono').Env, AbilityProcedureDefinitions>>(
+export function createBrokeredAbilityClient<TAbility extends ServiceAbilityDefinition<import('hono').Env, AbilityMethodDefinitions>>(
   options: CreateBrokeredAbilityClientOptions<TAbility>,
-): RouterClient<TAbility['methods']> {
+): AbilityClient<TAbility> {
   const timeoutMs = normalizeTimeoutMs(options.timeoutMs);
   const brokerHeaders = async () => {
     const configured = typeof options.transport.headers === 'function' ? await options.transport.headers() : options.transport.headers;
@@ -256,7 +263,6 @@ export function createBrokeredAbilityClient<TAbility extends OrpcServiceAbilityD
       ? new WebSocketRpcLink({
           connect: () => (transport.createWebSocket ?? ((url: string) => new WebSocket(url)))(transport.url),
           headers: brokerHeaders,
-          ...(transport.plugins ? { plugins: transport.plugins } : {}),
           ...(transport.reconnect ? { reconnect: transport.reconnect } : {}),
           url: brokerPath,
         })
@@ -271,18 +277,18 @@ export function createBrokeredAbilityClient<TAbility extends OrpcServiceAbilityD
             : {}),
           headers: brokerHeaders,
           origin: transport.origin ?? 'https://service-plane-control-plane.internal',
-          ...(transport.plugins ? { plugins: transport.plugins } : {}),
+          plugins: createRpcClientPlugins(transport),
           url: brokerPath,
         });
   const abilityLink: ClientLink<object> = {
     call(path, input, callOptions) {
       const method = path.at(-1) ?? '';
-      const procedure = options.ability.methods[method];
-      if (!procedure) {
+      const definition = options.ability.methods[method];
+      if (!definition) {
         throw new CapabilityAuthError(`Service-Plane ability method not found: ${options.ability.id}/${method}`, 404);
       }
       return brokerLink.call(
-        [abilityProcedureStreams(procedure) ? 'stream' : 'call'],
+        [definition.kind === 'unary' ? 'call' : 'stream'],
         {
           abilityId: options.ability.id,
           input,
@@ -297,7 +303,7 @@ export function createBrokeredAbilityClient<TAbility extends OrpcServiceAbilityD
   const deadlineLink: ClientLink<object> = {
     async call(path, input, callOptions) {
       if (options.timeoutMs === 0) {
-        throw new ORPCError('TIMEOUT', { message: `Service-Plane caller deadline is already exhausted: ${path.join('.')}` });
+        throw new ServicePlaneTimeoutError(`Service-Plane caller deadline is already exhausted: ${path.join('.')}`);
       }
       const call = Promise.resolve(abilityLink.call(path, input, callOptions));
       if (timeoutMs === undefined) return call;
@@ -307,19 +313,49 @@ export function createBrokeredAbilityClient<TAbility extends OrpcServiceAbilityD
       });
     },
   };
-  return createORPCClient<RouterClient<TAbility['methods']>>(deadlineLink);
+  return createTypedAbilityClient<TAbility>(deadlineLink);
 }
 
-function abilityClientLink<TAbility extends OrpcServiceAbilityDefinition>(
+function createTypedAbilityClient<TAbility extends ServiceAbilityDefinition>(link: ClientLink<object>): AbilityClient<TAbility> {
+  const client = createORPCClient<AnyNestedClient>(link) as unknown as AbilityClient<TAbility>;
+  const methods = new Map<PropertyKey, unknown>();
+  return new Proxy(client, {
+    get(target, property, receiver) {
+      const member = Reflect.get(target, property, receiver) as unknown;
+      if (typeof member !== 'function') return member;
+      const cached = methods.get(property);
+      if (cached) return cached;
+      const wrapped = async (...args: unknown[]) => {
+        try {
+          const result = await (member as (...input: unknown[]) => Promise<unknown>)(...args);
+          return isAsyncIterator(result)
+            ? wrapAsyncIteratorPreservingEventMeta(result, {
+                mapError: servicePlaneClientError,
+                mapResult: (value) => value,
+              })
+            : result;
+        } catch (error) {
+          throw servicePlaneClientError(error);
+        }
+      };
+      methods.set(property, wrapped);
+      return wrapped;
+    },
+  });
+}
+
+function isAsyncIterator(value: unknown): value is AsyncIterator<unknown> {
+  return Boolean(value && typeof value === 'object' && typeof (value as { next?: unknown }).next === 'function');
+}
+
+function abilityClientLink<TAbility extends ServiceAbilityDefinition>(
   options: CreateAbilityClientOptions<TAbility>,
   headers: () => Promise<Headers>,
 ): ClientLink<object> {
   const path = options.ability.rpc?.path ?? `/rpc/${options.ability.id}`;
   switch (options.transport.type) {
-    case 'custom':
-      return options.transport.link;
     case 'fetch':
-      return fetchAbilityLink(path, options.transport.fetch, options.transport.origin, headers, options.transport.plugins);
+      return fetchAbilityLink(path, options.transport.fetch, options.transport.origin, headers, options.transport);
     case 'websocket': {
       const transport = options.transport;
       const createWebSocket = transport.createWebSocket ?? ((url: string) => new WebSocket(url));
@@ -327,7 +363,6 @@ function abilityClientLink<TAbility extends OrpcServiceAbilityDefinition>(
         connect: () => createWebSocket(transport.url),
         headers,
         ...(transport.reconnect ? { reconnect: transport.reconnect } : {}),
-        ...(transport.plugins ? { plugins: transport.plugins } : {}),
         url: path as `/${string}`,
       });
     }
@@ -340,12 +375,12 @@ function abilityClientLink<TAbility extends OrpcServiceAbilityDefinition>(
             { fetch: (request) => (transport.binding.fetch as NonNullable<AbilityNativeBinding['fetch']>)(request) },
             transport.origin,
             headers,
-            transport.plugins,
+            transport,
           )
         : undefined;
-      return new DynamicLink((_callOptions, procedurePath) => {
-        const procedure = options.ability.methods[procedurePath.at(-1) ?? ''];
-        if (procedure && abilityProcedureStreams(procedure)) {
+      return new DynamicLink((_callOptions, methodPath) => {
+        const method = options.ability.methods[methodPath.at(-1) ?? ''];
+        if (method && method.kind !== 'unary') {
           if (!fetchFallback) {
             throw new CapabilityAuthError('Service-Plane streaming over a service binding requires binding.fetch', 500);
           }
@@ -362,7 +397,7 @@ function fetchAbilityLink(
   fetcher: FetchLike | typeof fetch | undefined,
   origin = 'https://service-plane-service.internal',
   headers: () => Promise<Headers>,
-  plugins?: StandardLinkPlugin<object>[],
+  wire: ServicePlaneClientWireOptions = {},
 ): ClientLink<object> {
   return new FetchRpcLink({
     ...(fetcher
@@ -372,12 +407,12 @@ function fetchAbilityLink(
       : {}),
     headers,
     origin,
-    ...(plugins ? { plugins } : {}),
+    plugins: createRpcClientPlugins(wire),
     url: path as `/${string}`,
   });
 }
 
-function nativeAbilityLink<TAbility extends OrpcServiceAbilityDefinition>(
+function nativeAbilityLink<TAbility extends ServiceAbilityDefinition>(
   options: CreateAbilityClientOptions<TAbility>,
   headers: () => Promise<Headers>,
 ): ClientLink<object> {
@@ -407,7 +442,7 @@ function nativeAbilityLink<TAbility extends OrpcServiceAbilityDefinition>(
   };
 }
 
-async function capabilityProof<TAbility extends OrpcServiceAbilityDefinition>(
+async function capabilityProof<TAbility extends ServiceAbilityDefinition>(
   options: CreateAbilityClientOptions<TAbility>,
   token: string,
 ): Promise<string | undefined> {

@@ -5,8 +5,8 @@ Goal: understand how callers are authenticated, how tokens are issued, and where
 Service Plane uses three layers:
 
 - Hono middleware handles HTTP policy: CORS, logging, request ids, rate limits, and deployment-specific sessions.
-- Service Plane oRPC middleware verifies the token, ingress, access class, and scopes before input validation.
-- oRPC validates procedure input and output around the handler.
+- Service Plane runtime middleware verifies the token, ingress, access class, and scopes before input validation.
+- Service Plane validates method input and output around the handler.
 
 ## Token Flow
 
@@ -19,10 +19,10 @@ sequenceDiagram
   Caller->>Plane: Typed broker call
   Plane->>Plane: Authenticate caller, discover ability, check grants
   Plane->>Plane: Mint brokered ServicePlane token
-  Plane->>Service: oRPC call + token
+  Plane->>Service: Service Plane RPC + token
   Service->>Service: Verify token against JWKS
   Service->>Service: Check ingress, access, scopes
-  Service->>Service: Validate input and execute procedure
+  Service->>Service: Validate input and execute method
 ```
 
 Tokens are short-lived ES256 JWS tokens. The control plane signs them. Services verify them with the control-plane JWKS.
@@ -307,7 +307,7 @@ stamps the thumbprint of the key that actually authenticated:
 { "iss": "control-plane", "sub": "workflow-runner", "aud": "asana", "cnf": { "jkt": "NzbLsXh8..." } }
 ```
 
-The direct caller signs a short-lived proof for each procedure call. With a shipped requester this is
+The direct caller signs a short-lived proof for each method call. With a shipped requester this is
 automatic because the requester already holds the key:
 
 ```ts
@@ -339,7 +339,7 @@ sender-constrained never pay for a signature.
 
 ### Limits
 
-The proof is per logical oRPC call, including calls carried over one long-lived WebSocket. A refreshed
+The proof is per logical Service Plane call, including calls carried over one long-lived WebSocket. A refreshed
 token therefore receives a fresh proof without rebuilding the typed client.
 
 Rotating a caller key needs both keys registered on the plane until cached tokens expire: a token
@@ -525,7 +525,7 @@ Method scopes are enforced automatically by the generated ability wrapper.
 
 ```ts
 ability
-  .procedure({ scopes: ['asana.tasks.write'] })
+  .method({ scopes: ['asana.tasks.write'] })
   .input(CreateTaskInput)
   .output(CreateTaskOutput)
   .handler(createTask);
