@@ -1,11 +1,11 @@
 import { wrapAsyncIteratorPreservingEventMeta } from '@orpc/client';
-import { asyncIteratorObject } from '@orpc/contract';
 import { HibernationAsyncIteratorClass } from '@orpc/hibernation';
-import { type AnyProcedure, ORPCError, os, ValidationError } from '@orpc/server';
+import { type AnyProcedure, asyncIteratorObject, ORPCError, os, ValidationError } from '@orpc/server';
 import type { StandardSchemaV1 } from '@standard-schema/spec';
 import type { Env } from 'hono';
 import { discardDisposableValue, raceDeadline } from '../shared/deadline.js';
 import {
+  AbilityHandlerError,
   AbilityValidationError,
   type AbilityValidationIssue,
   rememberHandlerFailureCause,
@@ -19,9 +19,11 @@ import {
   type AbilityMethodContext,
   type AbilitySchema,
   type AbilityStream,
+  type AbilityStreamSource,
   type AnyAbilityMethodDefinition,
   abilityHibernationCallback,
   abilityMethodHandler,
+  toAbilityStream,
 } from './ability.js';
 
 type ServicePlaneRpcErrorData = {
@@ -51,87 +53,162 @@ const validatedStreamItemSchema = {
 
 const servicePlaneErrorMap = {
   BAD_REQUEST: { data: servicePlaneRpcErrorDataSchema },
+  BAD_GATEWAY: { data: servicePlaneRpcErrorDataSchema },
+  CLIENT_CLOSED_REQUEST: { data: servicePlaneRpcErrorDataSchema },
+  CONFLICT: { data: servicePlaneRpcErrorDataSchema },
   FORBIDDEN: { data: servicePlaneRpcErrorDataSchema },
   GATEWAY_TIMEOUT: { data: servicePlaneRpcErrorDataSchema },
   GONE: { data: servicePlaneRpcErrorDataSchema },
   INTERNAL_SERVER_ERROR: { data: servicePlaneRpcErrorDataSchema },
   METHOD_NOT_SUPPORTED: { data: servicePlaneRpcErrorDataSchema },
+  NOT_ACCEPTABLE: { data: servicePlaneRpcErrorDataSchema },
   NOT_FOUND: { data: servicePlaneRpcErrorDataSchema },
+  NOT_IMPLEMENTED: { data: servicePlaneRpcErrorDataSchema },
+  PAYMENT_REQUIRED: { data: servicePlaneRpcErrorDataSchema },
+  PAYLOAD_TOO_LARGE: { data: servicePlaneRpcErrorDataSchema },
+  PRECONDITION_FAILED: { data: servicePlaneRpcErrorDataSchema },
+  PRECONDITION_REQUIRED: { data: servicePlaneRpcErrorDataSchema },
   SERVICE_UNAVAILABLE: { data: servicePlaneRpcErrorDataSchema },
+  TIMEOUT: { data: servicePlaneRpcErrorDataSchema },
   TOO_MANY_REQUESTS: { data: servicePlaneRpcErrorDataSchema },
   UNAUTHORIZED: { data: servicePlaneRpcErrorDataSchema },
   UNPROCESSABLE_CONTENT: { data: servicePlaneRpcErrorDataSchema },
+  UNSUPPORTED_MEDIA_TYPE: { data: servicePlaneRpcErrorDataSchema },
 } as const;
 
 type AuthorizeAbilityMethodInput = {
+  headers?: Headers;
   path: string[];
   procedure: AnyProcedure;
   signal?: AbortSignal;
 };
 
-type AbilityRpcRuntimeOptions<TEnv extends Env = Env> = {
-  authorize(input: AuthorizeAbilityMethodInput): Promise<AbilityMethodContext<TEnv>> | AbilityMethodContext<TEnv>;
+type AuthorizedAbilityMethodContext<TEnv extends Env> = Omit<AbilityMethodContext<TEnv>, 'methodName'> & {
+  methodName?: string;
+};
+
+type AuthorizedAbilityMethod<TEnv extends Env> = {
+  context: AuthorizedAbilityMethodContext<TEnv>;
   deadlineAt?: number;
+};
+
+type AbilityRpcRuntimeOptions<TEnv extends Env = Env> = {
+  authorize(input: AuthorizeAbilityMethodInput): Promise<AuthorizedAbilityMethod<TEnv>> | AuthorizedAbilityMethod<TEnv>;
   defaultMethodTimeoutMs?: false | number;
-  onHandlerFailure?: (cause: unknown, methodName: string) => void;
+  onHandlerFailure?: (cause: unknown, methodName: string, context?: AbilityMethodContext<TEnv>) => void;
+  /** Time this logical call entered the service, so a unary method ceiling includes authorization. */
+  receivedAt?: number;
+  /** Resolves the caller deadline before authorization so a slow trust source cannot escape it. */
+  resolveDeadlineAt?(input: AuthorizeAbilityMethodInput): number | undefined;
 };
 
 type AbilityRpcRuntimeContext<TEnv extends Env = Env> = {
   [ABILITY_RUNTIME]: AbilityRpcRuntimeOptions<TEnv>;
+  reqHeaders?: Headers;
 };
 
 const ABILITY_RUNTIME = Symbol('service-plane.ability-runtime');
+
+// Handler failures cross this private wrapper before oRPC can classify them. That provenance is
+// what lets the outer boundary distinguish an application-created ORPCError from one created by
+// Service Plane itself without trusting a forgeable message, code, or data shape.
+const abilityHandlerFailureCauses = new WeakMap<object, unknown>();
+
+class AbilityHandlerFailure extends Error {
+  constructor(failure: unknown) {
+    super('Service-Plane ability handler failed');
+    this.name = 'AbilityHandlerFailure';
+    abilityHandlerFailureCauses.set(this, failure);
+  }
+}
+
+const servicePlaneOrpcErrors = new WeakSet<object>();
 
 /** Compiles one transport-neutral method into the package's private oRPC execution engine. */
 export function compileAbilityMethod<TEnv extends Env>(method: AnyAbilityMethodDefinition<TEnv>): AnyProcedure {
   const base = os
     .$context<AbilityRpcRuntimeContext<TEnv>>()
     .errors(servicePlaneErrorMap)
-    .use(async ({ context, next, path, procedure, signal }) => {
+    .use(async ({ context, next, path, procedure, signal }, input) => {
       const runtime = context[ABILITY_RUNTIME];
       const methodName = path.at(-1) ?? 'unknown';
+      let methodContext: AbilityMethodContext<TEnv> | undefined;
 
       try {
-        const authorized = await runtime.authorize({ path, procedure, ...(signal ? { signal } : {}) });
+        const authorizationInput: AuthorizeAbilityMethodInput = {
+          ...(context.reqHeaders ? { headers: context.reqHeaders } : {}),
+          path,
+          procedure,
+          ...(signal ? { signal } : {}),
+        };
         const ceilingMs =
           method.kind === 'unary' ? resolveMethodTimeoutMs(method.metadata.timeoutMs, runtime.defaultMethodTimeoutMs) : undefined;
+        const ceilingDeadlineAt = ceilingMs === undefined ? undefined : (runtime.receivedAt ?? Date.now()) + ceilingMs;
+        const callerDeadlineAt = runtime.resolveDeadlineAt?.(authorizationInput);
+        let effectiveDeadline = resolveProcedureDeadline(callerDeadlineAt, ceilingDeadlineAt, ceilingMs, methodName);
+        if (effectiveDeadline && effectiveDeadline.at <= Date.now()) {
+          throw effectiveDeadline.error();
+        }
+        let deadlineController = effectiveDeadline ? new AbortController() : undefined;
+        const authorizationSignal = deadlineController
+          ? signal
+            ? AbortSignal.any([signal, deadlineController.signal])
+            : deadlineController.signal
+          : signal;
+        const authorization = Promise.resolve(
+          runtime.authorize({
+            ...authorizationInput,
+            ...(authorizationSignal ? { signal: authorizationSignal } : {}),
+          }),
+        );
+        const authorized =
+          effectiveDeadline === undefined
+            ? await authorization
+            : await raceDeadline(authorization, {
+                deadlineAt: effectiveDeadline.at,
+                deadlineError: effectiveDeadline.error,
+                onTimeout: (error) => deadlineController?.abort(error),
+              });
+        rejectPrototypePollutingInput(input);
+        methodContext = { ...authorized.context, methodName };
+        effectiveDeadline = resolveProcedureDeadline(callerDeadlineAt ?? authorized.deadlineAt, ceilingDeadlineAt, ceilingMs, methodName);
+        if (effectiveDeadline && effectiveDeadline.at <= Date.now()) throw effectiveDeadline.error();
+        if (!deadlineController && effectiveDeadline) deadlineController = new AbortController();
         const result = await raceDeadline<{ context: AbilityMethodContext<TEnv>; output: unknown }>(
-          Promise.resolve(next({ context: authorized })),
+          Promise.resolve(next({ context: methodContext })),
           {
-            ...(ceilingMs === undefined ? {} : { ceilingMs }),
-            ceilingError: (limit) =>
-              new ServicePlaneTimeoutError(`Service-Plane ability method exceeded its ${limit}ms limit: ${methodName}`),
-            ...(runtime.deadlineAt === undefined ? {} : { deadlineAt: runtime.deadlineAt }),
-            deadlineError: () => new ServicePlaneTimeoutError(`Service-Plane ability method exceeded its caller's deadline: ${methodName}`),
+            ...(effectiveDeadline === undefined ? {} : { deadlineAt: effectiveDeadline.at }),
+            deadlineError:
+              effectiveDeadline?.error ??
+              (() => new ServicePlaneTimeoutError(`Service-Plane ability method exceeded its caller's deadline: ${methodName}`)),
             discardLateValue(value) {
               discardDisposableValue((value as { output?: unknown }).output);
             },
+            onTimeout: (error) => deadlineController?.abort(error),
           },
         );
 
         if (method.kind === 'stream' && !(result.output instanceof HibernationAsyncIteratorClass)) {
-          const iterator = result.output as AsyncIterator<unknown>;
+          const iterator =
+            authorized.deadlineAt === undefined
+              ? (result.output as AsyncIterator<unknown>)
+              : deadlineBoundIterator(
+                  result.output as AsyncIterator<unknown>,
+                  authorized.deadlineAt,
+                  () => new ServicePlaneTimeoutError(`Service-Plane streaming method exceeded its caller's deadline: ${methodName}`),
+                );
           return {
             ...result,
             output: wrapAsyncIteratorPreservingEventMeta(iterator, {
-              mapError: (error) => normalizeMethodError(error, methodName, runtime.onHandlerFailure),
-              mapResult: async (item) => {
-                if (runtime.deadlineAt !== undefined && Date.now() >= runtime.deadlineAt) {
-                  throw normalizeMethodError(
-                    new ServicePlaneTimeoutError(`Service-Plane streaming method exceeded its caller's deadline: ${methodName}`),
-                    methodName,
-                    runtime.onHandlerFailure,
-                  );
-                }
-                return validateStreamResult(item, method.output, methodName);
-              },
+              mapError: (error) => normalizeMethodError(error, methodName, runtime.onHandlerFailure, methodContext),
+              mapResult: (item) => validateStreamResult(item, method.output, methodName),
             }),
           };
         }
 
         return result;
       } catch (error) {
-        throw normalizeMethodError(error, methodName, runtime.onHandlerFailure);
+        throw normalizeMethodError(error, methodName, runtime.onHandlerFailure, methodContext);
       }
     });
 
@@ -143,10 +220,16 @@ export function compileAbilityMethod<TEnv extends Env>(method: AnyAbilityMethodD
     return base
       .input(input)
       .output(asyncIteratorObject(validatedStreamItemSchema))
-      .handler(
-        async ({ context, input: value }) =>
-          (await handler({ context: context as unknown as AbilityMethodContext, input: value })) as AbilityStream<unknown> as never,
-      ) as AnyProcedure;
+      .handler(async ({ context, input: value }) => {
+        const stream = await invokeAbilityHandler(async () => {
+          const source = await handler({ context: context as unknown as AbilityMethodContext, input: value });
+          return toAbilityStream(source as AbilityStreamSource<unknown>) as AbilityStream<unknown>;
+        });
+        return wrapAsyncIteratorPreservingEventMeta(stream, {
+          mapError: (error) => new AbilityHandlerFailure(error),
+          mapResult: (result) => result,
+        }) as never;
+      }) as AnyProcedure;
   }
 
   if (method.kind === 'hibernation') {
@@ -154,7 +237,9 @@ export function compileAbilityMethod<TEnv extends Env>(method: AnyAbilityMethodD
       .input(input)
       .output(hibernationIteratorSchema())
       .handler(async ({ context, input: value }) => {
-        const subscription = await handler({ context: context as unknown as AbilityMethodContext, input: value });
+        const subscription = await invokeAbilityHandler(() =>
+          handler({ context: context as unknown as AbilityMethodContext, input: value }),
+        );
         if (!(subscription instanceof AbilityHibernationStream)) {
           throw new AbilityValidationError('Service-Plane hibernation handler must return AbilityHibernationStream', 500);
         }
@@ -166,7 +251,106 @@ export function compileAbilityMethod<TEnv extends Env>(method: AnyAbilityMethodD
   return base
     .input(input)
     .output(output)
-    .handler(({ context, input: value }) => handler({ context: context as unknown as AbilityMethodContext, input: value })) as AnyProcedure;
+    .handler(({ context, input: value }) =>
+      invokeAbilityHandler(() => handler({ context: context as unknown as AbilityMethodContext, input: value })),
+    ) as AnyProcedure;
+}
+
+async function invokeAbilityHandler<T>(invoke: () => Promise<T> | T): Promise<T> {
+  try {
+    return await invoke();
+  } catch (error) {
+    throw new AbilityHandlerFailure(error);
+  }
+}
+
+function rejectPrototypePollutingInput(root: unknown): void {
+  const visited = new WeakSet<object>();
+  const stack = [root];
+  while (stack.length > 0) {
+    const value = stack.pop();
+    if (typeof value !== 'object' || value === null || visited.has(value)) continue;
+    visited.add(value);
+    if (Array.isArray(value)) {
+      stack.push(...value);
+      continue;
+    }
+    if (value instanceof Map) {
+      for (const [key, entry] of value) stack.push(key, entry);
+      continue;
+    }
+    if (value instanceof Set) {
+      for (const entry of value) stack.push(entry);
+      continue;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== null && prototype !== Object.prototype) continue;
+    if (
+      Object.hasOwn(value, '__proto__') ||
+      (Object.hasOwn(value, 'constructor') &&
+        typeof (value as { constructor?: unknown }).constructor === 'object' &&
+        (value as { constructor?: unknown }).constructor !== null &&
+        Object.hasOwn((value as { constructor: object }).constructor, 'prototype'))
+    ) {
+      throw new AbilityValidationError('Service-Plane ability input was blocked by prototype-pollution protection', 400);
+    }
+    for (const key of Object.keys(value)) stack.push((value as Record<string, unknown>)[key]);
+  }
+}
+
+function deadlineBoundIterator(
+  iterator: AsyncIterator<unknown>,
+  deadlineAt: number,
+  deadlineError: () => ServicePlaneTimeoutError,
+): AsyncIterableIterator<unknown> {
+  let terminalError: ServicePlaneTimeoutError | undefined;
+  let returnRequested = false;
+
+  const release = (value?: unknown): Promise<IteratorResult<unknown>> => {
+    if (returnRequested) return Promise.resolve({ done: true, value });
+    returnRequested = true;
+    try {
+      return iterator.return ? Promise.resolve(iterator.return(value)) : Promise.resolve({ done: true, value });
+    } catch {
+      return Promise.resolve({ done: true, value });
+    }
+  };
+
+  return {
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+    async next(...args: [] | [undefined]) {
+      if (terminalError) throw terminalError;
+      if (returnRequested) return { done: true, value: undefined };
+      try {
+        const result = await raceDeadline(Promise.resolve(iterator.next(...args)), {
+          deadlineAt,
+          deadlineError,
+        });
+        if (result.done) returnRequested = true;
+        return result;
+      } catch (error) {
+        if (error instanceof ServicePlaneTimeoutError) {
+          terminalError = error;
+          void release().catch(() => undefined);
+        }
+        throw error;
+      }
+    },
+    return(value?: unknown) {
+      return release(value);
+    },
+    throw(error?: unknown) {
+      if (returnRequested) return Promise.reject(error);
+      returnRequested = true;
+      try {
+        return iterator.throw ? Promise.resolve(iterator.throw(error)) : Promise.reject(error);
+      } catch (cause) {
+        return Promise.reject(cause);
+      }
+    },
+  };
 }
 
 /** Creates the private runtime context accepted by compiled ability methods. */
@@ -234,17 +418,46 @@ function hibernationIteratorSchema(): StandardSchemaV1<HibernationAsyncIteratorC
   };
 }
 
+function resolveProcedureDeadline(
+  callerDeadlineAt: number | undefined,
+  ceilingDeadlineAt: number | undefined,
+  ceilingMs: number | undefined,
+  methodName: string,
+): { at: number; error: () => ServicePlaneTimeoutError } | undefined {
+  if (callerDeadlineAt !== undefined && (ceilingDeadlineAt === undefined || callerDeadlineAt <= ceilingDeadlineAt)) {
+    return {
+      at: callerDeadlineAt,
+      error: () => new ServicePlaneTimeoutError(`Service-Plane ability method exceeded its caller's deadline: ${methodName}`),
+    };
+  }
+  if (ceilingDeadlineAt === undefined || ceilingMs === undefined) return undefined;
+  return {
+    at: ceilingDeadlineAt,
+    error: () => new ServicePlaneTimeoutError(`Service-Plane ability method exceeded its ${ceilingMs}ms limit: ${methodName}`),
+  };
+}
+
 function resolveMethodTimeoutMs(declared: number | undefined, fallback: false | number | undefined): number | undefined {
   if (declared === 0) return undefined;
   return declared ?? (fallback === false ? undefined : fallback);
 }
 
-function normalizeMethodError(
+function normalizeMethodError<TEnv extends Env>(
   error: unknown,
   methodName: string,
-  onHandlerFailure: ((cause: unknown, methodName: string) => void) | undefined,
+  onHandlerFailure: ((cause: unknown, methodName: string, context?: AbilityMethodContext<TEnv>) => void) | undefined,
+  context?: AbilityMethodContext<TEnv>,
 ): ORPCError<string, unknown> {
+  if (error instanceof AbilityHandlerFailure) {
+    const failure = abilityHandlerFailureCauses.get(error);
+    if (failure instanceof AbilityHandlerError) {
+      return servicePlaneOrpcError(servicePlaneErrorInfo(failure) as ServicePlaneErrorInfo);
+    }
+    return opaqueHandlerError(failure, methodName, onHandlerFailure, context);
+  }
+
   if (error instanceof ORPCError) {
+    if (servicePlaneOrpcErrors.has(error)) return error;
     if (error.cause instanceof ValidationError) {
       const issues = normalizeValidationIssues(error.cause.issues);
       if (error.code === 'BAD_REQUEST') {
@@ -263,16 +476,25 @@ function normalizeMethodError(
         status: 500,
       });
     }
-    return error;
+    return opaqueHandlerError(error, methodName, onHandlerFailure, context);
   }
 
   const classified = servicePlaneErrorInfo(error);
   if (classified) return servicePlaneOrpcError(classified);
 
+  return opaqueHandlerError(error, methodName, onHandlerFailure, context);
+}
+
+function opaqueHandlerError<TEnv extends Env>(
+  error: unknown,
+  methodName: string,
+  onHandlerFailure: ((cause: unknown, methodName: string, context?: AbilityMethodContext<TEnv>) => void) | undefined,
+  context?: AbilityMethodContext<TEnv>,
+): ORPCError<string, ServicePlaneRpcErrorData> {
   const opaque = new ServicePlaneError(`Service-Plane ability handler failed: ${methodName}`, 500);
   rememberHandlerFailureCause(opaque, error);
   try {
-    onHandlerFailure?.(error, methodName);
+    void Promise.resolve(onHandlerFailure?.(error, methodName, context)).catch(() => undefined);
   } catch {
     // A logging hook must never replace the failure it is reporting.
   }
@@ -280,10 +502,12 @@ function normalizeMethodError(
 }
 
 function servicePlaneOrpcError(info: ServicePlaneErrorInfo): ORPCError<string, ServicePlaneRpcErrorData> {
-  return new ORPCError(orpcErrorCode(info.status), {
+  const error = new ORPCError(orpcErrorCode(info.status), {
     data: { servicePlane: info },
     message: info.message,
   });
+  servicePlaneOrpcErrors.add(error);
+  return error;
 }
 
 /** Converts a classified Service Plane failure into its private wire representation. */
@@ -298,18 +522,40 @@ function orpcErrorCode(status: number): string {
       return 'BAD_REQUEST';
     case 401:
       return 'UNAUTHORIZED';
+    case 402:
+      return 'PAYMENT_REQUIRED';
     case 403:
       return 'FORBIDDEN';
     case 404:
       return 'NOT_FOUND';
     case 405:
       return 'METHOD_NOT_SUPPORTED';
+    case 406:
+      return 'NOT_ACCEPTABLE';
+    case 408:
+      return 'TIMEOUT';
+    case 409:
+      return 'CONFLICT';
     case 410:
       return 'GONE';
+    case 412:
+      return 'PRECONDITION_FAILED';
+    case 413:
+      return 'PAYLOAD_TOO_LARGE';
+    case 415:
+      return 'UNSUPPORTED_MEDIA_TYPE';
     case 422:
       return 'UNPROCESSABLE_CONTENT';
+    case 428:
+      return 'PRECONDITION_REQUIRED';
     case 429:
       return 'TOO_MANY_REQUESTS';
+    case 499:
+      return 'CLIENT_CLOSED_REQUEST';
+    case 501:
+      return 'NOT_IMPLEMENTED';
+    case 502:
+      return 'BAD_GATEWAY';
     case 503:
       return 'SERVICE_UNAVAILABLE';
     case 504:

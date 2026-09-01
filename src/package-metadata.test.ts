@@ -14,8 +14,9 @@ describe('package metadata', () => {
     // Validation is Standard Schema based, so no validation library is a peer dependency.
     expect(packageJson.peerDependencies?.zod).toBeUndefined();
     expect(Object.keys(packageJson.dependencies ?? {})).toEqual(
-      expect.arrayContaining(['@orpc/client', '@orpc/contract', '@orpc/hibernation', '@orpc/server']),
+      expect.arrayContaining(['@orpc/client', '@orpc/hibernation', '@orpc/server']),
     );
+    expect(packageJson.dependencies).not.toHaveProperty('@orpc/contract');
     expect(Object.keys(packageJson.peerDependencies ?? {}).some((name) => name.startsWith('@orpc/'))).toBe(false);
     expect(Object.keys(packageJson.dependencies ?? {}).some((name) => name.includes('capn'))).toBe(false);
   });
@@ -30,5 +31,13 @@ describe('package metadata', () => {
     expect(serviceApi).not.toHaveProperty('ORPCError');
     expect(serviceApi).not.toHaveProperty('HibernationHandlerPlugin');
     expect(serviceApi).not.toHaveProperty('BatchLinkPlugin');
+  });
+
+  it('keeps the manual broker engine behind the contract-first control-plane API', async () => {
+    const controlPlaneApi = (await import('./control-plane/index.js')) as Record<string, unknown>;
+
+    expect(controlPlaneApi).not.toHaveProperty('createControlPlaneRpcBroker');
+    expect(controlPlaneApi).not.toHaveProperty('controlPlaneBrokerRouter');
+    expect(controlPlaneApi).not.toHaveProperty('issueCapabilityTokenForCaller');
   });
 });

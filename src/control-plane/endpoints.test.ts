@@ -27,4 +27,9 @@ describe('cloudflareServiceBinding', () => {
     const abilityRpc = { invokeAbility: () => ({}) };
     expect(cloudflareServiceBinding({ abilityRpc, binding: serviceBindingStub(), id: 'hub' }).abilityRpc).toBe(abilityRpc);
   });
+
+  it('uses the service binding itself after an explicit native RPC opt-in', () => {
+    const binding = serviceBindingStub();
+    expect(cloudflareServiceBinding({ abilityRpc: true, binding, id: 'hub' }).abilityRpc).toBe(binding);
+  });
 });

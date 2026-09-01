@@ -1,6 +1,5 @@
-import { sign } from 'hono/jwt';
-import { decodeBase64Url } from 'hono/utils/encode';
-import { verifying } from 'hono/utils/jwt/jws';
+import { decodeBase64Url, encodeBase64Url } from 'hono/utils/encode';
+import { signing, verifying } from 'hono/utils/jwt/jws';
 import { CapabilityAuthError } from './errors.js';
 import {
   decodeServicePlaneJwkToken,
@@ -62,7 +61,7 @@ export async function signCapabilityToken(options: SignCapabilityTokenOptions): 
 
   return {
     expiresAt: new Date(expiresAtSeconds * 1000),
-    token: await sign(claims, servicePlaneJwkSigningKey(options.privateJwk, options.keyId), SERVICE_PLANE_JWK_ALGORITHM),
+    token: await signCapabilityClaims(claims, options.privateJwk, options.keyId),
   };
 }
 
@@ -288,6 +287,61 @@ function isBoundedClaimString(value: string): boolean {
 // is web-standard (crypto.subtle, atob, TextEncoder), so it behaves identically on Node 20+,
 // Bun, workerd, and Deno — the same matrix hono itself targets.
 const utf8Encoder = new TextEncoder();
+
+type SigningKeyCacheEntry = {
+  fingerprint: string;
+  key: Promise<CryptoKey>;
+};
+
+// Keyed weakly by the caller's JWK object, not by a string containing private material. The
+// control plane reuses its derived JWK object until rotation, so hot issuance imports once while a
+// retired key becomes collectible with the object that owned it. The fingerprint detects callers
+// that mutate one object in place and prevents an old CryptoKey from masking the change.
+const signingKeyCache = new WeakMap<object, SigningKeyCacheEntry>();
+
+async function signCapabilityClaims(claims: CapabilityClaims, privateJwk: JsonWebKey, keyId: string): Promise<string> {
+  const header = { alg: SERVICE_PLANE_JWK_ALGORITHM, kid: keyId, typ: 'JWT' };
+  const partialToken = `${encodeJwtPart(header)}.${encodeJwtPart(claims)}`;
+  const signature = await signing(
+    await importedSigningKey(privateJwk, keyId),
+    SERVICE_PLANE_JWK_ALGORITHM,
+    utf8Encoder.encode(partialToken),
+  );
+  return `${partialToken}.${encodeBase64Url(signature).replace(/=/gu, '')}`;
+}
+
+function encodeJwtPart(value: unknown): string {
+  return encodeBase64Url(utf8Encoder.encode(JSON.stringify(value)).buffer).replace(/=/gu, '');
+}
+
+function importedSigningKey(privateJwk: JsonWebKey, keyId: string): Promise<CryptoKey> {
+  const signingJwk = servicePlaneJwkSigningKey(privateJwk, keyId);
+  const fingerprint = signingKeyFingerprint(signingJwk);
+  const cached = signingKeyCache.get(privateJwk);
+  if (cached?.fingerprint === fingerprint) return cached.key;
+
+  const key = crypto.subtle.importKey('jwk', signingJwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+  const entry = { fingerprint, key };
+  signingKeyCache.set(privateJwk, entry);
+  key.catch(() => {
+    if (signingKeyCache.get(privateJwk) === entry) signingKeyCache.delete(privateJwk);
+  });
+  return key;
+}
+
+function signingKeyFingerprint(key: JsonWebKey): string {
+  return JSON.stringify([
+    key.kty ?? null,
+    key.crv ?? null,
+    key.x ?? null,
+    key.y ?? null,
+    key.d ?? null,
+    key.alg ?? null,
+    key.use ?? null,
+    key.key_ops ?? null,
+    key.ext ?? null,
+  ]);
+}
 
 async function verifyTokenSignature(token: string, key: JsonWebKey & { kid?: string }): Promise<void> {
   // WebCrypto's ECDSA JWK import ignores the key's advisory `alg` member (though it does enforce

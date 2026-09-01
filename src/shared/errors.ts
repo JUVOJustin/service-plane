@@ -6,6 +6,8 @@
 export type ServicePlaneErrorCode =
   /** Input or output did not satisfy the method's schema. */
   | 'ability_validation'
+  /** The caller locally cancelled an in-flight call. */
+  | 'cancelled'
   /** Token, scope, ingress, or proof-of-possession check refused the call. */
   | 'capability_auth'
   /** The ability handler failed deliberately and chose what the caller sees. */
@@ -176,6 +178,7 @@ export type ServicePlaneErrorInfo = {
 // would drift silently and make servicePlaneErrorInfo blind to the new code.
 const SERVICE_PLANE_ERROR_CODE_ROWS: Record<ServicePlaneErrorCode, true> = {
   ability_validation: true,
+  cancelled: true,
   capability_auth: true,
   handler: true,
   internal: true,
@@ -203,7 +206,9 @@ export function servicePlaneErrorInfo(error: unknown): ServicePlaneErrorInfo | u
   if (typeof nested !== 'object' || nested === null) return undefined;
   const { code, issues: rawIssues, message, reason, retryable, status } = nested as Record<string, unknown>;
   if (typeof code !== 'string' || !SERVICE_PLANE_ERROR_CODES.has(code)) return undefined;
-  if (typeof status !== 'number' || !Number.isInteger(status) || typeof retryable !== 'boolean') return undefined;
+  if (typeof status !== 'number' || !Number.isInteger(status) || status < 400 || status > 599 || typeof retryable !== 'boolean') {
+    return undefined;
+  }
   const issues = servicePlaneValidationIssues(rawIssues);
   return {
     code: code as ServicePlaneErrorCode,
@@ -216,7 +221,15 @@ export function servicePlaneErrorInfo(error: unknown): ServicePlaneErrorInfo | u
 }
 
 /** Converts a private transport error into the stable error exposed by ability clients. */
-export function servicePlaneClientError(error: unknown): ServicePlaneClientError {
+export function servicePlaneClientError(error: unknown, signal?: AbortSignal): ServicePlaneClientError {
+  if (signal?.aborted) {
+    return new ServicePlaneClientError({
+      code: 'cancelled',
+      message: cancellationMessage(signal.reason),
+      retryable: false,
+      status: 499,
+    });
+  }
   if (error instanceof ServicePlaneClientError) return error;
   const info = servicePlaneErrorInfo(error);
   if (info) return new ServicePlaneClientError(info);
@@ -228,10 +241,47 @@ export function servicePlaneClientError(error: unknown): ServicePlaneClientError
   });
 }
 
+function cancellationMessage(reason: unknown): string {
+  if (reason instanceof Error && reason.message) return reason.message;
+  if (typeof reason === 'string' && reason) return reason;
+  return 'Service Plane call was cancelled';
+}
+
+// Private transports may fail before Service Plane can attach its own error data. Keep their common
+// string codes at this boundary so callers still receive the correct HTTP-style status without the
+// underlying RPC package becoming part of the public API.
+const PRIVATE_TRANSPORT_ERROR_STATUSES = {
+  BAD_GATEWAY: 502,
+  BAD_REQUEST: 400,
+  CLIENT_CLOSED_REQUEST: 499,
+  CONFLICT: 409,
+  FORBIDDEN: 403,
+  GATEWAY_TIMEOUT: 504,
+  GONE: 410,
+  INTERNAL_SERVER_ERROR: 500,
+  METHOD_NOT_SUPPORTED: 405,
+  NOT_ACCEPTABLE: 406,
+  NOT_FOUND: 404,
+  NOT_IMPLEMENTED: 501,
+  PAYMENT_REQUIRED: 402,
+  PAYLOAD_TOO_LARGE: 413,
+  PRECONDITION_FAILED: 412,
+  PRECONDITION_REQUIRED: 428,
+  SERVICE_UNAVAILABLE: 503,
+  TIMEOUT: 408,
+  TOO_MANY_REQUESTS: 429,
+  UNAUTHORIZED: 401,
+  UNPROCESSABLE_CONTENT: 422,
+  UNSUPPORTED_MEDIA_TYPE: 415,
+} as const;
+
 function transportErrorStatus(error: unknown): number {
   if (!error || typeof error !== 'object') return 500;
   const status = (error as { status?: unknown }).status;
-  return typeof status === 'number' && Number.isInteger(status) && status >= 400 && status <= 599 ? status : 500;
+  if (typeof status === 'number' && Number.isInteger(status) && status >= 400 && status <= 599) return status;
+  const code = (error as { code?: unknown }).code;
+  if (typeof code !== 'string' || !Object.hasOwn(PRIVATE_TRANSPORT_ERROR_STATUSES, code)) return 500;
+  return PRIVATE_TRANSPORT_ERROR_STATUSES[code as keyof typeof PRIVATE_TRANSPORT_ERROR_STATUSES];
 }
 
 function servicePlaneValidationIssues(value: unknown): AbilityValidationIssue[] | undefined {

@@ -1,174 +1,132 @@
 ---
 name: service-plane
 description: >-
-  Activate when building, extending, reviewing, or debugging code that uses the
-  service-plane TypeScript library: defining abilities or capability scopes,
-  wiring a ServicePlaneService or ServicePlaneControlPlane, creating typed
-  ability clients, issuing or verifying capability tokens, configuring ingress or the
-  broker, or projecting abilities to OpenAPI, Swagger, or MCP. Also activate
-  when a repo depends on the service-plane npm package and the task touches
-  service-to-service auth, RPC transports, service discovery, or tool metadata,
-  even if the user does not name the library explicitly.
+  Activate when building, reviewing, or debugging the service-plane TypeScript
+  library: abilities, typed clients, capability tokens, service discovery,
+  control-plane brokering, REST/OpenAPI/MCP projections, Cloudflare bindings,
+  or Fetch/WebSocket transports.
 ---
 
-# service-plane
+# Service Plane
 
-`service-plane` is a TypeScript library for **ability-first service APIs**. It
-replaces the usual sprawl of REST routes, internal RPC, hand-written OpenAPI
-files, ad hoc auth checks, and separate AI-tool metadata with one source of
-truth: the **ability**.
+Service Plane is an ability-first TypeScript library. One Standard Schema contract drives runtime
+validation, typed clients, discovery, REST/OpenAPI, and MCP.
 
-An ability is a schema-backed RPC surface owned by a service. Each method
-declares one input schema, one output schema, required scopes, and optional
-REST and MCP metadata. Those schemas drive runtime validation, service
-discovery, OpenAPI generation, and MCP tool metadata — define once, project
-everywhere.
+## Boundaries
 
-Schemas are Standard Schema values (https://standardschema.dev), so the
-validation library belongs to the service, not to `service-plane`. A schema
-must implement both `~standard.validate` and `~standard.jsonSchema`
-(https://standardschema.dev/json-schema): ArkType 2.1.28+, Valibot 1.2+
-wrapped in `toStandardJsonSchema()`, VineJS 4.3+, Zod 4.2+, or any other
-implementation. Read the schemas the repo already uses rather than assuming
-Zod; the choice is per schema, not per service.
-
-## Mental model
-
-Three roles, three responsibilities. Keep them separate; most mistakes with
-this library come from blurring them.
-
-| Role | Owns | Package entry |
+| Role | Owns | Import |
 | --- | --- | --- |
-| **Service** | Defines abilities, verifies tokens, validates input/output, enforces scopes | `service-plane/service` |
-| **Control plane** | Discovers services, checks grants, issues short-lived capability tokens, brokers calls, projects OpenAPI/MCP | `service-plane/control-plane` |
-| **Caller** | Requests a token, creates a typed ability client, invokes methods | `service-plane/service` (client + transports) |
+| Service | Contracts, handlers, token/scope enforcement | `service-plane/service` |
+| Control plane | Discovery, grants, token issuance, routing, projections | `service-plane/control-plane` |
+| Caller | Authentication, typed invocation, per-call metadata | `service-plane/service` |
 
-The control plane is the **only** component that issues capability tokens
-(short-lived ES256 JWS). Services verify issuer, audience, expiry, signature,
-and scopes against the plane's JWKS before any handler runs. Only the control
-plane should call services — no direct ingress.
+Hono is the HTTP shell. Fetch/WebSocket serialization uses a private engine; never import or expose
+its procedures, plugins, clients, or errors. Cloudflare native RPC is the unary service-binding fast
+path, with binding Fetch for streams.
 
-Hono is the public HTTP shell (middleware, discovery, request ids). Service
-Plane owns typed method contracts, validation, errors, batching, compression,
-and hibernation; its private RPC engine owns Fetch/WebSocket serialization.
-Cloudflare native RPC bypasses serialization for unary service-binding calls.
-Method auth and Service Plane policy live in the method runtime, **not** in
-Hono middleware. Do not import or configure the private engine from consumer
-code.
+## Preferred Ability Shape
 
-## The four knobs
+```ts
+const ability = createAbilityBuilder<{ Bindings: Env }>();
 
-Every ability decision reduces to four independent settings. Never conflate
-them:
+export const contract = defineAbility({
+  id: 'tasks',
+  scopes: ['tasks.read'],
+  methods: {
+    get: ability.method({ input: GetTask, output: Task, scopes: ['tasks.read'] }),
+    watch: ability.stream({ input: Watch, output: Event, scopes: ['tasks.read'] }),
+  },
+});
 
-- **`exposure`** — discoverability in user-facing projections.
-  `'private'` (default) keeps the ability out of OpenAPI/Swagger/MCP;
-  `'published'` makes methods with `rest`/`mcp` metadata projectable.
-- **`access`** — which class of caller may reach the ability. `'plane'`
-  (default): the control plane or gateway owns any product-level
-  user/API-key/anonymous decision. `'service'`: authenticated service callers
-  only (service-to-service), enforced by the broker from the catalog *and* by
-  the service from its own definition, using the caller-access claim on the
-  token. Never use it to model end-user authentication.
-- **`scopes`** — what a signed token may do once the service receives it.
-  Declared in the service capability catalog (`defineCapabilities`),
-  referenced at ability level (maximum surface) and method level (minimum for
-  one operation). A method must not require a scope its ability does not
-  declare.
-- **`ingress`** — whether the service accepts only brokered Service Plane
-  calls. With `ingress: {}`, a valid but non-brokered token is rejected with
-  403 *before* input validation or handler creation.
+export const implementation = implementAbility(contract, {
+  get: ({ context, input }) => context.env.TASKS.get(input.id),
+  watch: async function* ({ context, input }) { /* yield validated items */ },
+});
+```
 
-## Dos
+Clients import `contract`; `ServicePlaneService` receives `implementation`. An inline `handler` in
+the method options is fine when the contract is service-local. Every method uses a single options
+object; omit `handler` for a portable contract.
 
-- **Do** define schemas once and let them drive validation, discovery,
-  OpenAPI, and MCP. Never hand-maintain a parallel JSON Schema or OpenAPI file.
-- **Do** use whichever Standard Schema library the service already depends on.
-  Do not add one to `service-plane` itself — it has no validation dependency.
-- **Do** declare every scope in `defineCapabilities` first; the service fails
-  at setup if an ability or method references an unknown scope — that is a
-  feature, not a bug to route around.
-- **Do** keep `exposure: 'private'` as the default and publish only abilities
-  meant to become product or integration surfaces.
-- **Do** let the ability wrapper do its job: handlers receive
-  already-validated input, and output is validated after return. Add
-  `requireScopes(...)` inside a handler only when custom logic needs the
-  identity object.
-- **Do** enable `ingress: {}` on services that must only process brokered
-  traffic, and route their callers through the control-plane broker.
-- **Do** pass product context (tenant, user, connection) through validated
-  input or project-specific token claims — identity stays small: caller
-  service id, audience, scopes, token id.
-- **Do** use the simplest caller auth that matches the boundary: service
-  bindings on same-account Cloudflare, JWK for external callers holding a
-  private key, HMAC only as a shared-secret fallback.
-- **Do** configure a `caller` resolver for the broker and MCP endpoints. They
-  fail closed: no resolver → 500, resolver returns nothing → 401. Anonymous
-  access is only ever an explicit fixed caller, never a default.
-- **Do** keep code runtime-agnostic: the same ability definitions run on
-  Cloudflare Workers and Node 20+ (`@hono/node-server`); only transports and
-  JWKS sourcing differ.
+Schemas must implement both Standard Schema validation and Standard JSON Schema. Use the consumer's
+existing schema library; never add one to Service Plane itself.
 
-## Don'ts
+## Security Rules
 
-- **Don't** put provider OAuth tokens or credentials in Service Plane
-  identity or workflow metadata. Store them in service-owned storage (e.g. a
-  Durable Object per connection) and route to it via validated input claims.
-- **Don't** share the STS signing secret beyond the control plane. Services
-  verify via JWKS; callers only ever hold short-lived tokens.
-- **Don't** use `access: 'service'` to model end-user authentication — it
-  restricts the ability to service callers, nothing more.
-- **Don't** weaken scope checks, grant checks, token validation, replay
-  protection, or ingress protection to make tests pass. The security model is
-  core package behavior.
-- **Don't** call an ingress-protected service directly (Service Plane Fetch or native
-  binding RPC) with an ordinary token — it will 403 by design. Go through the
-  broker so the token carries the signed broker claim.
-- **Don't** generate OpenAPI in services. Services expose discovery at
-  `/.well-known/service-plane/service.json`; the plane builds `/openapi.json`
-  and the MCP tool list from published metadata.
-- **Don't** default to WebSocket for worker-to-worker calls. Prefer native
-  service bindings for unary calls on Cloudflare and Service Plane Fetch elsewhere;
-  reserve WebSocket for long-lived, interactive streams.
-- **Don't** invent new secrets when an existing signed token claim or
-  caller-auth mechanism can express the boundary safely.
+- The control plane alone signs capabilities; services verify issuer, audience, expiry, signature,
+  ingress, access, proof, and method scopes before input validation.
+- Enable `ingress: {}` when only the broker may reach a service.
+- `exposure` controls projection; `access` controls caller class; `scopes` control capability
+  authorization. Do not substitute one for another.
+- `access: 'service'` means an authenticated service caller, not an end user.
+- Product REST/MCP/broker auth belongs in `invocationMiddleware`. It must authenticate and set
+  `servicePlaneCaller`, or return its own refusal before `next()`.
+- `BrokeredAbilityTransport.headers` authenticates Fetch only. Authenticate a broker WebSocket's
+  physical HTTP upgrade with a browser cookie, short-lived URL ticket, or runtime-owned
+  `createWebSocket` closure that sets headers.
+- Set caller `kind: 'service'` only for a proven service. Users, API keys, automation, and anonymous
+  sessions are `kind: 'user'`; use `principalKind` for their application category.
+- Never authorize from `connInfo` or an unverified header. Forwarded connection data is advisory.
+- Never put provider credentials in capability identity or workflow metadata. Keep them in
+  service-owned storage and route with validated IDs.
+- Never weaken validation, grants, scope checks, replay bounds, or ingress to make tests pass.
 
-## Going deeper
+Handlers receive authorized `context.identity` and validated `input`; declared scopes need no
+second manual check. Arbitrary handler errors are opaque to callers. Use `AbilityHandlerError` only
+for an intentional, caller-safe message.
 
-The bundled references are the library's full documentation set. Load the
-one that matches the task; they cross-link with relative links, so follow
-those within `references/` as needed.
+## Runtime Choices
 
-- Concept, request flow, where auth and validation live, core terms:
-  LOAD references/architecture.md
-- Creating or changing a service (capabilities, abilities, handlers,
-  mounting the shell): LOAD references/service-creation.md
-- Creating or changing a control plane (grants, broker, ingress, caches):
-  LOAD references/plane-creation.md
-- Token flow, caller auth options, identity vs. context, scope checks:
-  LOAD references/auth.md
-- Streaming ability methods, hibernation, broker/MCP streaming:
-  LOAD references/streaming.md
-- Which transport to use between services (environment, performance, cost):
-  LOAD references/transports.md
-- API lookup: option shapes, routes, transports, logging events, errors:
-  LOAD references/reference.md
-- OpenAPI, Swagger UI/Scalar, MCP tools and their fail-closed callers:
-  LOAD references/openapi-mcp.md
-- Cloudflare Workers, bindings, Durable Objects, edge caching:
-  LOAD references/cloudflare.md
-- Node.js and self-hosted services: LOAD references/nodejs.md
-- Updating consumers from the former public oRPC surface:
-  LOAD references/migration-rpc-boundary.md
+- Same-account/bound Workers, unary: service-binding native RPC.
+- Bound Worker stream or cross-runtime call: Fetch.
+- Long-lived interactive stream: WebSocket.
+- Sleeping Durable Object subscription: direct hibernating WebSocket.
+- Public browser/headless caller: broker, REST, or MCP through the control plane.
 
-When working inside the service-plane repository itself (not a consumer),
-`docs/` is the source of truth for these files (synced via
-`npm run sync:skill-docs`), and `AGENTS.md` defines the package boundaries.
+Batching combines only concurrent unary calls on one Fetch hop. For broker clients it reduces only
+caller-to-plane round trips; downstream calls remain individual. Streams and WebSockets are never
+batched. Hibernation requires a direct service WebSocket/Durable Object; broker and in-process
+ability clients fail fast.
 
-## Verifying changes
+`plane.abilityClient({ ability, targetServiceId, caller?, scopes? }, bindings)` infers methods and
+required scopes from the contract. Extra `scopes` are additive. Endpoint, grants, and issuer resolve
+per call; method calls may override request ID, idempotency key, and timeout.
 
-In a consumer repo, run its normal checks. In the service-plane repo itself:
+Defined `timeoutMs` values fail on invalid input, expire immediately at `0`, and clamp above the
+maximum. Caller aborts surface as `ServicePlaneClientError` with `code: 'cancelled'`, status 499,
+and `retryable: false`. `rest: false` disables the control-plane REST facade and catch-all only.
+
+## References
+
+Load only the document needed for the task:
+
+- Model and ownership: `references/architecture.md`
+- Define and implement abilities: `references/service-creation.md`
+- Configure the plane, grants, and caches: `references/plane-creation.md`
+- Auth, delegation, keys, ingress: `references/auth.md`
+- Streams and hibernation: `references/streaming.md`
+- Transport and performance choices: `references/transports.md`
+- REST, OpenAPI, MCP: `references/openapi-mcp.md`
+- Cloudflare or Node deployment: `references/cloudflare.md`, `references/nodejs.md`
+- Exact API/default lookup: `references/reference.md`
+- Breaking migration: `references/migration-rpc-boundary.md`
+
+Inside the Service Plane repository, edit `docs/`, never `references/`, then run
+`npm run sync:skill-docs`.
+
+## Verification
 
 ```sh
-npm run check && npm run typecheck && npm run test && npm run build
+npm run check
+npm run typecheck
+npm run test
+npm run build
 ```
+
+## Releases
+
+Releases are repository-owned. Update `package.json` and `package-lock.json` to the intended version
+in a reviewed release PR, then create a GitHub release with the matching SemVer `v*` tag. The
+release workflow verifies that the tag and committed package version agree, reruns the complete
+package verification, and publishes stable versions to npm `latest` or prereleases to `next` with
+provenance. Never publish from a standalone local tag.

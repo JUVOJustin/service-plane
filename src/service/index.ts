@@ -55,6 +55,7 @@ export type {
   CapabilityTokenCacheEntry,
   CapabilityTokenProvider,
   CapabilityVerifierOptions,
+  ControlPlaneRpcTokenBinding,
   FetchLike,
   IssueCapabilityTokenInput,
   IssuedCapabilityToken,
@@ -65,6 +66,7 @@ export type {
   McpServicePlaneMeta,
   McpToolDiscovery,
   OpenApiObject,
+  PinnedCapabilityTokenInput,
   ServiceAbilityDiscovery,
   ServiceAbilityMcpProjection,
   ServiceAbilityMcpPromptArgument,
@@ -93,14 +95,18 @@ export {
 export type {
   AbilityMethodContext,
   AbilityMethodDefinition,
+  AbilityMethodHandlerFor,
   AbilityMethodKind,
   AbilityMethodMetadata,
   AbilitySchema,
   AbilityStream,
+  AbilityStreamMethodOptions,
+  AbilityStreamSource,
+  AbilityUnaryMethodOptions,
   AnyAbilityMethodDefinition,
   ServiceAbilityWebSocket,
 } from './ability.js';
-export { AbilityHibernationStream, createAbilityBuilder } from './ability.js';
+export { AbilityHibernationStream, createAbilityBuilder, toAbilityStream } from './ability.js';
 export {
   type GenerateServiceCallerSigningJwkOptions,
   generateServiceCallerSigningJwk,
@@ -111,8 +117,6 @@ export type {
   CapabilityTokenRequester,
   ControlPlaneHmacTokenRequesterOptions,
   ControlPlaneJwkTokenRequesterOptions,
-  ControlPlaneRpcCallerTokenBinding,
-  ControlPlaneRpcTokenBinding,
   ControlPlaneRpcTokenRequesterOptions,
   CreateCapabilityTokenProviderOptions,
   JwkCapabilityProofSignerOptions,
@@ -126,6 +130,8 @@ export {
   controlPlaneJwkTokenRequester,
   controlPlaneRpcTokenRequester,
   createCapabilityTokenProvider,
+  DEFAULT_CAPABILITY_JWKS_RESPONSE_MAX_BYTES,
+  DEFAULT_CAPABILITY_TOKEN_RESPONSE_MAX_BYTES,
   defineCapabilities,
   jwkCapabilityProofSigner,
   jwksFromServiceBinding,
@@ -135,17 +141,20 @@ export {
 } from './capabilities.js';
 export type {
   AbilityClientTransport,
+  AbilityClientWebSocket,
   AbilityNativeBinding,
+  BrokeredAbilityCallOptions,
   BrokeredAbilityTransport,
   CreateAbilityClientOptions,
   CreateBrokeredAbilityClientOptions,
   NativeAbilityCall,
   ServicePlaneWebSocketReconnectOptions,
 } from './client.js';
-export { createAbilityClient, createBrokeredAbilityClient } from './client.js';
+export { createAbilityClient, createBrokeredAbilityClient, disposeAbilityClient } from './client.js';
 export type {
   AbilityCallOptions,
   AbilityClient,
+  AbilityImplementation,
   AbilityMethodDefinitions,
   AnyServiceAbilityDefinition,
   DefineServiceInput,
@@ -159,6 +168,7 @@ export {
   defaultAbilityRpcPath,
   defineAbility,
   defineAbilityService,
+  implementAbility,
   serviceDiscoveryDocument,
 } from './discovery.js';
 export type { AbilityHibernationEventOptions } from './hibernation.js';
@@ -177,11 +187,12 @@ export {
   type ServicePlaneServiceIngressOptions,
   type ServicePlaneServiceOptions,
 } from './service.js';
-export type {
-  ServicePlaneBatchOptions,
-  ServicePlaneClientCompressionOptions,
-  ServicePlaneClientWireOptions,
-  ServicePlaneCompressionEncoding,
-  ServicePlaneServerCompressionOptions,
-  ServicePlaneServerWireOptions,
+export {
+  DEFAULT_SERVICE_PLANE_RPC_MAX_REQUEST_BODY_BYTES,
+  type ServicePlaneBatchOptions,
+  type ServicePlaneClientCompressionOptions,
+  type ServicePlaneClientWireOptions,
+  type ServicePlaneCompressionEncoding,
+  type ServicePlaneServerCompressionOptions,
+  type ServicePlaneServerWireOptions,
 } from './wire-options.js';

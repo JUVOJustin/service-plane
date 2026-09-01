@@ -1,176 +1,192 @@
 # Choosing A Transport
 
-Goal: choose the caller-to-plane and plane-to-service transports independently.
+Start with the topology, then optimize measured bottlenecks. The public API stays the same across
+transports.
 
-The production topology has two hops:
+## Decision Table
 
-```text
-application -> control plane -> private service
+| Hop | Recommended transport | Why |
+| --- | --- | --- |
+| Cloudflare Worker → bound Worker, unary | `service-binding` native RPC | No Service Plane HTTP/JSON codec; platform-owned routing |
+| Cloudflare Worker → bound Worker, stream | Service-binding Fetch | Streaming codec and backpressure |
+| Node, another account, or another runtime | Fetch | Universal, stateless, easy to observe |
+| Browser/headless client → control plane | Broker Fetch, REST, or MCP | Keeps services and capability tokens private |
+| Interactive, long-lived session | WebSocket | Reuses one connection and supports streams |
+| Durable Object that must sleep | Direct hibernating WebSocket | Runtime owns socket state across wake-ups |
+
+Do not expose private services merely to avoid one control-plane hop. On Cloudflare, keep the plane
+public and use service bindings for its downstream calls.
+
+## Fetch
+
+Fetch is the default ability transport and the right baseline for most deployments:
+
+```ts
+const client = createAbilityClient({
+  ability: tasksContract,
+  requestToken,
+  callerServiceId: 'workflow-service',
+  targetServiceId: 'tasks-service',
+  transport: {
+    type: 'fetch',
+    origin: 'https://tasks.internal.example',
+  },
+});
 ```
 
-Both hops use Service Plane RPC, but they solve different problems. The public hop authenticates an application
-caller and exposes one stable API. The private hop carries a short-lived brokered capability token to
-the service that owns the ability. Keeping the control plane in the path is what enforces discovery,
-grants, delegation, ingress, and central MCP/OpenAPI exposure.
-
-## Transport Matrix
-
-| Transport | Use | Unary | Streams | Connection state |
-| --- | --- | --- | --- | --- |
-| Fetch | default public and private RPC | yes | yes | none |
-| Fetch + batching | concurrent small calls | yes | not for hibernation streams | none |
-| WebSocket | interactive or high-frequency sessions | yes | yes | caller owns reconnect |
-| Cloudflare native service binding | plane-to-service in one account | yes, without HTTP serialization | uses the binding's Fetch fallback | none for unary |
-
-`createBrokeredAbilityClient()` configures the application-to-plane hop. The control plane chooses the
-private hop from service discovery and the endpoint registered with `cloudflareServiceBinding()` or
-`httpsService()`.
-
-## Recommended Defaults
-
-1. Use Fetch from browsers, headless fronts, cron jobs, and ordinary services to the control plane.
-2. Register a Cloudflare service binding with `abilityRpc.invokeAbility` for services in the same
-   account. The broker uses native RPC for unary methods and binding Fetch for streams.
-3. Use WebSocket when the application needs a long-lived interactive stream or enough repeated calls
-   to justify connection ownership.
-4. Add batching for bursts of independent unary calls. Add compression for large payloads after
-   measuring CPU and transfer size.
-
-This means a deployment with one public control-plane Worker still gets native Worker-to-Worker RPC.
-The browser or headless front calls only the control plane; the control plane then calls an auxiliary
-service Worker through its private binding. The service Worker does not need public ingress.
+It is request-scoped, works across runtimes, and carries unary results and ordinary streams. It also
+supports Service Plane batching and compression.
 
 ## Cloudflare Service Bindings
 
-Expose `ServicePlaneService.invokeAbility` from the service's Worker entrypoint and register it
-explicitly on the control plane:
+Declare the fast path on the ability and endpoint:
 
 ```ts
+// Service contract
+rpc: { transports: ['fetch', 'service-binding'] }
+
+// Control-plane endpoint
 cloudflareServiceBinding({
-  id: 'tasks',
+  id: 'tasks-service',
   binding: c.env.TASKS,
-  abilityRpc: {
-    invokeAbility: (input) => c.env.TASKS.invokeAbility(input),
-  },
-  grants: [{ caller: 'headless-front', scopes: ['tasks.read'] }],
+  abilityRpc: true,
+  grants,
 })
 ```
 
-The explicit `abilityRpc` option matters. A Cloudflare binding proxy makes every property appear
-callable, so runtime feature probing cannot reliably distinguish a Worker that really exports
-`invokeAbility`.
+Unary calls use `invokeAbility` without Service Plane's HTTP/JSON codec. Ordinary streams
+automatically use `binding.fetch`. Cloudflare RPC can carry `ReadableStream` values, but Service
+Plane does not yet use that path: the Fetch stream adapter already owns validation, cancellation,
+backpressure, and connection cleanup consistently across runtimes. A native stream path should be
+added only with the same lifecycle guarantees and a measured gain. Native calls bypass Hono
+middleware, so security and invariants must live in the ability policy or handler. Service Plane
+still verifies tokens, scopes, ingress, schemas, and deadlines on this path.
 
-Native RPC is intentionally unary. A live async iterator needs the streaming codec and backpressure,
-so the client and broker route that method through `binding.fetch`. This is still private
-Worker-to-Worker traffic through the service binding.
+Cloudflare allows at most 32 Worker invocations from one originating request. Every downstream
+service-binding call still counts, including calls unpacked from a public batch. Native RPC values
+are limited to 32 MiB; larger byte streams use ownership-transferring `ReadableStream` values, which
+is a different lifecycle from Service Plane's typed item streams. See Cloudflare's
+[service-binding limits](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/#limits)
+and [RPC stream rules](https://developers.cloudflare.com/workers/runtime-apis/rpc/#readablestream-writablestream-request-and-response).
 
 ## WebSocket
 
-For a public interactive client:
+Use WebSocket when a session is genuinely long-lived or interactive:
 
 ```ts
-const tasks = createBrokeredAbilityClient({
-  ability: tasksAbility,
-  scopes: ['tasks.read'],
-  targetServiceId: 'tasks',
+const client = createBrokeredAbilityClient({
+  ability: eventsContract,
+  targetServiceId: 'events-service',
   transport: {
     type: 'websocket',
     url: 'wss://api.example.com/rpc/broker/ws',
-    reconnect: { enabled: true },
+    reconnect: { enabled: true, maxAttempt: 5 },
   },
 });
 ```
 
-Configure `broker.upgradeWebSocket` on `ServicePlaneControlPlane`. For a direct service WebSocket,
-declare `websocket` on the ability and configure `rpc.upgradeWebSocket` on `ServicePlaneService`.
-Authentication headers are sent per logical call, so a refreshed capability token does not require
-rebuilding the ability client.
+The server needs a runtime-specific `upgradeWebSocket`. A socket saves repeated connection setup,
+but adds connection ownership, reconnect policy, idle lifecycle, and deploy behavior. Fetch is
+usually simpler for sporadic calls.
 
-A WebSocket is bound to the process or isolate serving it. Reconnect can restore the transport, but
-it cannot make an in-flight non-idempotent mutation safe to replay. Retry only methods declared
-idempotent or protected by an idempotency key.
+A broker socket authenticates its physical HTTP upgrade, not each logical call. Browser clients
+normally use a secure cookie or short-lived URL ticket. Server runtimes may close over a WebSocket
+implementation that adds upgrade headers in `createWebSocket`. `transport.headers` is available on
+broker Fetch only. Request ID, idempotency key, and timeout remain per-call metadata after the
+socket is accepted.
 
-## Durable Object Hibernation
+Hibernation is a special direct-service WebSocket mode; see [streaming](streaming.md). It is never
+brokered, opened by `plane.abilityClient`, or batched; those clients fail fast.
 
-Hibernation is endpoint-local: the Durable Object must own the client-facing WebSocket. A
-normal control-plane broker can proxy a live iterator, but cannot hibernate its public socket by
-borrowing a private service's subscription id. In a strict one-public-control-plane deployment, use
-ordinary brokered Fetch/WebSocket streams unless the application adds a deliberate control-plane
-handoff to a Durable Object. Service Plane does not currently ship that handoff protocol.
+## Batch Concurrent Fetch Calls
 
-Hibernation requires three pieces:
-
-- methods declared with `ability.hibernationStream()` that return `AbilityHibernationStream`
-- a Durable Object that accepts the socket with `acceptWebSocket` and forwards platform events to
-  `service.webSocketMessage()` and `service.webSocketClose()`
-- `rpc.manualWebSocket: true` on the service; the internal hibernation support is installed
-  automatically
-
-Set `rpc.manualWebSocket: true` when the Durable Object owns acceptance instead of a Hono upgrade
-helper. The plugin serializes the iterator subscription id into the socket attachment; application
-code sends later events with `encodeAbilityHibernationEvent(outputSchema, id, value)`. That helper
-validates each awakened yield against the method's output schema before encoding it.
-
-Hibernating methods use WebSocket and are not placed into finite Fetch batches.
-
-## Batching And Compression
-
-Enable a feature on both ends of the same hop:
+Enable batching on both ends:
 
 ```ts
-const service = new ServicePlaneService({
-  // ...
-  rpc: {
-    batch: { maxSize: 20 },
-    compression: true,
-  },
-});
+// Service or public broker
+rpc: {
+  batch: { maxSize: 20 },
+}
 
-const client = createAbilityClient({
-  // ...
-  transport: {
-    type: 'fetch',
-    batch: { maxSize: 20 },
-    compression: true,
-  },
-});
+// Client transport
+transport: {
+  type: 'fetch',
+  origin: 'https://api.example.com',
+  batch: { maxSize: 20 },
+}
 ```
 
-Service Plane chooses the internal plugin order so compression sees the final combined request or
-response. Batching reduces request count but also couples latency: the group completes at the speed
-of its slowest subrequest. Use separate clients when calls need different batching policies.
+Batching combines only concurrent unary logical calls into one physical Fetch request. Streams and
+WebSocket calls never enter a batch. Every subrequest retains its own method scopes, request ID,
+idempotency key, and timeout.
 
-The same stable options exist on the control-plane broker. Batching on the application client and
-broker handler combines several application-to-plane calls; it does not turn the subsequent calls
-to different services into one network request.
+The largest win is usually a high-latency public or HTTP/1.1 hop. HTTP/2 and HTTP/3 already
+multiplex concurrent requests on one connection, so batching saves less there; measure before
+accepting batch-wide latency coupling.
 
-## TanStack Query Does Not Change Routing
+For a brokered client, batching removes caller-to-plane round trips only. The plane still performs
+authorization, token handling, and one downstream service invocation per logical call. It is not a
+distributed fan-in protocol. `servicePlaneConnInfo` also remains owned by trusted invocation
+middleware, not by individual public calls.
 
-`createBrokeredAbilityClient()` returns promise-returning typed methods, so use them directly as
-TanStack Query `queryFn` or `mutationFn` callbacks. No RPC-engine adapter is required or supported.
-TanStack Query still calls the one public control plane. The plane still discovers the target,
-checks grants, mints a brokered token, and calls the service. Client caching and request
-deduplication do not bypass Service Plane.
+Use a bounded `maxSize`; an unbounded batch turns one request into unbounded service work. On
+Cloudflare, leave room below the 32-invocation request limit for any other Workers called by the
+plane or target services. The example size of 20 is a starting point, not a universal default.
 
-## Rule Of Thumb
+## Compress Fetch Payloads
 
-```mermaid
-flowchart TD
-  A["Application calls an ability"] --> B{"Long-lived interactive stream?"}
-  B -- no --> F["Fetch to control plane"]
-  B -- yes --> W["WebSocket to control plane"]
-  F --> C{"Concurrent small unary calls?"}
-  C -- yes --> BA["Enable batch"]
-  C -- no --> P["Keep plain Fetch"]
-  W --> H{"Durable Object must sleep?"}
-  H -- yes --> HI["Manual WS events + hibernation method"]
-  H -- no --> WS["Normal upgrade adapter"]
-  P --> S{"Target service has a same-account binding?"}
-  BA --> S
-  WS --> S
-  HI --> S
-  S -- yes --> N["Native unary; binding Fetch streams"]
-  S -- no --> HF["HTTPS Fetch or WebSocket to service"]
+```ts
+// Server
+rpc: {
+  compression: {
+    request: true,
+    response: { encodings: ['gzip', 'deflate'], threshold: 1_024 },
+  },
+}
+
+// Client
+transport: {
+  type: 'fetch',
+  origin: 'https://api.example.com',
+  compression: {
+    request: { encoding: 'gzip', threshold: 1_024 },
+    response: true,
+  },
+}
 ```
 
-Next: [Streaming](streaming.md), [Cloudflare](cloudflare.md), [Node.js](nodejs.md), and the [reference](reference.md).
+Supported Service Plane encodings are `gzip`, `deflate`, and `deflate-raw`; choose only values
+available in the target runtime. Compression helps large JSON or text payloads and usually hurts
+small requests through extra CPU and latency. Measure with realistic payloads.
+
+Every RPC server rejects decoded request bodies and individual WebSocket messages larger than one
+MiB by default, including compressed and batched requests. Change `maxRequestBodyBytes`
+deliberately; `false` disables the guard.
+
+## Performance Expectations
+
+The useful ordering is stable even when absolute numbers change by machine:
+
+1. A direct in-process method call is cheapest.
+2. Cloudflare native binding RPC avoids Service Plane's HTTP/JSON codec for unary calls.
+3. Fetch adds encoding and request dispatch.
+4. A public broker adds discovery/grant/token work plus a second hop.
+5. Batching amortizes the first Fetch hop; it does not erase downstream work.
+
+`npm run bench` measures the current engine, Service Plane middleware, token signing, discovery,
+REST matching, native calls, Fetch, broker calls, batching, and streams. Treat those as regression
+benchmarks, not production latency claims: network, runtime placement, payload size, schema
+complexity, cold starts, and storage usually dominate microbenchmarks. The project does not publish
+an apples-to-apples Cap'n Web benchmark, so do not infer a protocol speedup from the framework
+migration alone.
+
+## Practical Defaults
+
+- Keep Fetch enabled on every ordinary ability.
+- Add `service-binding` for unary calls between bound Workers.
+- Add WebSocket only for a stream or session that benefits from it.
+- Enable batching for measured bursts of concurrent unary calls.
+- Enable compression above a measured payload threshold.
+- Preserve the one-MiB decoded request limit unless the API requires more.
+
+See [Cloudflare](cloudflare.md), [Node.js](nodejs.md), and [streaming](streaming.md).

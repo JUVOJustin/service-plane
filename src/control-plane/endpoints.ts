@@ -8,7 +8,8 @@ import {
 } from '../shared/types.js';
 
 export function cloudflareServiceBinding(input: {
-  abilityRpc?: ServiceAbilityNativeRpcBinding;
+  /** Enables native unary RPC on `binding`, or supplies a separate native RPC adapter. */
+  abilityRpc?: true | ServiceAbilityNativeRpcBinding;
   binding: FetchLike & Partial<ServiceAbilityNativeRpcBinding>;
   discovery?: ServiceDiscoveryDocument | (() => Promise<ServiceDiscoveryDocument> | ServiceDiscoveryDocument);
   grants?: ServiceEndpointGrant[];
@@ -17,9 +18,11 @@ export function cloudflareServiceBinding(input: {
 }): ServiceEndpoint {
   // Native ability RPC must be opted into explicitly with `abilityRpc`. A Workers service-binding
   // stub returns a callable proxy for any property name, so feature probing cannot distinguish a
-  // service that implements `invokeAbility` from one that does not.
+  // service that implements `invokeAbility` from one that does not. `true` is the caller's explicit
+  // assertion that the same binding implements it; an object remains available for custom adapters.
+  const abilityRpc = input.abilityRpc === true ? (input.binding as ServiceAbilityNativeRpcBinding) : input.abilityRpc;
   return {
-    ...(input.abilityRpc ? { abilityRpc: input.abilityRpc } : {}),
+    ...(abilityRpc ? { abilityRpc } : {}),
     ...(input.discovery ? { discovery: input.discovery } : {}),
     fetch: (request) => input.binding.fetch(request),
     ...(input.grants ? { grants: input.grants } : {}),

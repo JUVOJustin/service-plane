@@ -16,7 +16,7 @@ export type AbilitySchema = StandardSchemaV1 & StandardJSONSchemaV1;
 export type ServiceAbilityWebSocket = {
   /** Reads a Durable Object Hibernation attachment when the runtime supports it. */
   deserializeAttachment?: () => unknown;
-  /** Sends a WebSocket frame. */
+  /** Writes an application frame to the authorized socket; the transport owns framing and delivery. */
   send(data: string | ArrayBuffer | Uint8Array<ArrayBuffer>): unknown;
   /** Stores a Durable Object Hibernation attachment when the runtime supports it. */
   serializeAttachment?: (attachment: unknown) => void;
@@ -26,6 +26,8 @@ export type ServiceAbilityWebSocket = {
 export type AbilityMethodContext<TEnv extends Env = Env> = {
   /** The ability owning the running method. */
   abilityId: string;
+  /** Public method currently executing, useful for correctly scoped deduplication and metrics. */
+  methodName: string;
   /** Advisory connection information forwarded by an authenticated control plane. */
   connInfo?: ConnInfo;
   /** Runtime bindings without requiring method code to depend on Hono. */
@@ -67,6 +69,8 @@ export type AbilityMethodMetadata = {
 /** Execution shape of a method independent of its wire protocol. */
 export type AbilityMethodKind = 'hibernation' | 'stream' | 'unary';
 
+declare const ABILITY_METHOD_DEFINITION_BRAND: unique symbol;
+
 /**
  * Portable method contract. Its phantom type field drives clients and handlers without exposing
  * the RPC engine used to execute it.
@@ -77,13 +81,15 @@ export type AbilityMethodDefinition<
   TOutput extends AbilitySchema = AbilitySchema,
   TKind extends AbilityMethodKind = AbilityMethodKind,
 > = {
-  /** Input schema shared by validation and projections. */
+  /** Nominal marker: method definitions are created by {@link createAbilityBuilder}. */
+  readonly [ABILITY_METHOD_DEFINITION_BRAND]: true;
+  /** Validates caller data before handler execution and drives client input inference and projections. */
   input: TInput;
   /** Whether the method returns one value, a stream, or a hibernating subscription. */
   kind: TKind;
   /** Service Plane policy and projection metadata. */
   metadata: AbilityMethodMetadata;
-  /** Output schema, or yielded-item schema for streams. */
+  /** Validates each boundary result and drives client output inference and projections. */
   output: TOutput;
   /** Compile-time method information; absent at runtime. */
   readonly '~types'?: {
@@ -109,6 +115,9 @@ type Promisable<T> = T | Promise<T>;
 /** Async iterator returned by streaming ability clients. */
 export type AbilityStream<T> = AsyncIterable<T> & AsyncIterator<T, unknown, void>;
 
+/** Runtime-neutral source accepted from an ordinary streaming ability handler. */
+export type AbilityStreamSource<T> = AsyncIterable<T> | (Iterable<T> & object) | ReadableStream<T>;
+
 type UnaryHandler<TEnv extends Env, TInput extends AbilitySchema, TOutput extends AbilitySchema> = (options: {
   context: AbilityMethodContext<TEnv>;
   input: StandardSchemaV1.InferOutput<TInput>;
@@ -117,7 +126,7 @@ type UnaryHandler<TEnv extends Env, TInput extends AbilitySchema, TOutput extend
 type StreamHandler<TEnv extends Env, TInput extends AbilitySchema, TOutput extends AbilitySchema> = (options: {
   context: AbilityMethodContext<TEnv>;
   input: StandardSchemaV1.InferOutput<TInput>;
-}) => Promisable<AbilityStream<StandardSchemaV1.InferInput<TOutput>>>;
+}) => Promisable<AbilityStreamSource<StandardSchemaV1.InferInput<TOutput>>>;
 
 type HibernationHandler<TEnv extends Env, TInput extends AbilitySchema, TOutput extends AbilitySchema> = (options: {
   context: AbilityMethodContext<TEnv>;
@@ -127,6 +136,7 @@ type HibernationHandler<TEnv extends Env, TInput extends AbilitySchema, TOutput 
 type AbilityMethodHandler = (options: { context: AbilityMethodContext; input: unknown }) => Promisable<unknown>;
 
 const methodHandlers = new WeakMap<object, AbilityMethodHandler>();
+const methodDefinitions = new WeakSet<object>();
 const hibernationCallbacks = new WeakMap<object, (id: string) => Promisable<void>>();
 
 /**
@@ -142,11 +152,28 @@ export class AbilityHibernationStream<T> {
   }
 }
 
+/** Converts a readable, iterable, or async iterable source to the iterator used on the wire. */
+export function toAbilityStream<T>(source: AbilityStreamSource<T>): AbilityStream<T> {
+  if (isAbilityStream(source)) return source;
+  if (isReadableStream(source)) return readableAbilityStream(source);
+  if (!source || typeof source !== 'object') {
+    throw new TypeError('Service-Plane stream handler must return a ReadableStream, iterable, or async iterable object');
+  }
+  if (Symbol.asyncIterator in source) return iteratorAbilityStream(source[Symbol.asyncIterator]());
+  if (Symbol.iterator in source) return iteratorAbilityStream(source[Symbol.iterator]());
+  throw new TypeError('Service-Plane stream handler must return a ReadableStream, iterable, or async iterable object');
+}
+
 /** Reads the handler kept outside the serializable method contract. */
 export function abilityMethodHandler(method: AnyAbilityMethodDefinition): AbilityMethodHandler {
   const handler = methodHandlers.get(method);
   if (!handler) throw new TypeError('Service-Plane method has no handler');
   return handler;
+}
+
+/** Returns whether a portable method contract already has a service-side implementation. */
+export function isImplementedAbilityMethod(method: AnyAbilityMethodDefinition): boolean {
+  return methodHandlers.has(method);
 }
 
 /** Reads the subscription callback used by the internal hibernation runtime. */
@@ -158,100 +185,97 @@ export function abilityHibernationCallback(stream: AbilityHibernationStream<unkn
 
 /** Returns true only for a method produced by createAbilityBuilder. */
 export function isAbilityMethodDefinition(value: unknown): value is AnyAbilityMethodDefinition {
-  return Boolean(value && typeof value === 'object' && methodHandlers.has(value as object));
+  return Boolean(value && typeof value === 'object' && methodDefinitions.has(value as object));
 }
 
-type UnaryInputBuilder<TEnv extends Env> = {
-  /** Declares the method input schema. */
-  input<TInput extends AbilitySchema>(input: TInput): UnaryOutputBuilder<TEnv, TInput>;
+/** Concise unary method declaration, optionally carrying an inline implementation. */
+export type AbilityUnaryMethodOptions<
+  TEnv extends Env,
+  TInput extends AbilitySchema,
+  TOutput extends AbilitySchema,
+> = AbilityMethodMetadata & {
+  /** Validates caller data before handler execution and drives client input inference. */
+  input: TInput;
+  /** Validates the returned value before transport and drives client output inference. */
+  output: TOutput;
+  /** Optional inline implementation; omit it in a shared client/server contract. */
+  handler?: UnaryHandler<TEnv, TInput, TOutput>;
 };
 
-type UnaryOutputBuilder<TEnv extends Env, TInput extends AbilitySchema> = {
-  /** Declares the method output schema. */
-  output<TOutput extends AbilitySchema>(output: TOutput): UnaryHandlerBuilder<TEnv, TInput, TOutput>;
-};
-
-type UnaryHandlerBuilder<TEnv extends Env, TInput extends AbilitySchema, TOutput extends AbilitySchema> = {
-  /** Implements the method after Service Plane authorization and input validation. */
-  handler(handler: UnaryHandler<TEnv, TInput, TOutput>): AbilityMethodDefinition<TEnv, TInput, TOutput, 'unary'>;
-};
-
-type StreamInputBuilder<TEnv extends Env, TOutput extends AbilitySchema, TKind extends 'hibernation' | 'stream'> = {
-  /** Declares the stream subscription input schema. */
-  input<TInput extends AbilitySchema>(input: TInput): StreamHandlerBuilder<TEnv, TInput, TOutput, TKind>;
-};
-
-type StreamHandlerBuilder<
+/** Concise stream declaration, optionally carrying an inline implementation. */
+export type AbilityStreamMethodOptions<
   TEnv extends Env,
   TInput extends AbilitySchema,
   TOutput extends AbilitySchema,
   TKind extends 'hibernation' | 'stream',
-> = {
-  /** Implements the stream after Service Plane authorization and input validation. */
-  handler(
-    handler: TKind extends 'hibernation' ? HibernationHandler<TEnv, TInput, TOutput> : StreamHandler<TEnv, TInput, TOutput>,
-  ): AbilityMethodDefinition<TEnv, TInput, TOutput, TKind>;
+> = AbilityMethodMetadata & {
+  /** Validates subscription arguments before the handler runs and drives client input inference. */
+  input: TInput;
+  /** Validates every yielded item before transport and drives client item inference. */
+  output: TOutput;
+  /** Optional inline implementation; omit it in a shared client/server contract. */
+  handler?: TKind extends 'hibernation' ? HibernationHandler<TEnv, TInput, TOutput> : StreamHandler<TEnv, TInput, TOutput>;
 };
 
-/**
- * Creates transport-neutral method builders. The installed RPC engine compiles the resulting
- * contracts internally, so service definitions never expose engine procedures or plugin types.
- */
-export function createAbilityBuilder<TEnv extends Env = Env>() {
+/** Correct handler signature inferred from one portable method contract. */
+export type AbilityMethodHandlerFor<TMethod extends AnyAbilityMethodDefinition> =
+  TMethod extends AbilityMethodDefinition<infer TEnv, infer TInput, infer TOutput, infer TKind>
+    ? TKind extends 'unary'
+      ? UnaryHandler<TEnv, TInput, TOutput>
+      : TKind extends 'hibernation'
+        ? HibernationHandler<TEnv, TInput, TOutput>
+        : StreamHandler<TEnv, TInput, TOutput>
+    : never;
+
+/** Transport-neutral method factory for portable contracts and optional inline implementations. */
+export type AbilityBuilder<TEnv extends Env> = {
+  /** Declares a hibernating stream, optionally with an inline implementation. */
+  hibernationStream<TInput extends AbilitySchema, TOutput extends AbilitySchema>(
+    options: AbilityStreamMethodOptions<TEnv, TInput, TOutput, 'hibernation'>,
+  ): AbilityMethodDefinition<TEnv, TInput, TOutput, 'hibernation'>;
+  /** Declares a unary method, optionally with an inline implementation. */
+  method<TInput extends AbilitySchema, TOutput extends AbilitySchema>(
+    options: AbilityUnaryMethodOptions<TEnv, TInput, TOutput>,
+  ): AbilityMethodDefinition<TEnv, TInput, TOutput, 'unary'>;
+  /** Declares an ordinary stream, optionally with an inline implementation. */
+  stream<TInput extends AbilitySchema, TOutput extends AbilitySchema>(
+    options: AbilityStreamMethodOptions<TEnv, TInput, TOutput, 'stream'>,
+  ): AbilityMethodDefinition<TEnv, TInput, TOutput, 'stream'>;
+};
+
+/** Creates transport-neutral method definitions from one explicit options object per method. */
+export function createAbilityBuilder<TEnv extends Env = Env>(): AbilityBuilder<TEnv> {
   return {
-    /** Starts a unary ability method. */
-    method(metadata: AbilityMethodMetadata = {}): UnaryInputBuilder<TEnv> {
-      return {
-        input<TInput extends AbilitySchema>(input: TInput) {
-          return {
-            output<TOutput extends AbilitySchema>(output: TOutput) {
-              return {
-                handler(handler: UnaryHandler<TEnv, TInput, TOutput>) {
-                  return defineMethod<TEnv, TInput, TOutput, 'unary'>(
-                    'unary',
-                    metadata,
-                    input,
-                    output,
-                    handler as unknown as AbilityMethodHandler,
-                  );
-                },
-              };
-            },
-          };
-        },
-      };
+    hibernationStream<TInput extends AbilitySchema, TOutput extends AbilitySchema>(
+      options: AbilityStreamMethodOptions<TEnv, TInput, TOutput, 'hibernation'>,
+    ) {
+      const { handler, input, output, ...metadata } = options;
+      return defineMethod('hibernation', metadata, input, output, handler as AbilityMethodHandler | undefined);
     },
-    /** Starts a streaming method whose yielded items are validated with output. */
-    stream<TOutput extends AbilitySchema>(
-      output: TOutput,
-      metadata: AbilityMethodMetadata = {},
-    ): StreamInputBuilder<TEnv, TOutput, 'stream'> {
-      return streamBuilder<TEnv, TOutput, 'stream'>('stream', metadata, output);
+    method<TInput extends AbilitySchema, TOutput extends AbilitySchema>(options: AbilityUnaryMethodOptions<TEnv, TInput, TOutput>) {
+      const { handler, input, output, ...metadata } = options;
+      return defineMethod('unary', metadata, input, output, handler as AbilityMethodHandler | undefined);
     },
-    /** Starts a stream whose subscription can survive a Durable Object hibernation cycle. */
-    hibernationStream<TOutput extends AbilitySchema>(
-      output: TOutput,
-      metadata: AbilityMethodMetadata = {},
-    ): StreamInputBuilder<TEnv, TOutput, 'hibernation'> {
-      return streamBuilder<TEnv, TOutput, 'hibernation'>('hibernation', metadata, output);
+    stream<TInput extends AbilitySchema, TOutput extends AbilitySchema>(
+      options: AbilityStreamMethodOptions<TEnv, TInput, TOutput, 'stream'>,
+    ) {
+      const { handler, input, output, ...metadata } = options;
+      return defineMethod('stream', metadata, input, output, handler as AbilityMethodHandler | undefined);
     },
   };
 }
 
-function streamBuilder<TEnv extends Env, TOutput extends AbilitySchema, TKind extends 'hibernation' | 'stream'>(
-  kind: TKind,
-  metadata: AbilityMethodMetadata,
-  output: TOutput,
-): StreamInputBuilder<TEnv, TOutput, TKind> {
-  return {
-    input<TInput extends AbilitySchema>(input: TInput) {
-      return {
-        handler(handler: TKind extends 'hibernation' ? HibernationHandler<TEnv, TInput, TOutput> : StreamHandler<TEnv, TInput, TOutput>) {
-          return defineMethod<TEnv, TInput, TOutput, TKind>(kind, metadata, input, output, handler as unknown as AbilityMethodHandler);
-        },
-      };
-    },
-  };
+/** Binds one contract method to a service-side handler without mutating the shared contract. */
+export function implementAbilityMethod<TMethod extends AnyAbilityMethodDefinition>(
+  method: TMethod,
+  handler: AbilityMethodHandlerFor<TMethod>,
+): TMethod {
+  if (!isAbilityMethodDefinition(method)) throw new TypeError('Service-Plane method must be created with createAbilityBuilder');
+  if (typeof handler !== 'function') throw new TypeError('Service-Plane method implementation must be a function');
+  const implemented = { ...method, metadata: { ...method.metadata } } as TMethod;
+  methodDefinitions.add(implemented);
+  methodHandlers.set(implemented, handler as unknown as AbilityMethodHandler);
+  return implemented;
 }
 
 function defineMethod<TEnv extends Env, TInput extends AbilitySchema, TOutput extends AbilitySchema, TKind extends AbilityMethodKind>(
@@ -259,14 +283,106 @@ function defineMethod<TEnv extends Env, TInput extends AbilitySchema, TOutput ex
   metadata: AbilityMethodMetadata,
   input: TInput,
   output: TOutput,
-  handler: AbilityMethodHandler,
+  handler?: AbilityMethodHandler,
 ): AbilityMethodDefinition<TEnv, TInput, TOutput, TKind> {
-  const definition: AbilityMethodDefinition<TEnv, TInput, TOutput, TKind> = {
+  const definition = {
     input,
     kind,
     metadata: { ...metadata },
     output,
-  };
-  methodHandlers.set(definition, handler);
+  } as AbilityMethodDefinition<TEnv, TInput, TOutput, TKind>;
+  methodDefinitions.add(definition);
+  if (handler) methodHandlers.set(definition, handler);
   return definition;
+}
+
+function isReadableStream<T>(value: AbilityStreamSource<T>): value is ReadableStream<T> {
+  return Boolean(value && typeof value === 'object' && typeof (value as ReadableStream<T>).getReader === 'function');
+}
+
+function isAbilityStream<T>(value: AbilityStreamSource<T>): value is AbilityStream<T> {
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      typeof (value as unknown as AsyncIterator<T>).next === 'function' &&
+      typeof (value as AsyncIterable<T>)[Symbol.asyncIterator] === 'function',
+  );
+}
+
+function iteratorAbilityStream<T>(iterator: AsyncIterator<T, unknown, void> | Iterator<T, unknown, void>): AbilityStream<T> {
+  let closed = false;
+  const stream: AbilityStream<T> = {
+    [Symbol.asyncIterator]: () => stream,
+    async next(value) {
+      if (closed) return { done: true, value: undefined };
+      try {
+        const item = await iterator.next(value);
+        if (item.done) closed = true;
+        return item;
+      } catch (error) {
+        closed = true;
+        throw error;
+      }
+    },
+    async return(value) {
+      if (closed) return { done: true, value };
+      closed = true;
+      return iterator.return ? iterator.return(value) : { done: true, value };
+    },
+    async throw(error) {
+      if (closed) throw error;
+      closed = true;
+      if (iterator.throw) return iterator.throw(error);
+      if (iterator.return) await iterator.return();
+      throw error;
+    },
+  };
+  return stream;
+}
+
+function readableAbilityStream<T>(source: ReadableStream<T>): AbilityStream<T> {
+  const reader = source.getReader();
+  let closed = false;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    reader.releaseLock();
+  };
+  const cancel = async (reason?: unknown) => {
+    if (closed) return;
+    closed = true;
+    try {
+      await reader.cancel(reason);
+    } finally {
+      release();
+    }
+  };
+  const stream: AbilityStream<T> = {
+    [Symbol.asyncIterator]: () => stream,
+    async next() {
+      if (closed) return { done: true, value: undefined };
+      try {
+        const item = await reader.read();
+        if (item.done) {
+          closed = true;
+          release();
+        }
+        return item;
+      } catch (error) {
+        closed = true;
+        release();
+        throw error;
+      }
+    },
+    async return(value) {
+      await cancel(value);
+      return { done: true, value };
+    },
+    async throw(error) {
+      await cancel(error);
+      throw error;
+    },
+  };
+  return stream;
 }

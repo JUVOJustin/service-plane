@@ -33,7 +33,9 @@ export type ServicePlaneBrokerLogEvent = {
     | 'service_plane.mcp.resource.completed'
     | 'service_plane.mcp.resource.failed'
     | 'service_plane.mcp.tool.completed'
-    | 'service_plane.mcp.tool.failed';
+    | 'service_plane.mcp.tool.failed'
+    | 'service_plane.rest.completed'
+    | 'service_plane.rest.failed';
   level: 'info' | 'warn';
   abilityId?: string;
   brokered?: boolean;
@@ -76,4 +78,33 @@ export function defaultServicePlaneLogSink(event: ServicePlaneLoggableEvent): vo
     return;
   }
   console.log(message);
+}
+
+/**
+ * Emits an operational event without allowing an application-owned sink to change request
+ * behavior. Logging is best effort at every Service Plane boundary: synchronous sink failures and
+ * rejected async sinks are both contained.
+ *
+ * @internal
+ */
+export function emitBestEffortServicePlaneLog<TEvent extends ServicePlaneLoggableEvent>(
+  sink: ServicePlaneLogSink<TEvent> | undefined,
+  event: TEvent,
+  context?: Context,
+): void {
+  if (!sink) return;
+  try {
+    const result = (sink as (event: TEvent, context?: Context) => unknown)(event, context);
+    if (isPromiseLike(result)) void Promise.resolve(result).catch(() => undefined);
+  } catch {
+    // An observability integration must never turn a successful request into an application error.
+  }
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (
+    (typeof value === 'object' || typeof value === 'function') &&
+    value !== null &&
+    typeof (value as PromiseLike<unknown>).then === 'function'
+  );
 }

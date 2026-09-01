@@ -10,8 +10,8 @@ import { createAbilityClient } from './client.js';
 import { type AbilityMethodDefinitions, defineAbility, serviceDiscoveryDocument } from './discovery.js';
 import { ServicePlaneService } from './service.js';
 
-const ISSUED_AT = new Date('2026-08-20T12:00:00.000Z');
-const VERIFIED_AT = new Date('2026-08-20T12:00:01.000Z');
+const ISSUED_AT = new Date('2099-08-20T12:00:00.000Z');
+const VERIFIED_AT = new Date('2099-08-20T12:00:01.000Z');
 
 // A hand-written vendor: proves abilities depend on the Standard Schema contracts only, with no
 // validation library involved. Real services use Zod, ArkType, Valibot, VineJS, or similar.
@@ -89,11 +89,12 @@ async function serve<TMethods extends AbilityMethodDefinitions>(methods: TMethod
 describe('standard schema abilities over the Service Plane client', () => {
   it('runs a hand-rolled non-Zod Standard Schema end to end as input and output', async () => {
     const { client, service } = await serve({
-      get: ability
-        .method({ scopes: ['notes.read'] })
-        .input(stringField('query'))
-        .output(stringField('result'))
-        .handler(({ input }) => ({ result: input.query })),
+      get: ability.method({
+        scopes: ['notes.read'],
+        input: stringField('query'),
+        output: stringField('result'),
+        handler: ({ input }) => ({ result: input.query }),
+      }),
     });
 
     await expect(client.get({ query: 'hi' })).resolves.toEqual({ result: 'hi' });
@@ -115,14 +116,15 @@ describe('standard schema abilities over the Service Plane client', () => {
   it('refuses input the hand-rolled vendor rejects with structured 422 issues', async () => {
     let handlerRan = false;
     const { client } = await serve({
-      get: ability
-        .method({ scopes: ['notes.read'] })
-        .input(stringField('query'))
-        .output(stringField('result'))
-        .handler(({ input }) => {
+      get: ability.method({
+        scopes: ['notes.read'],
+        input: stringField('query'),
+        output: stringField('result'),
+        handler: ({ input }) => {
           handlerRan = true;
           return { result: input.query };
-        }),
+        },
+      }),
     });
 
     const error = await client.get({ query: 7 } as never).catch((caught: unknown) => caught);
@@ -140,18 +142,17 @@ describe('standard schema abilities over the Service Plane client', () => {
   it('treats a throwing validator as a refusal without running the handler or leaking the throw', async () => {
     let handlerRan = false;
     const { client } = await serve({
-      get: ability
-        .method({ scopes: ['notes.read'] })
-        .input(
-          malformedSchema(() => {
-            throw new Error('validator exploded: db=secret-internal');
-          }),
-        )
-        .output(z.object({ result: z.string() }))
-        .handler(() => {
+      get: ability.method({
+        scopes: ['notes.read'],
+        input: malformedSchema(() => {
+          throw new Error('validator exploded: db=secret-internal');
+        }),
+        output: z.object({ result: z.string() }),
+        handler: () => {
           handlerRan = true;
           return { result: 'ok' };
-        }),
+        },
+      }),
     });
 
     const error = await client.get({ query: 'hi' }).catch((caught: unknown) => caught);
@@ -175,14 +176,15 @@ describe('standard schema abilities over the Service Plane client', () => {
   it('fails closed when a validator returns neither value nor issues', async () => {
     let handlerRan = false;
     const { client } = await serve({
-      get: ability
-        .method({ scopes: ['notes.read'] })
-        .input(malformedSchema(() => ({})))
-        .output(z.object({ result: z.string() }))
-        .handler(() => {
+      get: ability.method({
+        scopes: ['notes.read'],
+        input: malformedSchema(() => ({})),
+        output: z.object({ result: z.string() }),
+        handler: () => {
           handlerRan = true;
           return { result: 'ok' };
-        }),
+        },
+      }),
     });
 
     const error = await client.get({ query: 'hi' }).catch((caught: unknown) => caught);
@@ -198,11 +200,12 @@ describe('standard schema abilities over the Service Plane client', () => {
 
   it('replaces a handler output the schema rejects with an opaque 500', async () => {
     const { client } = await serve({
-      get: ability
-        .method({ scopes: ['notes.read'] })
-        .input(z.object({ query: z.string() }))
-        .output(z.object({ result: z.number() }))
-        .handler(() => ({ result: 'secret-row-data' as unknown as number })),
+      get: ability.method({
+        scopes: ['notes.read'],
+        input: z.object({ query: z.string() }),
+        output: z.object({ result: z.number() }),
+        handler: () => ({ result: 'secret-row-data' as unknown as number }),
+      }),
     });
 
     const error = await client.get({ query: 'hi' }).catch((caught: unknown) => caught);
@@ -219,14 +222,16 @@ describe('standard schema abilities over the Service Plane client', () => {
 
   it('terminates a stream when a yielded item fails the per-item output schema', async () => {
     const { client } = await serve({
-      watch: ability
-        .stream(stringField('result'), { scopes: ['notes.read'] })
-        .input(z.object({ after: z.number() }))
-        .handler(async function* () {
+      watch: ability.stream({
+        scopes: ['notes.read'],
+        input: z.object({ after: z.number() }),
+        output: stringField('result'),
+        handler: async function* () {
           yield { result: 'ok' };
           yield { result: 1729 } as unknown as { result: string };
           yield { result: 'never reached' };
-        }),
+        },
+      }),
     });
 
     const stream = await client.watch({ after: 0 });

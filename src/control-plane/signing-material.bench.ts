@@ -42,6 +42,14 @@ const grants = {
     })),
   ).flat(),
 };
+const tokenIssuer = await createCapabilityIssuerFromPrivateJwk({
+  capabilities,
+  grants,
+  issuer: 'bench',
+  privateJwks,
+  ttlSeconds: 120,
+  validateKeyPair: false,
+});
 
 describe('issuer build: key material vs catalog', () => {
   // The expensive half, and the reason the memo exists: pure P-256 scalar multiplication.
@@ -75,6 +83,19 @@ describe('issuer build: key material vs catalog', () => {
         privateJwks,
         ttlSeconds: 120,
         validateKeyPair: false,
+      });
+    },
+    ISSUER_BENCH,
+  );
+
+  bench(
+    'issue capability token (warm imported signing key)',
+    async () => {
+      await tokenIssuer.issueCapabilityToken({
+        callerAccess: 'service',
+        callerServiceId: 'caller0',
+        scopes: ['svc0.s0'],
+        targetServiceId: 'svc0',
       });
     },
     ISSUER_BENCH,

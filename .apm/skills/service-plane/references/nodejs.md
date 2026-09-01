@@ -1,111 +1,133 @@
 # Node.js And Self-Hosted Services
 
-Goal: run Service Plane across normal HTTPS services outside Cloudflare.
+Contracts and handlers are runtime-neutral. Outside Cloudflare, use Fetch for normal calls and HTTPS
+for discovery/JWKS.
 
-Use the same ability definitions as Cloudflare services. The main difference is transport and caller auth.
-
-## Service
-
-A self-hosted Hono service exposes discovery and one RPC endpoint per ability.
+## Serve A Service
 
 ```ts
 import { serve } from '@hono/node-server';
 import { ServicePlaneService, jwksFromUrl } from 'service-plane/service';
-import { asanaTasks } from './abilities';
+import { tasks } from './tasks.implementation';
 import { capabilities } from './capabilities';
+import { taskRepository } from './task-repository';
+import type { TasksEnv } from './tasks.contract';
 
-const service = new ServicePlaneService({
-  id: 'asana',
-  title: 'Asana Service',
-  version: '0.2.0',
+const service = new ServicePlaneService<TasksEnv>({
+  id: 'tasks-service',
+  title: 'Tasks Service',
+  version: '1.0.0',
+  abilities: [tasks],
+  capabilities,
   auth: {
     issuer: 'control-plane',
-    jwks: jwksFromUrl('https://plane.example.com/.well-known/service-plane/jwks.json'),
+    jwks: jwksFromUrl(
+      'https://plane.example.com/.well-known/service-plane/jwks.json',
+    ),
   },
-  capabilities,
-  abilities: [asanaTasks],
+  ingress: {},
 });
 
-serve({ fetch: service.fetch, port: 8787 });
+const fetch = (request: Request) =>
+  service.fetch(request, { TASKS: taskRepository });
+
+serve({ fetch, port: 8787 });
 ```
 
-The service exposes:
+Put TLS and any network-level allowlist in the reverse proxy or platform. `ingress: {}` remains the
+application-level guarantee that only a brokered capability reaches handlers. The Node adapter does
+not create Hono bindings: the `fetch` wrapper supplies the same `TASKS` repository declared by
+`TasksEnv` on every request.
 
-```txt
-GET  /.well-known/service-plane/service.json
-POST /rpc/asana.tasks/createTask
-```
-
-## Local Caller Over Fetch
-
-Fetch is the default self-hosted transport and supports both unary and streaming methods.
+## Register It At The Plane
 
 ```ts
-import { createAbilityClient, controlPlaneJwkTokenRequester } from 'service-plane/service';
-import { asanaTasks } from './abilities';
+httpsService({
+  id: 'tasks-service',
+  baseUrl: 'https://tasks.internal.example',
+  grants: [{ caller: 'control-plane', scopes: ['tasks.read'] }],
+});
+```
 
-const asana = createAbilityClient({
-  ability: asanaTasks,
-  callerServiceId: 'workflow-runner',
-  targetServiceId: 'asana',
-  scopes: ['asana.tasks.write'],
+The plane fetches discovery and invokes methods through the supplied Fetch implementation. Inject a
+custom `fetch` in `httpsService` for mTLS, an internal DNS client, or test transport.
+
+## Direct Fetch Client
+
+Use a direct client for trusted service-to-service calls only when service ingress allows it:
+
+```ts
+const tasks = createAbilityClient({
+  ability: tasksContract,
+  callerServiceId: 'workflow-service',
+  targetServiceId: 'tasks-service',
   requestToken: controlPlaneJwkTokenRequester({
-    clientId: 'workflow-runner',
+    clientId: 'workflow-service',
     controlPlaneUrl: 'https://plane.example.com',
-    keyId: 'workflow-runner-2026-01',
+    keyId: 'workflow-2026-08',
     privateJwk,
   }),
-  transport: { type: 'fetch', origin: 'https://asana.example.com' },
-});
-
-await asana.createTask({
-  connectionId: 'conn_123',
-  name: 'Follow up',
-  projectId: 'proj_456',
+  transport: {
+    type: 'fetch',
+    origin: 'https://tasks.internal.example',
+  },
 });
 ```
 
-This local-development example deliberately leaves `ingress` disabled. Production services should
-enable `ingress: {}` and expose the ability through the control-plane broker instead of calling the
-service URL directly. Direct Fetch calls with ordinary tokens are rejected when ingress is
-enabled.
+For ingress-protected production services, use `createBrokeredAbilityClient` against the plane
+instead. The caller never receives the private service URL or service capability token.
 
-## HMAC Fallback
+JWK authentication is preferable for external services because only the public key reaches the
+plane and tokens are sender-constrained automatically. HMAC is available as a shared-secret
+fallback.
 
-Use HMAC caller auth when a private JWK is not practical.
+## WebSocket
+
+Current [`@hono/node-server`](https://github.com/honojs/node-server#websocket) ships the upgrade
+adapter directly. Install `ws` and give the same `WebSocketServer` to the Node server:
 
 ```ts
-controlPlaneHmacTokenRequester({
-  clientId: 'workflow-runner',
-  controlPlaneUrl: 'https://plane.example.com',
-  clientSecret: process.env.WORKFLOW_RUNNER_SECRET,
+import { serve, upgradeWebSocket } from '@hono/node-server';
+import { WebSocketServer } from 'ws';
+import { ServicePlaneService } from 'service-plane/service';
+import { taskRepository } from './task-repository';
+import type { TasksEnv } from './tasks.contract';
+
+const service = new ServicePlaneService<TasksEnv>({
+  // ...identity, abilities, capabilities, and auth
+  rpc: { upgradeWebSocket },
+});
+
+const webSocketServer = new WebSocketServer({ noServer: true });
+
+serve({
+  fetch: (request) => service.fetch(request, { TASKS: taskRepository }),
+  port: 3000,
+  websocket: { server: webSocketServer },
 });
 ```
 
-JWK is preferable for distributed services because the private key stays with the caller and the public key can be discovered or configured by the plane.
-
-## WebSocket Clients
-
-Use WebSocket only when the connection is long-lived, interactive, or chatty.
+Inject a standards-compatible client when the Node version or WebSocket package you use does not
+provide one globally:
 
 ```ts
-const api = createAbilityClient({
+const client = createAbilityClient({
   // ...
   transport: {
     type: 'websocket',
-    url: 'wss://asana.example.com/rpc/asana.tasks',
+    url: 'wss://tasks.internal.example/rpc/tasks',
     createWebSocket,
   },
 });
 ```
 
-If the Node runtime does not provide a global `WebSocket`, inject the standards-compatible client
-you already use through `createWebSocket`. The same option exists on
-`createBrokeredAbilityClient`, whose public URL normally ends in `/rpc/broker/ws`. This keeps
-WebSocket construction runtime-owned and does not require a persistent global.
+Prefer Fetch for sporadic calls and ordinary streams. WebSocket is valuable when a persistent,
+interactive session amortizes its lifecycle cost.
 
-For ordinary calls and streams, prefer Fetch. It is easier to deploy, observe, and retry. Wire
-`upgradeWebSocket` from `@hono/node-ws` when an interactive or high-frequency client benefits from
-a persistent connection. The full decision guide is [Choosing A Transport](transports.md).
+For a broker WebSocket, authenticate the physical upgrade in the `createWebSocket` closure using a
+standards-compatible client that supports upgrade headers, or pass a short-lived URL ticket.
+`BrokeredAbilityTransport.headers` configures Fetch requests only; logical request IDs,
+idempotency keys, and timeouts remain per method call.
 
-Next: [auth](auth.md), [OpenAPI and MCP](openapi-mcp.md), and [reference](reference.md).
+Service Plane requires Node.js 22 or later and web-standard `fetch`, `Request`, Web Crypto, streams,
+and timers. See [transports](transports.md) and [auth](auth.md).

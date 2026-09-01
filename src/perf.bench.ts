@@ -3,25 +3,27 @@ import { bench, describe } from 'vitest';
 import { z } from 'zod';
 import { createControlPlaneRpcBroker } from './control-plane/broker.js';
 import { createCapabilityIssuer, defineServiceGrants } from './control-plane/capabilities.js';
+import { ServicePlaneControlPlane } from './control-plane/control-plane.js';
+import { cloudflareServiceBinding } from './control-plane/endpoints.js';
 import { createAbilityBuilder } from './service/ability.js';
 import { defineCapabilities } from './service/capabilities.js';
-import { createAbilityClient } from './service/client.js';
+import { createAbilityClient, createBrokeredAbilityClient } from './service/client.js';
 import { defineAbility } from './service/discovery.js';
 import { compileAbilityMethod, createAbilityRpcRuntimeContext } from './service/orpc.js';
 import { ServicePlaneService } from './service/service.js';
 import type { CapabilityIdentity } from './shared/types.js';
 import { testKeys } from './test-support/index.js';
 
-const ISSUED_AT = new Date('2026-05-09T12:00:00.000Z');
-const VERIFIED_AT = new Date('2026-05-09T12:00:01.000Z');
 const keys = await testKeys();
+const signingSecret = keys.privateJwk.d;
+if (!signingSecret) throw new Error('benchmark signing key is missing private material');
 const capabilities = defineCapabilities({ scopes: [{ id: 'llm.run' }], serviceId: 'llm' });
 const issuer = createCapabilityIssuer({
   capabilities: [capabilities],
   grants: defineServiceGrants({ grants: [{ caller: 'frontend', scopes: ['llm.run'], target: 'llm' }] }),
   issuer: 'control-plane',
-  now: () => ISSUED_AT,
   privateJwks: [keys.privateJwk],
+  ttlSeconds: 3_600,
 });
 const issued = await issuer.issueCapabilityToken({
   callerAccess: 'service',
@@ -53,24 +55,27 @@ const completion = defineAbility({
   exposure: 'published',
   id: 'llm.completion',
   methods: {
-    complete: builder
-      .method({ scopes: ['llm.run'] })
-      .input(inputSchema)
-      .output(outputSchema)
-      .handler(({ input: value }) => ({ text: value.prompt.toUpperCase() })),
-    tokens: builder
-      .stream(z.object({ index: z.number() }), { scopes: ['llm.run'] })
-      .input(z.object({ count: z.number().int().nonnegative() }))
-      .handler(async function* ({ input: value }) {
+    complete: builder.method({
+      handler: ({ input: value }) => ({ text: value.prompt.toUpperCase() }),
+      input: inputSchema,
+      output: outputSchema,
+      scopes: ['llm.run'],
+    }),
+    tokens: builder.stream({
+      handler: async function* ({ input: value }) {
         for (let index = 0; index < value.count; index += 1) yield { index };
-      }),
+      },
+      input: z.object({ count: z.number().int().nonnegative() }),
+      output: z.object({ index: z.number() }),
+      scopes: ['llm.run'],
+    }),
   },
-  rpc: { transports: ['fetch', 'cloudflare-service-binding'] },
+  rpc: { transports: ['fetch', 'service-binding'] },
   scopes: ['llm.run'],
 });
 const service = new ServicePlaneService({
   abilities: [completion],
-  auth: { issuer: 'control-plane', jwks: { keys: [keys.publicJwk] }, now: () => VERIFIED_AT },
+  auth: { issuer: 'control-plane', jwks: { keys: [keys.publicJwk] } },
   capabilities,
   id: 'llm',
   logger: false,
@@ -80,11 +85,13 @@ const service = new ServicePlaneService({
 });
 const runtime = createAbilityRpcRuntimeContext({
   authorize: () => ({
-    abilityId: completion.id,
-    context: {} as never,
-    env: {},
-    identity,
-    request: new Request('https://llm.internal/rpc/llm.completion/complete'),
+    context: {
+      abilityId: completion.id,
+      context: {} as never,
+      env: {},
+      identity,
+      request: new Request('https://llm.internal/rpc/llm.completion/complete'),
+    },
   }),
 });
 const binding = {
@@ -115,9 +122,9 @@ const batchClient = createAbilityClient({
   scopes: ['llm.run'],
   targetServiceId: 'llm',
   transport: {
+    batch: true,
     fetch: binding,
     origin: 'https://llm.internal',
-    batch: true,
     type: 'fetch',
   },
 });
@@ -154,6 +161,43 @@ const broker = createControlPlaneRpcBroker({
       origin: 'https://llm.internal',
     },
   ],
+});
+const plane = new ServicePlaneControlPlane({
+  broker: { batch: true },
+  controlPlaneServiceId: 'control-plane',
+  invocationMiddleware: async (context, next) => {
+    context.set('servicePlaneCaller', { id: 'frontend', kind: 'service' });
+    await next();
+  },
+  log: false,
+  openapi: false,
+  services: () => [
+    cloudflareServiceBinding({
+      abilityRpc: binding,
+      binding,
+      grants: [{ caller: 'frontend', scopes: ['llm.run'] }],
+      id: 'llm',
+      origin: 'https://llm.internal',
+    }),
+  ],
+  signingKeys: () => [{ kid: keys.privateJwk.kid ?? 'benchmark-key', secret: signingSecret }],
+});
+const publicBrokerClient = createBrokeredAbilityClient({
+  ability: completion,
+  targetServiceId: 'llm',
+  transport: {
+    fetch: async (url, init) => plane.fetch(new Request(url, init)),
+    origin: 'https://plane.internal',
+  },
+});
+const publicBrokerBatchClient = createBrokeredAbilityClient({
+  ability: completion,
+  targetServiceId: 'llm',
+  transport: {
+    batch: true,
+    fetch: async (url, init) => plane.fetch(new Request(url, init)),
+    origin: 'https://plane.internal',
+  },
 });
 
 function verifyCompletion(value: unknown): void {
@@ -201,9 +245,19 @@ describe('Service Plane RPC throughput', () => {
     );
   });
 
+  bench('typed public client -> control-plane Fetch -> native service RPC', async () => {
+    verifyCompletion(await publicBrokerClient.complete(input));
+  });
+
   bench('10 typed calls in one Service Plane batch', async () => {
     const values = await Promise.all(Array.from({ length: 10 }, () => batchClient.complete(input)));
     if (values.length !== 10) throw new Error('benchmark batch produced no samples');
+    for (const value of values) verifyCompletion(value);
+  });
+
+  bench('10 typed public calls in one control-plane batch', async () => {
+    const values = await Promise.all(Array.from({ length: 10 }, () => publicBrokerBatchClient.complete(input)));
+    if (values.length !== 10) throw new Error('benchmark public broker batch produced no samples');
     for (const value of values) verifyCompletion(value);
   });
 });

@@ -28,8 +28,8 @@ const CALLER = 'worker-a';
 const KEY_ID = 'worker-a-key';
 const SERVICE_ID = 'example';
 const SCOPE = 'example.sync.run';
-const ISSUED_AT = new Date('2026-05-09T12:00:00.000Z');
-const VERIFIED_AT = new Date('2026-05-09T12:00:01.000Z');
+const ISSUED_AT = new Date('2099-05-09T12:00:00.000Z');
+const VERIFIED_AT = new Date('2099-05-09T12:00:01.000Z');
 
 const capabilities = defineCapabilities({ scopes: [{ id: SCOPE }], serviceId: SERVICE_ID });
 
@@ -213,14 +213,15 @@ async function deployment(caller: Awaited<ReturnType<typeof callerKeys>>) {
     exposure: 'private',
     id: 'example.sync',
     methods: {
-      run: builder
-        .method({ scopes: [SCOPE] })
-        .input(z.object({}))
-        .output(z.object({ boundTo: z.string().nullable(), caller: z.string() }))
-        .handler(({ context }) => ({
+      run: builder.method({
+        scopes: [SCOPE],
+        input: z.object({}),
+        output: z.object({ boundTo: z.string().nullable(), caller: z.string() }),
+        handler: ({ context }) => ({
           boundTo: context.identity.confirmation?.jkt ?? null,
           caller: context.identity.serviceId,
-        })),
+        }),
+      }),
     },
     rpc: { transports: ['fetch'] },
     scopes: [SCOPE],
@@ -266,7 +267,6 @@ function tokenClient(
 ) {
   return createAbilityClient({
     ability,
-    callerServiceId: CALLER,
     ...(input.proveTokenPossession ? { proveTokenPossession: input.proveTokenPossession } : {}),
     scopes: [SCOPE],
     targetServiceId: SERVICE_ID,

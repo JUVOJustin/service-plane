@@ -8,14 +8,15 @@ import { ServicePlaneService } from '../service/service.js';
 import type { CapabilityJwks } from '../shared/types.js';
 import { SERVICE_PLANE_CAPABILITY_JWKS_PATH } from '../shared/types.js';
 import { testKeys } from '../test-support/index.js';
-import { type BrokerCaller, createControlPlaneRpcBroker } from './broker.js';
+import { createControlPlaneRpcBroker } from './broker.js';
+import type { BrokerCaller } from './caller.js';
 import { createCapabilityIssuer, defineServiceGrants } from './capabilities.js';
 import { ServicePlaneControlPlane } from './control-plane.js';
 import { cloudflareServiceBinding } from './endpoints.js';
 import { generateCapabilitySigningSecret } from './signing-keys.js';
 
-const ISSUED_AT = new Date('2026-05-09T12:00:00.000Z');
-const VERIFIED_AT = new Date('2026-05-09T12:00:01.000Z');
+const ISSUED_AT = new Date('2099-05-09T12:00:00.000Z');
+const VERIFIED_AT = new Date('2099-05-09T12:00:01.000Z');
 const SINCE = '2026-05-09T00:00:00.000Z';
 
 // One service-only ability shared by every test: published so MCP can project it, which is exactly
@@ -27,16 +28,18 @@ function defineSyncAbility(onHandlerRun?: () => void) {
     exposure: 'published',
     id: 'internal.sync',
     methods: {
-      run: ability
-        .method({ mcp: { name: 'internal_sync_run' }, scopes: ['internal.sync.run'] })
-        .input(z.object({ since: z.string() }))
-        .output(z.object({ caller: z.string(), since: z.string() }))
-        .handler(({ context, input }) => {
+      run: ability.method({
+        mcp: { name: 'internal_sync_run' },
+        scopes: ['internal.sync.run'],
+        input: z.object({ since: z.string() }),
+        output: z.object({ caller: z.string(), since: z.string() }),
+        handler: ({ context, input }) => {
           onHandlerRun?.();
           return { caller: context.identity.serviceId, since: input.since };
-        }),
+        },
+      }),
     },
-    rpc: { transports: ['fetch', 'cloudflare-service-binding'] },
+    rpc: { transports: ['fetch', 'service-binding'] },
     scopes: ['internal.sync.run'],
   });
 }
@@ -125,10 +128,14 @@ async function createPlaneFixture(caller: BrokerCaller) {
   });
   const signingSecret = await generateCapabilitySigningSecret();
   plane = new ServicePlaneControlPlane({
-    broker: { caller: () => caller },
+    broker: {},
     controlPlaneServiceId: 'control-plane',
+    invocationMiddleware: async (context, next) => {
+      context.set('servicePlaneCaller', caller);
+      await next();
+    },
     log: false,
-    mcp: { caller: () => caller },
+    mcp: {},
     openapi: false,
     services: () => [
       cloudflareServiceBinding({
@@ -158,7 +165,7 @@ async function createPlaneFixture(caller: BrokerCaller) {
   });
   const mcpToolCall = async (id: number) =>
     resolvedPlane.fetch(
-      new Request('https://plane.internal/rpc/mcp', {
+      new Request('https://plane.internal/mcp', {
         body: JSON.stringify({
           id,
           jsonrpc: '2.0',

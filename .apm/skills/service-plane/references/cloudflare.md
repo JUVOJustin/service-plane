@@ -1,59 +1,35 @@
-# Cloudflare
+# Cloudflare Workers
 
-Goal: use Service Plane with Workers, Service Bindings, Durable Objects, and Dynamic Workers.
+Use one public control-plane Worker and private service Workers connected by service bindings. Unary
+downstream calls use native RPC; streams use binding Fetch.
 
-Keep the control plane as the public Worker and use service bindings for private calls to auxiliary
-Workers. The broker uses native Cloudflare RPC for unary methods and binding Fetch for streams.
+## Bind The Workers
 
-## Local Worker-To-Worker Calls
-
-For local development, a trusted service can request a token and call a service binding directly.
-Production application traffic should use `createBrokeredAbilityClient` so the caller connects only
-to the control plane.
-
-```ts
-import { createAbilityClient, controlPlaneRpcTokenRequester } from 'service-plane/service';
-import { asanaTasks } from './abilities';
-
-const asana = createAbilityClient({
-  ability: asanaTasks,
-  callerServiceId: 'workflow-runner',
-  targetServiceId: 'asana',
-  scopes: ['asana.tasks.write'],
-  requestToken: controlPlaneRpcTokenRequester({
-    binding: env.CONTROL_PLANE,
-    callerServiceId: 'workflow-runner',
-  }),
-  transport: {
-    type: 'service-binding',
-    binding: {
-      fetch: (request) => env.ASANA.fetch(request),
-      invokeAbility: (input) => env.ASANA.invokeAbility(input),
-    },
-  },
-});
+```jsonc
+// control-plane/wrangler.jsonc
+{
+  "services": [
+    { "binding": "TASKS", "service": "tasks-service" }
+  ]
+}
 ```
 
-The client resolves lazily. It calls `invokeAbility` for unary methods and `fetch` for streaming
-methods. This direct client is for service-to-service or ingress-disabled development; the
-production browser/headless-front path goes through the broker.
+Give service Workers a `CONTROL_PLANE` binding so they can load JWKS. Keep service routes private
+when the platform topology permits it, and enable `ingress: {}` regardless so the method runtime
+requires a brokered token.
 
-## Native Binding RPC
+## Expose Fetch And Native RPC
 
-When the service binding exposes `invokeAbility(...)`, the control plane can call a unary method
-without an HTTP serialization hop. It still mints a brokered token, and the service still performs
-the full issuer, audience, expiry, ingress, access, and scope checks before input validation.
-
-Expose both Hono HTTP routes and the native method from a `WorkerEntrypoint`:
+Wrap the service in a `WorkerEntrypoint`:
 
 ```ts
 import { WorkerEntrypoint } from 'cloudflare:workers';
 
 const service = new ServicePlaneService<{ Bindings: Env }>({
-  // ...
+  // abilities, auth, ingress, ...
 });
 
-export default class AsanaService extends WorkerEntrypoint<Env> {
+export default class TasksService extends WorkerEntrypoint<Env> {
   fetch(request: Request) {
     return service.fetch(request, this.env, this.ctx);
   }
@@ -64,245 +40,142 @@ export default class AsanaService extends WorkerEntrypoint<Env> {
 }
 ```
 
-For the control plane to use the same path, register the binding as the endpoint's `abilityRpc`:
+Register native RPC explicitly at the plane:
 
 ```ts
 cloudflareServiceBinding({
-  abilityRpc: { invokeAbility: (input) => env.ASANA.invokeAbility(input) },
-  binding: env.ASANA,
-  id: 'asana',
+  id: 'tasks-service',
+  binding: c.env.TASKS,
+  abilityRpc: true,
+  grants,
+})
+```
+
+The explicit `abilityRpc` matters: a service-binding proxy returns a callable property for any
+name, so runtime feature probing would produce false positives. Set it to `true` only when that same
+binding exposes `invokeAbility`; a separate `ServiceAbilityNativeRpcBinding` adapter also remains
+available.
+
+Native RPC skips Service Plane's HTTP/JSON codec and Hono middleware, but still runs token, ingress,
+access, scope, deadline, input, and output checks. Handlers receive runtime bindings and a synthetic
+request context. Put security invariants in Service Plane policy, not only in Hono middleware.
+
+Cloudflare permits at most 32 Worker invocations from one originating request. A broker batch saves
+the public Fetch hop but each downstream service-binding call still counts, so size batches below
+the remaining fan-out budget. Native RPC values are capped at 32 MiB. See the platform's
+[service-binding limits](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/#limits)
+and [RPC serialization rules](https://developers.cloudflare.com/workers/runtime-apis/rpc/).
+
+## Direct Service-To-Service Calls
+
+A trusted Worker may use a direct client when the target is not ingress-protected:
+
+```ts
+const tasks = createAbilityClient({
+  ability: tasksContract,
+  callerServiceId: 'workflow-service',
+  targetServiceId: 'tasks-service',
+  requestToken: controlPlaneRpcTokenRequester({
+    binding: env.CONTROL_PLANE,
+  }),
+  transport: {
+    type: 'service-binding',
+    binding: env.TASKS,
+  },
 });
 ```
 
-This is always explicit — a service-binding stub answers any property access with a callable RPC
-proxy, so the presence of `invokeAbility` proves nothing about the target.
-
-Both transports use the same ability wrapper: token verification, method scopes, input validation, handler call, and output validation.
-
-Native binding calls do not traverse the Hono middleware chain. Method handlers still receive
-`context.env`, `context.request`, the verified identity, deadline signal, and an advanced Hono
-context escape hatch with the propagated request id.
-
-Ingress-protected services reject native binding RPC when the caller uses a normal non-brokered capability token.
-
-For private token requests, expose a caller-pinned control-plane entrypoint instead of trusting a
-caller id supplied over RPC:
+Prefer a caller-pinned binding method on the plane. Do not trust a caller ID supplied over native
+RPC merely because the transport is private:
 
 ```ts
-import { WorkerEntrypoint } from 'cloudflare:workers';
-import type { IssueCapabilityTokenInput } from 'service-plane/control-plane';
+import type { PinnedCapabilityTokenInput } from 'service-plane/control-plane';
 
-const plane = new ServicePlaneControlPlane<{ Bindings: Env }>({
-  // ...
-});
-
-export default class WorkflowRunnerPlane extends WorkerEntrypoint<Env> {
+export default class WorkflowPlaneBinding extends WorkerEntrypoint<Env> {
   fetch(request: Request) {
     return plane.fetch(request, this.env, this.ctx);
   }
 
-  issueCapabilityToken(input: IssueCapabilityTokenInput) {
-    const { callerServiceId, ...request } = input;
-    return plane.issueCapabilityTokenForCaller(
-      'workflow-runner',
-      { ...request, callerServiceId },
-      this.env,
-    );
+  issueCapabilityToken(input: PinnedCapabilityTokenInput) {
+    return plane
+      .capabilityTokenBinding('workflow-service', this.env)
+      .issueCapabilityToken(input);
   }
 }
 ```
 
-Give that entrypoint binding only to `workflow-runner`. `controlPlaneRpcTokenRequester` can call
-its `issueCapabilityToken` method directly; the adapter pins and verifies the deployment-owned
-identity before the control plane checks grants.
+The requester therefore has no `callerServiceId` option. Type `env.CONTROL_PLANE` as
+`ControlPlaneRpcTokenBinding`. `createAbilityClient` still declares its local caller identity for
+token caching and checks the trusted binding response's decoded claims against it; the dedicated
+binding must pin the same identity at the trust boundary.
 
-## Durable Objects For User Connections
+Expose that entrypoint only to the pinned service. Production product traffic should call the
+public broker instead; ingress-protected services reject ordinary direct capabilities.
 
-For connector services, use a normal Worker as the service and one Durable Object per user connection.
+## Store Connector State In Durable Objects
+
+A common connector topology is one stateless ability service plus one Durable Object per external
+connection:
 
 ```mermaid
 flowchart LR
-  Workflow["Dynamic Workflow"] --> Binding["Scoped service binding"]
-  Binding --> Service["Asana connector service"]
-  Service --> Ability["asana.tasks ability"]
-  Ability --> DO["AsanaConnection Durable Object<br/>tenant + user + connection"]
-  DO --> Provider["Asana API"]
+  Plane -->|service binding| Service
+  Service -->|validated connectionId| DO[Connection Durable Object]
+  DO --> Provider
 ```
 
-The service ability stays stateless. The Durable Object owns provider state:
+The Durable Object owns OAuth tokens, cursors, rate-limit state, and webhook deduplication. The
+ability receives a validated connection ID and verified delegated subject, then resolves the object.
+Never put provider credentials in a capability token, workflow payload, or browser bundle.
 
-- OAuth access and refresh tokens
-- provider-specific config
-- cursors and sync checkpoints
-- per-connection rate-limit state
-- webhook dedupe state
+Use a Durable Object as the service endpoint itself only when it must own a hibernating WebSocket.
+See [streaming](streaming.md#durable-object-hibernation).
 
-Use `identity.subject` (when the control plane delegates the call to an end user) together with validated input fields such as `connectionId` to route to the Durable Object. Do not pass provider credentials through Dynamic Workflow metadata or Service Plane identity.
+## Cache Discovery Deliberately
 
-## Dynamic Workers And Workflows
+The default registry cache is per isolate. That already changes service discovery from one fan-out
+per request to roughly one fan-out per isolate per 30 seconds.
 
-The loader can inject a small binding into the dynamic workflow.
+Use KV or a Durable Object-backed `RegistryCache` only when cold-isolate fan-out is significant. If
+you add a shared store, place a small in-memory cache in front so every hot request does not become a
+remote cache call. Service Plane exposes the `RegistryCache` interface but does not ship a tiering
+helper. Put the read-through memory layer inside your application-owned cache adapter, then pass
+that adapter as `discoveryCache`.
+
+Do not put a single Durable Object directly on every hot token or broker call; it becomes a
+serialized global bottleneck.
+
+## Cache Public Metadata
+
+`httpCache: true` adds cache headers and tags to discovery, OpenAPI, and JWKS. RPC, broker, REST
+responses, and MCP are never marked as metadata cache entries.
 
 ```ts
-await env.ASANA.createTask({
-  connectionId: 'conn_123',
-  name: 'Follow up',
-  projectId: 'proj_456',
-});
-```
-
-Behind that binding:
-
-1. The loader fixes the application-level tenant, user, connection, and allowed scopes.
-2. The binding requests a ServicePlane token when its lazy client needs one.
-3. The binding calls the typed `asana.tasks` ability client.
-4. The Asana service routes the call to the right Durable Object.
-
-This keeps workflow code simple and keeps credentials outside user-authored workflow code. Service Plane secures the plane-to-service call and can delegate it to an end-user subject per RFC 8693; the implementor owns any further user and tenant context in the validated input.
-
-## Sharing The Discovery Cache Across Isolates
-
-The plane caches the discovered service catalog by default, in memory. On Cloudflare that means **per isolate**: each one resolves the catalog once and then serves it for the TTL, but nothing is shared between isolates and each warms up on its own.
-
-That is already most of the benefit — it turns a fan-out on every request into one per isolate per TTL. A shared store only adds the last step: isolates stop warming up independently.
-
-### Layering a shared store behind the in-memory one
-
-The mistake to avoid is putting the shared store *in front*. A KV or Durable Object read is a network hop; doing it on every request replaces a cheap local lookup with a remote one. Put it **behind** the in-memory cache instead, so the hop happens only when the local copy is missing:
-
-```ts
-import { memoryRegistryCache, type RegistryCache } from 'service-plane/control-plane';
-
-function tieredRegistryCache(local: RegistryCache, shared: RegistryCache, promoteTtlSeconds = 5): RegistryCache {
-  return {
-    async get(key) {
-      const near = await local.get(key);
-      if (near) return near;            // almost always ends here
-      const far = await shared.get(key);
-      // Promoted for a short window, not a fresh full TTL. `RegistryCache.get` does not report how
-      // much life the shared entry had left, so giving the local copy the same TTL lets it outlive
-      // the entry it came from — with two 30s stores a catalog could stay stale for nearly 60s.
-      // A short promotion keeps the local layer doing its job without compounding staleness.
-      if (far) await local.set(key, far, promoteTtlSeconds);
-      return far;
-    },
-    getStale: (key) => shared.getStale?.(key),
-    async set(key, value, ttlSeconds) {
-      await Promise.all([local.set(key, value, ttlSeconds), shared.set(key, value, ttlSeconds)]);
-    },
-  };
-}
-```
-
-A warm isolate answers from memory in microseconds. A cold one reads the shared snapshot instead of asking every service. The fan-out is paid by whichever isolates miss both layers — the plane coalesces concurrent fills *within* a process, but there is no distributed lock across isolates, so several cold isolates racing an empty shared store can each resolve once before the first write lands. That is a bounded burst at cold start, not the steady state; a distributed single-flight would need an atomic reservation in the shared store and is not worth its complexity here.
-
-### A Durable Object as the shared store
-
-```ts
-import { DurableObject } from 'cloudflare:workers';
-import type { RegistryCache, ServiceDiscoverySnapshot } from 'service-plane/control-plane';
-
-type Entry = { expiresAt: number; value: ServiceDiscoverySnapshot };
-
-export class DiscoveryCacheObject extends DurableObject {
-  async read(key: string, allowStale: boolean): Promise<ServiceDiscoverySnapshot | undefined> {
-    const entry = await this.ctx.storage.get<Entry>(key);
-    if (!entry) return undefined;
-    // Expired entries stay readable as stale: that is what lets the registry revalidate with
-    // `if-none-match` and get 304s back instead of full documents.
-    return allowStale || Date.now() < entry.expiresAt ? entry.value : undefined;
-  }
-
-  async write(key: string, value: ServiceDiscoverySnapshot, ttlSeconds: number): Promise<void> {
-    await this.ctx.storage.put<Entry>(key, { expiresAt: Date.now() + ttlSeconds * 1000, value });
-  }
-}
-
-export function durableObjectRegistryCache(
-  namespace: DurableObjectNamespace<DiscoveryCacheObject>,
-  name = 'discovery',
-): RegistryCache {
-  const stub = () => namespace.get(namespace.idFromName(name));
-  return {
-    get: (key) => stub().read(key, false),
-    getStale: (key) => stub().read(key, true),
-    set: (key, value, ttlSeconds) => stub().write(key, value, ttlSeconds),
-  };
-}
-```
-
-The snapshot is plain JSON, so it crosses the Durable Object RPC boundary unchanged. Durable Object storage has no TTL of its own, which is why the entry carries its own `expiresAt`.
-
-**Use a Durable Object here only behind the in-memory layer.** One object serializes every access and sits in one location, so making it the first stop for a hot route builds a global bottleneck exactly where throughput matters. KV is the easier shared store for this — reads are edge-cached, and its eventual consistency only delays a new ability becoming grantable. Nothing it can delay *loosens* enforcement, `access` included: the caller's access class rides the token and the service checks it against its own definition, so an ability tightened to `access: 'service'` refuses a plane-class caller from the moment it deploys, however far behind the cached catalog is. (The service does the refusing, so this holds once the service runs a package version with the check — see the [rollout-order note](reference.md#capability-token-claims).)
-
-```ts
-new ServicePlaneControlPlane({
-  discoveryCache: {
-    // The call path — issuance, broker, MCP — wants the fast local layer in front.
-    token: tieredRegistryCache(memoryRegistryCache(), durableObjectRegistryCache(env.DISCOVERY_CACHE)),
-    // OpenAPI is cold and infrequent; a plain shared store is fine.
-    openapi: kvRegistryCache(env.SERVICE_DISCOVERY_KV),
-  },
-  // ...
-});
-```
-
-## Caching Metadata At The Edge
-
-Cloudflare [Workers Cache](https://blog.cloudflare.com/workers-cache/) puts the cache in front of the Worker: on a hit the Worker does not execute at all. Service Plane's metadata GET routes are the natural fit — the service discovery document, the aggregated `/openapi.json`, and the JWKS document. Ability RPC (POST), the broker, and MCP sessions are never cache-eligible.
-
-Enable the cache in the Worker config and turn on the `httpCache` flag:
-
-```jsonc
-// wrangler.jsonc
-{ "cache": { "enabled": true } }
-```
-
-```ts
-const service = new ServicePlaneService({
-  // ...
-  httpCache: true, // Cache-Control: public, max-age=30, stale-while-revalidate=300
-});
-
+const service = new ServicePlaneService({ httpCache: true, /* ... */ });
 const plane = new ServicePlaneControlPlane({
+  httpCache: { maxAgeSeconds: 60, tags: ['environment:production'] },
   // ...
-  httpCache: { maxAgeSeconds: 60, tags: ['env:prod'] },
 });
 ```
 
-With the flag on, the routes emit `Cache-Control` plus `Cache-Tag` headers (`service-plane`, `service-plane:discovery`, `service-plane:service:<id>`, `service-plane:openapi`, `service-plane:jwks`). All routes also emit `ETag`s, so the plane's conditional discovery fetches (`If-None-Match`) revalidate as cheap 304s. Without the flag, no cache headers are emitted and behavior is unchanged.
+After a service deploy, convergence is bounded by the edge discovery cache plus the plane registry
+cache. Staleness fails closed at the service, but removed projections may remain visible until the
+caches refresh. Purge service discovery and OpenAPI tags when immediate convergence matters.
 
-### Staleness After A Service Deploy
+JWKS rotation needs a longer overlap: include `max-age`, `stale-while-revalidate`, the service JWKS
+cache, token lifetime, and clock skew. See [authentication](auth.md#rotate-a-signing-key).
 
-Two caches now sit between a deployed service and what callers see: the plane's registry snapshot (`DEFAULT_REGISTRY_CACHE_TTL_SECONDS`, 30s) and the edge cache in front of the service's discovery route. Worst-case convergence after a deploy that changes abilities, RPC paths, or scopes is roughly `edge max-age + registry TTL` (about a minute on defaults; `stale-while-revalidate` refreshes in the background, so hits stay fast without extending the window further).
+## WebSocket Guidance
 
-During that window, staleness fails closed, not open:
+Use service bindings for normal Worker-to-Worker calls. Use WebSocket for long-lived public streams,
+and Durable Object hibernation only when sleeping between events materially reduces duration cost.
+Every public broker socket authenticates its HTTP upgrade through control-plane middleware. Browser
+clients can use a secure cookie or short-lived URL ticket; `BrokeredAbilityTransport.headers` is
+Fetch-only. Hibernation stays on the direct Durable Object service socket—the broker and
+`plane.abilityClient` reject it.
 
-- The service verifies every token against its **current** definition. A token minted from a stale snapshot with a removed or renamed scope is rejected with 403; a call brokered to a removed RPC path gets a 404; an ability the deploy tightened to `access: 'service'` refuses a plane-class caller even while the plane still brokers it. Nothing stale grants access.
-- A removed published ability can linger in a cached `/openapi.json`; callers get errors until the caches converge. A newly added ability is simply invisible until then.
-- A grant that still names a scope the deployed service renamed or dropped refuses tokens for that service alone. The rest of the plane keeps issuing and brokering, and the refusal stays the specific `Unknown Service-Plane capability scope` error so it reads as configuration drift, not a permissions bug.
+Use `setWebSocketAutoResponse` for fixed application heartbeats that should not wake the object;
+Cloudflare already handles protocol ping/pong. Auto-response messages are limited to 2,048
+characters. Keep hibernation attachments small as described in [streaming](streaming.md).
 
-To converge immediately instead of waiting out the window, purge by tag from a deploy hook:
-
-```ts
-// In the Worker fronting the service (or via the Cloudflare purge API):
-await ctx.cache.purge({ tags: ['service-plane:service:asana'] });
-// On the plane, after the registry cache TTL (or a registry cache purge):
-await ctx.cache.purge({ tags: ['service-plane:openapi'] });
-```
-
-Keep JWKS key rotation overlapping: publish a new key alongside the old one for at least the edge `max-age` **plus `stale-while-revalidate`** plus the services' JWKS cache TTL before signing with it, or purge `service-plane:jwks` on rotation. The `stale-while-revalidate` term is the one usually forgotten — an edge honouring it serves the old-only document for that long after `max-age` expires. Full runbook, including every overlap-window term and rollback: [Rotate The Signing Key](auth.md#rotate-the-signing-key).
-
-## When To Use WebSockets
-
-Use WebSocket for long-lived or interactive sessions, such as realtime updates. On Cloudflare,
-service-to-service streams use Service Plane streaming over the binding's Fetch interface; native binding RPC
-is the unary fast path (see [Streaming](streaming.md)).
-
-Do not use WebSocket as the default Worker-to-Worker transport. Bindings are simpler for ordinary
-calls and need no connection lifecycle. When a Durable Object genuinely owns a long-lived socket,
-hibernation is available through `ability.hibernationStream()`, `AbilityHibernationStream`,
-`rpc.manualWebSocket`, and the service's `webSocketMessage`/`webSocketClose` entrypoints. Full decision guide:
-[Choosing A Transport](transports.md).
-
-Next: [architecture](architecture.md), [auth](auth.md), and [Node.js](nodejs.md).
+See [transports](transports.md) and [the Cloudflare Workers best practices](https://developers.cloudflare.com/workers/best-practices/workers-best-practices/).

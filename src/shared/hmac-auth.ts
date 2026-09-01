@@ -1,5 +1,5 @@
+import { boundedRequestBodyBytes } from './body-limit.js';
 import { CapabilityAuthError } from './errors.js';
-import { boundedRequestBodyBytes } from './request-body.js';
 import { SERVICE_PLANE_REQUEST_ID_HEADER } from './types.js';
 
 export const SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME = 'ServicePlane-HMAC';

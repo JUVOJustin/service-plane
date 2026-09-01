@@ -34,7 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [20, 22, 24]
+        node-version: [22, 24]
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -56,8 +56,8 @@ jobs:
 
       # The same bundle the other runtimes execute; run it on Node too so a
       # bundling-only regression cannot hide behind a green vitest suite.
-      - name: Smoke (bundled)
-        run: npm run smoke:build && node smoke-dist/cli.mjs
+      - name: Smoke (bundled and public declarations)
+        run: npm run smoke
 
   # The portability claim, exercised for real. workerd — the deployment runtime — runs the full
   # vitest suite inside actual isolates via vitest-pool-workers. Deno and Bun run a bundled smoke

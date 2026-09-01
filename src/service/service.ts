@@ -5,6 +5,12 @@ import { Context, type Env, Hono, type MiddlewareHandler } from 'hono';
 import { etag } from 'hono/etag';
 import { type RequestIdVariables, requestId } from 'hono/request-id';
 import type { UpgradeWebSocket } from 'hono/ws';
+import {
+  closeOversizedWebSocket,
+  readBoundedWebSocketMessage,
+  resolveOptionalBodyByteLimit,
+  ServicePlaneBodyTooLargeError,
+} from '../shared/body-limit.js';
 import { extractServicePlaneToken, servicePlaneAuthorization } from '../shared/capability-tokens.js';
 import {
   type ConnInfo,
@@ -32,7 +38,7 @@ import {
   normalizeIdempotencyKey,
   SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER,
 } from '../shared/idempotency.js';
-import { defaultServicePlaneLogSink } from '../shared/logging.js';
+import { defaultServicePlaneLogSink, emitBestEffortServicePlaneLog } from '../shared/logging.js';
 import {
   type CapabilityIdentity,
   type CapabilityJwksResolver,
@@ -43,6 +49,7 @@ import {
   SERVICE_PLANE_REQUEST_ID_HEADER,
   SERVICE_PLANE_REQUEST_ID_QUERY_PARAM,
 } from '../shared/types.js';
+import { OrderedWebSocketTasks } from '../shared/web-socket-tasks.js';
 import type { AbilityMethodContext, ServiceAbilityWebSocket } from './ability.js';
 import { jwksFromServiceBinding, verifyAuthenticationToken } from './capabilities.js';
 import type { NativeAbilityCall } from './client.js';
@@ -63,15 +70,35 @@ import {
 } from './logger.js';
 import { compileAbilityMethod, createAbilityRpcRuntimeContext } from './orpc.js';
 import { createRpcHandlerPlugins } from './orpc-features.js';
-import type { ServicePlaneServerWireOptions } from './wire-options.js';
+import { DEFAULT_SERVICE_PLANE_RPC_MAX_REQUEST_BODY_BYTES, type ServicePlaneServerWireOptions } from './wire-options.js';
 
-export type ServicePlaneServiceAuthOptions<TEnv extends Env> = {
-  controlPlaneBinding?: (bindings: TEnv['Bindings'], context: Context<TEnv>) => FetchLike;
+const SERVICE_WEB_SOCKET_TOO_LARGE_MESSAGE = 'Service-Plane WebSocket message exceeds rpc.maxRequestBodyBytes';
+
+type ServicePlaneServiceAuthCommonOptions = {
+  /** Token audience accepted by this service. Defaults to the service id. */
   expectedAudience?: string;
+  /** Capability-token issuer. Defaults to `control-plane`. */
   issuer?: string;
-  jwks?: CapabilityJwksResolver | ((context: Context<TEnv>) => CapabilityJwksResolver | Promise<CapabilityJwksResolver>);
+  /** Verification clock override for deterministic tests or controlled runtimes. */
   now?: Date | (() => Date);
 };
+
+/** Trust source and token-verification policy for one service. */
+export type ServicePlaneServiceAuthOptions<TEnv extends Env> = ServicePlaneServiceAuthCommonOptions &
+  (
+    | {
+        /** Fetch binding to the control plane's JWKS endpoint. */
+        controlPlaneBinding: (bindings: TEnv['Bindings'], context: Context<TEnv>) => FetchLike;
+        /** Optional explicit resolver; when present it takes precedence over the binding. */
+        jwks?: CapabilityJwksResolver | ((context: Context<TEnv>) => CapabilityJwksResolver | Promise<CapabilityJwksResolver>);
+      }
+    | {
+        /** Optional binding retained when an explicit resolver is supplied. */
+        controlPlaneBinding?: (bindings: TEnv['Bindings'], context: Context<TEnv>) => FetchLike;
+        /** Explicit JWKS value or resolver used to verify capability tokens. */
+        jwks: CapabilityJwksResolver | ((context: Context<TEnv>) => CapabilityJwksResolver | Promise<CapabilityJwksResolver>);
+      }
+  );
 
 export type ServicePlaneServiceIngressOptions<TEnv extends Env> = {
   brokerServiceIds?: string[] | ((bindings: TEnv['Bindings'], context: Context<TEnv>) => Promise<string[]> | string[]);
@@ -84,7 +111,7 @@ type ServicePlaneServiceEnv<TEnv extends Env> = TEnv & {
 type ServicePlaneRequestIdOptions = NonNullable<Parameters<typeof requestId>[0]>;
 
 export type ServicePlaneServiceOptions<TEnv extends Env = Env> = DefineServiceInput<TEnv> &
-  DefineServiceOptions & {
+  Omit<DefineServiceOptions, 'defaultMethodTimeoutMs'> & {
     app?: Hono<TEnv>;
     auth: ServicePlaneServiceAuthOptions<TEnv>;
     discoveryPath?: string;
@@ -127,27 +154,38 @@ export class ServicePlaneService<TEnv extends Env = Env> {
   // RPC transports get no manufactured default; misconfigured policy values fail here, not at
   // the first request they silently loosen.
   private readonly timeoutPolicy: ServicePlaneTimeoutPolicy | undefined;
+  private readonly rpcMaxRequestBodyBytes: false | number;
   private readonly logHandlerFailure: ((event: ServicePlaneHandlerFailureLogEvent, context: Context<TEnv>) => void) | undefined;
+  private readonly abilitiesById = new Map<string, NormalizedServiceAbility<TEnv>>();
   private readonly rpcRouters = new Map<string, Record<string, AnyProcedure>>();
   private readonly webSocketHandlers = new Map<string, WebSocketRpcHandler<Record<PropertyKey, unknown>>>();
+  private readonly webSocketTasks = new OrderedWebSocketTasks();
 
   constructor(private readonly options: ServicePlaneServiceOptions<TEnv>) {
     this.app = (options.app ?? new Hono<ServicePlaneServiceEnv<TEnv>>()) as Hono<ServicePlaneServiceEnv<TEnv>>;
     this.timeoutPolicy = validateTimeoutPolicy(options.timeout);
+    this.rpcMaxRequestBodyBytes = resolveOptionalBodyByteLimit(
+      options.rpc?.maxRequestBodyBytes,
+      DEFAULT_SERVICE_PLANE_RPC_MAX_REQUEST_BODY_BYTES,
+      'Service-Plane maxRequestBodyBytes must be a positive integer or false',
+    );
     // The replacement is all the caller sees, so the original throw goes to the app's log sink; the
     // package never owns the logger, mirroring every other surface.
     const write = options.logger === false ? undefined : (options.logger?.log ?? defaultServicePlaneLogSink);
     this.logHandlerFailure = write
       ? (event, context) => {
           recordServicePlaneLogEvent(context as unknown as Context, event);
-          write(event, context as unknown as Context);
+          emitBestEffortServicePlaneLog(write, event, context as unknown as Context);
         }
       : undefined;
     this.definition = defineAbilityService(options, {
       ...(options.timeout?.methodMs === undefined ? {} : { defaultMethodTimeoutMs: options.timeout.methodMs }),
       requireAbilityScopes: options.requireAbilityScopes ?? true,
     });
-    for (const ability of this.definition.abilities) this.rpcRouters.set(ability.id, compileAbilityRouter(ability));
+    for (const ability of this.definition.abilities) {
+      this.abilitiesById.set(ability.id, ability);
+      this.rpcRouters.set(ability.id, compileAbilityRouter(ability));
+    }
     this.discoveryPath = options.discoveryPath ?? SERVICE_DISCOVERY_PATH;
 
     // A declared WebSocket path needs either Hono's upgrade adapter or a Durable Object forwarding
@@ -190,11 +228,11 @@ export class ServicePlaneService<TEnv extends Env = Env> {
 
   fetch: Hono<ServicePlaneServiceEnv<TEnv>>['fetch'] = (request, env, executionCtx) => this.app.fetch(request, env, executionCtx);
 
-  /** Calls a unary method through a Cloudflare native service binding without HTTP serialization. */
+  /** Calls a unary method through a Cloudflare binding without the Service Plane HTTP/JSON codec. */
   async invokeAbility(input: NativeAbilityCall, bindings?: TEnv['Bindings']): Promise<unknown> {
-    const ability = this.definition.abilities.find((candidate) => candidate.id === input.abilityId);
+    const ability = this.abilitiesById.get(input.abilityId);
     if (!ability) throw new CapabilityAuthError(`Service-Plane ability not found: ${input.abilityId}`, 404);
-    if (!ability.rpc.transports.includes('cloudflare-service-binding')) {
+    if (!ability.rpc.transports.includes('service-binding')) {
       throw new CapabilityAuthError(`Service-Plane native binding RPC is not enabled for ability: ${input.abilityId}`, 405);
     }
     const method = ability.methods[input.method];
@@ -226,7 +264,10 @@ export class ServicePlaneService<TEnv extends Env = Env> {
 
   /**
    * Handles one message from a manually accepted WebSocket. A Durable Object can call this from
-   * `webSocketMessage`, allowing the socket to hibernate between events.
+   * `webSocketMessage`, allowing the socket to hibernate between events. Call it at event entry;
+   * messages for one socket reach the private peer in call order, and `webSocketClose` lets queued
+   * frames reach that peer before releasing it. Messages exceeding `rpc.maxRequestBodyBytes`
+   * reject with status 413 before the private protocol decoder runs.
    */
   async webSocketMessage(
     abilityId: string,
@@ -234,21 +275,28 @@ export class ServicePlaneService<TEnv extends Env = Env> {
     message: string | ArrayBuffer,
     bindings?: TEnv['Bindings'],
   ): Promise<void> {
+    const receivedAt = Date.now();
     const ability = this.orpcWebSocketAbility(abilityId);
     const base = nativeBindingContext<TEnv>(ability.rpc.path, bindings, undefined);
-    await this.orpcWebSocketHandler(ability).message(webSocket, message, {
-      context: (request) => {
-        const callContext = rpcMessageContext(base, request);
-        return this.createRpcRuntime(ability, callContext, this.timeoutPolicy, request.signal, webSocket);
-      },
-      prefix: ability.rpc.path as `/${string}`,
+    const delivery = await this.webSocketTasks.run(webSocket, async () => {
+      const boundedMessage = await readBoundedWebSocketMessage(message, this.rpcMaxRequestBodyBytes, SERVICE_WEB_SOCKET_TOO_LARGE_MESSAGE);
+      return {
+        completion: this.orpcWebSocketHandler(ability).message(webSocket, boundedMessage, {
+          context: (request) => {
+            const callContext = rpcMessageContext(base, request);
+            return this.createRpcRuntime(ability, callContext, this.timeoutPolicy, request.signal, webSocket, receivedAt);
+          },
+          prefix: ability.rpc.path as `/${string}`,
+        }),
+      };
     });
+    await delivery.completion;
   }
 
-  /** Releases private RPC peer state after a manually accepted WebSocket closes. */
+  /** Delivers queued frames, then releases private RPC peer state after a manual socket closes. */
   async webSocketClose(abilityId: string, webSocket: ServiceAbilityWebSocket): Promise<void> {
     const ability = this.orpcWebSocketAbility(abilityId);
-    await this.orpcWebSocketHandler(ability).close(webSocket);
+    await this.webSocketTasks.run(webSocket, () => this.orpcWebSocketHandler(ability).close(webSocket));
   }
 
   private mountDiscovery(): void {
@@ -273,13 +321,12 @@ export class ServicePlaneService<TEnv extends Env = Env> {
 
   private mountRpcAbility(ability: NormalizedServiceAbility<TEnv>): void {
     const router = this.rpcRouter(ability);
-    const plugins = this.rpcHandlerPlugins(ability);
+    const plugins = this.rpcHandlerPlugins(ability, false);
     const handlerOptions = plugins.length > 0 ? { plugins } : {};
     const fetchHandler = new FetchRpcHandler(router, handlerOptions);
-    const websocketHandler = this.orpcWebSocketHandler(ability);
 
     const handleFetch = async (context: Context<ServicePlaneServiceEnv<TEnv>>) => {
-      if (!ability.rpc.transports.includes('fetch') && !ability.rpc.transports.includes('cloudflare-service-binding')) {
+      if (!ability.rpc.transports.includes('fetch') && !ability.rpc.transports.includes('service-binding')) {
         return new Response('Fetch RPC is not enabled for this ability', { status: 405 });
       }
       const handled = await fetchHandler.handle(context.req.raw, {
@@ -306,31 +353,42 @@ export class ServicePlaneService<TEnv extends Env = Env> {
         return new Response('Service-Plane WebSocket is configured for manual event handling', { status: 426 });
       }
 
+      const websocketHandler = this.orpcWebSocketHandler(ability);
       return upgradeWebSocket(context, {
         onClose: (_event, socket) => {
-          void websocketHandler.close(socket);
+          void this.webSocketTasks.run(socket, () => websocketHandler.close(socket));
         },
-        onMessage: async (event, socket) => {
-          const data =
-            event.data instanceof Blob
-              ? await event.data.arrayBuffer()
-              : typeof event.data === 'string' || event.data instanceof ArrayBuffer
-                ? event.data
-                : new Uint8Array(event.data).slice();
-          await websocketHandler.message(socket, data, {
-            context: (request: StandardLazyRequest) => {
-              const callContext = rpcMessageContext(context as unknown as Context<TEnv>, request);
-              return this.createRpcRuntime(ability, callContext, this.timeoutPolicy, request.signal, socket);
-            },
-            prefix: ability.rpc.path as `/${string}`,
+        onMessage: (event, socket) => {
+          const receivedAt = Date.now();
+          const delivery = this.webSocketTasks.run(socket, async () => {
+            let data: string | ArrayBuffer;
+            try {
+              data = await readBoundedWebSocketMessage(event.data, this.rpcMaxRequestBodyBytes, SERVICE_WEB_SOCKET_TOO_LARGE_MESSAGE);
+            } catch (error) {
+              if (!(error instanceof ServicePlaneBodyTooLargeError)) throw error;
+              closeOversizedWebSocket(socket);
+              return;
+            }
+            return {
+              completion: websocketHandler.message(socket, data, {
+                context: (request: StandardLazyRequest) => {
+                  const callContext = rpcMessageContext(context as unknown as Context<TEnv>, request);
+                  return this.createRpcRuntime(ability, callContext, this.timeoutPolicy, request.signal, socket, receivedAt);
+                },
+                prefix: ability.rpc.path as `/${string}`,
+              }),
+            };
           });
+          // The queue covers only normalization and synchronous protocol delivery. The RPC itself
+          // remains concurrent with later calls on the same socket, matching oRPC's own upgrader.
+          return delivery.then((result) => result?.completion);
         },
       });
     });
   }
 
   private orpcWebSocketAbility(abilityId: string): NormalizedServiceAbility<TEnv> {
-    const ability = this.definition.abilities.find((candidate) => candidate.id === abilityId);
+    const ability = this.abilitiesById.get(abilityId);
     if (!ability) throw new CapabilityAuthError(`Service-Plane ability not found: ${abilityId}`, 404);
     if (!ability.rpc.transports.includes('websocket')) {
       throw new CapabilityAuthError(`Service-Plane WebSocket transport is not enabled for ability: ${abilityId}`, 405);
@@ -342,7 +400,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
     let handler = this.webSocketHandlers.get(ability.id);
     if (!handler) {
       const router = this.rpcRouter(ability);
-      const plugins = this.rpcHandlerPlugins(ability);
+      const plugins = this.rpcHandlerPlugins(ability, true);
       const options = plugins.length > 0 ? { plugins } : {};
       handler = new WebSocketRpcHandler(router, options);
       this.webSocketHandlers.set(ability.id, handler);
@@ -356,8 +414,8 @@ export class ServicePlaneService<TEnv extends Env = Env> {
     return router;
   }
 
-  private rpcHandlerPlugins(ability: NormalizedServiceAbility<TEnv>) {
-    const hibernation = Object.values(ability.methods).some((method) => method.method.kind === 'hibernation');
+  private rpcHandlerPlugins(ability: NormalizedServiceAbility<TEnv>, supportsHibernation: boolean) {
+    const hibernation = supportsHibernation && Object.values(ability.methods).some((method) => method.method.kind === 'hibernation');
     return createRpcHandlerPlugins(this.options.rpc ?? {}, hibernation);
   }
 
@@ -367,54 +425,89 @@ export class ServicePlaneService<TEnv extends Env = Env> {
     timeoutPolicy: ServicePlaneTimeoutPolicy | undefined,
     transportSignal?: AbortSignal,
     webSocket?: ServiceAbilityWebSocket,
+    receivedAt = Date.now(),
   ) {
-    const timeoutMs = resolveTimeoutMs(timeoutMsFromRequest(context.req), timeoutPolicy);
-    const startedAt = Date.now();
-    const deadlineAt = timeoutMs === undefined ? undefined : startedAt + timeoutMs;
+    // Batch decoding, frame normalization, and authorization are part of the caller's budget, not
+    // free work before its timer begins. WebSocket callbacks therefore pass their entry timestamp.
     const onHandlerFailure = this.logHandlerFailure;
+    const resolveCallTimeoutMs = (headers?: Headers) =>
+      resolveTimeoutMs(
+        timeoutMsFromRequest(
+          headers
+            ? {
+                header: (name) => headers.get(name) ?? undefined,
+                query: (name) => context.req.query(name),
+              }
+            : context.req,
+        ),
+        timeoutPolicy,
+      );
+    const resolveCallDeadlineAt = (headers?: Headers) => {
+      const timeoutMs = resolveCallTimeoutMs(headers);
+      return timeoutMs === undefined ? undefined : receivedAt + timeoutMs;
+    };
 
     return createAbilityRpcRuntimeContext<TEnv>({
-      authorize: async ({ path, procedure, signal }) => {
+      authorize: async ({ headers, path, procedure, signal }) => {
+        const logicalSignal = signal ?? transportSignal;
+        const callContext =
+          headers || (logicalSignal && logicalSignal !== context.req.raw.signal)
+            ? rpcRequestContext(context, headers ?? context.req.raw.headers, logicalSignal)
+            : context;
+        const timeoutMs = resolveCallTimeoutMs(headers);
+        const deadlineAt = timeoutMs === undefined ? undefined : receivedAt + timeoutMs;
         const methodName = path.at(-1);
         const method = methodName ? ability.methods[methodName] : undefined;
         const expectedProcedure = methodName ? this.rpcRouter(ability)[methodName] : undefined;
         if (!method || !expectedProcedure || expectedProcedure !== procedure) {
           throw new CapabilityAuthError(`Service-Plane ability method not found: ${ability.id}/${methodName ?? ''}`, 404);
         }
-        const token = extractServicePlaneToken(context.req.raw);
-        const proof = context.req.header(SERVICE_PLANE_PROOF_HEADER);
+        const token = extractServicePlaneToken(callContext.req.raw);
+        const proof = callContext.req.header(SERVICE_PLANE_PROOF_HEADER);
         const identity = await verifyAuthenticationToken(token, {
-          ...(await serviceVerifier(this.options.auth, this.definition.id, context)),
+          ...(await serviceVerifier(this.options.auth, this.definition.id, callContext)),
           abilityId: ability.id,
           ...(proof ? { proof } : {}),
         });
-        await verifyServiceIngress(this.options.auth, this.options.ingress, identity, context);
+        await verifyServiceIngress(this.options.ingress, identity, callContext);
         verifyAbilityAccess(ability, identity);
         requireAbilityMethodScopes(identity, method.scopes);
+        if (method.method.kind === 'hibernation' && !webSocket) {
+          throw new CapabilityAuthError(
+            `Service-Plane hibernation method requires a WebSocket transport: ${ability.id}/${methodName}`,
+            405,
+          );
+        }
 
-        const connInfo = this.options.ingress && identity.brokerServiceId ? normalizeConnInfo(forwardedConnInfo(context)) : undefined;
-        const remaining = timeoutMs === undefined ? undefined : () => remainingTimeoutMs(timeoutMs, Date.now() - startedAt) as number;
-        const idempotencyKey = idempotencyKeyFromRequest(context.req);
+        const connInfo = this.options.ingress && identity.brokerServiceId ? normalizeConnInfo(forwardedConnInfo(callContext)) : undefined;
+        const remaining = timeoutMs === undefined ? undefined : () => remainingTimeoutMs(timeoutMs, Date.now() - receivedAt) as number;
+        const idempotencyKey = idempotencyKeyFromRequest(callContext.req);
         const procedureContext: AbilityMethodContext<TEnv> = {
           abilityId: ability.id,
+          methodName: methodName ?? '',
           ...(connInfo ? { connInfo } : {}),
-          context,
-          env: context.env,
+          context: callContext,
+          env: callContext.env,
           ...(idempotencyKey ? { idempotencyKey } : {}),
           identity,
-          request: context.req.raw,
+          request: callContext.req.raw,
           ...(remaining ? { remainingTimeoutMs: remaining } : {}),
           ...(webSocket ? { webSocket } : {}),
         };
         defineLazyProcedureSignal(procedureContext, deadlineAt, signal ?? transportSignal);
-        return procedureContext;
+        return {
+          context: procedureContext,
+          ...(deadlineAt === undefined ? {} : { deadlineAt }),
+        };
       },
-      ...(deadlineAt === undefined ? {} : { deadlineAt }),
       defaultMethodTimeoutMs: this.options.timeout?.methodMs ?? DEFAULT_ABILITY_TIMEOUT_MS,
+      receivedAt,
+      resolveDeadlineAt: ({ headers }) => resolveCallDeadlineAt(headers),
       ...(onHandlerFailure
         ? {
-            onHandlerFailure: (cause: unknown, methodName: string) => {
-              const requestId = requestIdFromContext(context as unknown as Context);
+            onHandlerFailure: (cause: unknown, methodName: string, methodContext?: AbilityMethodContext<TEnv>) => {
+              const failureContext = methodContext?.context ?? context;
+              const requestId = requestIdFromContext(failureContext as unknown as Context);
               onHandlerFailure(
                 {
                   abilityId: ability.id,
@@ -425,7 +518,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
                   ...(requestId ? { requestId } : {}),
                   serviceId: this.definition.id,
                 },
-                context,
+                failureContext,
               );
             },
           }
@@ -482,11 +575,38 @@ function rpcMessageContext<TEnv extends Env>(base: Context<TEnv>, message: Stand
   });
   const context = new Context<TEnv>(request, {
     env: base.env,
+    ...contextExecutionOptions(base),
     path: base.req.path,
   });
+  for (const [name, value] of Object.entries(base.var)) context.set(name as never, value as never);
   const requestId = validRequestId(headers.get(SERVICE_PLANE_REQUEST_ID_HEADER) ?? undefined) ?? requestIdFromContext(base);
   if (requestId) context.set('requestId' as never, requestId as never);
   return context;
+}
+
+function rpcRequestContext<TEnv extends Env>(base: Context<TEnv>, headers: Headers, signal?: AbortSignal): Context<TEnv> {
+  const request = new Request(base.req.url, {
+    headers,
+    method: base.req.method,
+    ...(signal ? { signal } : {}),
+  });
+  const context = new Context<TEnv>(request, {
+    env: base.env,
+    ...contextExecutionOptions(base),
+    path: base.req.path,
+  });
+  for (const [name, value] of Object.entries(base.var)) context.set(name as never, value as never);
+  const requestId = validRequestId(headers.get(SERVICE_PLANE_REQUEST_ID_HEADER) ?? undefined) ?? requestIdFromContext(base);
+  if (requestId) context.set('requestId' as never, requestId as never);
+  return context;
+}
+
+function contextExecutionOptions(context: Context): { executionCtx?: Context['executionCtx'] } {
+  try {
+    return { executionCtx: context.executionCtx };
+  } catch {
+    return {};
+  }
 }
 
 function applyStandardHeaders(target: Headers, source: StandardHeaders): void {
@@ -517,13 +637,12 @@ async function serviceVerifier<TEnv extends Env>(
 }
 
 async function verifyServiceIngress<TEnv extends Env>(
-  auth: ServicePlaneServiceAuthOptions<TEnv>,
   ingress: false | ServicePlaneServiceIngressOptions<TEnv> | undefined,
   identity: CapabilityIdentity,
   context: Context<TEnv>,
 ): Promise<void> {
   if (!ingress) return;
-  const allowed = await resolveIngressBrokerServiceIds(context, auth, ingress);
+  const allowed = await resolveIngressBrokerServiceIds(context, ingress);
   if (identity.brokerServiceId && allowed.includes(identity.brokerServiceId)) return;
   throw new CapabilityAuthError('Service-Plane brokered capability token is required', 403);
 }
@@ -580,7 +699,6 @@ async function resolveServiceJwks<TEnv extends Env>(
 
 async function resolveIngressBrokerServiceIds<TEnv extends Env>(
   context: Context<TEnv>,
-  auth: ServicePlaneServiceAuthOptions<TEnv>,
   ingress: ServicePlaneServiceIngressOptions<TEnv>,
 ): Promise<string[]> {
   const configured = ingress.brokerServiceIds;
@@ -588,7 +706,7 @@ async function resolveIngressBrokerServiceIds<TEnv extends Env>(
     ? typeof configured === 'function'
       ? await configured(context.env, context)
       : configured
-    : [auth.issuer ?? 'control-plane'];
+    : ['control-plane'];
   const normalized = [...new Set(brokerServiceIds.map((id) => id.trim()).filter(Boolean))];
   if (normalized.length === 0) throw new CapabilityAuthError('Service-Plane ingress requires at least one broker service id', 500);
   return normalized;

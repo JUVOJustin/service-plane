@@ -1,6 +1,9 @@
 /** Supported wire compression algorithms. */
 export type ServicePlaneCompressionEncoding = 'deflate' | 'deflate-raw' | 'gzip';
 
+/** Default maximum decoded RPC request body: one mebibyte. */
+export const DEFAULT_SERVICE_PLANE_RPC_MAX_REQUEST_BODY_BYTES = 1_048_576;
+
 /** Stable batching policy understood by Service Plane clients and servers. */
 export type ServicePlaneBatchOptions =
   | boolean
@@ -62,4 +65,6 @@ export type ServicePlaneServerWireOptions = {
   batch?: ServicePlaneBatchOptions;
   /** Accepts compressed requests and/or compresses responses. */
   compression?: ServicePlaneServerCompressionOptions;
+  /** Maximum decoded Fetch body or WebSocket message size. Defaults to one MiB; `false` disables the limit. */
+  maxRequestBodyBytes?: false | number;
 };

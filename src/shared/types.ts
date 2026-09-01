@@ -4,7 +4,7 @@ export const SERVICE_DISCOVERY_PATH = '/.well-known/service-plane/service.json';
 export const SERVICE_PLANE_OPENAPI_PATH = '/openapi.json';
 export const SERVICE_PLANE_CAPABILITY_JWKS_PATH = '/.well-known/service-plane/jwks.json';
 export const SERVICE_PLANE_CAPABILITY_TOKEN_PATH = '/.well-known/service-plane/capability-token';
-export const SERVICE_PLANE_MCP_PATH = '/rpc/mcp';
+export const SERVICE_PLANE_MCP_PATH = '/mcp';
 
 export const DEFAULT_REGISTRY_CACHE_TTL_SECONDS = 30;
 export const DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS = 120;
@@ -31,7 +31,7 @@ export function isAbilityAccess(value: unknown): value is AbilityAccess {
   return value === 'plane' || value === 'service';
 }
 export type AbilityExposure = 'private' | 'published';
-export type AbilityTransport = 'cloudflare-service-binding' | 'fetch' | 'websocket';
+export type AbilityTransport = 'fetch' | 'service-binding' | 'websocket';
 /**
  * `query` is the HTTP QUERY method (RFC 10008): a safe, idempotent request that carries its
  * parameters in a body. OpenAPI 3.2 gives it a fixed `query` field on the Path Item Object,
@@ -63,6 +63,11 @@ export type ServiceAbilityRestProjection = {
   method: ServiceHttpMethod;
   operationId?: string;
   path: string;
+  /**
+   * Successful HTTP response status. Defaults to 200; it is never inferred from the method because
+   * action-style POST operations legitimately return 200, 201, or 202.
+   */
+  status?: number;
   summary?: string;
   tags?: string[];
 };
@@ -171,29 +176,29 @@ export type ServiceGrantDefinition = {
 
 /** One unary method invocation sent through a Cloudflare native service binding. */
 export type ServiceAbilityNativeCall = {
-  /** Ability that owns the method. */
+  /** Stable contract id the target service resolves before selecting a method. */
   abilityId: string;
-  /** Authenticated control-plane connection metadata. */
+  /** Advisory original-client metadata forwarded only across the authenticated service boundary. */
   connInfo?: ConnInfo;
-  /** Caller key identifying this logical attempt. */
+  /** Caller-owned key that lets a handler recognize the same logical attempt across retries. */
   idempotencyKey?: string;
-  /** Procedure input. */
+  /** Untrusted value validated against the selected method schema after authorization. */
   input: unknown;
-  /** Procedure name inside the ability router. */
+  /** Public method key resolved within the selected ability contract. */
   method: string;
-  /** Optional proof of capability-token possession. */
+  /** Proof required when the capability token is sender-constrained. */
   proof?: string;
-  /** Correlation id forwarded across the plane. */
+  /** Caller correlation id preserved for downstream logs and handlers. */
   requestId?: string;
-  /** Remaining caller deadline in milliseconds. */
+  /** Remaining end-to-end caller budget when the native hop begins, in milliseconds. */
   timeoutMs?: number;
-  /** Broker-issued capability token. */
+  /** Capability the target service verifies before selecting or validating the method input. */
   token: string;
 };
 
 /** Native ability surface advertised by a Cloudflare service endpoint. */
 export type ServiceAbilityNativeRpcBinding = {
-  /** Calls one unary Service Plane method without HTTP serialization. */
+  /** Calls one unary Service Plane method without the Service Plane HTTP/JSON codec. */
   invokeAbility(input: ServiceAbilityNativeCall): Promise<unknown> | unknown;
 };
 
@@ -251,6 +256,8 @@ export type OpenApiDocument = {
   };
   openapi: '3.2.0';
   paths: Record<string, Record<string, OpenApiObject>>;
+  /** Application-authored security requirements for the public REST facade. */
+  security?: OpenApiObject[];
   servers?: OpenApiObject[];
   tags?: Array<{ description?: string; name: string }>;
 };
@@ -447,6 +454,15 @@ export type IssuedCapabilityToken = {
   token: string;
 };
 
+/** Token request accepted by a control-plane binding whose caller identity is deployment-pinned. */
+export type PinnedCapabilityTokenInput = Omit<IssueCapabilityTokenInput, 'callerServiceId' | 'confirmation' | 'subject'>;
+
+/** Native STS surface exposed to exactly one configured service caller. */
+export type ControlPlaneRpcTokenBinding = {
+  /** Issues a token for the caller identity fixed behind this binding. */
+  issueCapabilityToken(input: PinnedCapabilityTokenInput): Promise<IssuedCapabilityToken | { expiresAt: Date | string; token: string }>;
+};
+
 export type CapabilityTokenCacheEntry = {
   expiresAt: Date | string;
   token: string;
@@ -458,5 +474,6 @@ export type CapabilityTokenCache = {
 };
 
 export type CapabilityTokenProvider = {
-  token(): Promise<string>;
+  /** Returns a token; typed ability clients supply the scopes required by the current method. */
+  token(scopes?: readonly string[]): Promise<string>;
 };

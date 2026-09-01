@@ -52,6 +52,7 @@ export type {
   CapabilityJwks,
   CapabilityScopeDefinition,
   CapabilitySubject,
+  ControlPlaneRpcTokenBinding,
   DiscoveredServiceAbility,
   FetchLike,
   IssueCapabilityTokenInput,
@@ -65,6 +66,7 @@ export type {
   OpenApiDocument,
   OpenApiDocumentCache,
   OpenApiObject,
+  PinnedCapabilityTokenInput,
   RegistryCache,
   ServiceAbilityDiscovery,
   ServiceAbilityMcpProjection,
@@ -72,6 +74,7 @@ export type {
   ServiceAbilityMcpPromptProjection,
   ServiceAbilityMcpResourceProjection,
   ServiceAbilityMethodDiscovery,
+  ServiceAbilityNativeRpcBinding,
   ServiceAbilityRestProjection,
   ServiceCallerAuthDiscovery,
   ServiceDiscoveryDocument,
@@ -103,11 +106,7 @@ export {
   type BrokerCaller,
   brokerCallerAccess,
   brokerCallerSubject,
-  type ControlPlaneRpcBroker,
-  type ControlPlaneRpcBrokerCallInput,
-  type CreateControlPlaneRpcBrokerOptions,
-  createControlPlaneRpcBroker,
-} from './broker.js';
+} from './caller.js';
 export {
   generateHmacClientSecret,
   type HmacServiceClient,
@@ -146,11 +145,16 @@ export {
   mountCapabilityTokenEndpoint,
 } from './capabilities.js';
 export {
-  type BrokerCallerResolver,
-  type ConnInfoResolver,
+  type ControlPlaneAbilityClient,
+  type ControlPlaneAbilityClientCallOptions,
+  type ControlPlaneAbilityClientOptions,
+  type ControlPlaneRestOptions,
   type DiscoveryCacheRoute,
   ServicePlaneControlPlane,
+  type ServicePlaneControlPlaneEnv,
+  type ServicePlaneControlPlaneInvocation,
   type ServicePlaneControlPlaneOptions,
+  type ServicePlaneControlPlaneVariables,
   type ServicePlaneDiscoveryCaches,
 } from './control-plane.js';
 export {
@@ -158,6 +162,7 @@ export {
   httpsService,
   serviceDiscoveryRequest,
 } from './endpoints.js';
+export type { ControlPlaneInvocationOptions } from './invocation.js';
 export {
   type ControlPlaneMcpHandlerOptions,
   type ControlPlaneMcpServerInfo,
@@ -176,15 +181,15 @@ export {
 export {
   type CreateServiceRegistryOptions,
   createServiceRegistry,
+  DEFAULT_SERVICE_DISCOVERY_RESPONSE_MAX_BYTES,
   memoryRegistryCache,
   serviceRegistryCacheKey,
 } from './registry.js';
 export {
-  type IssueCapabilityTokenForCallerInput,
-  issueCapabilityTokenForCaller,
-  issuedCapabilityTokenRpcResponse,
-  type RpcIssuedCapabilityToken,
-} from './rpc.js';
+  type ControlPlaneRestHandlerOptions,
+  type ControlPlaneRestInvocation,
+  handleControlPlaneRestRequest,
+} from './rest.js';
 export {
   type CapabilitySigningKey,
   type CreateCapabilityIssuerFromSigningKeysOptions,

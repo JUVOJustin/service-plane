@@ -1,20 +1,22 @@
 name: Deploy
 
 on:
-  push:
-    tags:
-      - '*'
+  release:
+    types:
+      - published
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       id-token: write
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -22,41 +24,27 @@ jobs:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Extract tag version
+      - name: Verify release version
         id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          RAW="${GITHUB_REF#refs/tags/}"
-          CLEAN="${RAW#v}"
-          echo "RAW=$RAW" >> $GITHUB_OUTPUT
-          echo "VERSION=$CLEAN" >> $GITHUB_OUTPUT
-          if [[ "$CLEAN" =~ -[A-Za-z0-9]+ ]]; then
-            echo "NPM_TAG=next" >> $GITHUB_OUTPUT
-            echo "IS_PRERELEASE=true" >> $GITHUB_OUTPUT
-          else
-            echo "NPM_TAG=latest" >> $GITHUB_OUTPUT
-            echo "IS_PRERELEASE=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Update package.json version
-        run: npm version ${{ steps.version.outputs.VERSION }} --no-git-tag-version --allow-same-version
+          node --input-type=module -e '
+          import { appendFileSync, readFileSync } from "node:fs";
+          const tag = process.env.RELEASE_TAG ?? "";
+          const taggedVersion = tag.startsWith("v") ? tag.slice(1) : tag;
+          const packageVersion = JSON.parse(readFileSync("package.json", "utf8")).version;
+          if (taggedVersion !== packageVersion) {
+            throw new Error(`Release tag ${tag} does not match package.json version ${packageVersion}`);
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `NPM_TAG=${taggedVersion.includes("-") ? "next" : "latest"}\n`);
+          '
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Build
-        run: npm run build
-
-      - name: Test
-        run: npm test
-
-      - name: Commit version update
-        uses: test-room-7/action-update-file@v2
-        with:
-          file-path: |
-            package.json
-            package-lock.json
-          commit-msg: "chore: update package.json version to ${{ steps.version.outputs.VERSION }}"
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify release
+        run: npm run verify
 
       - name: Publish to npm
-        run: npm publish --tag ${{ steps.version.outputs.NPM_TAG }}
+        run: npm publish --access public --provenance --tag ${{ steps.version.outputs.NPM_TAG }}

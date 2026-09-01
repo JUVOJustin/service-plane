@@ -5,29 +5,61 @@ import { defineCapabilities } from '../service/capabilities.js';
 import { createBrokeredAbilityClient } from '../service/client.js';
 import { defineAbility } from '../service/discovery.js';
 import { ServicePlaneService } from '../service/service.js';
-import type { CapabilityJwks } from '../shared/types.js';
-import { SERVICE_PLANE_CAPABILITY_JWKS_PATH, SERVICE_PLANE_CAPABILITY_TOKEN_PATH, SERVICE_PLANE_MCP_PATH } from '../shared/types.js';
-import { type BrokerCallerResolver, ServicePlaneControlPlane } from './control-plane.js';
+import type { CapabilityJwks, ServiceDiscoveryDocument } from '../shared/types.js';
+import {
+  SERVICE_DISCOVERY_PATH,
+  SERVICE_PLANE_CAPABILITY_JWKS_PATH,
+  SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
+  SERVICE_PLANE_MCP_PATH,
+} from '../shared/types.js';
+import { ServicePlaneControlPlane } from './control-plane.js';
 import { cloudflareServiceBinding } from './endpoints.js';
 import { generateCapabilitySigningSecret } from './signing-keys.js';
 
 const BROKER_PATH = 'https://plane.internal/rpc/broker/call';
 const MCP_PATH = `https://plane.internal${SERVICE_PLANE_MCP_PATH}`;
 
+const discovery: ServiceDiscoveryDocument = {
+  abilities: [
+    {
+      access: 'plane',
+      exposure: 'published',
+      id: 'tasks.items',
+      methods: {
+        get: {
+          inputSchema: { type: 'object' },
+          mcp: { name: 'tasks_get' },
+          outputSchema: { type: 'object' },
+          scopes: ['tasks.read'],
+        },
+      },
+      rpc: { path: '/rpc/tasks.items', transports: ['fetch'] },
+      scopes: ['tasks.read'],
+    },
+  ],
+  capabilities: { scopes: [{ id: 'tasks.read' }], serviceId: 'tasks' },
+  id: 'tasks',
+  title: 'Tasks',
+  version: '1.0.0',
+};
+
 function stubEndpoint() {
   return cloudflareServiceBinding({
-    binding: { fetch: async () => Response.json({}) },
+    binding: {
+      fetch: async (request) => (new URL(request.url).pathname === SERVICE_DISCOVERY_PATH ? Response.json(discovery) : Response.json({})),
+    },
     grants: [{ caller: 'headless-front', scopes: ['tasks.read'] }],
     id: 'tasks',
   });
 }
 
 describe('fail-closed caller resolution', () => {
-  it('fails closed with 500 on broker and MCP endpoints when no caller resolver is configured', async () => {
+  it('fails closed with 500 on broker and MCP endpoints when invocation middleware does not provide a caller', async () => {
     // Misconfiguration is logged straight to console.error so it surfaces even without a log sink.
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       let serviceCalls = 0;
+      let signingKeyCalls = 0;
       const plane = new ServicePlaneControlPlane({
         broker: {},
         log: false,
@@ -37,31 +69,42 @@ describe('fail-closed caller resolution', () => {
           serviceCalls += 1;
           return [stubEndpoint()];
         },
-        signingKeys: async () => [{ kid: 'test-key', secret: await generateCapabilitySigningSecret() }],
+        signingKeys: async () => {
+          signingKeyCalls += 1;
+          return [{ kid: 'test-key', secret: await generateCapabilitySigningSecret() }];
+        },
       });
 
       const broker = await plane.fetch(new Request(BROKER_PATH, { method: 'POST' }));
       expect(broker.status).toBe(500);
-      await expect(broker.json()).resolves.toEqual({ error: 'Service-Plane broker caller authentication is not configured' });
-
-      const mcp = await plane.fetch(new Request(MCP_PATH, { method: 'POST' }));
-      expect(mcp.status).toBe(500);
-      await expect(mcp.json()).resolves.toEqual({ error: 'Service-Plane broker caller authentication is not configured' });
-
-      // Fail closed before any service work: a refused request must not trigger discovery.
+      await expect(broker.json()).resolves.toEqual({ error: 'Service-Plane Hono invocation context is missing servicePlaneCaller' });
       expect(serviceCalls).toBe(0);
+
+      const mcp = await plane.fetch(
+        new Request(MCP_PATH, {
+          body: JSON.stringify({ id: 1, jsonrpc: '2.0', method: 'ping' }),
+          headers: { 'content-type': 'application/json' },
+          method: 'POST',
+        }),
+      );
+      expect(mcp.status).toBe(500);
+      await expect(mcp.json()).resolves.toEqual({ error: 'Service-Plane Hono invocation context is missing servicePlaneCaller' });
+
+      // Authentication now completes before discovery for both public RPC surfaces.
+      expect(serviceCalls).toBe(0);
+      expect(signingKeyCalls).toBe(0);
     } finally {
       consoleError.mockRestore();
     }
   });
 
-  it('refuses with a generic 403 when the caller resolver returns undefined', async () => {
+  it('passes a generic 403 from invocation middleware through unchanged', async () => {
     let serviceCalls = 0;
-    const refuse: BrokerCallerResolver = () => undefined;
     const plane = new ServicePlaneControlPlane({
-      broker: { caller: refuse },
+      broker: {},
+      invocationMiddleware: async (context) => context.json({ error: 'Forbidden' }, 403),
       log: false,
-      mcp: { caller: refuse },
+      mcp: {},
       openapi: false,
       services: () => {
         serviceCalls += 1;
@@ -71,7 +114,13 @@ describe('fail-closed caller resolution', () => {
     });
 
     const broker = await plane.fetch(new Request(BROKER_PATH, { method: 'POST' }));
-    const mcp = await plane.fetch(new Request(MCP_PATH, { method: 'POST' }));
+    const mcp = await plane.fetch(
+      new Request(MCP_PATH, {
+        body: JSON.stringify({ id: 1, jsonrpc: '2.0', method: 'ping' }),
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
+      }),
+    );
     for (const response of [broker, mcp]) {
       expect(response.status).toBe(403);
       // A generic refusal: no invented auth scheme leaks how the plane authenticates callers.
@@ -81,15 +130,15 @@ describe('fail-closed caller resolution', () => {
     expect(serviceCalls).toBe(0);
   });
 
-  it('passes a resolver-owned authentication challenge through unchanged', async () => {
+  it('passes an invocation-middleware authentication challenge through unchanged', async () => {
     let serviceCalls = 0;
     let signingKeyCalls = 0;
-    const reject: BrokerCallerResolver = (context) =>
-      context.json({ error: 'Unauthorized' }, 401, { 'WWW-Authenticate': 'Bearer realm="service-plane"' });
     const plane = new ServicePlaneControlPlane({
-      broker: { caller: reject },
+      broker: {},
+      invocationMiddleware: async (context) =>
+        context.json({ error: 'Unauthorized' }, 401, { 'WWW-Authenticate': 'Bearer realm="service-plane"' }),
       log: false,
-      mcp: { caller: reject },
+      mcp: {},
       openapi: false,
       services: () => {
         serviceCalls += 1;
@@ -102,13 +151,19 @@ describe('fail-closed caller resolution', () => {
     });
 
     const broker = await plane.fetch(new Request(BROKER_PATH, { method: 'POST' }));
-    const mcp = await plane.fetch(new Request(MCP_PATH, { method: 'POST' }));
+    const mcp = await plane.fetch(
+      new Request(MCP_PATH, {
+        body: JSON.stringify({ id: 1, jsonrpc: '2.0', method: 'ping' }),
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
+      }),
+    );
     for (const response of [broker, mcp]) {
       expect(response.status).toBe(401);
       expect(response.headers.get('www-authenticate')).toBe('Bearer realm="service-plane"');
       await expect(response.json()).resolves.toEqual({ error: 'Unauthorized' });
     }
-    // Refused callers cost nothing: neither discovery nor signing material is touched.
+    // Refused callers never trigger discovery or signing-material derivation.
     expect(serviceCalls).toBe(0);
     expect(signingKeyCalls).toBe(0);
   });
@@ -133,7 +188,7 @@ describe('fail-closed caller resolution', () => {
     await expect(response.json()).resolves.toEqual({ error: 'Service-Plane caller authentication is not configured' });
   });
 
-  it('brokers the same call once a caller resolver is configured', async () => {
+  it('brokers the same call once invocation middleware provides a caller', async () => {
     const capabilities = defineCapabilities({ scopes: [{ id: 'tasks.read' }], serviceId: 'tasks' });
     const ability = createAbilityBuilder();
     const tasks = defineAbility({
@@ -141,11 +196,12 @@ describe('fail-closed caller resolution', () => {
       exposure: 'published',
       id: 'tasks.items',
       methods: {
-        get: ability
-          .method({ scopes: ['tasks.read'] })
-          .input(z.object({ id: z.string() }))
-          .output(z.object({ caller: z.string(), id: z.string() }))
-          .handler(({ context, input }) => ({ caller: context.identity.serviceId, id: input.id })),
+        get: ability.method({
+          scopes: ['tasks.read'],
+          input: z.object({ id: z.string() }),
+          output: z.object({ caller: z.string(), id: z.string() }),
+          handler: ({ context, input }) => ({ caller: context.identity.serviceId, id: input.id }),
+        }),
       },
       rpc: { transports: ['fetch'] },
       scopes: ['tasks.read'],
@@ -168,9 +224,15 @@ describe('fail-closed caller resolution', () => {
       version: '1.0.0',
     });
     const signingSecret = await generateCapabilitySigningSecret();
+    let authenticatedBody: string | undefined;
     plane = new ServicePlaneControlPlane({
-      broker: { caller: () => ({ id: 'headless-front', kind: 'service' }) },
+      broker: {},
       controlPlaneServiceId: 'control-plane',
+      invocationMiddleware: async (context, next) => {
+        authenticatedBody = await context.req.raw.text();
+        context.set('servicePlaneCaller', { id: 'headless-front', kind: 'service' });
+        await next();
+      },
       log: false,
       mcp: false,
       openapi: false,
@@ -195,5 +257,6 @@ describe('fail-closed caller resolution', () => {
     });
 
     await expect(client.get({ id: 'task-1' })).resolves.toEqual({ caller: 'headless-front', id: 'task-1' });
+    expect(authenticatedBody).toContain('task-1');
   });
 });

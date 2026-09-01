@@ -123,6 +123,11 @@ export type RaceDeadlineOptions = {
    * is released instead of pinning its remote resource on a live transport.
    */
   discardLateValue?: (value: unknown) => void;
+  /**
+   * Notifies abort-aware work when this race times out. The timeout remains authoritative even if
+   * cancellation itself throws; this hook only shortens work that can observe an AbortSignal.
+   */
+  onTimeout?: (error: Error) => void;
 };
 
 /**
@@ -139,7 +144,9 @@ export function raceDeadline<T>(call: Promise<T>, options: RaceDeadlineOptions):
       (value) => options.discardLateValue?.(value),
       () => undefined,
     );
-    return Promise.reject(options.deadlineError());
+    const error = options.deadlineError();
+    notifyDeadlineTimeout(options, error);
+    return Promise.reject(error);
   }
   const ceiling = options.ceilingMs;
   if (remaining === undefined && ceiling === undefined) return call;
@@ -150,7 +157,9 @@ export function raceDeadline<T>(call: Promise<T>, options: RaceDeadlineOptions):
     let lost = false;
     const timer = setTimeout(() => {
       lost = true;
-      reject(deadlineIsNearer || !options.ceilingError ? options.deadlineError() : options.ceilingError(ceiling as number));
+      const error = deadlineIsNearer || !options.ceilingError ? options.deadlineError() : options.ceilingError(ceiling as number);
+      notifyDeadlineTimeout(options, error);
+      reject(error);
     }, waitMs);
     call.then(
       (value) => {
@@ -169,20 +178,147 @@ export function raceDeadline<T>(call: Promise<T>, options: RaceDeadlineOptions):
   });
 }
 
+/** Creates one disposable AbortSignal for a local relative deadline and optional caller signal. */
+export function createDeadlineSignal(callerSignal: AbortSignal | undefined, waitMs: number, timeoutError: Error) {
+  const controller = new AbortController();
+  const forwardCallerAbort = () => controller.abort(callerSignal?.reason);
+  if (callerSignal?.aborted) controller.abort(callerSignal.reason);
+  else callerSignal?.addEventListener('abort', forwardCallerAbort, { once: true });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  if (!controller.signal.aborted) {
+    if (waitMs <= 0) controller.abort(timeoutError);
+    else timer = setTimeout(() => controller.abort(timeoutError), waitMs);
+  }
+  return {
+    dispose() {
+      if (timer !== undefined) clearTimeout(timer);
+      callerSignal?.removeEventListener('abort', forwardCallerAbort);
+    },
+    signal: controller.signal,
+  };
+}
+
+/** Races abort-aware setup while releasing a disposable value that arrives after cancellation. */
+export function raceAbortSignal<T>(call: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    call.then(discardDisposableValue, () => undefined);
+    return Promise.reject(signal.reason);
+  }
+  return new Promise<T>((resolve, reject) => {
+    let aborted = false;
+    const onAbort = () => {
+      aborted = true;
+      reject(signal.reason);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    call.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        if (aborted) {
+          discardDisposableValue(value);
+          return;
+        }
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        if (!aborted) reject(error);
+      },
+    );
+  });
+}
+
+/** Keeps a caller signal authoritative for every pull and releases the remote iterator on abort. */
+export function signalBoundAsyncIterator<T>(
+  iterator: AsyncIterator<T>,
+  signal: AbortSignal,
+  disposeSignal: () => void = () => undefined,
+): AsyncIterableIterator<T> {
+  let finished = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    signal.removeEventListener('abort', onAbort);
+    disposeSignal();
+  };
+  const release = () => {
+    if (finished) return;
+    finish();
+    try {
+      if (iterator.return) void Promise.resolve(iterator.return()).catch(() => undefined);
+    } catch {
+      // The abort result remains authoritative; cleanup cannot replace it.
+    }
+  };
+  const onAbort = () => release();
+  signal.addEventListener('abort', onAbort, { once: true });
+  if (signal.aborted) release();
+
+  const wrapped: AsyncIterableIterator<T> = {
+    [Symbol.asyncIterator]: () => wrapped,
+    async next() {
+      if (signal.aborted) throw signal.reason;
+      try {
+        const result = await raceAbortSignal(Promise.resolve(iterator.next()), signal);
+        if (result.done) finish();
+        return result;
+      } catch (error) {
+        finish();
+        throw error;
+      }
+    },
+    async return(value) {
+      if (finished) return { done: true, value };
+      finish();
+      return iterator.return ? iterator.return(value) : { done: true, value };
+    },
+    async throw(error) {
+      if (finished) throw error;
+      finish();
+      if (iterator.throw) return iterator.throw(error);
+      if (iterator.return) await iterator.return();
+      throw error;
+    },
+  };
+  return wrapped;
+}
+
+function notifyDeadlineTimeout(options: RaceDeadlineOptions, error: Error): void {
+  try {
+    options.onTimeout?.(error);
+  } catch {
+    // Cancellation is cleanup; it cannot replace the deadline that initiated it.
+  }
+}
+
 /**
  * Best-effort release of a value nobody will consume: resources may expose platform disposal
  * hooks, while a stream must be cancelled or its source stays pinned.
  */
 export function discardDisposableValue(value: unknown): void {
   try {
+    if (value instanceof Response) {
+      void value.body?.cancel().catch(() => undefined);
+      return;
+    }
     if (value instanceof ReadableStream) {
       void value.cancel().catch(() => undefined);
       return;
     }
     const disposable = value as Record<symbol, (() => unknown) | undefined> | null;
     if (typeof value === 'object' && value !== null) {
-      const dispose = disposable?.[Symbol.asyncDispose as unknown as symbol] ?? disposable?.[Symbol.dispose as unknown as symbol];
-      if (typeof dispose === 'function') void Promise.resolve(dispose.call(value)).catch(() => undefined);
+      const explicitResourceSymbols = Symbol as unknown as { asyncDispose?: symbol; dispose?: symbol };
+      const dispose =
+        (explicitResourceSymbols.asyncDispose ? disposable?.[explicitResourceSymbols.asyncDispose] : undefined) ??
+        (explicitResourceSymbols.dispose ? disposable?.[explicitResourceSymbols.dispose] : undefined);
+      if (typeof dispose === 'function') {
+        void Promise.resolve(dispose.call(value)).catch(() => undefined);
+        return;
+      }
+      const iterator = value as { [Symbol.asyncIterator]?: unknown; return?: () => unknown };
+      if (typeof iterator[Symbol.asyncIterator] === 'function' && typeof iterator.return === 'function') {
+        void Promise.resolve(iterator.return()).catch(() => undefined);
+      }
     }
   } catch {
     // Cleanup must never turn a timeout into a different failure.

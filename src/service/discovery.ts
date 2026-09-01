@@ -1,8 +1,15 @@
 import type { StandardJSONSchemaV1, StandardSchemaV1 } from '@standard-schema/spec';
 import type { Env } from 'hono';
+import type { ConnInfo } from '../shared/conn-info.js';
 import { DEFAULT_ABILITY_TIMEOUT_MS } from '../shared/deadline.js';
 import { CapabilityAuthError } from '../shared/errors.js';
-import { isOriginRelativePath } from '../shared/paths.js';
+import { jsonSchemaRootProperties } from '../shared/json-schema.js';
+import {
+  hasOnlySimpleTemplateExpressions,
+  isOriginRelativePath,
+  normalizeOriginRelativePath,
+  pathTemplateVariables,
+} from '../shared/paths.js';
 import {
   type AbilityAccess,
   type AbilityExposure,
@@ -23,12 +30,16 @@ import {
 } from '../shared/types.js';
 import {
   type AbilityMethodDefinition,
+  type AbilityMethodHandlerFor,
   type AbilityMethodKind,
   type AbilitySchema,
   type AbilityStream,
   type AnyAbilityMethodDefinition,
+  implementAbilityMethod,
   isAbilityMethodDefinition,
+  isImplementedAbilityMethod,
 } from './ability.js';
+import { defineCapabilities } from './capabilities.js';
 
 /**
  * Abilities accept any Standard Schema value, so services pick their own validation library.
@@ -39,8 +50,22 @@ import {
 // that stable across validation libraries instead of inheriting each vendor's default.
 const ABILITY_JSON_SCHEMA_TARGET: StandardJSONSchemaV1.Target = 'draft-2020-12';
 
+// Promise and JSON machinery call these names implicitly. Every other string is safe because the
+// public client is a flat null-prototype object rather than a recursive function proxy.
+const RESERVED_ABILITY_METHOD_NAMES = new Set(['then', 'toJSON']);
+
+/** Returns whether JavaScript machinery may invoke an ability method implicitly. */
+export function isReservedAbilityMethodName(name: string): boolean {
+  return RESERVED_ABILITY_METHOD_NAMES.has(name);
+}
+
 /** Transport-neutral method contracts forming one ability. */
 export type AbilityMethodDefinitions<TEnv extends Env = Env> = Record<string, AnyAbilityMethodDefinition<TEnv>>;
+
+/** Service-side handlers inferred from a shared ability contract. */
+export type AbilityImplementation<TMethods extends AbilityMethodDefinitions> = {
+  [TMethod in keyof TMethods]: AbilityMethodHandlerFor<TMethods[TMethod]>;
+};
 
 /** Ability definition consumed by Service Plane independently of its private RPC engine. */
 export type ServiceAbilityDefinition<
@@ -55,7 +80,7 @@ export type ServiceAbilityDefinition<
   exposure?: AbilityExposure;
   /** Stable ability identifier within the service. */
   id: string;
-  /** Implemented Service Plane methods; schemas, metadata, policy, and handlers stay together. */
+  /** Service Plane method contracts; implementations are attached privately by the service. */
   methods: TMethods;
   /** Wire path and transports implemented by the owning service. */
   rpc?: {
@@ -75,13 +100,21 @@ export type AnyServiceAbilityDefinition<TEnv extends Env = Env> = ServiceAbility
 
 /** Per-call controls shared by every generated ability client. */
 export type AbilityCallOptions = {
+  /** Advisory connection information for this call, overriding the client default. */
+  connInfo?: ConnInfo;
+  /** Caller-owned key for this logical attempt, overriding the client default. */
+  idempotencyKey?: string;
+  /** Correlation id for this call, overriding the client default. */
+  requestId?: string;
   /** Cancels the local transport call when the selected runtime supports cancellation. */
   signal?: AbortSignal;
+  /** End-to-end budget for this call in milliseconds, overriding the client default. */
+  timeoutMs?: number;
 };
 
-type AbilityClientMethod<TMethod extends AnyAbilityMethodDefinition> = (
+type AbilityClientMethod<TMethod extends AnyAbilityMethodDefinition, TCallOptions extends AbilityCallOptions> = (
   input: StandardSchemaV1.InferInput<TMethod['input']>,
-  options?: AbilityCallOptions,
+  options?: TCallOptions,
 ) => Promise<
   TMethod['kind'] extends 'unary'
     ? StandardSchemaV1.InferOutput<TMethod['output']>
@@ -89,9 +122,9 @@ type AbilityClientMethod<TMethod extends AnyAbilityMethodDefinition> = (
 >;
 
 /** Fully typed client shape derived only from the portable ability contract. */
-export type AbilityClient<TAbility extends ServiceAbilityDefinition> = {
+export type AbilityClient<TAbility extends ServiceAbilityDefinition, TCallOptions extends AbilityCallOptions = AbilityCallOptions> = {
   [TMethod in keyof TAbility['methods']]: TAbility['methods'][TMethod] extends AnyAbilityMethodDefinition
-    ? AbilityClientMethod<TAbility['methods'][TMethod]>
+    ? AbilityClientMethod<TAbility['methods'][TMethod], TCallOptions>
     : never;
 };
 
@@ -101,27 +134,27 @@ export type NormalizedAbilityMethodDefinition<
 > = {
   /** Whether retrying the same logical operation is declared safe. */
   idempotent?: true;
-  /** Runtime input schema. */
+  /** Validates caller data at the service boundary before the handler runs. */
   input: TInput;
-  /** Projected input JSON Schema. */
+  /** Draft 2020-12 representation emitted into discovery and public projections. */
   inputSchema: OpenApiObject;
-  /** Optional MCP tool projection. */
+  /** Validated metadata emitted when this method is published as an MCP tool. */
   mcp?: ServiceAbilityMcpProjection;
-  /** Optional MCP prompt projection. */
+  /** Validated metadata emitted when this method is published as an MCP prompt. */
   mcpPrompt?: ServiceAbilityMcpPromptProjection;
-  /** Optional MCP resource projection. */
+  /** Validated metadata emitted when this method is published as an MCP resource. */
   mcpResource?: ServiceAbilityMcpResourceProjection;
   /** Portable method contract compiled by the private runtime. */
   method: AbilityMethodDefinition<Env, TInput, TOutput, AbilityMethodKind>;
-  /** Runtime output or yielded-item schema. */
+  /** Validates a unary result or every yielded stream item before transport. */
   output: TOutput;
-  /** Projected output JSON Schema. */
+  /** Draft 2020-12 representation emitted into discovery and public projections. */
   outputSchema: OpenApiObject;
-  /** Optional REST projection. */
+  /** Validated HTTP method, path, and response metadata emitted into the REST facade. */
   rest?: ServiceAbilityRestProjection;
   /** Minimum capability scopes required by the method. */
   scopes: string[];
-  /** Present when the method returns a stream. */
+  /** When present, `output` and `outputSchema` describe each yielded item rather than one aggregate result. */
   stream?: true;
   /** Effective unary execution ceiling in milliseconds. */
   timeoutMs?: number;
@@ -130,11 +163,11 @@ export type NormalizedAbilityMethodDefinition<
 export type NormalizedServiceAbility<_TEnv extends Env = Env> = {
   /** Normalized caller access class. */
   access: AbilityAccess;
-  /** Human-readable ability description. */
+  /** Definition-authored description copied into discovery and public projections. */
   description?: string;
   /** Normalized projection visibility. */
   exposure: AbilityExposure;
-  /** Stable ability identifier. */
+  /** Trimmed service-local key used by routes, tokens, discovery, and typed clients. */
   id: string;
   /** Normalized methods keyed by their public names. */
   methods: Record<string, NormalizedAbilityMethodDefinition>;
@@ -147,7 +180,7 @@ export type NormalizedServiceAbility<_TEnv extends Env = Env> = {
   };
   /** Normalized maximum scope surface. */
   scopes: string[];
-  /** Human-readable ability title. */
+  /** Definition-authored title copied into discovery and public projections. */
   title?: string;
 };
 
@@ -158,11 +191,11 @@ export type ServiceDefinition<TEnv extends Env = Env> = {
   callerAuth?: ServiceCallerAuthDiscovery;
   /** Capability scopes issued for this service. */
   capabilities?: CapabilityCatalog;
-  /** Stable service identifier. */
+  /** Trimmed service id used as the capability audience and registry key. */
   id: string;
-  /** Human-readable service title. */
+  /** Non-empty display title emitted into service discovery. */
   title: string;
-  /** Deployed service contract version. */
+  /** Non-empty contract version emitted so caches and consumers can identify the deployed shape. */
   version: string;
 };
 
@@ -187,21 +220,105 @@ export function defineAbility<TEnv extends Env = Env, TMethods extends AbilityMe
   return definition;
 }
 
+/** Derives the complete capability scope set needed by each client method. */
+export function abilityClientScopesByMethod(
+  ability: ServiceAbilityDefinition,
+  additionalScopes: string[] | undefined,
+): ReadonlyMap<string, string[]> {
+  const abilityScopes = normalizeClientScopes(ability.scopes ?? [], ability.id);
+  const allowedScopes = new Set(abilityScopes);
+  const additional = normalizeClientScopes(additionalScopes ?? [], ability.id);
+  for (const scope of additional) {
+    if (!allowedScopes.has(scope)) {
+      throw new CapabilityAuthError(`Service-Plane client scope is not declared by ability: ${ability.id} -> ${scope}`, 500);
+    }
+  }
+
+  return new Map(
+    Object.entries(ability.methods).map(([methodName, method]) => {
+      if (isReservedAbilityMethodName(methodName)) {
+        throw new CapabilityAuthError(`Service-Plane ability method name is reserved: ${ability.id}/${methodName}`, 500);
+      }
+      const required = normalizeClientScopes(method.metadata.scopes ?? [], `${ability.id}/${methodName}`);
+      for (const scope of required) {
+        if (!allowedScopes.has(scope)) {
+          throw new CapabilityAuthError(
+            `Service-Plane ability method requires scope not declared by ability: ${ability.id}/${methodName} -> ${scope}`,
+            500,
+          );
+        }
+      }
+      return [methodName, [...new Set([...required, ...additional])]];
+    }),
+  );
+}
+
+/** Reads one method's previously derived capability scopes. */
+export function abilityClientScopesForMethod(
+  scopesByMethod: ReadonlyMap<string, string[]>,
+  abilityId: string,
+  methodName: string,
+): string[] {
+  const scopes = scopesByMethod.get(methodName);
+  if (!scopes) throw new CapabilityAuthError(`Service-Plane ability method not found: ${abilityId}/${methodName}`, 404);
+  return scopes;
+}
+
+function normalizeClientScopes(scopes: string[], source: string): string[] {
+  return [...new Set(scopes.map((scope) => normalizeClientScope(scope, source)))];
+}
+
+function normalizeClientScope(scope: string, source: string): string {
+  const normalized = scope.trim();
+  if (!normalized) throw new CapabilityAuthError(`Service-Plane client scope cannot be empty: ${source}`, 500);
+  if (normalized.includes('*')) throw new CapabilityAuthError(`Service-Plane client scope wildcard is not supported: ${source}`, 500);
+  return normalized;
+}
+
+/**
+ * Attaches service-only handlers to a portable ability contract. Keep the contract in a shared
+ * module and this implementation in the service module so browser clients never bundle handlers.
+ */
+export function implementAbility<TEnv extends Env = Env, TMethods extends AbilityMethodDefinitions<TEnv> = AbilityMethodDefinitions<TEnv>>(
+  contract: ServiceAbilityDefinition<TEnv, TMethods>,
+  handlers: AbilityImplementation<TMethods>,
+): ServiceAbilityDefinition<TEnv, TMethods> {
+  const methodNames = Object.keys(contract.methods);
+  const handlerNames = Object.keys(handlers);
+  const missing = methodNames.find((name) => !Object.hasOwn(handlers, name) || typeof handlers[name] !== 'function');
+  if (missing) throw new CapabilityAuthError(`Service-Plane ability implementation is missing method: ${contract.id}/${missing}`, 500);
+  const extra = handlerNames.find((name) => !Object.hasOwn(contract.methods, name));
+  if (extra) throw new CapabilityAuthError(`Service-Plane ability implementation has unknown method: ${contract.id}/${extra}`, 500);
+  return {
+    ...contract,
+    methods: Object.fromEntries(
+      methodNames.map((name) => [
+        name,
+        implementAbilityMethod(contract.methods[name] as AnyAbilityMethodDefinition, handlers[name] as never),
+      ]),
+    ) as TMethods,
+  };
+}
+
 export function defineAbilityService<TEnv extends Env = Env>(
   input: DefineServiceInput<TEnv>,
   options: DefineServiceOptions = {},
 ): ServiceDefinition<TEnv> {
   const serviceId = normalizeValue(input.id, 'service id');
+  const capabilities = input.capabilities ? defineCapabilities(input.capabilities) : undefined;
+  if (capabilities && capabilities.serviceId !== serviceId) {
+    throw new CapabilityAuthError(`Service-Plane capability catalog belongs to ${capabilities.serviceId}, not service ${serviceId}`, 500);
+  }
   const service: ServiceDefinition<TEnv> = {
     abilities: normalizeAbilities(
       serviceId,
       input.abilities,
-      input.capabilities,
+      capabilities,
       options.requireAbilityScopes ?? true,
       options.defaultMethodTimeoutMs === undefined ? DEFAULT_ABILITY_TIMEOUT_MS : options.defaultMethodTimeoutMs,
     ),
     ...(input.callerAuth ? { callerAuth: input.callerAuth } : {}),
-    ...(input.capabilities ? { capabilities: input.capabilities } : {}),
+    ...(capabilities ? { capabilities } : {}),
     id: serviceId,
     title: normalizeValue(input.title, 'service title'),
     version: normalizeValue(input.version, 'service version'),
@@ -263,7 +380,15 @@ function normalizeAbilities<TEnv extends Env>(
     );
     const path = normalizePath(ability.rpc?.path ?? defaultAbilityRpcPath(id), id);
     if (seenPaths.has(path)) throw new CapabilityAuthError(`Duplicate Service-Plane ability RPC path: ${path}`, 500);
+    const overlappingPath = [...seenPaths].find((existing) => routePathsOverlap(existing, path));
+    if (overlappingPath) {
+      throw new CapabilityAuthError(`Overlapping Service-Plane ability RPC paths: ${overlappingPath} and ${path}`, 500);
+    }
     seenPaths.add(path);
+    const transports = normalizeAbilityTransports(ability.rpc?.transports ?? ['fetch']);
+    if (Object.values(methods).some((method) => method.method.kind === 'hibernation') && !transports.includes('websocket')) {
+      throw new CapabilityAuthError(`Service-Plane hibernation ability must enable the websocket transport: ${id}`, 500);
+    }
 
     return {
       ...ability,
@@ -273,11 +398,19 @@ function normalizeAbilities<TEnv extends Env>(
       methods,
       rpc: {
         path,
-        transports: normalizeAbilityTransports(ability.rpc?.transports ?? ['fetch']),
+        transports,
       },
       scopes,
     };
   });
+}
+
+function routePathsOverlap(left: string, right: string): boolean {
+  return routePathContains(left, right) || routePathContains(right, left);
+}
+
+function routePathContains(parent: string, child: string): boolean {
+  return parent === '/' ? child.startsWith('/') : child.startsWith(`${parent}/`);
 }
 
 function normalizeAbilityMethods(
@@ -297,6 +430,9 @@ function normalizeAbilityMethods(
   return Object.fromEntries(
     names.map((methodName) => {
       const name = normalizeValue(methodName, `method name for ${abilityId}`);
+      if (isReservedAbilityMethodName(name)) {
+        throw new CapabilityAuthError(`Service-Plane ability method name is reserved: ${abilityId}/${name}`, 500);
+      }
       if (seenNames.has(name)) {
         throw new CapabilityAuthError(`Service-Plane ability method name is duplicated: ${abilityId}/${name}`, 500);
       }
@@ -304,6 +440,9 @@ function normalizeAbilityMethods(
       const method = methods[methodName];
       if (!method || !isAbilityMethodDefinition(method)) {
         throw new CapabilityAuthError(`Service-Plane ability method must be created with createAbilityBuilder: ${abilityId}/${name}`, 500);
+      }
+      if (!isImplementedAbilityMethod(method)) {
+        throw new CapabilityAuthError(`Service-Plane ability method has no implementation: ${abilityId}/${name}`, 500);
       }
 
       const definition = method.metadata;
@@ -322,9 +461,14 @@ function normalizeAbilityMethods(
       if (stream && definition.rest) {
         throw new CapabilityAuthError(`Service-Plane streaming method cannot project a REST operation: ${abilityId}/${name}`, 500);
       }
-
       const timeoutMs = stream ? undefined : resolveMethodTimeoutMs(abilityId, name, definition.timeoutMs, defaultMethodTimeoutMs);
-      const rest = definition.rest ? normalizeRestProjection(abilityId, name, definition.rest) : undefined;
+      const inputSchema = abilityJsonSchema(
+        input as AbilitySchema,
+        'input',
+        `${abilityId}/${name}`,
+        schemaResourceId(serviceId, abilityId, name, 'input'),
+      );
+      const rest = definition.rest ? normalizeRestProjection(serviceId, abilityId, name, definition.rest, inputSchema) : undefined;
       const mcp = definition.mcp ? normalizeMcpProjection(abilityId, name, definition.mcp) : undefined;
       const mcpPrompt = definition.mcpPrompt ? normalizeMcpPromptProjection(abilityId, name, definition.mcpPrompt) : undefined;
       const mcpResource = definition.mcpResource ? normalizeMcpResourceProjection(abilityId, name, definition.mcpResource) : undefined;
@@ -334,12 +478,7 @@ function normalizeAbilityMethods(
         {
           ...(definition.idempotent ? { idempotent: true as const } : {}),
           input: input as AbilitySchema,
-          inputSchema: abilityJsonSchema(
-            input as AbilitySchema,
-            'input',
-            `${abilityId}/${name}`,
-            schemaResourceId(serviceId, abilityId, name, 'input'),
-          ),
+          inputSchema,
           ...(mcp ? { mcp } : {}),
           ...(mcpPrompt ? { mcpPrompt } : {}),
           ...(mcpResource ? { mcpResource } : {}),
@@ -446,16 +585,55 @@ function abilityDiscovery<TEnv extends Env>(ability: NormalizedServiceAbility<TE
   };
 }
 
-function normalizeRestProjection(abilityId: string, methodName: string, rest: ServiceAbilityRestProjection): ServiceAbilityRestProjection {
+function normalizeRestProjection(
+  serviceId: string,
+  abilityId: string,
+  methodName: string,
+  rest: ServiceAbilityRestProjection,
+  inputSchema: OpenApiObject,
+): ServiceAbilityRestProjection {
+  const path = normalizePath(rest.path, `${abilityId}/${methodName}`);
+  const pathVariables = validateRestPathTemplate(path, abilityId, methodName);
+  validateRestPathInputFields(inputSchema, pathVariables, abilityId, methodName);
   return {
     ...rest,
     method: normalizeHttpMethod(rest.method),
     operationId: rest.operationId
       ? normalizeValue(rest.operationId, `REST operation id for ${abilityId}/${methodName}`)
-      : `${abilityId}.${methodName}`,
-    path: normalizePath(rest.path, `${abilityId}/${methodName}`),
+      : `${serviceId}.${abilityId}.${methodName}`,
+    path,
+    ...(rest.status === undefined ? {} : { status: normalizeRestStatus(rest.status, abilityId, methodName) }),
     ...(rest.tags ? { tags: normalizeTags(rest.tags, `${abilityId}/${methodName}`) } : {}),
   };
+}
+
+function validateRestPathTemplate(path: string, abilityId: string, methodName: string): string[] {
+  const variables = pathTemplateVariables(path);
+  if (!variables) {
+    throw new CapabilityAuthError(`Service-Plane REST path has an invalid or duplicate template variable: ${abilityId}/${methodName}`, 500);
+  }
+  return variables;
+}
+
+function validateRestPathInputFields(inputSchema: OpenApiObject, pathVariables: string[], abilityId: string, methodName: string): void {
+  const properties = jsonSchemaRootProperties(inputSchema);
+  const missing = pathVariables.find((name) => !properties || !Object.hasOwn(properties, name));
+  if (missing) {
+    throw new CapabilityAuthError(
+      `Service-Plane REST path template variable must name a top-level input field: ${abilityId}/${methodName} -> ${missing}`,
+      500,
+    );
+  }
+}
+
+function normalizeRestStatus(status: number, abilityId: string, methodName: string): number {
+  if (!Number.isInteger(status) || status < 200 || status > 299) {
+    throw new CapabilityAuthError(
+      `Service-Plane REST success status must be an integer from 200 through 299: ${abilityId}/${methodName}`,
+      500,
+    );
+  }
+  return status;
 }
 
 function normalizeMcpProjection(abilityId: string, methodName: string, mcp: ServiceAbilityMcpProjection): ServiceAbilityMcpProjection {
@@ -500,15 +678,7 @@ function normalizeMcpResourceProjection(
 
 // Only simple `{var}` template expressions are supported; the plane matches them and passes variables as method input.
 function validateMcpResourceUriTemplate(uri: string, abilityId: string, methodName: string): void {
-  const expressions = uri.match(/\{[^}]*\}|\{|\}/gu) ?? [];
-  let balance = 0;
-  for (const char of uri) {
-    if (char === '{') balance += 1;
-    if (char === '}') balance -= 1;
-    if (balance < 0) break;
-  }
-  const allSimple = expressions.every((expression) => /^\{[A-Za-z_][\w]*\}$/u.test(expression));
-  if (balance !== 0 || !allSimple) {
+  if (!hasOnlySimpleTemplateExpressions(uri)) {
     throw new CapabilityAuthError(`Service-Plane MCP resource URI has an invalid template expression: ${abilityId}/${methodName}`, 500);
   }
 }
@@ -539,7 +709,7 @@ function normalizeAbilityTransports(transports: AbilityTransport[]): AbilityTran
   if (transports.length === 0) throw new CapabilityAuthError('Service-Plane ability must enable at least one transport', 500);
   const normalized = [...new Set(transports)];
   for (const transport of normalized) {
-    if (transport !== 'cloudflare-service-binding' && transport !== 'fetch' && transport !== 'websocket') {
+    if (transport !== 'fetch' && transport !== 'service-binding' && transport !== 'websocket') {
       throw new CapabilityAuthError(`Unknown Service-Plane ability transport: ${transport as string}`, 500);
     }
   }
@@ -554,7 +724,7 @@ function normalizePath(path: string, source: string): string {
   if (!isOriginRelativePath(normalized)) {
     throw new CapabilityAuthError(`Service-Plane path must not include query or fragment: ${source}`, 500);
   }
-  return normalized.replace(/\/+$/u, '') || '/';
+  return normalizeOriginRelativePath(normalized) as string;
 }
 
 function normalizeHttpMethod(method: ServiceHttpMethod): ServiceHttpMethod {
@@ -676,6 +846,14 @@ function abilityJsonSchema(schema: AbilitySchema, io: 'input' | 'output', source
       500,
     );
   }
+  try {
+    JSON.stringify(rendered);
+  } catch (error) {
+    throw new CapabilityAuthError(
+      `Service-Plane ability schema rendered a non-serializable JSON Schema for ${source}: ${errorMessage(error)}`,
+      500,
+    );
+  }
   return withSchemaResourceId(rendered as OpenApiObject, resourceId);
 }
 
@@ -698,11 +876,19 @@ function withSchemaResourceId(schema: OpenApiObject, resourceId: string): OpenAp
 }
 
 function containsLocalRef(value: unknown): boolean {
-  if (Array.isArray(value)) return value.some(containsLocalRef);
-  if (!value || typeof value !== 'object') return false;
-  const record = value as Record<string, unknown>;
-  if (typeof record.$ref === 'string' && record.$ref.startsWith('#')) return true;
-  return Object.values(record).some(containsLocalRef);
+  const pending: unknown[] = [value];
+  const seen = new WeakSet<object>();
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (!current || typeof current !== 'object' || seen.has(current)) continue;
+    seen.add(current);
+    if (!Array.isArray(current)) {
+      const record = current as Record<string, unknown>;
+      if (typeof record.$ref === 'string' && record.$ref.startsWith('#')) return true;
+    }
+    pending.push(...Object.values(current));
+  }
+  return false;
 }
 
 function errorMessage(error: unknown): string {

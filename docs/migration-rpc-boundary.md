@@ -1,174 +1,249 @@
-# Migrate To The Engine-Neutral API
+# Migrate To The Stable Ability API
 
-Goal: update code that used the former public oRPC surface to Service Plane-owned contracts.
+This release removes the public Cap'n Web surface and the temporary public oRPC surface. The wire
+engine is now private. Typed methods, capabilities, discovery, OpenAPI, MCP, streaming, batching,
+compression, and Cloudflare native RPC remain available through Service Plane APIs.
 
-This is an intentionally breaking change. Ability definitions, clients, errors, wire options, and
-hibernation now belong to Service Plane. oRPC remains the current private Fetch/WebSocket engine,
-but consumers neither import it nor configure its plugins.
+This guide covers only breaking changes. Use the [API reference](reference.md) for current options,
+[transports](transports.md) for topology and performance choices, and [streaming](streaming.md) for
+stream lifecycle and hibernation.
 
-## Ability Definitions
+## Update Dependencies And Both Ends
 
-Before:
+```sh
+npm remove capnweb @hono/capnweb @orpc/client @orpc/contract @orpc/server
+npm install hono@^4.13.5
+```
+
+Hono `>=4.13.5 <5.0.0` and Node.js 22+ are now required. Node 20 reached end of life before this
+release. Remove every application import from `capnweb`, `@hono/capnweb`, and `@orpc/*`; Service
+Plane owns and pins its private RPC packages.
+
+Deploy migrated clients and servers together. The private wire format is not a compatibility
+contract with the previous release.
+
+## Define Contracts And Handlers
+
+Before (Cap'n Web):
 
 ```ts
 const tasks = defineAbility({
-  id: 'tasks.items',
+  id: 'tasks',
   scopes: ['tasks.read'],
   methods: {
-    get: ability
-      .procedure({ scopes: ['tasks.read'] })
-      .input(z.object({ id: z.string() }))
-      .output(z.object({ id: z.string() }))
-      .handler(({ input }) => input),
+    get: abilityMethod({ input: GetTask, output: Task, scopes: ['tasks.read'] }),
   },
+  handler: ({ context }) => new TasksTarget(context.env),
 });
+
+class TasksTarget extends RpcTarget {
+  get(input) {
+    return this.env.TASKS.get(input.id);
+  }
+}
 ```
 
 After:
 
 ```ts
-const tasks = defineAbility({
-  id: 'tasks.items',
+const ability = createAbilityBuilder<{ Bindings: Env }>();
+
+export const tasksContract = defineAbility({
+  id: 'tasks',
   scopes: ['tasks.read'],
   methods: {
-    get: ability
-      .method({ scopes: ['tasks.read'] })
-      .input(z.object({ id: z.string() }))
-      .output(z.object({ id: z.string() }))
-      .handler(({ input }) => input),
+    get: ability.method({ input: GetTask, output: Task, scopes: ['tasks.read'] }),
   },
+});
+
+export const tasks = implementAbility(tasksContract, {
+  get: ({ context, input }) => context.env.TASKS.get(input.id),
 });
 ```
 
-The method still owns its schemas, metadata, policy, and handler. `.method()` states what the public
-value is: a Service Plane method contract, not a framework procedure.
+`ServicePlaneService` receives the implementation; clients receive the contract. A service-local
+contract may instead put `handler` directly inside `ability.method({ ... })`.
 
-Renamed public types:
+Replace temporary `.procedure(...)` calls with `ability.method({ input, output, ... })`. Collapse
+`ability.method({ scopes }).input(Input).output(Output).handler(handler)` into the single options
+object `ability.method({ input: Input, output: Output, scopes, handler })`.
+
+Remove `RpcTarget`, the ability-level handler factory, `bindCapabilityIdentity`,
+`capabilityIdentity`, and `requireScopes`. Every handler now receives `{ context, input }`;
+`context` contains the verified identity, runtime bindings, method name, idempotency key, and abort
+signal. Declared scopes are enforced before handler creation.
+
+Low-level engine extensions have owned replacements:
+
+| Removed API | Migration path |
+| --- | --- |
+| `customRpcTransport`, `RpcTransport`, `CapabilityRpcTransport` | Use a built-in Fetch, WebSocket, or `service-binding` transport; inject `fetch` or `createWebSocket` for adapters |
+| `createValidatingAbilityHandler`, `verifyAbilityAccess` | Mount `implementAbility(...)` in `ServicePlaneService`; the shell owns authorization and validation |
+| `createControlPlaneRpcBroker` and broker types | Configure `ServicePlaneControlPlane({ broker: ... })`; use `createBrokeredAbilityClient` or `plane.abilityClient` |
+| `memoryRpcTransportPair` | Use `memoryWebSocketPair()` or inject an in-process `fetch` |
+| Raw procedures, routers, middleware, plugins, links, and framework errors | Use Service Plane contracts, wire options, middleware boundaries, and errors |
+
+There is no raw-engine escape hatch.
+
+## Replace Sessions And Transport Names
 
 | Before | After |
 | --- | --- |
-| `AbilityProcedureContext` | `AbilityMethodContext` |
-| `AbilityProcedureDefinitions` | `AbilityMethodDefinitions` |
-| `OrpcServiceAbilityDefinition` | `ServiceAbilityDefinition` |
-| `AbilityRpc<TAbility>` | `AbilityClient<TAbility>` |
-| `NormalizedAbilityMethodDefinition.procedure` | `NormalizedAbilityMethodDefinition.method` |
+| `abilitySession<AbilityRpc<T>>()` | `createAbilityClient({ ability: contract, ... })` |
+| `httpBatchRpc(url)` | Fetch transport with `batch` when batching is still needed |
+| `websocketRpc(url)` | `{ type: 'websocket', url }` |
+| `cloudflareServiceBindingRpc(binding)` | `{ type: 'service-binding', binding }` |
+| `cloudflareNativeRpc(binding)` | The same `service-binding` transport; unary selection is automatic |
+| `disposeAbilitySession(session)` | `disposeAbilityClient(client)` for a long-lived WebSocket client |
+| Discovery transport `http-batch` | `fetch` |
+| Discovery transport `cloudflare-binding-rpc` | `service-binding` |
 
-The engine-facing `ControlPlaneBrokerProcedureInput` and
-`ControlPlaneBrokerProcedureContext` exports were removed. Configure the broker through
-`ServicePlaneControlPlaneOptions` or call the framework-neutral `ControlPlaneRpcBroker` instead.
-The package also no longer re-exports `ORPCError`, `safe`, `isDefinedError`, engine plugin classes,
-or engine option types.
+Client construction is synchronous and lazy. Required scopes come from the contract; `scopes`
+adds only extra ability-level scopes. Public callers use `createBrokeredAbilityClient` and connect
+only to the control plane.
 
-## Client Errors
+`BrokeredAbilityTransport.headers` is Fetch-only. Authenticate a broker WebSocket's physical
+upgrade with a secure cookie, short-lived URL ticket, or runtime-specific `createWebSocket`
+closure. Request ID, idempotency key, timeout, and signal remain logical per-call options.
 
-Before, callers caught an `ORPCError` and read `error.data.servicePlane`:
+See [transports](transports.md) for complete client shapes and [streaming](streaming.md) for cleanup.
+
+## Update Native Ability And Token Bindings
+
+Replace Cap'n Web targets such as `connectAbility` with the service's unary entrypoint:
 
 ```ts
-try {
-  await tasksClient.get({ id: '' });
-} catch (error) {
-  if (error instanceof ORPCError) {
-    console.log(error.data?.servicePlane?.status);
-  }
+invokeAbility(input) {
+  return service.invokeAbility(input, env);
 }
 ```
 
-After, every shipped ability client translates its transport error:
+Register it with `cloudflareServiceBinding({ abilityRpc: true })`. Unary calls use native RPC;
+ordinary streams use the binding's Fetch method.
+
+Native token bindings now pin caller identity in the deployed binding. Remove the requester-side
+`callerServiceId`:
+
+Before: `controlPlaneRpcTokenRequester({ binding, callerServiceId: 'workflow-service' })`.
+
+After: `controlPlaneRpcTokenRequester({ binding })`, with the caller binding typed as
+`ControlPlaneRpcTokenBinding` and backed by a dedicated entrypoint exposed only to that caller:
 
 ```ts
-try {
-  await tasksClient.get({ id: '' });
-} catch (error) {
-  if (error instanceof ServicePlaneClientError) {
-    console.log(error.code, error.status, error.issues);
-  }
+import type { PinnedCapabilityTokenInput } from 'service-plane/control-plane';
+
+issueCapabilityToken(input: PinnedCapabilityTokenInput) {
+  return plane
+    .capabilityTokenBinding('workflow-service', this.env)
+    .issueCapabilityToken(input);
 }
 ```
 
-`servicePlaneErrorInfo(error)` remains useful when the same branch also handles errors thrown inside
-a service or control plane.
+`createAbilityClient` still declares its local `callerServiceId`; the native STS binding no longer
+accepts or trusts it. The requester checks that the returned token is non-delegated, has service
+access, and has a `sub` matching that local caller ID; a binding pinned to the wrong service fails
+before the ability call. A shared native binding whose caller chooses an identity is not safe. See
+the [Cloudflare binding example](cloudflare.md#direct-service-to-service-calls).
 
-## Batch And Compression
+## Partition Sender-Constrained Token Caches
 
-Before:
+`controlPlaneJwkTokenRequester` now partitions cached tokens by the current public-key thumbprint
+and rotates the partition when its key changes. No application change is needed when using that
+requester.
 
-```ts
-new ServicePlaneService({
-  // ...
-  rpc: { plugins: [new BatchHandlerPlugin(), new ResponseCompressionHandlerPlugin()] },
-});
-
-createAbilityClient({
-  // ...
-  transport: {
-    type: 'fetch',
-    plugins: [new BatchLinkPlugin({ groups: [{ condition: true, context: {} }] })],
-  },
-});
-```
-
-After:
+For a custom proof-capable `CapabilityTokenRequester`, add a stable public discriminator through
+`cacheBinding`. This prevents one key or replica from reusing a token bound to another:
 
 ```ts
-new ServicePlaneService({
-  // ...
-  rpc: { batch: { maxSize: 20 }, compression: true },
-});
-
-createAbilityClient({
-  // ...
-  transport: { type: 'fetch', batch: { maxSize: 20 }, compression: true },
-});
+const requestToken: CapabilityTokenRequester = async (input) => issueToken(input);
+requestToken.proveTokenPossession = (input) => signProof(input, currentPrivateKey());
+requestToken.cacheBinding = () => currentPublicKeyThumbprint();
 ```
 
-The same stable server options are available on `ServicePlaneControlPlane.broker`. Arbitrary oRPC
-plugins and custom client links are no longer accepted. Add HTTP-wide behavior through Hono
-middleware; request a Service Plane option when a wire feature should become part of the supported
-contract.
+Return a public fingerprint, never private key material. Update the value when the proof key
+rotates. This partitions both the provider's in-memory entry and any supplied shared
+`CapabilityTokenCache`.
 
-## Hibernation
+## Update The Control Plane
 
-Before, a service installed `HibernationHandlerPlugin` and returned
-`HibernationAsyncIteratorClass`. After, define the hibernating method and return
-`AbilityHibernationStream`:
+Breaking route and configuration changes:
 
-```ts
-const service = new ServicePlaneService({
-  // ...
-  rpc: { manualWebSocket: true },
-});
+- top-level `rpc` becomes opt-in `broker`; service-side `rpc` remains;
+- the broker defaults to `/rpc/broker` and `/rpc/broker/ws`;
+- MCP is no longer implicit—add `mcp: {}` to mount `/mcp`;
+- published REST routes remain enabled; `rest: false` removes the facade and catch-all;
+- OpenAPI remains enabled by default;
+- REST catch-all requests and enabled MCP/broker calls share `invocationMiddleware`, which must
+  authenticate and set `servicePlaneCaller`; REST now authenticates before discovery, including
+  route misses, while later application routes still bypass the catch-all;
+- `broker.caller`, `mcp.caller`, and raw framework handler options are removed.
 
-const events = ability
-  .hibernationStream(EventSchema, { scopes: ['events.read'] })
-  .input(z.object({ channel: z.string() }))
-  .handler(({ context }) =>
-    new AbilityHibernationStream((id) => {
-      context.webSocket?.serializeAttachment?.({ id });
-    }),
-  );
-```
+Trusted plane code now calls `plane.abilityClient({ ability: contract, targetServiceId, ... }, env)`.
+Remove manual API generics, `abilityId`, and required method scopes. Construction is synchronous;
+the endpoint, grant, and issuer are resolved again on every call. See
+[control-plane creation](plane-creation.md#trusted-in-process-calls).
 
-The private handler support is installed automatically. Continue emitting awakened values through
-`encodeAbilityHibernationEvent()` so the output schema remains enforced.
+## Replace Plugin Configuration
 
-## TanStack Query
+Raw batching, compression, and hibernation plugins are no longer public:
 
-The client is no longer advertised as an oRPC router, so `@orpc/tanstack-query` is not a supported
-integration. Pass typed methods directly to TanStack Query:
+| Location | Stable replacement |
+| --- | --- |
+| Service | `rpc.batch`, `rpc.compression`, `rpc.maxRequestBodyBytes` |
+| Control-plane broker | `broker.batch`, `broker.compression`, `broker.maxRequestBodyBytes` |
+| Fetch client | `transport.batch`, `transport.compression` |
 
-```ts
-useMutation({ mutationFn: tasksClient.create });
-```
+Batching combines concurrent unary calls on one Fetch hop only. Broker batches do not combine
+downstream service calls. Streams and WebSockets are never batched. See [transports](transports.md).
 
-## What Did Not Change
+## Update Streams And Hibernation
 
-- Ability ids, discovery documents, route defaults, and current Fetch/WebSocket wire behavior.
-- Standard Schema validation and OpenAPI/MCP projections.
-- Hono apps and middleware composition.
-- Capability tokens, ingress, access, scopes, proof-of-possession, and auth-before-validation.
-- Cloudflare native RPC for unary service-binding calls and binding Fetch for streams.
-- Typed unary, streaming, brokered, and WebSocket clients.
+| Before | After |
+| --- | --- |
+| Raw iterator procedures or classes | `ability.stream(...)` with an async iterator, iterable, or `ReadableStream` handler source |
+| Raw hibernation plugin/types | `ability.hibernationStream`, `AbilityHibernationStream`, and `encodeAbilityHibernationEvent` |
+| `ReadableStream` client reader | Typed async iteration with `for await` |
 
-The removed surface is framework control, not the product functionality above. Retry and
-deduplication remain application policies: use method `idempotent` metadata, forwarded
-`idempotencyKey`, and the retry/store implementation appropriate to the caller.
+Hibernating methods require a direct service WebSocket; batching, brokering, and
+`plane.abilityClient` now fail fast. Follow the [streaming guide](streaming.md) for the stable setup.
+
+Client-call `timeoutMs` is no longer discarded: invalid values reject, `0` is already expired, and
+values above the package maximum clamp. Method metadata keeps a separate meaning:
+`timeoutMs: 0` disables that method's service-side execution ceiling.
+
+The budget now begins before client token, proof, or caller-header resolution; only the remaining
+milliseconds are forwarded. Ordinary streams keep that local deadline across iterator pulls,
+including streams returned by `plane.abilityClient`. Public control-plane middleware is inside the
+same budget, and a late `next()` no longer starts background discovery or dispatch after a timeout.
+
+## Update Errors And TanStack Callbacks
+
+Catch `ServicePlaneClientError` or use `servicePlaneErrorInfo(error)` instead of inspecting
+framework error data. Caller aborts now surface as `code: 'cancelled'`, status `499`, and
+`retryable: false`; they are distinct from deadline timeouts.
+
+TanStack needs no RPC adapter, but replace direct callbacks with wrappers such as
+`mutationFn: (input) => tasks.create(input)` and `queryFn: () => tasks.get({ id: taskId })` so its
+context is not interpreted as Service Plane call options.
+
+## Account For Bounded Remote Responses
+
+Remote metadata and credential responses now have explicit byte limits. A response that previously
+loaded without a bound may now fail before JSON parsing:
+
+| Response | Default | Override |
+| --- | --- | --- |
+| One service discovery document | 1 MiB | `ServicePlaneControlPlane.discoveryMaxResponseBytes` or `createServiceRegistry({ maxResponseBytes })` |
+| JWKS from URL or service binding | 256 KiB | `jwksFromUrl(..., { maxResponseBytes })` or `jwksFromServiceBinding(..., { maxResponseBytes })` |
+| HTTP capability-token response | 64 KiB | `controlPlaneHmacTokenRequester({ maxResponseBytes })` or `controlPlaneJwkTokenRequester({ maxResponseBytes })` |
+
+Keep the defaults unless a known document requires more. These response limits are separate from
+the token endpoint's `tokenMaxBodyBytes` request limit.
+
+## Final Checks
+
+- No application imports Cap'n Web or oRPC, Hono is `>=4.13.5`, and Node.js is 22+.
+- Native STS bindings pin the caller; custom proof requesters partition caches with `cacheBinding`.
+- The plane uses `broker` and `invocationMiddleware`; MCP is enabled explicitly when required.
+- WebSocket auth moved to the upgrade, and stream/error/TanStack consumers use stable APIs.
+- Response bounds are intentional, and both sides deploy together.

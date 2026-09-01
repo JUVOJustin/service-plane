@@ -13,6 +13,30 @@ export function normalizePath(path: string): string {
   return withLeadingSlash.length > 1 ? withLeadingSlash.replace(/\/+$/u, '') : withLeadingSlash;
 }
 
+/** Accepts only balanced `{identifier}` expressions while allowing ordinary URI text around them. */
+export function hasOnlySimpleTemplateExpressions(value: string): boolean {
+  const expressions = value.match(/\{[^}]*\}|\{|\}/gu) ?? [];
+  let balance = 0;
+  for (const char of value) {
+    if (char === '{') balance += 1;
+    if (char === '}') balance -= 1;
+    if (balance < 0) return false;
+  }
+  return balance === 0 && expressions.every((expression) => /^\{[A-Za-z_]\w*\}$/u.test(expression));
+}
+
+/** Returns unique whole-segment `{name}` variables, or `undefined` for an invalid template. */
+export function pathTemplateVariables(path: string): string[] | undefined {
+  const names = new Set<string>();
+  for (const segment of path.split('/')) {
+    if (!segment.includes('{') && !segment.includes('}')) continue;
+    const match = /^\{([A-Za-z_]\w*)\}$/u.exec(segment);
+    if (!match?.[1] || names.has(match[1])) return undefined;
+    names.add(match[1]);
+  }
+  return [...names];
+}
+
 // The WHATWG URL parser strips tab/CR/LF from anywhere in the input and trims C0 controls and
 // spaces at both ends, so a value like '/\t/attacker.example' passes a naive '//' check and then
 // resolves to a foreign origin. Route paths never contain these bytes unencoded.
@@ -32,6 +56,12 @@ function hasStrippablePathChar(path: string): boolean {
 export function isOriginRelativePath(path: string): boolean {
   if (hasStrippablePathChar(path)) return false;
   return path.startsWith('/') && !path.startsWith('//') && !path.includes('\\') && !path.includes('?') && !path.includes('#');
+}
+
+/** Trims and removes trailing slashes from a safe origin-relative route. */
+export function normalizeOriginRelativePath(path: string): string | undefined {
+  const trimmed = path.trim();
+  return isOriginRelativePath(trimmed) ? normalizePath(trimmed) : undefined;
 }
 
 export function pathAndQuery(request: Request): string {

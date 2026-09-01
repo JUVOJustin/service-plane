@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { createControlPlaneRpcBroker } from '../control-plane/broker.js';
 import { createCapabilityIssuer, defineServiceGrants } from '../control-plane/capabilities.js';
 import { servicePlaneAuthorization } from '../shared/capability-tokens.js';
+import { ServicePlaneClientError } from '../shared/errors.js';
 import { memoryWebSocketPair, testKeys } from '../test-support/index.js';
 import { AbilityHibernationStream, createAbilityBuilder } from './ability.js';
 import { defineCapabilities } from './capabilities.js';
@@ -14,10 +15,56 @@ import { type AbilityClient, defineAbility } from './discovery.js';
 import { encodeAbilityHibernationEvent } from './hibernation.js';
 import { ServicePlaneService } from './service.js';
 
-const ISSUED_AT = new Date('2026-05-09T12:00:00.000Z');
-const VERIFIED_AT = new Date('2026-05-09T12:00:01.000Z');
+const ISSUED_AT = new Date('2099-05-09T12:00:00.000Z');
+const VERIFIED_AT = new Date('2099-05-09T12:00:01.000Z');
+const RAW_RPC_SECRET = 'rpc-secret://tasks.internal/database';
+
+function rawHandlerRpcError(): ORPCError<string, unknown> {
+  return new ORPCError('BAD_REQUEST', {
+    data: {
+      servicePlane: {
+        code: 'handler',
+        message: RAW_RPC_SECRET,
+        reason: RAW_RPC_SECRET,
+        retryable: false,
+        status: 400,
+      },
+    },
+    message: RAW_RPC_SECRET,
+  });
+}
 
 describe('ServicePlaneService private RPC runtime', () => {
+  it('rejects a hibernation contract that does not advertise WebSocket transport', () => {
+    const capabilities = defineCapabilities({ scopes: [{ id: 'tasks.read' }], serviceId: 'tasks' });
+    const method = createAbilityBuilder().hibernationStream({
+      handler: () => new AbilityHibernationStream<string>(() => undefined),
+      input: z.object({}),
+      output: z.string(),
+      scopes: ['tasks.read'],
+    });
+
+    expect(
+      () =>
+        new ServicePlaneService({
+          abilities: [
+            defineAbility({
+              id: 'tasks.events',
+              methods: { watch: method },
+              rpc: { transports: ['fetch'] },
+              scopes: ['tasks.read'],
+            }),
+          ],
+          auth: { issuer: 'control-plane', jwks: { keys: [] } },
+          capabilities,
+          id: 'tasks',
+          logger: false,
+          title: 'Tasks',
+          version: '1.0.0',
+        }),
+    ).toThrow('Service-Plane hibernation ability must enable the websocket transport: tasks.events');
+  });
+
   it('serves unary and streaming methods over Fetch with capability checks before validation', async () => {
     const keys = await testKeys();
     const capabilities = defineCapabilities({
@@ -45,47 +92,66 @@ describe('ServicePlaneService private RPC runtime', () => {
     const tasks = defineAbility({
       id: 'tasks.items',
       methods: {
-        get: ability
-          .method({ scopes: ['tasks.read'] })
-          .input(z.object({ id: z.string() }))
-          .output(z.object({ caller: z.string(), id: z.string() }))
-          .handler(({ context, input }) => ({ caller: context.identity.serviceId, id: input.id })),
-        inspect: ability
-          .method({ scopes: ['tasks.read'] })
-          .input(z.object({}))
-          .output(
-            z.object({
-              hasSignal: z.boolean(),
-              hasTimeout: z.boolean(),
-              idempotencyKey: z.string(),
-              requestId: z.string(),
-            }),
-          )
-          .handler(({ context }) => ({
+        get: ability.method({
+          scopes: ['tasks.read'],
+          input: z.object({ id: z.string() }),
+          output: z.object({ caller: z.string(), id: z.string() }),
+          handler: ({ context, input }) => ({ caller: context.identity.serviceId, id: input.id }),
+        }),
+        failRawRpc: ability.method({
+          scopes: ['tasks.read'],
+          input: z.object({}),
+          output: z.never(),
+          handler: () => {
+            throw rawHandlerRpcError();
+          },
+        }),
+        inspect: ability.method({
+          scopes: ['tasks.read'],
+          input: z.object({}),
+          output: z.object({
+            hasSignal: z.boolean(),
+            hasTimeout: z.boolean(),
+            idempotencyKey: z.string(),
+            requestId: z.string(),
+          }),
+          handler: ({ context }) => ({
             hasSignal: context.signal !== undefined,
             hasTimeout: context.remainingTimeoutMs !== undefined && context.remainingTimeoutMs() > 0,
             idempotencyKey: context.idempotencyKey ?? '',
             requestId: context.request.headers.get('x-request-id') ?? '',
-          })),
-        watch: ability
-          .stream(z.object({ sequence: z.number() }), { scopes: ['tasks.read'] })
-          .input(z.object({ after: z.number() }))
-          .handler(async function* ({ input }) {
+          }),
+        }),
+        watch: ability.stream({
+          scopes: ['tasks.read'],
+          input: z.object({ after: z.number() }),
+          output: z.object({ sequence: z.number() }),
+          handler: async function* ({ input }) {
             yield { sequence: input.after + 1 };
             yield { sequence: input.after + 2 };
-          }),
-        watchHibernating: ability
-          .hibernationStream(eventSchema, { scopes: ['tasks.read'] })
-          .input(z.object({}))
-          .handler(
-            ({ context }) =>
-              new AbilityHibernationStream<{ sequence: number }>((id) => {
-                hibernationIteratorId = id;
-                context.webSocket?.serializeAttachment?.({ id });
-              }),
-          ),
+          },
+        }),
+        watchRawRpc: ability.stream({
+          scopes: ['tasks.read'],
+          input: z.object({}),
+          output: z.string(),
+          handler: async function* () {
+            yield 'ready';
+            throw rawHandlerRpcError();
+          },
+        }),
+        watchHibernating: ability.hibernationStream({
+          scopes: ['tasks.read'],
+          input: z.object({}),
+          output: eventSchema,
+          handler: ({ context }) =>
+            new AbilityHibernationStream<{ sequence: number }>((id) => {
+              hibernationIteratorId = id;
+              context.webSocket?.serializeAttachment?.({ id });
+            }),
+        }),
       },
-      rpc: { transports: ['fetch', 'cloudflare-service-binding', 'websocket'] },
+      rpc: { transports: ['fetch', 'service-binding', 'websocket'] },
       scopes: ['tasks.read'],
     });
     const service = new ServicePlaneService({
@@ -111,6 +177,11 @@ describe('ServicePlaneService private RPC runtime', () => {
       });
       return createORPCClient<AnyNestedClient>(link) as unknown as AbilityClient<typeof tasks>;
     };
+
+    await expect(createClient(servicePlaneAuthorization(issued.token)).watchHibernating({})).rejects.toMatchObject({
+      code: 'METHOD_NOT_SUPPORTED',
+      message: 'Service-Plane hibernation method requires a WebSocket transport: tasks.items/watchHibernating',
+    });
 
     const denied = createClient();
     const deniedError = await denied.get({ id: 42 } as never).catch((error: unknown) => error);
@@ -140,6 +211,18 @@ describe('ServicePlaneService private RPC runtime', () => {
       caller: 'headless-front',
       id: 'task-native',
     });
+    const nativeFailure = await nativeClient.failRawRpc({}).catch((error: unknown) => error);
+    expect(nativeFailure).toBeInstanceOf(ServicePlaneClientError);
+    expect(nativeFailure).toMatchObject({ code: 'internal', status: 500 });
+    expect(JSON.stringify(nativeFailure)).not.toContain(RAW_RPC_SECRET);
+    expect((nativeFailure as Error).message).not.toContain(RAW_RPC_SECRET);
+
+    const bindingFailureStream = await nativeClient.watchRawRpc({});
+    await expect(bindingFailureStream.next()).resolves.toEqual({ done: false, value: 'ready' });
+    const bindingStreamFailure = await bindingFailureStream.next().catch((error: unknown) => error);
+    expect(bindingStreamFailure).toBeInstanceOf(ServicePlaneClientError);
+    expect(bindingStreamFailure).toMatchObject({ code: 'internal', status: 500 });
+    expect(JSON.stringify(bindingStreamFailure)).not.toContain(RAW_RPC_SECRET);
     const metadataClient = createAbilityClient({
       ability: tasks,
       callerServiceId: 'headless-front',
@@ -214,6 +297,28 @@ describe('ServicePlaneService private RPC runtime', () => {
       { caller: 'headless-front', id: 'batch-2' },
     ]);
     expect(batchFetches).toBe(1);
+    const [firstMetadata, secondMetadata] = await Promise.all([
+      batchClient.inspect({}, { idempotencyKey: 'attempt-batch-1', requestId: 'request-batch-1', timeoutMs: 4_001 }),
+      batchClient.inspect({}, { idempotencyKey: 'attempt-batch-2', requestId: 'request-batch-2', timeoutMs: 4_002 }),
+    ]);
+    expect(batchFetches).toBe(2);
+    expect(firstMetadata).toMatchObject({ idempotencyKey: 'attempt-batch-1', requestId: 'request-batch-1' });
+    expect(secondMetadata).toMatchObject({ idempotencyKey: 'attempt-batch-2', requestId: 'request-batch-2' });
+    expect(firstMetadata.hasTimeout).toBe(true);
+    expect(secondMetadata.hasTimeout).toBe(true);
+
+    const fetchFailure = await batchClient.failRawRpc({}).catch((error: unknown) => error);
+    expect(fetchFailure).toBeInstanceOf(ServicePlaneClientError);
+    expect(fetchFailure).toMatchObject({ code: 'internal', status: 500 });
+    expect(JSON.stringify(fetchFailure)).not.toContain(RAW_RPC_SECRET);
+    expect((fetchFailure as Error).message).not.toContain(RAW_RPC_SECRET);
+
+    const fetchFailureStream = await batchClient.watchRawRpc({});
+    await expect(fetchFailureStream.next()).resolves.toEqual({ done: false, value: 'ready' });
+    const fetchStreamFailure = await fetchFailureStream.next().catch((error: unknown) => error);
+    expect(fetchStreamFailure).toBeInstanceOf(ServicePlaneClientError);
+    expect(fetchStreamFailure).toMatchObject({ code: 'internal', status: 500 });
+    expect(JSON.stringify(fetchStreamFailure)).not.toContain(RAW_RPC_SECRET);
 
     const broker = createControlPlaneRpcBroker({
       controlPlaneServiceId: 'control-plane',

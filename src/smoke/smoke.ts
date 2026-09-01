@@ -31,23 +31,26 @@ export async function runSmoke(): Promise<string[]> {
   const jobs = defineAbility({
     id: 'smoke.jobs',
     methods: {
-      chunks: ability
-        .stream(objectSchema('index', 'number'), { scopes: ['smoke.stream'] })
-        .input(objectSchema('count', 'number'))
-        .handler(async function* ({ input }) {
+      chunks: ability.stream({
+        scopes: ['smoke.stream'],
+        input: objectSchema('count', 'number'),
+        output: objectSchema('index', 'number'),
+        handler: async function* ({ input }) {
           const { count } = input as { count: number };
           for (let index = 0; index < count; index += 1) yield { index };
-        }),
-      run: ability
-        .method({ scopes: ['smoke.run'] })
-        .input(objectSchema('name', 'string'))
-        .output(recordSchema())
-        .handler(({ context, input }) => ({
+        },
+      }),
+      run: ability.method({
+        scopes: ['smoke.run'],
+        input: objectSchema('name', 'string'),
+        output: recordSchema(),
+        handler: ({ context, input }) => ({
           caller: context.identity.serviceId,
           name: (input as { name: string }).name,
-        })),
+        }),
+      }),
     },
-    rpc: { transports: ['fetch', 'cloudflare-service-binding'] },
+    rpc: { transports: ['fetch', 'service-binding'] },
     scopes: ['smoke.run', 'smoke.stream'],
   });
   const service = new ServicePlaneService({

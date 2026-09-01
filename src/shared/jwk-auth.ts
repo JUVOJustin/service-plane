@@ -1,6 +1,6 @@
 import { decode, sign, verifyWithJwks } from 'hono/jwt';
+import { boundedRequestBodyBytes } from './body-limit.js';
 import { CapabilityAuthError } from './errors.js';
-import { boundedRequestBodyBytes } from './request-body.js';
 import { type CapabilityJwks, SERVICE_PLANE_REQUEST_ID_HEADER } from './types.js';
 
 export const SERVICE_PLANE_JWK_ALGORITHM = 'ES256';

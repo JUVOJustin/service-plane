@@ -1,7 +1,11 @@
-import { isOriginRelativePath } from '../shared/paths.js';
+import { readBoundedResponseJson, validateBodyByteLimit } from '../shared/body-limit.js';
+import { jsonSchemaRootProperties } from '../shared/json-schema.js';
+import { hasOnlySimpleTemplateExpressions, isOriginRelativePath, normalizePath, pathTemplateVariables } from '../shared/paths.js';
 import {
   type AbilityExposure,
   type AbilityTransport,
+  type CapabilityCatalog,
+  type CapabilityScopeDefinition,
   DEFAULT_REGISTRY_CACHE_TTL_SECONDS,
   type DiscoveredServiceAbility,
   isAbilityAccess,
@@ -16,20 +20,48 @@ import {
   type ServiceRegistry,
   type ServiceRegistrySnapshot,
 } from '../shared/types.js';
+import { runBestEffortCacheOperation } from './best-effort-cache.js';
 import { serviceDiscoveryRequest } from './endpoints.js';
+
+/** Default maximum response size for one service discovery document: 1 MiB. */
+export const DEFAULT_SERVICE_DISCOVERY_RESPONSE_MAX_BYTES = 1_048_576;
+
+// Coalescing is a stampede guard, not ownership of the underlying network operation. A fill that
+// never settles must eventually stop being handed to healthy follow-up requests.
+const DEFAULT_IN_FLIGHT_DISCOVERY_MAX_AGE_MS = 10_000;
+const IN_FLIGHT_DISCOVERY_RELEASE_SKEW_MS = 10;
 
 export type CreateServiceRegistryOptions = {
   cache?: RegistryCache;
   cacheKey?: string;
   cacheTtlSeconds?: number;
   discoveryPath?: string;
+  /** Maximum accepted response size for one remote discovery document. Defaults to 1 MiB. */
+  maxResponseBytes?: number;
+  /** Control-plane paths that published REST projections must not shadow; a trailing `/*` reserves descendants. */
+  reservedRestPaths?: string[];
   services: ServiceEndpoint[];
 };
 
 export function createServiceRegistry(options: CreateServiceRegistryOptions): ServiceRegistry {
+  return createServiceRegistryInternal(options);
+}
+
+/** Builds a request-owned registry whose caller deadline can release a shared stuck fill. */
+export function createRequestServiceRegistry(options: CreateServiceRegistryOptions, deadlineAt?: number): ServiceRegistry {
+  return createServiceRegistryInternal(options, deadlineAt);
+}
+
+function createServiceRegistryInternal(options: CreateServiceRegistryOptions, deadlineAt?: number): ServiceRegistry {
   const discoveryPath = options.discoveryPath ?? SERVICE_DISCOVERY_PATH;
-  const cacheKey = options.cacheKey ?? serviceRegistryCacheKey(options.services, discoveryPath);
+  const reservedRestPaths = normalizedReservedRestPaths(options.reservedRestPaths);
+  const maxResponseBytes = validateBodyByteLimit(
+    options.maxResponseBytes ?? DEFAULT_SERVICE_DISCOVERY_RESPONSE_MAX_BYTES,
+    'Service-Plane discovery maxResponseBytes must be a positive safe integer',
+  );
+  const cacheKey = options.cacheKey ?? serviceRegistryCacheKey(options.services, discoveryPath, reservedRestPaths, maxResponseBytes);
   const cacheTtlSeconds = options.cacheTtlSeconds ?? DEFAULT_REGISTRY_CACHE_TTL_SECONDS;
+  const cache = options.cache;
   const endpointsById = new Map(options.services.map((endpoint) => [endpoint.id, endpoint] as const));
 
   return {
@@ -43,8 +75,8 @@ export function createServiceRegistry(options: CreateServiceRegistryOptions): Se
     },
 
     async discover() {
-      const cached = await options.cache?.get(cacheKey);
-      if (cached) return withAbilities(cached, options.services);
+      const cached = await runBestEffortCacheOperation(cache ? () => cache.get(cacheKey) : undefined);
+      if (cached) return withAbilities(cached, endpointsById);
 
       // Coalesced per cache key: without this, every request that arrives before the first one
       // finishes writing observes the same miss and fans out independently, so a cold start or a
@@ -53,35 +85,23 @@ export function createServiceRegistry(options: CreateServiceRegistryOptions): Se
       // a function of the services and the discovery path — which is what the key covers — so
       // sharing one resolution between callers is sound even when their caches differ; each still
       // writes its own entry below.
-      const { complete, etags, services } = await coalescedDiscovery(options.cache, cacheKey, async () => {
-        const stale = await options.cache?.getStale?.(cacheKey);
-        return discoverServices(options.services, discoveryPath, stale);
+      const { complete, etags, services } = await coalescedDiscovery(cache, cacheKey, deadlineAt, async () => {
+        const getStale = cache?.getStale?.bind(cache);
+        const stale = await runBestEffortCacheOperation(getStale ? () => getStale(cacheKey) : undefined);
+        return discoverServices(options.services, discoveryPath, reservedRestPaths, maxResponseBytes, stale);
       });
       const snapshot: ServiceDiscoverySnapshot = {
         discoveredAt: new Date().toISOString(),
         ...(Object.keys(etags).length > 0 ? { etags } : {}),
         services,
       };
-      // A service that was unreachable is simply missing from this snapshot, and storing that would
-      // turn a momentary outage into a catalog gap that outlives it by the full TTL — the service
-      // comes back and the plane keeps refusing it until the entry expires. An incomplete discovery
-      // is therefore used for this request and not written; the next request retries.
-      //
-      // Two things this deliberately does not do yet, both tracked in #28:
-      //
-      // `complete` is consumed here and then discarded. `ServiceDiscoverySnapshot` carries a `stale`
-      // flag that nothing currently sets or reads, and it is the natural place to hand this to
-      // callers — one that knows the catalog is partial can say so instead of leaving an operator to
-      // infer it from a missing target. Combined with the bare `catch` in `discoverServices`, which
-      // swallows every per-endpoint failure, a degraded catalog is invisible: nothing reports which
-      // service dropped out, or that one did at all.
-      //
-      // And the retry has no ceiling. One service unreachable for good — decommissioned but still
-      // configured, or serving a document that stopped validating — keeps `complete` false forever,
-      // so nothing is ever cached again and every route fans out over the whole catalog on every
-      // request. Right for a blip, unbounded for a permanent failure, and silent either way.
-      if (complete) await options.cache?.set(cacheKey, snapshot, cacheTtlSeconds);
-      return withAbilities(snapshot, options.services);
+      // Caching an incomplete snapshot would turn a brief outage into a catalog gap for the full
+      // TTL, so the next request retries instead. Issue #28 tracks the remaining removal condition:
+      // expose degraded state and bound repeated fan-out when an endpoint fails permanently.
+      if (complete) {
+        await runBestEffortCacheOperation(cache ? () => cache.set(cacheKey, snapshot, cacheTtlSeconds) : undefined);
+      }
+      return withAbilities(snapshot, endpointsById);
     },
 
     endpoint(id) {
@@ -90,10 +110,17 @@ export function createServiceRegistry(options: CreateServiceRegistryOptions): Se
   };
 }
 
-export function serviceRegistryCacheKey(services: ServiceEndpoint[], discoveryPath = SERVICE_DISCOVERY_PATH): string {
+export function serviceRegistryCacheKey(
+  services: ServiceEndpoint[],
+  discoveryPath = SERVICE_DISCOVERY_PATH,
+  reservedRestPaths: string[] = [],
+  maxResponseBytes = DEFAULT_SERVICE_DISCOVERY_RESPONSE_MAX_BYTES,
+): string {
   return JSON.stringify({
     discoveryPath,
-    namespace: 'service-plane:registry:v2',
+    namespace: 'service-plane:registry:v5',
+    maxResponseBytes,
+    reservedRestPaths: normalizedReservedRestPaths(reservedRestPaths),
     services: services
       .map((service) => ({
         id: service.id,
@@ -111,6 +138,8 @@ type DiscoveredDocument = {
 
 type DiscoveryResult = { complete: boolean; etags: Record<string, string>; services: ServiceDiscoveryDocument[] };
 
+const NO_RESERVED_REST_PATHS = new Set<string>();
+
 // Scoped per cache instance, never module-wide: two planes in one process can share endpoint ids
 // and origins (the default origin is derived from the id) while resolving genuinely different
 // catalogs behind them, and a global map would hand the second plane the first one's result — and
@@ -118,11 +147,18 @@ type DiscoveryResult = { complete: boolean; etags: Record<string, string>; servi
 // for. Sharing a fill is only sound between callers that already share the entry it fills, and the
 // cache instance is what defines that group. Entries only ever hold a resolution that is still
 // running — dropped as soon as it settles — so this is a stampede guard, not a second cache.
-const inFlightDiscovery = new WeakMap<RegistryCache, Map<string, Promise<DiscoveryResult>>>();
+type InFlightDiscovery = {
+  pending: Promise<DiscoveryResult>;
+  releaseAt: number;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+const inFlightDiscovery = new WeakMap<RegistryCache, Map<string, InFlightDiscovery>>();
 
 function coalescedDiscovery(
   cache: RegistryCache | undefined,
   cacheKey: string,
+  deadlineAt: number | undefined,
   discover: () => Promise<DiscoveryResult>,
 ): Promise<DiscoveryResult> {
   // No cache, no coalescing: without an instance there is nothing safe to group callers by, and a
@@ -135,12 +171,18 @@ function coalescedDiscovery(
     inFlightDiscovery.set(cache, inFlight);
   }
   const running = inFlight.get(cacheKey);
-  if (running) return running;
+  if (running) {
+    if (running.releaseAt > Date.now()) return running.pending;
+    clearTimeout(running.timer);
+    inFlight.delete(cacheKey);
+  }
 
   const pending = discover();
-  inFlight.set(cacheKey, pending);
+  const fill = discoveryFill(inFlight, cacheKey, pending, deadlineAt);
+  inFlight.set(cacheKey, fill);
   const settle = () => {
-    if (inFlight.get(cacheKey) === pending) inFlight.delete(cacheKey);
+    clearTimeout(fill.timer);
+    if (inFlight.get(cacheKey) === fill) inFlight.delete(cacheKey);
   };
   // Both handlers, so a rejection clears the entry without becoming an unhandled rejection here —
   // the callers awaiting `pending` are the ones that see it.
@@ -148,18 +190,50 @@ function coalescedDiscovery(
   return pending;
 }
 
+function discoveryFill(
+  inFlight: Map<string, InFlightDiscovery>,
+  cacheKey: string,
+  pending: Promise<DiscoveryResult>,
+  deadlineAt: number | undefined,
+): InFlightDiscovery {
+  const releaseAt = discoveryReleaseAt(deadlineAt);
+  let fill: InFlightDiscovery;
+  const timer = setTimeout(
+    () => {
+      if (inFlight.get(cacheKey) === fill) inFlight.delete(cacheKey);
+    },
+    Math.max(0, releaseAt - Date.now()),
+  );
+  fill = { pending, releaseAt, timer };
+  return fill;
+}
+
+function discoveryReleaseAt(deadlineAt: number | undefined): number {
+  const maxAgeDeadline = Date.now() + DEFAULT_IN_FLIGHT_DISCOVERY_MAX_AGE_MS;
+  // Release just before the waiting request's own timer. Deleting the map entry does not interrupt
+  // that request; it only guarantees a follow-up cannot inherit the stuck fill after seeing 504.
+  const callerDeadline =
+    deadlineAt === undefined || !Number.isFinite(deadlineAt) ? maxAgeDeadline : deadlineAt - IN_FLIGHT_DISCOVERY_RELEASE_SKEW_MS;
+  return Math.min(callerDeadline, maxAgeDeadline);
+}
+
 async function discoverServices(
   endpoints: ServiceEndpoint[],
   discoveryPath: string,
+  reservedRestPaths: string[],
+  maxResponseBytes: number,
   previous?: ServiceDiscoverySnapshot,
 ): Promise<DiscoveryResult> {
+  const reservedRestPathSet = new Set(reservedRestPaths);
   const previousServices = new Map(previous?.services.map((service) => [service.id, service]));
   const discovered = await Promise.all(
     endpoints.map(async (endpoint) => {
       try {
         if (endpoint.discovery) {
           const discovery = typeof endpoint.discovery === 'function' ? await endpoint.discovery() : endpoint.discovery;
-          return isDiscoveryForEndpoint(discovery, endpoint) ? { document: discovery, endpointId: endpoint.id } : undefined;
+          return isDiscoveryForEndpoint(discovery, endpoint, reservedRestPathSet)
+            ? { document: discovery, endpointId: endpoint.id }
+            : undefined;
         }
 
         const request = serviceDiscoveryRequest(endpoint, discoveryPath);
@@ -173,8 +247,11 @@ async function discoverServices(
         }
         if (!response.ok) return undefined;
 
-        const value = await response.json();
-        if (!isDiscoveryForEndpoint(value, endpoint)) return undefined;
+        const value = await readBoundedResponseJson(response, maxResponseBytes, {
+          invalidJsonMessage: 'Invalid Service-Plane discovery response',
+          tooLargeMessage: 'Service-Plane discovery response is too large',
+        });
+        if (!isDiscoveryForEndpoint(value, endpoint, reservedRestPathSet)) return undefined;
         const etag = response.headers.get('etag') ?? undefined;
         return { document: value, endpointId: endpoint.id, ...(etag ? { etag } : {}) };
       } catch {
@@ -196,16 +273,19 @@ async function discoverServices(
 
 // The configured endpoint is the plane's identity authority; discovery may describe that service,
 // but it cannot redirect metadata or capability scopes onto another configured endpoint.
-function isDiscoveryForEndpoint(value: unknown, endpoint: ServiceEndpoint): value is ServiceDiscoveryDocument {
+function isDiscoveryForEndpoint(
+  value: unknown,
+  endpoint: ServiceEndpoint,
+  reservedRestPaths: Set<string>,
+): value is ServiceDiscoveryDocument {
   return (
-    isServiceDiscoveryDocument(value) &&
+    isServiceDiscoveryDocument(value, reservedRestPaths) &&
     value.id === endpoint.id &&
     (value.capabilities === undefined || value.capabilities.serviceId === endpoint.id)
   );
 }
 
-function withAbilities(snapshot: ServiceDiscoverySnapshot, endpoints: ServiceEndpoint[]): ServiceRegistrySnapshot {
-  const endpointsById = new Map(endpoints.map((endpoint) => [endpoint.id, endpoint]));
+function withAbilities(snapshot: ServiceDiscoverySnapshot, endpointsById: ReadonlyMap<string, ServiceEndpoint>): ServiceRegistrySnapshot {
   const abilities = snapshot.services.flatMap((service) => {
     const endpoint = endpointsById.get(service.id);
     if (!endpoint) return [];
@@ -232,7 +312,7 @@ function discoveredAbility(
   };
 }
 
-function isServiceDiscoveryDocument(value: unknown): value is ServiceDiscoveryDocument {
+function isServiceDiscoveryDocument(value: unknown, reservedRestPaths: Set<string>): value is ServiceDiscoveryDocument {
   if (!value || typeof value !== 'object') return false;
   const document = value as ServiceDiscoveryDocument;
   return (
@@ -240,11 +320,8 @@ function isServiceDiscoveryDocument(value: unknown): value is ServiceDiscoveryDo
     typeof document.title === 'string' &&
     typeof document.version === 'string' &&
     Array.isArray(document.abilities) &&
-    document.abilities.every(isAbilityDiscovery) &&
-    (document.capabilities === undefined ||
-      (typeof document.capabilities === 'object' &&
-        typeof document.capabilities.serviceId === 'string' &&
-        Array.isArray(document.capabilities.scopes))) &&
+    document.abilities.every((ability) => isAbilityDiscovery(ability, reservedRestPaths)) &&
+    (document.capabilities === undefined || isCapabilityCatalog(document.capabilities)) &&
     (!document.callerAuth ||
       (!!document.callerAuth &&
         typeof document.callerAuth === 'object' &&
@@ -255,9 +332,42 @@ function isServiceDiscoveryDocument(value: unknown): value is ServiceDiscoveryDo
   );
 }
 
-function isAbilityDiscovery(value: unknown): value is ServiceAbilityDiscovery {
+// Discovery is an untyped network boundary. Validate the complete catalog before the control plane
+// passes it to the shared issuer, which legitimately dereferences every scope during construction.
+// Mirroring `defineCapabilities` here also keeps hand-authored discovery from advertising a shape a
+// Service Plane service cannot produce.
+function isCapabilityCatalog(value: unknown): value is CapabilityCatalog {
+  if (!isRecord(value) || !isCanonicalId(value.serviceId) || !Array.isArray(value.scopes)) return false;
+
+  const scopeIds = new Set<string>();
+  for (const scope of value.scopes) {
+    if (!isCapabilityScopeDefinition(scope) || scopeIds.has(scope.id)) return false;
+    scopeIds.add(scope.id);
+  }
+  return true;
+}
+
+function isCapabilityScopeDefinition(value: unknown): value is CapabilityScopeDefinition {
+  return (
+    isRecord(value) &&
+    isCanonicalScope(value.id) &&
+    (value.description === undefined || typeof value.description === 'string') &&
+    (value.title === undefined || typeof value.title === 'string')
+  );
+}
+
+function isCanonicalId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value === value.trim();
+}
+
+function isCanonicalScope(value: unknown): value is string {
+  return isCanonicalId(value) && !value.includes('*');
+}
+
+function isAbilityDiscovery(value: unknown, reservedRestPaths: Set<string>): value is ServiceAbilityDiscovery {
   if (!value || typeof value !== 'object') return false;
   const ability = value as ServiceAbilityDiscovery;
+  const methodReservedRestPaths = ability.exposure === 'published' ? reservedRestPaths : NO_RESERVED_REST_PATHS;
   return (
     typeof ability.id === 'string' &&
     isAbilityAccess(ability.access) &&
@@ -271,11 +381,11 @@ function isAbilityDiscovery(value: unknown): value is ServiceAbilityDiscovery {
     Array.isArray(ability.rpc.transports) &&
     ability.rpc.transports.every(isAbilityTransport) &&
     isRecord(ability.methods) &&
-    Object.values(ability.methods).every(isAbilityMethodDiscovery)
+    Object.values(ability.methods).every((method) => isAbilityMethodDiscovery(method, methodReservedRestPaths))
   );
 }
 
-function isAbilityMethodDiscovery(value: unknown): value is ServiceAbilityMethodDiscovery {
+function isAbilityMethodDiscovery(value: unknown, reservedRestPaths: Set<string>): value is ServiceAbilityMethodDiscovery {
   if (!isRecord(value)) return false;
   return (
     Array.isArray(value.scopes) &&
@@ -291,14 +401,74 @@ function isAbilityMethodDiscovery(value: unknown): value is ServiceAbilityMethod
     // Mirrors defineAbilityService: streaming methods cannot claim single-response projections,
     // and foreign discovery documents do not get to bypass that.
     (value.stream !== true || (value.mcpPrompt === undefined && value.mcpResource === undefined && value.rest === undefined)) &&
-    (value.rest === undefined ||
-      (isRecord(value.rest) &&
-        isHttpMethod(value.rest.method) &&
-        typeof value.rest.path === 'string' &&
-        isOriginRelativePath(value.rest.path) &&
-        (value.rest.operationId === undefined || typeof value.rest.operationId === 'string'))) &&
-    (value.mcp === undefined || (isRecord(value.mcp) && typeof value.mcp.name === 'string'))
+    (value.rest === undefined || isValidRestDiscovery(value.rest, value.inputSchema, reservedRestPaths)) &&
+    (value.mcp === undefined || isMcpProjection(value.mcp)) &&
+    (value.mcpPrompt === undefined || isMcpPromptProjection(value.mcpPrompt)) &&
+    (value.mcpResource === undefined || isMcpResourceProjection(value.mcpResource))
   );
+}
+
+function isMcpProjection(value: unknown): value is Record<string, unknown> {
+  return isRecord(value) && isCanonicalId(value.name) && (value.description === undefined || typeof value.description === 'string');
+}
+
+function isMcpPromptProjection(value: unknown): boolean {
+  return (
+    isMcpProjection(value) &&
+    (value.title === undefined || typeof value.title === 'string') &&
+    (value.arguments === undefined || (Array.isArray(value.arguments) && value.arguments.every(isMcpPromptArgument)))
+  );
+}
+
+function isMcpPromptArgument(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    isCanonicalId(value.name) &&
+    (value.description === undefined || typeof value.description === 'string') &&
+    (value.required === undefined || typeof value.required === 'boolean')
+  );
+}
+
+function isMcpResourceProjection(value: unknown): boolean {
+  return (
+    isMcpProjection(value) &&
+    isCanonicalId(value.uri) &&
+    hasOnlySimpleTemplateExpressions(value.uri) &&
+    (value.mimeType === undefined || typeof value.mimeType === 'string') &&
+    (value.title === undefined || typeof value.title === 'string')
+  );
+}
+
+function isValidRestDiscovery(rest: unknown, inputSchema: Record<string, unknown>, reservedRestPaths: Set<string>): boolean {
+  if (
+    !isRecord(rest) ||
+    !isHttpMethod(rest.method) ||
+    typeof rest.path !== 'string' ||
+    !isOriginRelativePath(rest.path) ||
+    isReservedRestPath(normalizePath(rest.path), reservedRestPaths) ||
+    (rest.operationId !== undefined && typeof rest.operationId !== 'string') ||
+    (rest.tags !== undefined && (!Array.isArray(rest.tags) || !rest.tags.every((tag) => typeof tag === 'string'))) ||
+    (rest.status !== undefined &&
+      (typeof rest.status !== 'number' || !Number.isInteger(rest.status) || rest.status < 200 || rest.status > 299))
+  ) {
+    return false;
+  }
+  const variables = pathTemplateVariables(rest.path);
+  if (!variables) return false;
+  const properties = jsonSchemaRootProperties(inputSchema);
+  return variables.every((name) => !!properties && Object.hasOwn(properties, name));
+}
+
+function isReservedRestPath(path: string, rules: ReadonlySet<string>): boolean {
+  for (const rule of rules) {
+    if (rule.endsWith('/*')) {
+      const prefix = rule.slice(0, -2) || '/';
+      if (prefix === '/' || path.startsWith(`${prefix}/`)) return true;
+      continue;
+    }
+    if (path === rule) return true;
+  }
+  return false;
 }
 
 function isAbilityExposure(value: unknown): value is AbilityExposure {
@@ -306,7 +476,7 @@ function isAbilityExposure(value: unknown): value is AbilityExposure {
 }
 
 function isAbilityTransport(value: unknown): value is AbilityTransport {
-  return value === 'cloudflare-service-binding' || value === 'fetch' || value === 'websocket';
+  return value === 'fetch' || value === 'service-binding' || value === 'websocket';
 }
 
 function isHttpMethod(value: unknown): value is ServiceHttpMethod {
@@ -315,6 +485,10 @@ function isHttpMethod(value: unknown): value is ServiceHttpMethod {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function normalizedReservedRestPaths(paths: string[] | undefined): string[] {
+  return [...new Set((paths ?? []).map(normalizePath))].sort();
 }
 
 /**

@@ -1,6 +1,6 @@
 import type { Context } from 'hono';
 import { createMiddleware } from 'hono/factory';
-import { defaultServicePlaneLogSink, type ServicePlaneLogLevel } from '../shared/logging.js';
+import { defaultServicePlaneLogSink, emitBestEffortServicePlaneLog, type ServicePlaneLogLevel } from '../shared/logging.js';
 import {
   SERVICE_DISCOVERY_PATH,
   SERVICE_PLANE_REQUEST_ID_HEADER,
@@ -98,7 +98,7 @@ export function servicePlaneLogger(service: ServiceDefinition, options: ServiceP
       if (requestId) event.requestId = requestId;
       if (ability) event.ability = compactAbility(ability);
       stashLogEvent(context, event);
-      write(event, context);
+      emitBestEffortServicePlaneLog(write, event, context);
     } catch (error) {
       const durationMs = Date.now() - startedAt;
       const event: ServicePlaneRequestLogEvent = {
@@ -114,7 +114,7 @@ export function servicePlaneLogger(service: ServiceDefinition, options: ServiceP
       if (requestId) event.requestId = requestId;
       if (ability) event.ability = compactAbility(ability);
       stashLogEvent(context, event);
-      write(event, context);
+      emitBestEffortServicePlaneLog(write, event, context);
       throw error;
     }
   });

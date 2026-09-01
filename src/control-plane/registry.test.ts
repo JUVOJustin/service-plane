@@ -49,6 +49,22 @@ describe('service registry', () => {
     expect(registry.endpoint('example')?.id).toBe('example');
   });
 
+  it('omits a service whose discovery response exceeds the configured bound', async () => {
+    const body = JSON.stringify(document);
+    const registry = createServiceRegistry({
+      maxResponseBytes: body.length - 1,
+      services: [
+        httpsService({
+          baseUrl: 'https://example.internal',
+          fetch: async () => new Response(body, { headers: { 'content-length': String(body.length) } }),
+          id: 'example',
+        }),
+      ],
+    });
+
+    await expect(registry.discover()).resolves.toMatchObject({ abilities: [], services: [] });
+  });
+
   it('caches discovery documents and revalidates stale cache entries with ETags', async () => {
     let now = Date.parse('2026-05-09T12:00:00.000Z');
     let fetches = 0;
@@ -73,6 +89,49 @@ describe('service registry', () => {
     now += 31_000;
     await registry.discover();
     expect(fetches).toBe(2);
+  });
+
+  it.each(['get', 'getStale', 'set'] as const)('treats a rejected cache %s as a miss', async (failedOperation) => {
+    let failedOperationCalls = 0;
+    let fetches = 0;
+    const registry = createServiceRegistry({
+      cache: {
+        async get() {
+          if (failedOperation === 'get') {
+            failedOperationCalls += 1;
+            throw new Error('cache unavailable');
+          }
+          return undefined;
+        },
+        async getStale() {
+          if (failedOperation === 'getStale') {
+            failedOperationCalls += 1;
+            throw new Error('cache unavailable');
+          }
+          return undefined;
+        },
+        async set() {
+          if (failedOperation === 'set') {
+            failedOperationCalls += 1;
+            throw new Error('cache unavailable');
+          }
+        },
+      },
+      services: [
+        httpsService({
+          baseUrl: 'https://example.internal',
+          fetch: async () => {
+            fetches += 1;
+            return Response.json(document);
+          },
+          id: 'example',
+        }),
+      ],
+    });
+
+    await expect(registry.discover()).resolves.toMatchObject({ services: [{ id: 'example' }] });
+    expect(failedOperationCalls).toBe(1);
+    expect(fetches).toBe(1);
   });
 
   it('namespaces the default cache key by resolved service set', async () => {
@@ -142,6 +201,171 @@ describe('service registry', () => {
     expect(snapshot.services.map((service) => service.id)).toEqual(['example']);
   });
 
+  it('omits discovery documents whose REST path variables are absent from the input schema', async () => {
+    const ability = document.abilities.at(0);
+    if (!ability) throw new Error('missing test ability');
+    const method = ability.methods.runSync;
+    if (!method) throw new Error('missing test method');
+    const registry = createServiceRegistry({
+      services: [
+        httpsService({
+          baseUrl: 'https://example.internal',
+          discovery: {
+            ...document,
+            abilities: [
+              {
+                ...ability,
+                exposure: 'published',
+                methods: {
+                  runSync: {
+                    ...method,
+                    inputSchema: { properties: { id: { type: 'string' } }, type: 'object' },
+                    rest: { method: 'post', path: '/examples/{connectionId}' },
+                  },
+                },
+              },
+            ],
+          },
+          id: 'example',
+        }),
+      ],
+    });
+
+    await expect(registry.discover()).resolves.toMatchObject({ abilities: [], services: [] });
+  });
+
+  it('omits discovery documents whose REST projections collide with built-in control-plane paths', async () => {
+    const ability = document.abilities.at(0);
+    if (!ability) throw new Error('missing test ability');
+    const method = ability.methods.runSync;
+    if (!method) throw new Error('missing test method');
+    const registry = createServiceRegistry({
+      reservedRestPaths: ['/mcp'],
+      services: [
+        httpsService({
+          baseUrl: 'https://example.internal',
+          discovery: {
+            ...document,
+            abilities: [
+              {
+                ...ability,
+                exposure: 'published',
+                methods: {
+                  runSync: {
+                    ...method,
+                    rest: { method: 'get', path: '/mcp' },
+                  },
+                },
+              },
+            ],
+          },
+          id: 'example',
+        }),
+      ],
+    });
+
+    await expect(registry.discover()).resolves.toMatchObject({ abilities: [], services: [] });
+  });
+
+  it('allows private REST metadata to reuse a control-plane path because it is never mounted', async () => {
+    const ability = document.abilities.at(0);
+    if (!ability) throw new Error('missing test ability');
+    const method = ability.methods.runSync;
+    if (!method) throw new Error('missing test method');
+    const registry = createServiceRegistry({
+      reservedRestPaths: ['/mcp'],
+      services: [
+        httpsService({
+          baseUrl: 'https://example.internal',
+          discovery: {
+            ...document,
+            abilities: [
+              {
+                ...ability,
+                methods: {
+                  runSync: {
+                    ...method,
+                    rest: { method: 'get', path: '/mcp' },
+                  },
+                },
+              },
+            ],
+          },
+          id: 'example',
+        }),
+      ],
+    });
+
+    await expect(registry.discover()).resolves.toMatchObject({
+      abilities: [{ exposure: 'private', id: 'example.sync' }],
+      services: [{ id: 'example' }],
+    });
+  });
+
+  it.each([199, 300, 201.5, '201'])('omits discovery documents with invalid REST status $status', async (status) => {
+    const ability = document.abilities.at(0);
+    if (!ability) throw new Error('missing test ability');
+    const method = ability.methods.runSync;
+    if (!method) throw new Error('missing test method');
+    const registry = createServiceRegistry({
+      services: [
+        httpsService({
+          baseUrl: 'https://example.internal',
+          discovery: {
+            ...document,
+            abilities: [
+              {
+                ...ability,
+                exposure: 'published',
+                methods: {
+                  runSync: {
+                    ...method,
+                    rest: { method: 'post', path: '/examples', status: status as number },
+                  },
+                },
+              },
+            ],
+          },
+          id: 'example',
+        }),
+      ],
+    });
+
+    await expect(registry.discover()).resolves.toMatchObject({ abilities: [], services: [] });
+  });
+
+  it.each([{ length: 1 }, ['valid', 42], 'invalid'])('omits discovery documents with malformed REST tags %#', async (tags) => {
+    const ability = document.abilities.at(0);
+    if (!ability) throw new Error('missing test ability');
+    const method = ability.methods.runSync;
+    if (!method) throw new Error('missing test method');
+    const registry = createServiceRegistry({
+      services: [
+        httpsService({
+          baseUrl: 'https://example.internal',
+          discovery: {
+            ...document,
+            abilities: [
+              {
+                ...ability,
+                exposure: 'published',
+                methods: {
+                  runSync: {
+                    ...method,
+                    rest: { method: 'post', path: '/examples', tags: tags as string[] },
+                  },
+                },
+              },
+            ],
+          },
+          id: 'example',
+        }),
+      ],
+    });
+
+    await expect(registry.discover()).resolves.toMatchObject({ abilities: [], services: [] });
+  });
+
   it('rejects discovery documents that claim another configured endpoint id', async () => {
     const victimDocument: ServiceDiscoveryDocument = {
       ...document,
@@ -182,6 +406,124 @@ describe('service registry', () => {
     });
 
     await expect(registry.discover()).resolves.toMatchObject({ abilities: [], services: [] });
+  });
+
+  it.each([
+    ['a non-object catalog', null],
+    ['a missing service id', { scopes: [] }],
+    ['a non-string service id', { scopes: [], serviceId: 42 }],
+    ['a blank service id', { scopes: [], serviceId: '   ' }],
+    ['non-array scopes', { scopes: {}, serviceId: 'bad' }],
+    ['a non-object scope', { scopes: [null], serviceId: 'bad' }],
+    ['a scope with no id', { scopes: [{}], serviceId: 'bad' }],
+    ['a scope with a non-string id', { scopes: [{ id: 42 }], serviceId: 'bad' }],
+    ['a scope with a blank id', { scopes: [{ id: '   ' }], serviceId: 'bad' }],
+    ['a wildcard scope', { scopes: [{ id: 'bad.*' }], serviceId: 'bad' }],
+    ['non-string scope metadata', { scopes: [{ id: 'bad.use', title: 42 }], serviceId: 'bad' }],
+    ['duplicate scopes', { scopes: [{ id: 'bad.use' }, { id: 'bad.use' }], serviceId: 'bad' }],
+  ])('isolates a service whose capability catalog contains %s', async (_description, capabilities) => {
+    const registry = createServiceRegistry({
+      services: [
+        httpsService({ baseUrl: 'https://example.internal', discovery: document, id: 'example' }),
+        httpsService({
+          baseUrl: 'https://bad.internal',
+          fetch: async () =>
+            Response.json({
+              abilities: [],
+              capabilities,
+              id: 'bad',
+              title: 'Bad',
+              version: '0.0.1',
+            }),
+          id: 'bad',
+        }),
+      ],
+    });
+
+    const snapshot = await registry.discover();
+    expect(snapshot.services.map((service) => service.id)).toEqual(['example']);
+    expect(snapshot.abilities).toMatchObject([{ id: 'example.sync', serviceId: 'example' }]);
+  });
+
+  it.each([
+    ['a non-object tool projection', { mcp: null }],
+    ['a blank tool name', { mcp: { name: '   ' } }],
+    ['non-string tool metadata', { mcp: { description: 42, name: 'bad_tool' } }],
+    ['a non-object prompt projection', { mcpPrompt: null }],
+    ['a non-string prompt name', { mcpPrompt: { name: 42 } }],
+    ['non-array prompt arguments', { mcpPrompt: { arguments: {}, name: 'bad_prompt' } }],
+    ['a non-object prompt argument', { mcpPrompt: { arguments: [null], name: 'bad_prompt' } }],
+    ['a blank prompt argument name', { mcpPrompt: { arguments: [{ name: ' ' }], name: 'bad_prompt' } }],
+    ['non-string prompt argument metadata', { mcpPrompt: { arguments: [{ description: 42, name: 'id' }], name: 'bad_prompt' } }],
+    ['a non-boolean prompt requirement', { mcpPrompt: { arguments: [{ name: 'id', required: 'yes' }], name: 'bad_prompt' } }],
+    ['a non-object resource projection', { mcpResource: null }],
+    ['a blank resource name', { mcpResource: { name: ' ', uri: 'example://bad' } }],
+    ['a non-string resource URI', { mcpResource: { name: 'bad', uri: 42 } }],
+    ['a blank resource URI', { mcpResource: { name: 'bad', uri: ' ' } }],
+    ['an invalid resource template', { mcpResource: { name: 'bad', uri: 'example://items/{nested{id}}' } }],
+    ['non-string resource metadata', { mcpResource: { mimeType: 42, name: 'bad', uri: 'example://bad' } }],
+  ])('isolates a service whose method publishes %s', async (_description, projection) => {
+    const ability = document.abilities[0];
+    const method = ability?.methods.runSync;
+    if (!ability || !method) throw new Error('missing registry fixture method');
+    const registry = createServiceRegistry({
+      services: [
+        httpsService({ baseUrl: 'https://example.internal', discovery: document, id: 'example' }),
+        httpsService({
+          baseUrl: 'https://bad.internal',
+          fetch: async () =>
+            Response.json({
+              ...document,
+              abilities: [
+                {
+                  ...ability,
+                  exposure: 'published',
+                  id: 'bad.sync',
+                  methods: { runSync: { ...method, ...projection, scopes: ['bad.use'] } },
+                  rpc: { path: '/rpc/bad.sync', transports: ['fetch'] },
+                  scopes: ['bad.use'],
+                },
+              ],
+              capabilities: { scopes: [{ id: 'bad.use' }], serviceId: 'bad' },
+              id: 'bad',
+              title: 'Bad',
+            }),
+          id: 'bad',
+        }),
+      ],
+    });
+
+    const snapshot = await registry.discover();
+    expect(snapshot.services.map((service) => service.id)).toEqual(['example']);
+    expect(snapshot.abilities).toMatchObject([{ id: 'example.sync', serviceId: 'example' }]);
+  });
+
+  it('reserves descendant routes only for explicit wildcard rules', async () => {
+    const ability = document.abilities[0];
+    const method = ability?.methods.runSync;
+    if (!ability || !method) throw new Error('missing registry fixture method');
+    const projected = (path: string) => ({
+      ...document,
+      abilities: [
+        {
+          ...ability,
+          exposure: 'published' as const,
+          methods: { runSync: { ...method, rest: { method: 'get' as const, path } } },
+        },
+      ],
+    });
+
+    const exactOnly = createServiceRegistry({
+      reservedRestPaths: ['/mcp'],
+      services: [httpsService({ baseUrl: 'https://example.internal', discovery: projected('/mcp/health'), id: 'example' })],
+    });
+    await expect(exactOnly.discover()).resolves.toMatchObject({ services: [{ id: 'example' }] });
+
+    const withDescendants = createServiceRegistry({
+      reservedRestPaths: ['/rpc/broker', '/rpc/broker/*'],
+      services: [httpsService({ baseUrl: 'https://example.internal', discovery: projected('/rpc/broker/shadow'), id: 'example' })],
+    });
+    await expect(withDescendants.discover()).resolves.toMatchObject({ abilities: [], services: [] });
   });
 
   it('omits discovery documents with RPC paths that replace the configured service origin', async () => {
@@ -237,6 +579,18 @@ describe('service registry', () => {
   });
 
   it('versions the derived cache namespace when discovery trust rules change', () => {
-    expect(serviceRegistryCacheKey([])).toContain('"namespace":"service-plane:registry:v2"');
+    expect(serviceRegistryCacheKey([])).toContain('"namespace":"service-plane:registry:v5"');
+  });
+
+  it('namespaces the cache by reserved control-plane REST paths', () => {
+    expect(serviceRegistryCacheKey([], SERVICE_DISCOVERY_PATH, ['/custom-mcp'])).not.toBe(
+      serviceRegistryCacheKey([], SERVICE_DISCOVERY_PATH),
+    );
+  });
+
+  it('namespaces the cache by the discovery response limit', () => {
+    expect(serviceRegistryCacheKey([], SERVICE_DISCOVERY_PATH, [], 1024)).not.toBe(
+      serviceRegistryCacheKey([], SERVICE_DISCOVERY_PATH, [], 2048),
+    );
   });
 });
