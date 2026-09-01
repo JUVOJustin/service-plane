@@ -376,7 +376,7 @@ describe('stable ability client call options', () => {
     ).toThrow('Service-Plane client scope is not declared by ability: client.metadata -> metadata.admin');
   });
 
-  it.each(['then', 'toJSON'])('rejects implicitly invoked method name %s before creating a client', (methodName) => {
+  it.each(['then', 'toJSON', '__proto__'])('rejects reserved method name %s before creating a client', (methodName) => {
     const invalid = defineAbility({
       id: 'client.invalid',
       methods: { [methodName]: clientAbility.methods.inspect },

@@ -13,7 +13,7 @@ export type ControlPlaneMethodInvocation = {
   /** Method key already resolved within the discovered ability. */
   method: string;
   /** Method scopes to mint into the downstream capability token. */
-  scopes: string[];
+  scopes: ReadonlyArray<string>;
 };
 
 /** Authenticated request facts needed to authorize and dispatch one projected method. */
@@ -85,7 +85,7 @@ export async function invokeControlPlaneMethod(
       ...(options.caller ? { caller: options.caller } : {}),
       input,
       method: invocation.method,
-      scopes: invocation.scopes,
+      scopes: [...invocation.scopes],
       targetServiceId: invocation.ability.serviceId,
     }),
     options,

@@ -10,6 +10,7 @@ import { defineAbility, defineAbilityService, serviceDiscoveryDocument } from '.
 import { ServicePlaneService } from '../service/service.js';
 import { SERVICE_PLANE_TIMEOUT_GRACE_MS } from '../shared/deadline.js';
 import { AbilityHandlerError, ServicePlaneClientError } from '../shared/errors.js';
+import { DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS } from '../shared/request-preparation.js';
 import type { CapabilityJwks, FetchLike, RegistryCache } from '../shared/types.js';
 import { SERVICE_PLANE_CAPABILITY_JWKS_PATH, SERVICE_PLANE_MCP_PATH } from '../shared/types.js';
 import { memoryWebSocketPair } from '../test-support/index.js';
@@ -19,6 +20,60 @@ import { memoryRegistryCache } from './registry.js';
 import { generateCapabilitySigningSecret } from './signing-keys.js';
 
 describe('Service Plane control-plane broker', () => {
+  it('bounds and cancels broker decoding even when a physical batch has no timeout header', async () => {
+    vi.useFakeTimers();
+    let bodyCancels = 0;
+    let middlewareSettled = false;
+    let serviceResolutions = 0;
+    try {
+      const plane = new ServicePlaneControlPlane({
+        broker: { batch: true },
+        invocationMiddleware: async (context, next) => {
+          try {
+            await context.req.raw.text();
+            context.set('servicePlaneCaller', { id: 'headless-front', kind: 'user' });
+            await next();
+          } finally {
+            middlewareSettled = true;
+          }
+        },
+        log: false,
+        openapi: false,
+        rest: false,
+        services: () => {
+          serviceResolutions += 1;
+          return [];
+        },
+        signingKeys: () => [],
+      });
+      const body = new ReadableStream<Uint8Array>({
+        cancel() {
+          bodyCancels += 1;
+        },
+        pull: () => new Promise<void>(() => undefined),
+      });
+      const responsePromise = plane.fetch(
+        new Request('https://plane.internal/rpc/broker', {
+          body,
+          duplex: 'half',
+          headers: { 'content-type': 'application/json', 'orpc-batch': 'streaming' },
+          method: 'POST',
+        } as RequestInit & { duplex: 'half' }),
+      );
+
+      await vi.advanceTimersByTimeAsync(DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS);
+      const response = await responsePromise;
+      await Promise.resolve();
+
+      expect(response.status).toBe(504);
+      expect(bodyCancels).toBe(1);
+      expect(middlewareSettled).toBe(true);
+      expect(serviceResolutions).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('keeps the README control-plane environment pattern fully typed', () => {
     type ReadmeControlPlaneEnv = {
       Bindings: {
@@ -401,6 +456,7 @@ describe('Service Plane control-plane broker', () => {
     });
     const signingSecret = await generateCapabilitySigningSecret();
     let brokerSigningKeyResolutions = 0;
+    let controlPlaneWebSocketColo: string | undefined;
     let grantsEnabled = true;
     const [planeClientSocket, planeServerSocket] = memoryWebSocketPair();
     const upgradeWebSocket = (async (_context: unknown, events: { onMessage?: (event: unknown, socket: unknown) => void }) => {
@@ -423,17 +479,21 @@ describe('Service Plane control-plane broker', () => {
       log: false,
       mcp: {},
       openapi: false,
-      services: () => [
-        cloudflareServiceBinding({
-          abilityRpc: {
-            invokeAbility: (input) => service.invokeAbility(input),
-          },
-          binding: { fetch: async (request) => service.fetch(request) },
-          grants: grantsEnabled ? [{ caller: 'headless-front', scopes: ['tasks.read'] }] : [],
-          id: 'tasks',
-          origin: 'https://tasks.internal',
-        }),
-      ],
+      services: (context) => {
+        const colo = (context.req.raw as Request & { cf?: { colo?: unknown } }).cf?.colo;
+        if (typeof colo === 'string') controlPlaneWebSocketColo = colo;
+        return [
+          cloudflareServiceBinding({
+            abilityRpc: {
+              invokeAbility: (input) => service.invokeAbility(input),
+            },
+            binding: { fetch: async (request) => service.fetch(request) },
+            grants: grantsEnabled ? [{ caller: 'headless-front', scopes: ['tasks.read'] }] : [],
+            id: 'tasks',
+            origin: 'https://tasks.internal',
+          }),
+        ];
+      },
       signingKeys: (_bindings, context) => {
         if (new URL(context.req.url).pathname.startsWith('/rpc/broker')) brokerSigningKeyResolutions += 1;
         return [{ kid: 'test-key', secret: signingSecret }];
@@ -514,11 +574,15 @@ describe('Service Plane control-plane broker', () => {
     for await (const value of stream) values.push(value);
     expect(values).toEqual([{ sequence: 9 }, { sequence: 10 }]);
 
-    await plane.fetch(
-      new Request('https://plane.internal/rpc/broker/ws', {
-        headers: { connection: 'upgrade', upgrade: 'websocket' },
-      }),
-    );
+    const webSocketUpgradeRequest = new Request('https://plane.internal/rpc/broker/ws', {
+      headers: { connection: 'upgrade', upgrade: 'websocket' },
+    });
+    Object.defineProperty(webSocketUpgradeRequest, 'cf', {
+      configurable: true,
+      enumerable: true,
+      value: { colo: 'FRA' },
+    });
+    await plane.fetch(webSocketUpgradeRequest);
     const webSocketClient = createBrokeredAbilityClient({
       ability: tasks,
       scopes: ['tasks.read'],
@@ -530,6 +594,7 @@ describe('Service Plane control-plane broker', () => {
       },
     });
     await expect(webSocketClient.get({ id: 'task-ws' })).resolves.toEqual({ caller: 'headless-front', id: 'task-ws' });
+    expect(controlPlaneWebSocketColo).toBe('FRA');
     const webSocketStream = await webSocketClient.watch({ after: 20 });
     const webSocketValues = [];
     for await (const value of webSocketStream) webSocketValues.push(value);

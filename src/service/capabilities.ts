@@ -78,7 +78,7 @@ export type CreateCapabilityTokenProviderOptions = {
    * wrap the issuer in a closure that supplies `callerAccess` instead.
    */
   requestToken: (input: IssueCapabilityTokenInput) => Promise<IssuedCapabilityToken | { expiresAt: Date | string; token: string }>;
-  scopes: string[];
+  scopes: ReadonlyArray<string>;
   subject?: CapabilitySubject;
   targetServiceId: string;
   ttlSeconds?: number;
@@ -138,13 +138,13 @@ export type CapabilityTokenRequester = CreateCapabilityTokenProviderOptions['req
 };
 
 export function defineCapabilities(catalog: CapabilityCatalog): CapabilityCatalog {
-  const scopes = catalog.scopes.map(normalizeScopeDefinition);
+  const scopes = catalog.scopes.map((scope) => Object.freeze(normalizeScopeDefinition(scope)));
   const duplicate = firstDuplicate(scopes.map((scope) => scope.id));
   if (duplicate) throw new CapabilityAuthError(`Duplicate Service-Plane capability scope: ${duplicate}`, 500);
-  return {
-    scopes,
+  return Object.freeze({
+    scopes: Object.freeze(scopes),
     serviceId: normalizeValue(catalog.serviceId, 'service id'),
-  };
+  });
 }
 
 export async function verifyAuthenticationToken(token: string, verifier: CapabilityVerifierOptions): Promise<CapabilityIdentity> {
@@ -264,7 +264,7 @@ async function capabilityProviderCacheKey(options: {
   cacheKey: string | undefined;
   callerServiceId: string;
   requester: CapabilityTokenRequester;
-  scopes: string[];
+  scopes: ReadonlyArray<string>;
   senderConstrained: boolean;
   subject: CapabilitySubject | undefined;
   targetServiceId: string;
@@ -294,7 +294,7 @@ async function capabilityProviderCacheKey(options: {
 export function capabilityTokenCacheKey(input: {
   abilityId?: string;
   callerServiceId: string;
-  scopes: string[];
+  scopes: ReadonlyArray<string>;
   senderConstraint?: string;
   senderConstrained?: boolean;
   subject?: CapabilitySubject;
@@ -537,7 +537,7 @@ function normalizeScopeDefinition(scope: CapabilityScopeDefinition): CapabilityS
   };
 }
 
-function normalizeScopes(scopes: string[]): string[] {
+function normalizeScopes(scopes: ReadonlyArray<string>): string[] {
   if (scopes.length === 0) throw new CapabilityAuthError('Service-Plane capability requires at least one scope', 500);
   return [...new Set(scopes.map(normalizeScope))];
 }

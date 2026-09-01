@@ -41,119 +41,168 @@ export type AbilityTransport = 'fetch' | 'service-binding' | 'websocket';
 export type ServiceHttpMethod = 'delete' | 'get' | 'patch' | 'post' | 'put' | 'query';
 
 export type CapabilityScopeDefinition = {
-  description?: string;
-  id: string;
-  title?: string;
+  readonly description?: string;
+  readonly id: string;
+  readonly title?: string;
 };
 
 export type CapabilityCatalog = {
-  scopes: CapabilityScopeDefinition[];
-  serviceId: string;
+  readonly scopes: ReadonlyArray<CapabilityScopeDefinition>;
+  readonly serviceId: string;
 };
 
 export type OpenApiObject = Record<string, unknown>;
 
+type ImmutableArrayMutationGuards = {
+  readonly copyWithin?: never;
+  readonly fill?: never;
+  readonly pop?: never;
+  readonly push?: never;
+  readonly reverse?: never;
+  readonly shift?: never;
+  readonly sort?: never;
+  readonly splice?: never;
+  readonly unshift?: never;
+};
+
+type ImmutableArray<T> = ReadonlyArray<T> & ImmutableArrayMutationGuards;
+
+type DeepReadonly<T> = T extends (...args: never[]) => unknown
+  ? T
+  : T extends ReadonlyArray<infer TItem>
+    ? ImmutableArray<DeepReadonly<TItem>>
+    : T extends object
+      ? { readonly [TKey in keyof T]: DeepReadonly<T[TKey]> }
+      : T;
+
+// Every union member carries the guards because TypeScript's `Array.isArray` otherwise narrows a
+// readonly union to mutable `any[]` and permits code that the runtime-frozen value would reject.
+type ReadonlyJsonElement = (string | number | boolean | null | ReadonlyOpenApiObject | ReadonlyJsonArray) & ImmutableArrayMutationGuards;
+
+interface ReadonlyJsonArray extends ReadonlyArray<ReadonlyJsonElement>, ImmutableArrayMutationGuards {}
+
+/** Deeply immutable JSON Schema or OpenAPI fragment owned by a live Service Plane definition. */
+export type ReadonlyOpenApiObject = {
+  readonly [key: string]: ReadonlyJsonElement | undefined;
+};
+
+declare global {
+  interface ArrayConstructor {
+    /** Preserves readonly JSON-array methods when narrowing a live Service Plane schema value. */
+    isArray(value: ReadonlyJsonElement | undefined): value is ReadonlyJsonArray;
+  }
+}
+
+type ReadonlyJsonWebKey = DeepReadonly<JsonWebKey & { kid?: string }>;
+
 export type ServiceAbilityRpcDiscovery = {
-  path: string;
-  transports: AbilityTransport[];
+  readonly path: string;
+  readonly transports: ReadonlyArray<AbilityTransport>;
 };
 
 export type ServiceAbilityRestProjection = {
-  description?: string;
-  method: ServiceHttpMethod;
-  operationId?: string;
-  path: string;
+  readonly description?: string;
+  readonly method: ServiceHttpMethod;
+  readonly operationId?: string;
+  readonly path: string;
   /**
    * Successful HTTP response status. Defaults to 200; it is never inferred from the method because
    * action-style POST operations legitimately return 200, 201, or 202.
    */
-  status?: number;
-  summary?: string;
-  tags?: string[];
+  readonly status?: number;
+  readonly summary?: string;
+  readonly tags?: ReadonlyArray<string>;
 };
 
 export type ServiceAbilityMcpProjection = {
-  description?: string;
-  name: string;
+  readonly description?: string;
+  readonly name: string;
 };
 
 /**
  * A `{var}` URI declares a resource template; template variables become the method input.
  */
 export type ServiceAbilityMcpResourceProjection = {
-  description?: string;
-  mimeType?: string;
-  name: string;
-  title?: string;
-  uri: string;
+  readonly description?: string;
+  readonly mimeType?: string;
+  readonly name: string;
+  readonly title?: string;
+  readonly uri: string;
 };
 
 export type ServiceAbilityMcpPromptArgument = {
-  description?: string;
-  name: string;
-  required?: boolean;
+  readonly description?: string;
+  readonly name: string;
+  readonly required?: boolean;
 };
 
 /**
  * Prompt arguments default to the method input schema's top-level properties when omitted.
  */
 export type ServiceAbilityMcpPromptProjection = {
-  arguments?: ServiceAbilityMcpPromptArgument[];
-  description?: string;
-  name: string;
-  title?: string;
+  readonly arguments?: ReadonlyArray<ServiceAbilityMcpPromptArgument>;
+  readonly description?: string;
+  readonly name: string;
+  readonly title?: string;
 };
 
 export type ServiceAbilityMethodDiscovery = {
-  inputSchema: OpenApiObject;
-  mcp?: ServiceAbilityMcpProjection;
-  mcpPrompt?: ServiceAbilityMcpPromptProjection;
-  mcpResource?: ServiceAbilityMcpResourceProjection;
-  outputSchema: OpenApiObject;
-  rest?: ServiceAbilityRestProjection;
+  readonly inputSchema: OpenApiObject;
+  readonly mcp?: ServiceAbilityMcpProjection;
+  readonly mcpPrompt?: ServiceAbilityMcpPromptProjection;
+  readonly mcpResource?: ServiceAbilityMcpResourceProjection;
+  readonly outputSchema: OpenApiObject;
+  readonly rest?: ServiceAbilityRestProjection;
   /**
    * The method is safe to call again with the same input: a retry after an ambiguous failure
    * cannot double its effect. Advertised so callers and gateways can decide whether retrying is
    * safe — this package never retries on its own.
    */
-  idempotent?: true;
-  scopes: string[];
+  readonly idempotent?: true;
+  readonly scopes: ReadonlyArray<string>;
   /**
    * Streaming methods return an async iterator of output items over Service Plane RPC
    * transport; `outputSchema` then describes one streamed item, not the whole response.
    */
-  stream?: true;
+  readonly stream?: true;
   /**
    * How long this method may run, in milliseconds, independent of any caller budget. Advertised so
    * a gateway can size its own wait against it. Absent on streaming methods, which are not bounded
    * this way.
    */
-  timeoutMs?: number;
+  readonly timeoutMs?: number;
 };
 
 export type ServiceAbilityDiscovery = {
-  access: AbilityAccess;
-  description?: string;
-  exposure: AbilityExposure;
-  id: string;
-  methods: Record<string, ServiceAbilityMethodDiscovery>;
-  rpc: ServiceAbilityRpcDiscovery;
-  scopes: string[];
-  title?: string;
+  readonly access: AbilityAccess;
+  readonly description?: string;
+  readonly exposure: AbilityExposure;
+  readonly id: string;
+  readonly methods: Readonly<Record<string, ServiceAbilityMethodDiscovery>>;
+  readonly rpc: ServiceAbilityRpcDiscovery;
+  readonly scopes: ReadonlyArray<string>;
+  readonly title?: string;
 };
 
 export type ServiceCallerAuthDiscovery = {
-  jwks: CapabilityJwks;
+  readonly jwks: CapabilityJwks;
+};
+
+/** Caller-auth discovery held by a live service after defensive snapshotting. */
+export type ReadonlyServiceCallerAuthDiscovery = {
+  readonly jwks: {
+    readonly keys: ImmutableArray<ReadonlyJsonWebKey>;
+  };
 };
 
 export type ServiceDiscoveryDocument = {
-  abilities: ServiceAbilityDiscovery[];
-  callerAuth?: ServiceCallerAuthDiscovery;
-  capabilities?: CapabilityCatalog;
-  id: string;
-  ingress?: ServiceIngressDiscovery;
-  title: string;
-  version: string;
+  readonly abilities: ReadonlyArray<ServiceAbilityDiscovery>;
+  readonly callerAuth?: ServiceCallerAuthDiscovery;
+  readonly capabilities?: CapabilityCatalog;
+  readonly id: string;
+  readonly ingress?: ServiceIngressDiscovery;
+  readonly title: string;
+  readonly version: string;
 };
 
 export type FetchLike = {
@@ -162,7 +211,7 @@ export type FetchLike = {
 
 export type ServiceGrant = {
   caller: string;
-  scopes: string[];
+  scopes: ReadonlyArray<string>;
   target: string;
 };
 
@@ -171,7 +220,7 @@ export type ServiceEndpointGrant = Omit<ServiceGrant, 'target'> & {
 };
 
 export type ServiceGrantDefinition = {
-  grants: ServiceGrant[];
+  grants: ReadonlyArray<ServiceGrant>;
 };
 
 /** One unary method invocation sent through a Cloudflare native service binding. */
@@ -431,7 +480,7 @@ export type VerifyCapabilityTokenOptions = {
   jwks: CapabilityJwksResolver;
   now?: Date;
   proof?: string;
-  requiredScopes?: string[];
+  requiredScopes?: ReadonlyArray<string>;
 };
 
 export type CapabilityVerifierOptions = Omit<VerifyCapabilityTokenOptions, 'requiredScopes'>;
@@ -443,7 +492,7 @@ export type IssueCapabilityTokenInput = {
    * the request, never by the caller — a caller-chosen confirmation would bind a key of its choosing.
    */
   confirmation?: CapabilityConfirmation;
-  scopes: string[];
+  scopes: ReadonlyArray<string>;
   subject?: CapabilitySubject;
   targetServiceId: string;
   ttlSeconds?: number;

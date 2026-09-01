@@ -60,6 +60,39 @@ function callInput() {
 }
 
 describe('control-plane broker deadlines', () => {
+  it.each(['constructor', 'hasOwnProperty', 'toString', '__proto__'])(
+    'rejects inherited method name %s before capability issuance or service dispatch',
+    async (method) => {
+      let issued = 0;
+      let invoked = 0;
+      const service: ServiceEndpoint = {
+        ...endpoint,
+        abilityRpc: {
+          invokeAbility: async () => {
+            invoked += 1;
+            return undefined;
+          },
+        },
+      };
+      const ability = discoveredAbility(service);
+      const broker = createControlPlaneRpcBroker({
+        controlPlaneServiceId: 'control-plane',
+        issuer: issuer(async () => {
+          issued += 1;
+          return { expiresAt: new Date(Date.now() + 60_000), token: 'token' };
+        }),
+        registry: registryWithAbility(async () => ability),
+      });
+
+      await expect(broker.callAbility({ ...callInput(), method })).rejects.toMatchObject({
+        code: 'capability_auth',
+        status: 404,
+      });
+      expect(issued).toBe(0);
+      expect(invoked).toBe(0);
+    },
+  );
+
   it('times out while service discovery never resolves', async () => {
     const broker = createControlPlaneRpcBroker({
       controlPlaneServiceId: 'control-plane',

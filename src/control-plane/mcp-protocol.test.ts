@@ -362,6 +362,30 @@ describe('control-plane MCP protocol hardening', () => {
     expect(invocations).toHaveBeenCalledWith(expect.objectContaining({ abilityId: 'beta.duplicate', input: {} }));
   });
 
+  it('keeps MCP invocation observers from changing dispatch scopes', async () => {
+    const { issueCapabilityToken, options, snapshot } = mcpDispatchFixture([
+      { mcp: { name: 'scope_observer' } },
+      { mcp: { name: 'other_tool' } },
+    ]);
+    options.onInvocation = (invocation) => {
+      (invocation.scopes as string[]).push('duplicate.admin');
+    };
+
+    const response = await handlePreparedControlPlaneMcpRequest(
+      {
+        acceptsEventStream: true,
+        id: 'scope-copy',
+        method: 'tools/call',
+        params: { arguments: {}, name: 'scope_observer' },
+      },
+      options,
+    );
+
+    expect(response.status).toBe(200);
+    expect(issueCapabilityToken).toHaveBeenCalledWith(expect.objectContaining({ scopes: ['duplicate.read'] }));
+    expect(snapshot.abilities[0]?.methods.run?.scopes).toEqual(['duplicate.read']);
+  });
+
   it('only accepts POST', async () => {
     const { plane } = await createFixture();
     const get = await plane.fetch(new Request('https://plane.internal/mcp'));

@@ -455,6 +455,56 @@ describe('capability issuer', () => {
     expect(issuerResolutions).toBe(1);
   });
 
+  it('stops an oversized streaming token body before a custom authenticator can consume it', async () => {
+    let authenticatorCalls = 0;
+    let cancelled = false;
+    let pulls = 0;
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelled = true;
+      },
+      pull(controller) {
+        pulls += 1;
+        controller.enqueue(new Uint8Array(64));
+        if (pulls === 512) controller.close();
+      },
+    });
+    const app = new Hono();
+    mountCapabilityTokenEndpoint(
+      app,
+      {
+        issueBrokeredCapabilityToken: async () => {
+          throw new Error('not reached');
+        },
+        issueCapabilityToken: async () => {
+          throw new Error('not reached');
+        },
+        jwks: async () => ({ keys: [] }),
+      },
+      {
+        authenticateCaller: async (context) => {
+          authenticatorCalls += 1;
+          await context.req.raw.text();
+          return 'moco';
+        },
+        maxBodyBytes: 8,
+      },
+    );
+
+    const response = await app.request(
+      new Request('https://plane.internal/.well-known/service-plane/capability-token', {
+        body,
+        method: 'POST',
+        duplex: 'half',
+      } as RequestInit),
+    );
+
+    expect(response.status).toBe(413);
+    expect(authenticatorCalls).toBe(0);
+    await vi.waitFor(() => expect(cancelled).toBe(true));
+    expect(pulls).toBeLessThanOrEqual(2);
+  });
+
   it('bounds and validates token input before resolving the issuer', async () => {
     let issuerResolutions = 0;
     const issuer: CapabilityIssuer = {

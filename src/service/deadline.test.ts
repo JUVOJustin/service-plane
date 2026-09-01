@@ -7,6 +7,7 @@ import type { CapabilityIdentity, CapabilityJwks } from '../shared/types.js';
 import { testKeys } from '../test-support/index.js';
 import { type AbilityMethodContext, createAbilityBuilder } from './ability.js';
 import { defineCapabilities } from './capabilities.js';
+import { createAbilityClient } from './client.js';
 import { defineAbility } from './discovery.js';
 import { compileAbilityMethod, createAbilityRpcRuntimeContext } from './orpc.js';
 import { ServicePlaneService } from './service.js';
@@ -14,6 +15,133 @@ import { ServicePlaneService } from './service.js';
 const NOW = new Date('2099-05-09T12:00:00.000Z');
 
 describe('service authorization deadlines', () => {
+  it('times out and cancels a Fetch body that never finishes before authentication', async () => {
+    const ability = createAbilityBuilder();
+    let authenticationRuns = 0;
+    let handlerRuns = 0;
+    let bodyCancels = 0;
+    const tasks = defineAbility({
+      id: 'tasks.items',
+      methods: {
+        get: ability.method({
+          handler: () => {
+            handlerRuns += 1;
+            return { ok: true };
+          },
+          input: z.object({}),
+          output: z.object({ ok: z.boolean() }),
+        }),
+      },
+      rpc: { transports: ['fetch'] },
+    });
+    const service = new ServicePlaneService({
+      abilities: [tasks],
+      auth: {
+        jwks: () => {
+          authenticationRuns += 1;
+          return { keys: [] };
+        },
+      },
+      id: 'tasks',
+      logger: false,
+      requireAbilityScopes: false,
+      timeout: { methodMs: 20 },
+      title: 'Tasks',
+      version: '1.0.0',
+    });
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        bodyCancels += 1;
+      },
+      pull: () => new Promise<void>(() => undefined),
+    });
+
+    const response = await service.fetch(
+      new Request('https://tasks.internal/rpc/tasks.items/get', {
+        body,
+        duplex: 'half',
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
+      } as RequestInit & { duplex: 'half' }),
+    );
+
+    expect(response.status).toBe(504);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: 'timeout', retryable: true } });
+    expect(bodyCancels).toBe(1);
+    expect(authenticationRuns).toBe(0);
+    expect(handlerRuns).toBe(0);
+  });
+
+  it('keeps timeout errors stable for a stalled compressed batch', async () => {
+    const ability = createAbilityBuilder();
+    const tasks = defineAbility({
+      id: 'tasks.items',
+      methods: {
+        get: ability.method({
+          handler: () => ({ ok: true }),
+          input: z.object({ id: z.string() }),
+          output: z.object({ ok: z.boolean() }),
+        }),
+      },
+      rpc: { transports: ['fetch'] },
+    });
+    let bodyCancels = 0;
+    let fetches = 0;
+    const service = new ServicePlaneService({
+      abilities: [tasks],
+      auth: { jwks: { keys: [] } },
+      id: 'tasks',
+      logger: false,
+      requireAbilityScopes: false,
+      rpc: { batch: true, compression: { request: true } },
+      timeout: { methodMs: 20 },
+      title: 'Tasks',
+      version: '1.0.0',
+    });
+    const client = createAbilityClient({
+      ability: tasks,
+      targetServiceId: 'tasks',
+      tokenProvider: { token: async () => 'unused' },
+      transport: {
+        batch: true,
+        compression: { request: { encoding: 'gzip', threshold: 0 } },
+        fetch: async (url, init) => {
+          fetches += 1;
+          const encoded = new Request(url, init);
+          const body = new ReadableStream<Uint8Array>({
+            cancel() {
+              bodyCancels += 1;
+            },
+            pull: () => new Promise<void>(() => undefined),
+          });
+          void encoded.body?.cancel().catch(() => undefined);
+          return service.fetch(
+            new Request(encoded.url, {
+              body,
+              duplex: 'half',
+              headers: encoded.headers,
+              method: encoded.method,
+            } as RequestInit & { duplex: 'half' }),
+          );
+        },
+        origin: 'https://tasks.internal',
+        type: 'fetch',
+      },
+    });
+
+    const failures = await Promise.all([
+      client.get({ id: 'first' }).catch((error: unknown) => error),
+      client.get({ id: 'second' }).catch((error: unknown) => error),
+    ]);
+
+    expect(fetches).toBe(1);
+    expect(bodyCancels).toBe(1);
+    expect(failures).toEqual([
+      expect.objectContaining({ code: 'timeout', retryable: true, status: 504 }),
+      expect.objectContaining({ code: 'timeout', retryable: true, status: 504 }),
+    ]);
+  });
+
   it('times out a pending JWKS resolver and never starts the handler after a late resolution', async () => {
     const keys = await testKeys();
     const capabilities = defineCapabilities({ scopes: [{ id: 'tasks.read' }], serviceId: 'tasks' });

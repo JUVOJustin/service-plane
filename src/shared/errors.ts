@@ -14,7 +14,7 @@ export type ServicePlaneErrorCode =
   | 'handler'
   /** Anything else, including a handler failure the service did not shape for callers. */
   | 'internal'
-  /** The caller's deadline elapsed. */
+  /** An effective caller deadline or server-owned execution/preparation ceiling elapsed. */
   | 'timeout';
 
 export type ServicePlaneErrorOptions = {
@@ -66,9 +66,10 @@ export class CapabilityAuthError extends ServicePlaneError {
 }
 
 /**
- * The call ran out of the budget its caller gave it. Thrown on whichever hop notices first: the
- * caller when its own wait elapses, the broker when no budget is left to forward, and the service
- * when a handler outlives the deadline it was handed.
+ * The call exceeded an effective deadline or server-owned ceiling. Thrown on whichever hop notices
+ * first: the caller when its own wait elapses, a Fetch boundary while request preparation stalls,
+ * the broker when no budget is left to forward, or the service when unary work exceeds method
+ * policy. The error alone therefore does not imply that the caller supplied a deadline.
  */
 export class ServicePlaneTimeoutError extends ServicePlaneError {
   constructor(message: string, status = 504) {
@@ -233,11 +234,13 @@ export function servicePlaneClientError(error: unknown, signal?: AbortSignal): S
   if (error instanceof ServicePlaneClientError) return error;
   const info = servicePlaneErrorInfo(error);
   if (info) return new ServicePlaneClientError(info);
+  const status = transportErrorStatus(error);
+  const timeout = status === 408 || status === 504;
   return new ServicePlaneClientError({
-    code: 'internal',
-    message: error instanceof Error ? error.message : 'Service Plane call failed',
-    retryable: false,
-    status: transportErrorStatus(error),
+    code: timeout ? 'timeout' : 'internal',
+    message: timeout ? 'Service Plane call timed out' : error instanceof Error ? error.message : 'Service Plane call failed',
+    retryable: timeout,
+    status,
   });
 }
 
@@ -278,10 +281,20 @@ const PRIVATE_TRANSPORT_ERROR_STATUSES = {
 function transportErrorStatus(error: unknown): number {
   if (!error || typeof error !== 'object') return 500;
   const status = (error as { status?: unknown }).status;
-  if (typeof status === 'number' && Number.isInteger(status) && status >= 400 && status <= 599) return status;
+  if (isErrorStatus(status)) return status;
+  // oRPC puts the HTTP response on `data` when a non-protocol response (for example the service's
+  // unmatched-route 404) cannot be decoded. Keep that private shape at this boundary while
+  // preserving the status a rolling deployment needs to distinguish from an actual service 500.
+  const data = (error as { data?: unknown }).data;
+  const responseStatus = data && typeof data === 'object' ? (data as { status?: unknown }).status : undefined;
+  if (isErrorStatus(responseStatus)) return responseStatus;
   const code = (error as { code?: unknown }).code;
   if (typeof code !== 'string' || !Object.hasOwn(PRIVATE_TRANSPORT_ERROR_STATUSES, code)) return 500;
   return PRIVATE_TRANSPORT_ERROR_STATUSES[code as keyof typeof PRIVATE_TRANSPORT_ERROR_STATUSES];
+}
+
+function isErrorStatus(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 400 && value <= 599;
 }
 
 function servicePlaneValidationIssues(value: unknown): AbilityValidationIssue[] | undefined {

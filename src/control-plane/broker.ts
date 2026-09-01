@@ -104,7 +104,7 @@ export type ControlPlaneRpcBrokerCallInput = {
   /** Method from the discovered ability catalog. */
   method: string;
   /** Scopes authorized for this call. */
-  scopes: string[];
+  scopes: ReadonlyArray<string>;
   /** Service that owns the ability. */
   targetServiceId: string;
 };
@@ -123,7 +123,7 @@ export type ControlPlaneBrokerProcedureInput = {
   /** Method name from the discovered catalog. */
   method: string;
   /** Scopes requested from the broker. */
-  scopes: string[];
+  scopes: ReadonlyArray<string>;
   /** Service that owns the ability. */
   targetServiceId: string;
 };
@@ -245,7 +245,7 @@ export function createControlPlaneRpcBroker(options: CreateControlPlaneRpcBroker
           }
           remainingBudget('during discovery');
           authorizeAbility(ability, input.caller);
-          const method = ability.methods[input.method];
+          const method = Object.hasOwn(ability.methods, input.method) ? ability.methods[input.method] : undefined;
           if (!method) {
             throw new CapabilityAuthError(
               `Service-Plane broker has no ability method: ${input.targetServiceId}/${input.abilityId}/${input.method}`,
@@ -330,7 +330,7 @@ export function createControlPlaneRpcBroker(options: CreateControlPlaneRpcBroker
   };
 }
 
-function validateBrokerScopes(ability: DiscoveredServiceAbility, methodName: string, scopes: string[]): string[] {
+function validateBrokerScopes(ability: DiscoveredServiceAbility, methodName: string, scopes: ReadonlyArray<string>): string[] {
   const requested = [...new Set(scopes.map((scope) => scope.trim()).filter(Boolean))];
   if (requested.length === 0) throw new CapabilityAuthError('Service-Plane broker call requires at least one scope', 400);
   for (const scope of requested) {
@@ -338,7 +338,8 @@ function validateBrokerScopes(ability: DiscoveredServiceAbility, methodName: str
       throw new CapabilityAuthError(`Service-Plane broker ability does not declare scope: ${scope}`, 403);
     }
   }
-  for (const required of ability.methods[methodName]?.scopes ?? []) {
+  const method = Object.hasOwn(ability.methods, methodName) ? ability.methods[methodName] : undefined;
+  for (const required of method?.scopes ?? []) {
     if (!requested.includes(required)) {
       throw new CapabilityAuthError(`Service-Plane broker call is missing method scope: ${required}`, 403);
     }
@@ -355,7 +356,8 @@ async function callDiscoveredAbility(
   signal?: AbortSignal,
 ): Promise<unknown> {
   const nativeBinding = ability.service.abilityRpc;
-  const streams = ability.methods[method]?.stream === true;
+  const definition = Object.hasOwn(ability.methods, method) ? ability.methods[method] : undefined;
+  const streams = definition?.stream === true;
   if (nativeBinding?.invokeAbility && !streams && ability.rpc.transports.includes('service-binding')) {
     return nativeBinding.invokeAbility({
       abilityId: ability.id,

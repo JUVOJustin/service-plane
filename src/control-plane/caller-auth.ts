@@ -23,7 +23,13 @@ import {
   verifyServicePlaneJwkSignature,
 } from '../shared/jwk-auth.js';
 import { emitBestEffortServicePlaneLog } from '../shared/logging.js';
-import { type CapabilityJwks, type RegistryCache, SERVICE_PLANE_REQUEST_ID_HEADER, type ServiceEndpoint } from '../shared/types.js';
+import {
+  type CapabilityJwks,
+  type RegistryCache,
+  SERVICE_PLANE_REQUEST_ID_HEADER,
+  type ServiceCallerAuthDiscovery,
+  type ServiceEndpoint,
+} from '../shared/types.js';
 import type { CallerAuthResult } from './capabilities.js';
 import { createServiceRegistry } from './registry.js';
 
@@ -368,8 +374,17 @@ async function resolveJwkServiceClient<TEnv extends Env>(
   if (!service?.callerAuth?.jwks) return undefined;
   return {
     clientId: service.id,
-    jwks: service.callerAuth.jwks,
+    jwks: { keys: service.callerAuth.jwks.keys.map(mutableJsonWebKey) },
     serviceId: service.id,
+  };
+}
+
+function mutableJsonWebKey(key: ServiceCallerAuthDiscovery['jwks']['keys'][number]): JsonWebKey & { kid?: string } {
+  const { key_ops: keyOperations, oth: otherPrimes, ...members } = key;
+  return {
+    ...members,
+    ...(keyOperations ? { key_ops: [...keyOperations] } : {}),
+    ...(otherPrimes ? { oth: otherPrimes.map((entry) => ({ ...entry })) } : {}),
   };
 }
 

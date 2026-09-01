@@ -8,7 +8,7 @@ import { cloudflareServiceBinding } from './control-plane/endpoints.js';
 import { createAbilityBuilder } from './service/ability.js';
 import { defineCapabilities } from './service/capabilities.js';
 import { createAbilityClient, createBrokeredAbilityClient } from './service/client.js';
-import { defineAbility } from './service/discovery.js';
+import { defineAbility, serviceDiscoveryDocument } from './service/discovery.js';
 import { compileAbilityMethod, createAbilityRpcRuntimeContext } from './service/orpc.js';
 import { ServicePlaneService } from './service/service.js';
 import type { CapabilityIdentity } from './shared/types.js';
@@ -134,27 +134,7 @@ const broker = createControlPlaneRpcBroker({
   services: [
     {
       abilityRpc: { invokeAbility: (nativeInput) => service.invokeAbility(nativeInput) },
-      discovery: () => ({
-        ...service.definition,
-        abilities: service.definition.abilities.map((ability) => ({
-          access: ability.access,
-          exposure: ability.exposure,
-          id: ability.id,
-          methods: Object.fromEntries(
-            Object.entries(ability.methods).map(([name, method]) => [
-              name,
-              {
-                inputSchema: method.inputSchema,
-                outputSchema: method.outputSchema,
-                scopes: method.scopes,
-                ...(method.stream ? { stream: true as const } : {}),
-              },
-            ]),
-          ),
-          rpc: ability.rpc,
-          scopes: ability.scopes,
-        })),
-      }),
+      discovery: () => serviceDiscoveryDocument(service.definition),
       fetch: binding.fetch,
       grants: [{ caller: 'frontend', scopes: ['llm.run'] }],
       id: 'llm',

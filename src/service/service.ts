@@ -30,7 +30,7 @@ import {
   timeoutMsFromRequest,
   validateTimeoutPolicy,
 } from '../shared/deadline.js';
-import { CapabilityAuthError } from '../shared/errors.js';
+import { CapabilityAuthError, ServicePlaneTimeoutError, servicePlaneErrorInfo } from '../shared/errors.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
 import {
   idempotencyKeyFromRequest,
@@ -39,6 +39,11 @@ import {
   SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER,
 } from '../shared/idempotency.js';
 import { defaultServicePlaneLogSink, emitBestEffortServicePlaneLog } from '../shared/logging.js';
+import {
+  createFetchRequestPreparation,
+  DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS,
+  preserveRuntimeRequestMetadata,
+} from '../shared/request-preparation.js';
 import {
   type CapabilityIdentity,
   type CapabilityJwksResolver,
@@ -110,6 +115,10 @@ type ServicePlaneServiceEnv<TEnv extends Env> = TEnv & {
 
 type ServicePlaneRequestIdOptions = NonNullable<Parameters<typeof requestId>[0]>;
 
+type ServicePlaneBindingsArgument<TEnv extends Env> = undefined extends TEnv['Bindings']
+  ? [bindings?: TEnv['Bindings']]
+  : [bindings: TEnv['Bindings']];
+
 export type ServicePlaneServiceOptions<TEnv extends Env = Env> = DefineServiceInput<TEnv> &
   Omit<DefineServiceOptions, 'defaultMethodTimeoutMs'> & {
     app?: Hono<TEnv>;
@@ -133,7 +142,9 @@ export type ServicePlaneServiceOptions<TEnv extends Env = Env> = DefineServiceIn
      * `methodMs` is a per-call ceiling on every unary method, defaulting to
      * `DEFAULT_ABILITY_TIMEOUT_MS` (10s, matching Armeria's server request timeout). Override one
      * slow method with `timeoutMs` on the method rather than raising this for everything, and use
-     * `false` to opt the whole service out. Streaming methods are never bounded this way.
+     * `false` to opt the whole service out. Streaming execution is never bounded this way. Before
+     * any method is known, the same service-wide value bounds Fetch body decoding; `false` removes
+     * that preparation ceiling too when the caller supplied no deadline.
      *
      * `maxMs` clamps a budget a caller forwarded. `defaultMs` supplies one when a caller sent none.
      * Fetch, WebSocket, and native binding paths resolve it independently for every logical call.
@@ -228,14 +239,17 @@ export class ServicePlaneService<TEnv extends Env = Env> {
 
   fetch: Hono<ServicePlaneServiceEnv<TEnv>>['fetch'] = (request, env, executionCtx) => this.app.fetch(request, env, executionCtx);
 
-  /** Calls a unary method through a Cloudflare binding without the Service Plane HTTP/JSON codec. */
-  async invokeAbility(input: NativeAbilityCall, bindings?: TEnv['Bindings']): Promise<unknown> {
+  /**
+   * Calls a unary method through a Cloudflare binding without the Service Plane HTTP/JSON codec.
+   * The bindings argument is required when this service's typed environment requires bindings.
+   */
+  async invokeAbility(input: NativeAbilityCall, ...[bindings]: ServicePlaneBindingsArgument<TEnv>): Promise<unknown> {
     const ability = this.abilitiesById.get(input.abilityId);
     if (!ability) throw new CapabilityAuthError(`Service-Plane ability not found: ${input.abilityId}`, 404);
     if (!ability.rpc.transports.includes('service-binding')) {
       throw new CapabilityAuthError(`Service-Plane native binding RPC is not enabled for ability: ${input.abilityId}`, 405);
     }
-    const method = ability.methods[input.method];
+    const method = Object.hasOwn(ability.methods, input.method) ? ability.methods[input.method] : undefined;
     if (!method) {
       throw new CapabilityAuthError(`Service-Plane ability method not found: ${input.abilityId}/${input.method}`, 404);
     }
@@ -254,7 +268,8 @@ export class ServicePlaneService<TEnv extends Env = Env> {
     if (input.proof) headers.set(SERVICE_PLANE_PROOF_HEADER, input.proof);
     if (timeout) headers.set(SERVICE_PLANE_TIMEOUT_HEADER, timeout);
     const context = nativeBindingContext<TEnv>(ability.rpc.path, bindings, input.requestId, headers);
-    const procedure = this.rpcRouter(ability)[input.method];
+    const router = this.rpcRouter(ability);
+    const procedure = Object.hasOwn(router, input.method) ? router[input.method] : undefined;
     if (!procedure) throw new CapabilityAuthError(`Service-Plane ability method not found: ${input.abilityId}/${input.method}`, 404);
     return call(procedure, input.input, {
       context: this.createRpcRuntime(ability, context, this.timeoutPolicy),
@@ -267,13 +282,14 @@ export class ServicePlaneService<TEnv extends Env = Env> {
    * `webSocketMessage`, allowing the socket to hibernate between events. Call it at event entry;
    * messages for one socket reach the private peer in call order, and `webSocketClose` lets queued
    * frames reach that peer before releasing it. Messages exceeding `rpc.maxRequestBodyBytes`
-   * reject with status 413 before the private protocol decoder runs.
+   * reject with status 413 before the private protocol decoder runs. The bindings argument is
+   * required when this service's typed environment requires bindings.
    */
   async webSocketMessage(
     abilityId: string,
     webSocket: ServiceAbilityWebSocket,
     message: string | ArrayBuffer,
-    bindings?: TEnv['Bindings'],
+    ...[bindings]: ServicePlaneBindingsArgument<TEnv>
   ): Promise<void> {
     const receivedAt = Date.now();
     const ability = this.orpcWebSocketAbility(abilityId);
@@ -329,11 +345,42 @@ export class ServicePlaneService<TEnv extends Env = Env> {
       if (!ability.rpc.transports.includes('fetch') && !ability.rpc.transports.includes('service-binding')) {
         return new Response('Fetch RPC is not enabled for this ability', { status: 405 });
       }
-      const handled = await fetchHandler.handle(context.req.raw, {
-        context: this.createRpcRuntime(ability, context as unknown as Context<TEnv>, this.timeoutPolicy),
-        prefix: ability.rpc.path as `/${string}`,
+      const receivedAt = Date.now();
+      const callerTimeoutMs = resolveTimeoutMs(timeoutMsFromRequest(context.req), this.timeoutPolicy);
+      const configuredPreparationMs = this.options.timeout?.methodMs ?? DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS;
+      const preparationTimeoutMs = minimumDefinedTimeout(
+        callerTimeoutMs,
+        configuredPreparationMs === false ? undefined : configuredPreparationMs,
+      );
+      const preparation = createFetchRequestPreparation(context.req.raw, {
+        ...(preparationTimeoutMs === undefined ? {} : { deadlineAt: receivedAt + preparationTimeoutMs }),
+        deadlineError: () => new ServicePlaneTimeoutError(`Service-Plane request decoding exceeded its deadline: ${ability.id}`),
       });
-      return handled.matched ? handled.response : new Response('Service-Plane method not found', { status: 404 });
+      try {
+        const handled = await preparation.run(
+          () =>
+            fetchHandler.handle(preparation.request, {
+              context: this.createRpcRuntime(
+                ability,
+                context as unknown as Context<TEnv>,
+                this.timeoutPolicy,
+                preparation.signal,
+                undefined,
+                receivedAt,
+                preparation.complete,
+              ),
+              prefix: ability.rpc.path as `/${string}`,
+            }),
+          (late) => {
+            void late.response?.body?.cancel().catch(() => undefined);
+          },
+        );
+        return handled.matched ? handled.response : new Response('Service-Plane method not found', { status: 404 });
+      } catch (error) {
+        const info = servicePlaneErrorInfo(error);
+        if (info?.code !== 'timeout') throw error;
+        return Response.json({ error: { code: info.code, message: info.message, retryable: info.retryable } }, { status: info.status });
+      }
     };
 
     // Fetch RPC addresses a method below the ability prefix (`/rpc/ability/method`).
@@ -426,6 +473,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
     transportSignal?: AbortSignal,
     webSocket?: ServiceAbilityWebSocket,
     receivedAt = Date.now(),
+    onProcedureEntry?: () => void,
   ) {
     // Batch decoding, frame normalization, and authorization are part of the caller's budget, not
     // free work before its timer begins. WebSocket callbacks therefore pass their entry timestamp.
@@ -449,7 +497,9 @@ export class ServicePlaneService<TEnv extends Env = Env> {
 
     return createAbilityRpcRuntimeContext<TEnv>({
       authorize: async ({ headers, path, procedure, signal }) => {
+        onProcedureEntry?.();
         const logicalSignal = signal ?? transportSignal;
+        logicalSignal?.throwIfAborted();
         const callContext =
           headers || (logicalSignal && logicalSignal !== context.req.raw.signal)
             ? rpcRequestContext(context, headers ?? context.req.raw.headers, logicalSignal)
@@ -457,8 +507,9 @@ export class ServicePlaneService<TEnv extends Env = Env> {
         const timeoutMs = resolveCallTimeoutMs(headers);
         const deadlineAt = timeoutMs === undefined ? undefined : receivedAt + timeoutMs;
         const methodName = path.at(-1);
-        const method = methodName ? ability.methods[methodName] : undefined;
-        const expectedProcedure = methodName ? this.rpcRouter(ability)[methodName] : undefined;
+        const method = methodName && Object.hasOwn(ability.methods, methodName) ? ability.methods[methodName] : undefined;
+        const router = this.rpcRouter(ability);
+        const expectedProcedure = methodName && Object.hasOwn(router, methodName) ? router[methodName] : undefined;
         if (!method || !expectedProcedure || expectedProcedure !== procedure) {
           throw new CapabilityAuthError(`Service-Plane ability method not found: ${ability.id}/${methodName ?? ''}`, 404);
         }
@@ -502,7 +553,10 @@ export class ServicePlaneService<TEnv extends Env = Env> {
       },
       defaultMethodTimeoutMs: this.options.timeout?.methodMs ?? DEFAULT_ABILITY_TIMEOUT_MS,
       receivedAt,
-      resolveDeadlineAt: ({ headers }) => resolveCallDeadlineAt(headers),
+      resolveDeadlineAt: ({ headers }) => {
+        onProcedureEntry?.();
+        return resolveCallDeadlineAt(headers);
+      },
       ...(onHandlerFailure
         ? {
             onHandlerFailure: (cause: unknown, methodName: string, methodContext?: AbilityMethodContext<TEnv>) => {
@@ -533,7 +587,7 @@ function verifyAbilityAccess(ability: Pick<NormalizedServiceAbility, 'access' | 
   }
 }
 
-function requireAbilityMethodScopes(identity: CapabilityIdentity, scopes: string[]): void {
+function requireAbilityMethodScopes(identity: CapabilityIdentity, scopes: ReadonlyArray<string>): void {
   for (const scope of scopes) {
     if (!identity.scopes.includes(scope)) {
       throw new CapabilityAuthError(`Missing Service-Plane capability scope: ${scope}`, 403);
@@ -562,17 +616,24 @@ function defineLazyProcedureSignal<TEnv extends Env>(
 }
 
 function compileAbilityRouter<TEnv extends Env>(ability: NormalizedServiceAbility<TEnv>): Record<string, AnyProcedure> {
-  return Object.fromEntries(Object.entries(ability.methods).map(([name, method]) => [name, compileAbilityMethod(method.method)]));
+  const router = Object.create(null) as Record<string, AnyProcedure>;
+  for (const [name, method] of Object.entries(ability.methods)) {
+    router[name] = compileAbilityMethod(method.method);
+  }
+  return router;
 }
 
 function rpcMessageContext<TEnv extends Env>(base: Context<TEnv>, message: StandardLazyRequest): Context<TEnv> {
   const headers = new Headers(base.req.raw.headers);
   applyStandardHeaders(headers, message.headers);
-  const request = new Request(base.req.url, {
-    headers,
-    method: message.method,
-    ...(message.signal ? { signal: message.signal } : {}),
-  });
+  const request = preserveRuntimeRequestMetadata(
+    base.req.raw,
+    new Request(base.req.url, {
+      headers,
+      method: message.method,
+      ...(message.signal ? { signal: message.signal } : {}),
+    }),
+  );
   const context = new Context<TEnv>(request, {
     env: base.env,
     ...contextExecutionOptions(base),
@@ -585,11 +646,14 @@ function rpcMessageContext<TEnv extends Env>(base: Context<TEnv>, message: Stand
 }
 
 function rpcRequestContext<TEnv extends Env>(base: Context<TEnv>, headers: Headers, signal?: AbortSignal): Context<TEnv> {
-  const request = new Request(base.req.url, {
-    headers,
-    method: base.req.method,
-    ...(signal ? { signal } : {}),
-  });
+  const request = preserveRuntimeRequestMetadata(
+    base.req.raw,
+    new Request(base.req.url, {
+      headers,
+      method: base.req.method,
+      ...(signal ? { signal } : {}),
+    }),
+  );
   const context = new Context<TEnv>(request, {
     env: base.env,
     ...contextExecutionOptions(base),
@@ -662,6 +726,12 @@ function brokeredRequestId(context: Context): string | undefined {
 function validRequestId(value: string | undefined): string | undefined {
   // Same rule as every other forwarded token-shaped value, from one shared implementation.
   return normalizeForwardedToken(value);
+}
+
+function minimumDefinedTimeout(first: number | undefined, second: number | undefined): number | undefined {
+  if (first === undefined) return second;
+  if (second === undefined) return first;
+  return Math.min(first, second);
 }
 
 // Native-binding calls skip Hono routing, but handlers still receive an actual Hono Context.

@@ -25,7 +25,7 @@ export type ServicePlaneRequestLogEvent = {
   ability?: {
     exposure: string;
     id: string;
-    scopes?: string[];
+    scopes?: ReadonlyArray<string>;
   };
   serviceId: string;
   status: number;

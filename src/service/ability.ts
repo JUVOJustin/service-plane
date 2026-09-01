@@ -51,19 +51,19 @@ export type AbilityMethodContext<TEnv extends Env = Env> = {
 /** Metadata Service Plane attaches to one method for policy and projections. */
 export type AbilityMethodMetadata = {
   /** Marks a method safe to retry after an ambiguous transport failure. */
-  idempotent?: true;
+  readonly idempotent?: true;
   /** Publishes the method as an MCP tool. */
-  mcp?: ServiceAbilityMcpProjection;
+  readonly mcp?: ServiceAbilityMcpProjection;
   /** Publishes the method as an MCP prompt. */
-  mcpPrompt?: ServiceAbilityMcpPromptProjection;
+  readonly mcpPrompt?: ServiceAbilityMcpPromptProjection;
   /** Publishes the method as an MCP resource. */
-  mcpResource?: ServiceAbilityMcpResourceProjection;
+  readonly mcpResource?: ServiceAbilityMcpResourceProjection;
   /** Publishes the method as a REST operation. */
-  rest?: ServiceAbilityRestProjection;
+  readonly rest?: ServiceAbilityRestProjection;
   /** Minimum capability scopes required before input validation or handler execution. */
-  scopes?: string[];
+  readonly scopes?: ReadonlyArray<string>;
   /** Overrides the service-wide unary execution ceiling; zero disables the ceiling. */
-  timeoutMs?: number;
+  readonly timeoutMs?: number;
 };
 
 /** Execution shape of a method independent of its wire protocol. */
@@ -76,7 +76,7 @@ declare const ABILITY_METHOD_DEFINITION_BRAND: unique symbol;
  * the RPC engine used to execute it.
  */
 export type AbilityMethodDefinition<
-  TEnv extends Env = Env,
+  in TEnv extends Env = Env,
   TInput extends AbilitySchema = AbilitySchema,
   TOutput extends AbilitySchema = AbilitySchema,
   TKind extends AbilityMethodKind = AbilityMethodKind,
@@ -84,31 +84,35 @@ export type AbilityMethodDefinition<
   /** Nominal marker: method definitions are created by {@link createAbilityBuilder}. */
   readonly [ABILITY_METHOD_DEFINITION_BRAND]: true;
   /** Validates caller data before handler execution and drives client input inference and projections. */
-  input: TInput;
+  readonly input: TInput;
   /** Whether the method returns one value, a stream, or a hibernating subscription. */
-  kind: TKind;
+  readonly kind: TKind;
   /** Service Plane policy and projection metadata. */
-  metadata: AbilityMethodMetadata;
+  readonly metadata: AbilityMethodMetadata;
   /** Validates each boundary result and drives client output inference and projections. */
-  output: TOutput;
+  readonly output: TOutput;
   /** Compile-time method information; absent at runtime. */
   readonly '~types'?: {
-    /** Hono environment used by the method context. */
-    env: TEnv;
+    /** Environment accepted by the method context; the function shape preserves safe contravariance. */
+    readonly env: (value: TEnv) => void;
     /** Value delivered to the handler after input validation. */
-    input: StandardSchemaV1.InferOutput<TInput>;
+    readonly input: StandardSchemaV1.InferOutput<TInput>;
     /** Value exposed to the client after output validation. */
-    output: StandardSchemaV1.InferOutput<TOutput>;
+    readonly output: StandardSchemaV1.InferOutput<TOutput>;
   };
 };
 
 /** Any portable method contract accepted by an ability. */
-export type AnyAbilityMethodDefinition<TEnv extends Env = Env> = AbilityMethodDefinition<
+export type AnyAbilityMethodDefinition<TEnv extends Env = never> = AbilityMethodDefinition<
   TEnv,
   AbilitySchema,
   AbilitySchema,
   AbilityMethodKind
 >;
+
+/** Extracts the Hono environment required by one method without depending on its phantom type shape. */
+export type AbilityMethodEnvironment<TMethod extends AnyAbilityMethodDefinition<never>> =
+  TMethod extends AbilityMethodDefinition<infer TEnv, infer _TInput, infer _TOutput, infer _TKind> ? TEnv : never;
 
 type Promisable<T> = T | Promise<T>;
 
@@ -165,14 +169,14 @@ export function toAbilityStream<T>(source: AbilityStreamSource<T>): AbilityStrea
 }
 
 /** Reads the handler kept outside the serializable method contract. */
-export function abilityMethodHandler(method: AnyAbilityMethodDefinition): AbilityMethodHandler {
+export function abilityMethodHandler(method: AnyAbilityMethodDefinition<never>): AbilityMethodHandler {
   const handler = methodHandlers.get(method);
   if (!handler) throw new TypeError('Service-Plane method has no handler');
   return handler;
 }
 
 /** Returns whether a portable method contract already has a service-side implementation. */
-export function isImplementedAbilityMethod(method: AnyAbilityMethodDefinition): boolean {
+export function isImplementedAbilityMethod(method: AnyAbilityMethodDefinition<never>): boolean {
   return methodHandlers.has(method);
 }
 
@@ -184,7 +188,7 @@ export function abilityHibernationCallback(stream: AbilityHibernationStream<unkn
 }
 
 /** Returns true only for a method produced by createAbilityBuilder. */
-export function isAbilityMethodDefinition(value: unknown): value is AnyAbilityMethodDefinition {
+export function isAbilityMethodDefinition(value: unknown): value is AnyAbilityMethodDefinition<never> {
   return Boolean(value && typeof value === 'object' && methodDefinitions.has(value as object));
 }
 
@@ -195,11 +199,11 @@ export type AbilityUnaryMethodOptions<
   TOutput extends AbilitySchema,
 > = AbilityMethodMetadata & {
   /** Validates caller data before handler execution and drives client input inference. */
-  input: TInput;
+  readonly input: TInput;
   /** Validates the returned value before transport and drives client output inference. */
-  output: TOutput;
+  readonly output: TOutput;
   /** Optional inline implementation; omit it in a shared client/server contract. */
-  handler?: UnaryHandler<TEnv, TInput, TOutput>;
+  readonly handler?: UnaryHandler<TEnv, TInput, TOutput>;
 };
 
 /** Concise stream declaration, optionally carrying an inline implementation. */
@@ -210,15 +214,15 @@ export type AbilityStreamMethodOptions<
   TKind extends 'hibernation' | 'stream',
 > = AbilityMethodMetadata & {
   /** Validates subscription arguments before the handler runs and drives client input inference. */
-  input: TInput;
+  readonly input: TInput;
   /** Validates every yielded item before transport and drives client item inference. */
-  output: TOutput;
+  readonly output: TOutput;
   /** Optional inline implementation; omit it in a shared client/server contract. */
-  handler?: TKind extends 'hibernation' ? HibernationHandler<TEnv, TInput, TOutput> : StreamHandler<TEnv, TInput, TOutput>;
+  readonly handler?: TKind extends 'hibernation' ? HibernationHandler<TEnv, TInput, TOutput> : StreamHandler<TEnv, TInput, TOutput>;
 };
 
 /** Correct handler signature inferred from one portable method contract. */
-export type AbilityMethodHandlerFor<TMethod extends AnyAbilityMethodDefinition> =
+export type AbilityMethodHandlerFor<TMethod extends AnyAbilityMethodDefinition<never>> =
   TMethod extends AbilityMethodDefinition<infer TEnv, infer TInput, infer TOutput, infer TKind>
     ? TKind extends 'unary'
       ? UnaryHandler<TEnv, TInput, TOutput>
@@ -266,13 +270,13 @@ export function createAbilityBuilder<TEnv extends Env = Env>(): AbilityBuilder<T
 }
 
 /** Binds one contract method to a service-side handler without mutating the shared contract. */
-export function implementAbilityMethod<TMethod extends AnyAbilityMethodDefinition>(
+export function implementAbilityMethod<TMethod extends AnyAbilityMethodDefinition<never>>(
   method: TMethod,
   handler: AbilityMethodHandlerFor<TMethod>,
 ): TMethod {
   if (!isAbilityMethodDefinition(method)) throw new TypeError('Service-Plane method must be created with createAbilityBuilder');
   if (typeof handler !== 'function') throw new TypeError('Service-Plane method implementation must be a function');
-  const implemented = { ...method, metadata: { ...method.metadata } } as TMethod;
+  const implemented = Object.freeze({ ...method, metadata: immutableAbilityMethodMetadata(method.metadata) }) as TMethod;
   methodDefinitions.add(implemented);
   methodHandlers.set(implemented, handler as unknown as AbilityMethodHandler);
   return implemented;
@@ -285,15 +289,42 @@ function defineMethod<TEnv extends Env, TInput extends AbilitySchema, TOutput ex
   output: TOutput,
   handler?: AbilityMethodHandler,
 ): AbilityMethodDefinition<TEnv, TInput, TOutput, TKind> {
-  const definition = {
+  const definition = Object.freeze({
     input,
     kind,
-    metadata: { ...metadata },
+    metadata: immutableAbilityMethodMetadata(metadata),
     output,
-  } as AbilityMethodDefinition<TEnv, TInput, TOutput, TKind>;
+  }) as AbilityMethodDefinition<TEnv, TInput, TOutput, TKind>;
   methodDefinitions.add(definition);
   if (handler) methodHandlers.set(definition, handler);
   return definition;
+}
+
+function immutableAbilityMethodMetadata(metadata: AbilityMethodMetadata): AbilityMethodMetadata {
+  return Object.freeze({
+    ...metadata,
+    ...(metadata.mcp ? { mcp: Object.freeze({ ...metadata.mcp }) } : {}),
+    ...(metadata.mcpPrompt
+      ? {
+          mcpPrompt: Object.freeze({
+            ...metadata.mcpPrompt,
+            ...(metadata.mcpPrompt.arguments
+              ? { arguments: Object.freeze(metadata.mcpPrompt.arguments.map((argument) => Object.freeze({ ...argument }))) }
+              : {}),
+          }),
+        }
+      : {}),
+    ...(metadata.mcpResource ? { mcpResource: Object.freeze({ ...metadata.mcpResource }) } : {}),
+    ...(metadata.rest
+      ? {
+          rest: Object.freeze({
+            ...metadata.rest,
+            ...(metadata.rest.tags ? { tags: Object.freeze([...metadata.rest.tags]) } : {}),
+          }),
+        }
+      : {}),
+    ...(metadata.scopes ? { scopes: Object.freeze([...metadata.scopes]) } : {}),
+  });
 }
 
 function isReadableStream<T>(value: AbilityStreamSource<T>): value is ReadableStream<T> {

@@ -92,6 +92,14 @@ describe('ServicePlaneService private RPC runtime', () => {
     const tasks = defineAbility({
       id: 'tasks.items',
       methods: {
+        cloudflareMetadata: ability.method({
+          scopes: ['tasks.read'],
+          input: z.object({}),
+          output: z.object({ colo: z.string() }),
+          handler: ({ context }) => ({
+            colo: String((context.request as Request & { cf?: { colo?: unknown } }).cf?.colo ?? ''),
+          }),
+        }),
         get: ability.method({
           scopes: ['tasks.read'],
           input: z.object({ id: z.string() }),
@@ -154,8 +162,21 @@ describe('ServicePlaneService private RPC runtime', () => {
       rpc: { transports: ['fetch', 'service-binding', 'websocket'] },
       scopes: ['tasks.read'],
     });
+    const naturalNames = defineAbility({
+      id: 'tasks.natural-names',
+      methods: {
+        constructor: ability.method({
+          scopes: ['tasks.read'],
+          input: z.object({ id: z.string() }),
+          output: z.object({ caller: z.string(), id: z.string() }),
+          handler: ({ context, input }) => ({ caller: context.identity.serviceId, id: input.id }),
+        }),
+      },
+      rpc: { transports: ['fetch', 'service-binding'] },
+      scopes: ['tasks.read'],
+    });
     const service = new ServicePlaneService({
-      abilities: [tasks],
+      abilities: [tasks, naturalNames],
       auth: {
         issuer: 'control-plane',
         jwks: { keys: [keys.publicJwk] },
@@ -190,6 +211,19 @@ describe('ServicePlaneService private RPC runtime', () => {
 
     const client = createClient(servicePlaneAuthorization(issued.token));
     await expect(client.get({ id: 'task-1' })).resolves.toEqual({ caller: 'headless-front', id: 'task-1' });
+    const cloudflareClient = createORPCClient<AnyNestedClient>(
+      new RPCLink({
+        fetch: async (url, init) => {
+          const request = new Request(url, init);
+          Object.defineProperty(request, 'cf', { configurable: true, enumerable: true, value: { colo: 'FRA' } });
+          return service.fetch(request);
+        },
+        headers: { authorization: servicePlaneAuthorization(issued.token) },
+        origin: 'https://tasks.internal',
+        url: '/rpc/tasks.items',
+      }),
+    ) as unknown as AbilityClient<typeof tasks>;
+    await expect(cloudflareClient.cloudflareMetadata({})).resolves.toEqual({ colo: 'FRA' });
     const stream = await client.watch({ after: 2 });
     const values = [];
     for await (const value of stream) values.push(value);
@@ -211,6 +245,40 @@ describe('ServicePlaneService private RPC runtime', () => {
       caller: 'headless-front',
       id: 'task-native',
     });
+    await expect(
+      service.invokeAbility({
+        abilityId: naturalNames.id,
+        input: { id: 'task-constructor' },
+        method: 'constructor',
+        token: issued.token,
+      }),
+    ).resolves.toEqual({ caller: 'headless-front', id: 'task-constructor' });
+    const naturalFetchClient = createAbilityClient({
+      ability: naturalNames,
+      callerServiceId: 'headless-front',
+      requestToken: async () => issued,
+      scopes: ['tasks.read'],
+      targetServiceId: 'tasks',
+      transport: {
+        fetch: async (url, init) => service.fetch(new Request(url, init)),
+        origin: 'https://tasks.internal',
+        type: 'fetch',
+      },
+    });
+    await expect(naturalFetchClient.constructor({ id: 'task-constructor-fetch' })).resolves.toEqual({
+      caller: 'headless-front',
+      id: 'task-constructor-fetch',
+    });
+    for (const method of ['constructor', 'hasOwnProperty', 'toString', '__proto__']) {
+      await expect(
+        service.invokeAbility({
+          abilityId: tasks.id,
+          input: {},
+          method,
+          token: 'not-a-token',
+        }),
+      ).rejects.toMatchObject({ code: 'capability_auth', status: 404 });
+    }
     const nativeFailure = await nativeClient.failRawRpc({}).catch((error: unknown) => error);
     expect(nativeFailure).toBeInstanceOf(ServicePlaneClientError);
     expect(nativeFailure).toMatchObject({ code: 'internal', status: 500 });
@@ -355,5 +423,54 @@ describe('ServicePlaneService private RPC runtime', () => {
     const brokeredValues = [];
     for await (const value of brokeredStream) brokeredValues.push(value);
     expect(brokeredValues).toEqual([{ sequence: 7 }, { sequence: 8 }]);
+  });
+
+  it('preserves a 404 when a stale Fetch contract calls a removed method', async () => {
+    const ability = createAbilityBuilder();
+    const capabilities = defineCapabilities({ scopes: [{ id: 'tasks.read' }], serviceId: 'tasks' });
+    const current = defineAbility({
+      id: 'tasks.versioned',
+      methods: {
+        get: ability.method({
+          scopes: ['tasks.read'],
+          input: z.object({}),
+          output: z.object({}),
+          handler: () => ({}),
+        }),
+      },
+      rpc: { transports: ['fetch'] },
+      scopes: ['tasks.read'],
+    });
+    const stale = defineAbility({
+      id: current.id,
+      methods: {
+        removed: ability.method({ scopes: ['tasks.read'], input: z.object({}), output: z.object({}) }),
+      },
+      rpc: { transports: ['fetch'] },
+      scopes: ['tasks.read'],
+    });
+    const service = new ServicePlaneService({
+      abilities: [current],
+      auth: { issuer: 'control-plane', jwks: { keys: [] } },
+      capabilities,
+      id: 'tasks',
+      logger: false,
+      title: 'Tasks',
+      version: '1.0.0',
+    });
+    const client = createAbilityClient({
+      ability: stale,
+      targetServiceId: 'tasks',
+      tokenProvider: { token: async () => 'not-a-token' },
+      transport: {
+        fetch: async (url, init) => service.fetch(new Request(url, init)),
+        origin: 'https://tasks.internal',
+        type: 'fetch',
+      },
+    });
+
+    const error = await client.removed({}).catch((cause: unknown) => cause);
+    expect(error).toBeInstanceOf(ServicePlaneClientError);
+    expect(error).toMatchObject({ code: 'internal', message: 'Not Found', status: 404 });
   });
 });

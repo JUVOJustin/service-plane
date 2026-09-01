@@ -24,8 +24,6 @@ export type ServicePlaneLogSink<TEvent extends ServicePlaneLoggableEvent = Servi
 
 export type ServicePlaneBrokerLogEvent = {
   event:
-    | 'service_plane.broker.connect.completed'
-    | 'service_plane.broker.connect.failed'
     | 'service_plane.broker.call.completed'
     | 'service_plane.broker.call.failed'
     | 'service_plane.mcp.prompt.completed'
@@ -53,7 +51,7 @@ export type ServicePlaneBrokerLogEvent = {
   prompt?: string;
   requestId?: string;
   resource?: string;
-  scopes?: string[];
+  scopes?: ReadonlyArray<string>;
   serviceId?: string;
   status?: number;
   tool?: string;

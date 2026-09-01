@@ -31,10 +31,9 @@ import { type CapabilityProofSigner, type CapabilityTokenRequester, createCapabi
 import {
   type AbilityCallOptions,
   type AbilityClient,
-  type AbilityMethodDefinitions,
+  type AnyServiceAbilityDefinition,
   abilityClientScopesByMethod,
   abilityClientScopesForMethod,
-  type ServiceAbilityDefinition,
 } from './discovery.js';
 import { createRpcClientPlugins } from './orpc-features.js';
 import type { ServicePlaneClientWireOptions } from './wire-options.js';
@@ -129,7 +128,7 @@ type AbilityClientTokenOptions =
     };
 
 /** Options for creating a typed client from an ability definition. */
-export type CreateAbilityClientOptions<TAbility extends ServiceAbilityDefinition> = AbilityClientTokenOptions & {
+export type CreateAbilityClientOptions<TAbility extends AnyServiceAbilityDefinition> = AbilityClientTokenOptions & {
   /** Portable ability definition; its id and method contracts drive the client. */
   ability: TAbility;
   /** Default advisory connection information; individual calls may override it. */
@@ -141,7 +140,7 @@ export type CreateAbilityClientOptions<TAbility extends ServiceAbilityDefinition
   /** Default correlation id; individual calls may override it. */
   requestId?: string;
   /** Additional ability-level scopes requested by every method; required method scopes are automatic. */
-  scopes?: string[];
+  scopes?: ReadonlyArray<string>;
   /** Service that owns the ability. */
   targetServiceId: string;
   /** Default local and forwarded deadline; individual calls may override it. */
@@ -181,7 +180,7 @@ export type BrokeredAbilityTransport =
 export type BrokeredAbilityCallOptions = Omit<AbilityCallOptions, 'connInfo'>;
 
 /** Options for a typed ability client whose calls all pass through the control plane. */
-export type CreateBrokeredAbilityClientOptions<TAbility extends ServiceAbilityDefinition> = {
+export type CreateBrokeredAbilityClientOptions<TAbility extends AnyServiceAbilityDefinition> = {
   /** Portable ability definition; its methods drive the returned client type. */
   ability: TAbility;
   /** Default caller-owned attempt key; individual calls may override it. */
@@ -189,7 +188,7 @@ export type CreateBrokeredAbilityClientOptions<TAbility extends ServiceAbilityDe
   /** Default correlation id; individual calls may override it. */
   requestId?: string;
   /** Additional ability-level scopes requested by every method; required method scopes are automatic. */
-  scopes?: string[];
+  scopes?: ReadonlyArray<string>;
   /** Service that owns the ability. */
   targetServiceId: string;
   /** Default end-to-end caller budget; individual calls may override it. */
@@ -311,7 +310,7 @@ function managedAbilityClientWebSocket(socket: AbilityClientWebSocket, lifecycle
  * Creates a synchronous, fully typed ability client. Tokens and sockets are resolved lazily on the
  * first call, so constructing a client has no network side effects.
  */
-export function createAbilityClient<TAbility extends ServiceAbilityDefinition<import('hono').Env, AbilityMethodDefinitions>>(
+export function createAbilityClient<TAbility extends AnyServiceAbilityDefinition>(
   options: CreateAbilityClientOptions<TAbility>,
 ): AbilityClient<TAbility> {
   const scopesByMethod = abilityClientScopesByMethod(options.ability, options.scopes);
@@ -342,7 +341,7 @@ export function createAbilityClient<TAbility extends ServiceAbilityDefinition<im
  * browser/headless-front path: callers know the ability contract but never see a service token or
  * a private service address.
  */
-export function createBrokeredAbilityClient<TAbility extends ServiceAbilityDefinition<import('hono').Env, AbilityMethodDefinitions>>(
+export function createBrokeredAbilityClient<TAbility extends AnyServiceAbilityDefinition>(
   options: CreateBrokeredAbilityClientOptions<TAbility>,
 ): AbilityClient<TAbility, BrokeredAbilityCallOptions> {
   const scopesByMethod = abilityClientScopesByMethod(options.ability, options.scopes);
@@ -428,13 +427,13 @@ export function createBrokeredAbilityClient<TAbility extends ServiceAbilityDefin
  * clients have no persistent transport resource, so disposing them is an idempotent no-op.
  */
 export function disposeAbilityClient<
-  TAbility extends ServiceAbilityDefinition,
+  TAbility extends AnyServiceAbilityDefinition,
   TCallOptions extends AbilityCallOptions = AbilityCallOptions,
 >(client: AbilityClient<TAbility, TCallOptions>): void {
   abilityClientLifecycles.get(client)?.dispose();
 }
 
-function createTypedAbilityClient<TAbility extends ServiceAbilityDefinition>(
+function createTypedAbilityClient<TAbility extends AnyServiceAbilityDefinition>(
   ability: TAbility,
   link: AbilityClientLink,
   lifecycle?: WebSocketAbilityClientLifecycle,
@@ -470,7 +469,7 @@ function abilityClientCallError(
   return servicePlaneClientError(error, abortedSignal);
 }
 
-function abilityTokenProvider<TAbility extends ServiceAbilityDefinition>(
+function abilityTokenProvider<TAbility extends AnyServiceAbilityDefinition>(
   options: CreateAbilityClientOptions<TAbility>,
   scopesByMethod: ReadonlyMap<string, string[]>,
 ): (methodName: string) => Promise<string> {
@@ -638,11 +637,11 @@ function callWithSignal<T>(call: Promise<T>, signal: AbortSignal | undefined): P
   return signal ? raceAbortSignal(call, signal) : call;
 }
 
-function methodNameFromPath(ability: ServiceAbilityDefinition, path: string[]): string {
+function methodNameFromPath(ability: AnyServiceAbilityDefinition, path: string[]): string {
   return abilityMethodFromPath(ability, path).methodName;
 }
 
-function abilityMethodFromPath(ability: ServiceAbilityDefinition, path: string[]) {
+function abilityMethodFromPath(ability: AnyServiceAbilityDefinition, path: string[]) {
   const methodName = path.at(-1) ?? '';
   const definition = Object.hasOwn(ability.methods, methodName) ? ability.methods[methodName] : undefined;
   if (!definition) {
@@ -666,7 +665,7 @@ function isAsyncIterator(value: unknown): value is AsyncIterator<unknown> {
   return Boolean(value && typeof value === 'object' && typeof (value as { next?: unknown }).next === 'function');
 }
 
-function abilityClientLink<TAbility extends ServiceAbilityDefinition>(
+function abilityClientLink<TAbility extends AnyServiceAbilityDefinition>(
   options: CreateAbilityClientOptions<TAbility>,
   headers: AbilityHeadersResolver,
   defaults: ClientMetadataDefaults,
@@ -758,7 +757,7 @@ function fetchAbilityLink(
   });
 }
 
-function nativeAbilityLink<TAbility extends ServiceAbilityDefinition>(
+function nativeAbilityLink<TAbility extends AnyServiceAbilityDefinition>(
   options: CreateAbilityClientOptions<TAbility>,
   headers: AbilityHeadersResolver,
   defaults: ClientMetadataDefaults,
@@ -791,7 +790,7 @@ function nativeAbilityLink<TAbility extends ServiceAbilityDefinition>(
   };
 }
 
-async function capabilityProof<TAbility extends ServiceAbilityDefinition>(
+async function capabilityProof<TAbility extends AnyServiceAbilityDefinition>(
   options: CreateAbilityClientOptions<TAbility>,
   token: string,
 ): Promise<string | undefined> {

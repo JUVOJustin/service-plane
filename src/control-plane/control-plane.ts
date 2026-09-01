@@ -10,10 +10,9 @@ import type { UpgradeWebSocket } from 'hono/ws';
 import {
   type AbilityCallOptions,
   type AbilityClient,
-  type AbilityMethodDefinitions,
+  type AnyServiceAbilityDefinition,
   abilityClientScopesByMethod,
   abilityClientScopesForMethod,
-  type ServiceAbilityDefinition,
 } from '../service/discovery.js';
 import { orpcErrorFromServicePlane } from '../service/orpc.js';
 import { createRpcHandlerPlugins } from '../service/orpc-features.js';
@@ -56,6 +55,11 @@ import {
   type ServicePlaneLogSink,
 } from '../shared/logging.js';
 import { normalizeOriginRelativePath } from '../shared/paths.js';
+import {
+  createFetchRequestPreparation,
+  DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS,
+  preserveRuntimeRequestMetadata,
+} from '../shared/request-preparation.js';
 import {
   type ControlPlaneRpcTokenBinding,
   DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
@@ -125,7 +129,7 @@ export type ServicePlaneControlPlaneInvocation =
       /** Resolved method within an MCP ability; absent for a broker session that can multiplex calls. */
       method?: string;
       /** Method scopes used when minting the downstream capability. */
-      scopes?: string[];
+      scopes?: ReadonlyArray<string>;
       /** Catalog owner selected for the projected operation. */
       serviceId?: string;
       /** Originating protocol; broker sessions intentionally omit per-call target metadata. */
@@ -163,7 +167,7 @@ export type ControlPlaneRestOptions = {
 export type ControlPlaneAbilityClientCallOptions = Pick<AbilityCallOptions, 'idempotencyKey' | 'requestId' | 'timeoutMs'>;
 
 /** Describes one trusted in-process ability client created by the control plane. */
-export type ControlPlaneAbilityClientOptions<TAbility extends ServiceAbilityDefinition = ServiceAbilityDefinition> = {
+export type ControlPlaneAbilityClientOptions<TAbility extends AnyServiceAbilityDefinition = AnyServiceAbilityDefinition> = {
   /** Portable ability contract used to infer methods, schemas, and required scopes. */
   ability: TAbility;
   /** Authenticated caller delegated by trusted control-plane code. */
@@ -175,7 +179,7 @@ export type ControlPlaneAbilityClientOptions<TAbility extends ServiceAbilityDefi
   /** Correlation id forwarded to the target service. */
   requestId?: string;
   /** Additional ability-level scopes requested by every method; required method scopes are automatic. */
-  scopes?: string[];
+  scopes?: ReadonlyArray<string>;
   /** Service that owns the ability. */
   targetServiceId: string;
   /** End-to-end budget in milliseconds, including discovery and token issuance. */
@@ -183,7 +187,7 @@ export type ControlPlaneAbilityClientOptions<TAbility extends ServiceAbilityDefi
 };
 
 /** In-process typed ability surface; returned streams own their own cleanup. */
-export type ControlPlaneAbilityClient<TAbility extends ServiceAbilityDefinition> = AbilityClient<
+export type ControlPlaneAbilityClient<TAbility extends AnyServiceAbilityDefinition> = AbilityClient<
   TAbility,
   ControlPlaneAbilityClientCallOptions
 >;
@@ -414,9 +418,10 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
    * Creates a trusted in-process client through the same authorization and ingress path as public
    * broker calls, without serializing the caller-to-plane hop.
    */
-  abilityClient<
-    TAbility extends ServiceAbilityDefinition<Env, AbilityMethodDefinitions> = ServiceAbilityDefinition<Env, AbilityMethodDefinitions>,
-  >(input: ControlPlaneAbilityClientOptions<TAbility>, bindings: TEnv['Bindings']): ControlPlaneAbilityClient<TAbility> {
+  abilityClient<TAbility extends AnyServiceAbilityDefinition = AnyServiceAbilityDefinition>(
+    input: ControlPlaneAbilityClientOptions<TAbility>,
+    bindings: TEnv['Bindings'],
+  ): ControlPlaneAbilityClient<TAbility> {
     const scopesByMethod = abilityClientScopesByMethod(input.ability, input.scopes);
     const connInfo = normalizeConnInfo(input.connInfo);
     const defaultRequestId = normalizeForwardedToken(input.requestId);
@@ -574,51 +579,68 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       const rawRequest = context.req.raw;
       // Product authentication may bind a signature to the body. Give the private decoder its own
       // branch so middleware can consume the original without making the RPC request unusable.
-      const decodingRequest = this.options.invocationMiddleware ? rawRequest.clone() : rawRequest;
+      const decodingSource = this.options.invocationMiddleware ? rawRequest.clone() : rawRequest;
+      const preparationTimeoutMs = Math.min(
+        requestTimeoutMs ?? DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS,
+        DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS,
+      );
+      const preparation = createFetchRequestPreparation(decodingSource, {
+        deadlineAt: receivedAt + preparationTimeoutMs,
+        deadlineError: () => new ServicePlaneTimeoutError('Service-Plane broker request decoding exceeded its deadline'),
+        ...(this.options.invocationMiddleware ? { linkedRequests: [rawRequest] } : {}),
+      });
+      const decodingRequest = preparation.request;
+      const middlewareRequest = preparation.linkedRequests[0];
+      if (middlewareRequest) context.req.raw = middlewareRequest;
       try {
-        return await raceControlPlaneOperation(
-          this.runInvocationMiddleware(
-            context,
-            async () => {
-              if (!controlPlaneCaller(context)) return invocationCallerNotConfigured(context, this.log);
-              let resolving: Promise<Response | BrokeredRequest> | undefined;
-              const handled = await orpcHandler.handle(decodingRequest, {
-                context: {
-                  resolveBroker: async (headers?: Headers) => {
-                    const requestedTimeoutMs = headers?.has(SERVICE_PLANE_TIMEOUT_HEADER)
-                      ? resolveTimeoutMs(parseTimeoutMs(headers.get(SERVICE_PLANE_TIMEOUT_HEADER)), this.options.timeout)
-                      : requestTimeoutMs;
-                    resolving ??= this.resolveBrokeredRequest(context as Context<TEnv>, undefined, undefined, {
-                      receivedAt,
-                      ...(requestedTimeoutMs === undefined ? {} : { timeoutMs: requestedTimeoutMs }),
-                    });
-                    const resolved = await raceControlPlaneOperation(
-                      resolving,
-                      { receivedAt, ...(requestedTimeoutMs === undefined ? {} : { timeoutMs: requestedTimeoutMs }) },
-                      'broker service resolution',
-                    );
-                    if (resolved instanceof Response) throw brokerCallerResolutionError(resolved);
-                    return {
-                      broker: this.brokerForRequest(resolved, context as unknown as Context<TEnv>, receivedAt, headers),
-                      caller: resolved.caller,
-                    };
-                  },
+        return await preparation.run(
+          () =>
+            raceControlPlaneOperation(
+              this.runInvocationMiddleware(
+                context,
+                async () => {
+                  if (!controlPlaneCaller(context)) return invocationCallerNotConfigured(context, this.log);
+                  let resolving: Promise<Response | BrokeredRequest> | undefined;
+                  const handled = await orpcHandler.handle(decodingRequest, {
+                    context: {
+                      resolveBroker: async (headers?: Headers) => {
+                        preparation.complete();
+                        const requestedTimeoutMs = headers?.has(SERVICE_PLANE_TIMEOUT_HEADER)
+                          ? resolveTimeoutMs(parseTimeoutMs(headers.get(SERVICE_PLANE_TIMEOUT_HEADER)), this.options.timeout)
+                          : requestTimeoutMs;
+                        resolving ??= this.resolveBrokeredRequest(context as Context<TEnv>, undefined, undefined, {
+                          receivedAt,
+                          ...(requestedTimeoutMs === undefined ? {} : { timeoutMs: requestedTimeoutMs }),
+                        });
+                        const resolved = await raceControlPlaneOperation(
+                          resolving,
+                          { receivedAt, ...(requestedTimeoutMs === undefined ? {} : { timeoutMs: requestedTimeoutMs }) },
+                          'broker service resolution',
+                        );
+                        if (resolved instanceof Response) throw brokerCallerResolutionError(resolved);
+                        return {
+                          broker: this.brokerForRequest(resolved, context as unknown as Context<TEnv>, receivedAt, headers),
+                          caller: resolved.caller,
+                        };
+                      },
+                    },
+                    prefix: path as `/${string}`,
+                  });
+                  return handled.matched ? handled.response : new Response('Service-Plane broker method not found', { status: 404 });
                 },
-                prefix: path as `/${string}`,
-              });
-              return handled.matched ? handled.response : new Response('Service-Plane broker method not found', { status: 404 });
-            },
-            deadline,
-            'broker request dispatch',
-          ),
-          deadline,
-          'broker invocation middleware',
+                deadline,
+                'broker request dispatch',
+              ),
+              deadline,
+              'broker invocation middleware',
+            ),
+          discardDisposableValue,
         );
       } catch (error) {
         return controlPlaneRouteErrorResponse(error);
       } finally {
         cancelUnusedRequestBody(decodingRequest);
-        if (decodingRequest !== rawRequest) cancelUnusedRequestBody(rawRequest);
+        if (middlewareRequest) cancelUnusedRequestBody(middlewareRequest);
       }
     });
   }
@@ -1058,11 +1080,14 @@ function controlPlaneRpcMessageContext<TEnv extends Env>(base: Context<TEnv>, me
   applyStandardHeaders(headers, message.headers);
   const requestId = normalizeForwardedToken(headers.get(SERVICE_PLANE_REQUEST_ID_HEADER)) ?? brokerRequestId(base);
   if (requestId) headers.set(SERVICE_PLANE_REQUEST_ID_HEADER, requestId);
-  const request = new Request(base.req.url, {
-    headers,
-    method: message.method,
-    ...(message.signal ? { signal: message.signal } : {}),
-  });
+  const request = preserveRuntimeRequestMetadata(
+    base.req.raw,
+    new Request(base.req.url, {
+      headers,
+      method: message.method,
+      ...(message.signal ? { signal: message.signal } : {}),
+    }),
+  );
   const context = new Context<ServicePlaneControlPlaneEnv<TEnv>>(request, {
     env: base.env,
     ...contextExecutionOptions(base),
@@ -1256,7 +1281,7 @@ function serviceGrantsFromEndpoints(services: ServiceEndpoint[]): ServiceGrant[]
   );
 }
 
-function controlPlaneAbilityClient<TAbility extends ServiceAbilityDefinition>(
+function controlPlaneAbilityClient<TAbility extends AnyServiceAbilityDefinition>(
   resolveBroker: (
     options: ControlPlaneAbilityClientCallOptions,
     receivedAt: number,

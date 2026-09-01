@@ -30,7 +30,7 @@ export type ControlPlaneRestInvocation = {
   /** Published path template that matched the request, before parameter substitution. */
   path: string;
   /** Method scopes requested when the plane mints the downstream capability. */
-  scopes: string[];
+  readonly scopes: ReadonlyArray<string>;
   /** Catalog service that owns the matched ability. */
   serviceId: string;
   /**
@@ -67,7 +67,7 @@ type RestMatch = {
   httpMethod: ServiceHttpMethod;
   method: string;
   params: Record<string, string>;
-  scopes: string[];
+  scopes: ReadonlyArray<string>;
   staticSegments: number;
 };
 

@@ -67,6 +67,8 @@ export type {
   OpenApiDocumentCache,
   OpenApiObject,
   PinnedCapabilityTokenInput,
+  ReadonlyOpenApiObject,
+  ReadonlyServiceCallerAuthDiscovery,
   RegistryCache,
   ServiceAbilityDiscovery,
   ServiceAbilityMcpProjection,
@@ -165,6 +167,7 @@ export {
 export type { ControlPlaneInvocationOptions } from './invocation.js';
 export {
   type ControlPlaneMcpHandlerOptions,
+  type ControlPlaneMcpInvocation,
   type ControlPlaneMcpServerInfo,
   DEFAULT_MCP_PATH,
   generateMcpDiscovery,

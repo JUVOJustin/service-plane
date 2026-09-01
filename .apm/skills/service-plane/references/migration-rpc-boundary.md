@@ -64,6 +64,10 @@ export const tasks = implementAbility(tasksContract, {
 `ServicePlaneService` receives the implementation; clients receive the contract. A service-local
 contract may instead put `handler` directly inside `ability.method({ ... })`.
 
+Rename methods called `then`, `toJSON`, or `__proto__`. These names are now reserved because Promise
+and JSON machinery can invoke the first two implicitly, while an ordinary `__proto__` object literal
+changes the method record's prototype instead of defining a callable own property.
+
 Replace temporary `.procedure(...)` calls with `ability.method({ input, output, ... })`. Collapse
 `ability.method({ scopes }).input(Input).output(Output).handler(handler)` into the single options
 object `ability.method({ input: Input, output: Output, scopes, handler })`.
@@ -121,6 +125,39 @@ invokeAbility(input) {
 Register it with `cloudflareServiceBinding({ abilityRpc: true })`. Unary calls use native RPC;
 ordinary streams use the binding's Fetch method.
 
+`invokeAbility(input, bindings)` and manual `webSocketMessage(..., bindings)` now require the
+bindings argument when the service's typed environment requires bindings. This turns a previous
+runtime failure from an empty synthetic environment into a compile-time error. Environment-neutral
+services may still omit it.
+
+The complete ability declaration graph is now readonly: method schemas, kind, metadata and nested
+projection arrays; ability access, RPC, transports and scopes; service input and normalized
+definitions; capability catalogs; and the structural discovery DTO collections. Service Plane snapshots and
+freezes the live contract and normalized service graph, including caller JWKS, normalized
+projections, and generated JSON Schema fragments projected into OpenAPI, while leaving
+application-owned Standard Schema validator objects untouched. Code that programmatically extends
+a definition must create a new object or array with spread syntax instead of mutating an existing
+value. `serviceDiscoveryDocument()` returns fresh defensive payload copies—including caller keys
+and schema fragments—so consumers may transform a document without changing the mounted service.
+Scope-taking client, token and grant options accept readonly arrays, so values can pass directly
+from a contract without a copy. These boundaries prevent mounted routes, authorization policy and
+discovery from drifting apart and keep a broader environment view from injecting a handler that
+needs unavailable bindings.
+
+Low-level MCP shells now receive `ControlPlaneMcpInvocation` in `onInvocation`. Its `scopes` are a
+readonly observation copy; replace in-place edits such as `scopes.sort()` with
+`const sortedScopes = [...scopes].sort()`. Observer changes can no longer alter downstream token
+issuance.
+
+Generic helpers should no longer read `method['~types']['env']` directly. The phantom field now uses
+a contravariant function shape; use the stable helper instead:
+
+```ts
+import type { AbilityMethodEnvironment } from 'service-plane/service';
+
+type MethodEnv = AbilityMethodEnvironment<typeof tasksContract.methods.get>;
+```
+
 Native token bindings now pin caller identity in the deployed binding. Remove the requester-side
 `callerServiceId`:
 
@@ -173,10 +210,18 @@ Breaking route and configuration changes:
 - MCP is no longer implicit—add `mcp: {}` to mount `/mcp`;
 - published REST routes remain enabled; `rest: false` removes the facade and catch-all;
 - OpenAPI remains enabled by default;
+- generated OpenAPI now defaults `info.version` to `1.0.0` instead of `0.2.0`, which also changes
+  `controlPlaneOpenApiCacheKey`; set `openapi.version: '0.2.0'` to retain the previous document and
+  cache identity;
 - REST catch-all requests and enabled MCP/broker calls share `invocationMiddleware`, which must
   authenticate and set `servicePlaneCaller`; REST now authenticates before discovery, including
   route misses, while later application routes still bypass the catch-all;
-- `broker.caller`, `mcp.caller`, and raw framework handler options are removed.
+- `broker.caller`, `mcp.caller`, and raw framework handler options are removed;
+- replace log filters for `service_plane.broker.connect.completed|failed` with
+  `service_plane.broker.call.completed|failed`. The new events describe each ability invocation,
+  not the lifetime of a transport connection. The obsolete event names are removed from
+  `ServicePlaneBrokerLogEvent`, so exhaustive TypeScript sinks fail visibly during migration
+  instead of compiling while silently missing broker traffic.
 
 Trusted plane code now calls `plane.abilityClient({ ability: contract, targetServiceId, ... }, env)`.
 Remove manual API generics, `abilityId`, and required method scopes. Construction is synchronous;
@@ -215,6 +260,13 @@ The budget now begins before client token, proof, or caller-header resolution; o
 milliseconds are forwarded. Ordinary streams keep that local deadline across iterator pulls,
 including streams returned by `plane.abilityClient`. Public control-plane middleware is inside the
 same budget, and a late `next()` no longer starts background discovery or dispatch after a timeout.
+
+Fetch request decoding is no longer unbounded before authorization. The service applies its
+service-wide method default as a preparation ceiling, while the public broker applies a 10-second
+ceiling even when a physical batch carries its deadlines only inside the unread body. A slower body
+now receives status 504 and is cancelled. The service does so before capability authentication or
+handler dispatch; the broker ceiling includes product-authentication middleware and stops before
+service resolution or downstream ability dispatch.
 
 ## Update Errors And TanStack Callbacks
 

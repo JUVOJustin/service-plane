@@ -86,6 +86,136 @@ describe('ability service discovery', () => {
     });
   });
 
+  it('snapshots and freezes the live declarative service graph', () => {
+    const methodScopes = ['example.search'];
+    const restTags = ['examples'];
+    const rest: { method: 'post'; path: string; tags: string[] } = {
+      method: 'post',
+      path: '/examples/run',
+      tags: restTags,
+    };
+    const run = ability.method({
+      handler: ({ input }) => input,
+      input: z.object({ value: z.string() }),
+      output: z.object({ value: z.string() }),
+      rest,
+      scopes: methodScopes,
+    });
+    const sourceMethods: Record<string, typeof run> = { run };
+    const abilityScopes = ['example.search'];
+    const transports: Array<'fetch' | 'websocket'> = ['fetch'];
+    const contract = defineAbility({
+      exposure: 'published',
+      id: 'example.immutable',
+      methods: sourceMethods,
+      rpc: { transports },
+      scopes: abilityScopes,
+    });
+
+    sourceMethods.extra = run;
+    abilityScopes.splice(0);
+    transports.push('websocket');
+    methodScopes.splice(0);
+    rest.path = '/changed';
+    restTags.splice(0);
+
+    expect(Object.isFrozen(run)).toBe(true);
+    expect(Object.isFrozen(run.metadata)).toBe(true);
+    expect(Object.isFrozen(run.metadata.rest)).toBe(true);
+    expect(Object.isFrozen(run.metadata.rest?.tags)).toBe(true);
+    expect(Object.isFrozen(contract)).toBe(true);
+    expect(Object.isFrozen(contract.methods)).toBe(true);
+    expect(Object.isFrozen(contract.rpc)).toBe(true);
+    expect(Object.isFrozen(contract.rpc?.transports)).toBe(true);
+    expect(Object.isFrozen(contract.scopes)).toBe(true);
+    expect(Object.keys(contract.methods)).toEqual(['run']);
+    expect(contract.methods.run?.metadata).toMatchObject({
+      rest: { path: '/examples/run', tags: ['examples'] },
+      scopes: ['example.search'],
+    });
+    expect(contract.rpc?.transports).toEqual(['fetch']);
+    expect(contract.scopes).toEqual(['example.search']);
+
+    const capabilityInput = { scopes: [{ id: 'example.search' }], serviceId: 'example' };
+    const callerKeys: Array<JsonWebKey & { kid?: string }> = [{ key_ops: ['verify'], kid: 'caller', kty: 'EC' }];
+    const service = defineAbilityService({
+      abilities: [contract],
+      callerAuth: { jwks: { keys: callerKeys } },
+      capabilities: capabilityInput,
+      id: 'example',
+      title: 'Example',
+      version: '1.0.0',
+    });
+    capabilityInput.scopes.splice(0);
+    const sourceCallerKey = callerKeys[0];
+    if (!sourceCallerKey) throw new Error('missing source caller key');
+    sourceCallerKey.kid = 'changed';
+    sourceCallerKey.key_ops?.push('sign');
+
+    const normalizedAbility = service.abilities[0];
+    const normalizedMethod = normalizedAbility?.methods.run;
+    const serviceCapabilities = service.capabilities;
+    const liveKeyOperations = service.callerAuth?.jwks.keys[0]?.key_ops;
+    if (!normalizedAbility || !normalizedMethod || !serviceCapabilities || !liveKeyOperations) {
+      throw new Error('missing normalized ability');
+    }
+    expect(Object.isFrozen(service)).toBe(true);
+    expect(Object.isFrozen(service.abilities)).toBe(true);
+    expect(Object.isFrozen(serviceCapabilities)).toBe(true);
+    expect(Object.isFrozen(serviceCapabilities.scopes)).toBe(true);
+    expect(Object.isFrozen(serviceCapabilities.scopes[0])).toBe(true);
+    expect(Object.isFrozen(service.callerAuth)).toBe(true);
+    expect(Object.isFrozen(service.callerAuth?.jwks)).toBe(true);
+    expect(Object.isFrozen(service.callerAuth?.jwks.keys)).toBe(true);
+    expect(Object.isFrozen(service.callerAuth?.jwks.keys[0])).toBe(true);
+    expect(Object.isFrozen(service.callerAuth?.jwks.keys[0]?.key_ops)).toBe(true);
+    expect(Object.isFrozen(normalizedAbility)).toBe(true);
+    expect(Object.isFrozen(normalizedAbility.methods)).toBe(true);
+    expect(Object.isFrozen(normalizedMethod)).toBe(true);
+    expect(Object.isFrozen(normalizedMethod.rest)).toBe(true);
+    expect(Object.isFrozen(normalizedMethod.rest?.tags)).toBe(true);
+    expect(Object.isFrozen(normalizedMethod.inputSchema)).toBe(true);
+    expect(Object.isFrozen(normalizedMethod.inputSchema.properties)).toBe(true);
+    expect(serviceCapabilities.scopes).toEqual([{ id: 'example.search' }]);
+    expect(service.callerAuth?.jwks.keys[0]).toMatchObject({ key_ops: ['verify'], kid: 'caller' });
+
+    expect(() => {
+      (service as unknown as { id: string }).id = 'changed-service';
+    }).toThrow(TypeError);
+    expect(() => {
+      (serviceCapabilities.scopes as unknown as unknown[]).splice(0);
+    }).toThrow(TypeError);
+    expect(() => {
+      (normalizedMethod.rest as unknown as { path: string }).path = '/changed';
+    }).toThrow(TypeError);
+    expect(() => {
+      (normalizedMethod.inputSchema as unknown as Record<string, unknown>).type = 'string';
+    }).toThrow(TypeError);
+    expect(() => {
+      (liveKeyOperations as unknown as string[]).push('sign');
+    }).toThrow(TypeError);
+
+    const discovery = serviceDiscoveryDocument(service);
+    expect(discovery).toMatchObject({
+      abilities: [{ id: 'example.immutable', methods: { run: { rest: { path: '/examples/run' } } } }],
+      id: 'example',
+    });
+    const discoveryKey = discovery.callerAuth?.jwks.keys[0];
+    const discoveryMethod = discovery.abilities[0]?.methods.run;
+    const discoveryRequired = discoveryMethod?.inputSchema.required;
+    if (!discoveryKey || !Array.isArray(discoveryRequired)) throw new Error('missing discovery snapshot');
+    discoveryKey.kid = 'wire-copy';
+    discoveryKey.key_ops?.push('sign');
+    discoveryRequired.push('wireOnly');
+
+    expect(service.callerAuth?.jwks.keys[0]).toMatchObject({ key_ops: ['verify'], kid: 'caller' });
+    expect(normalizedMethod.inputSchema.required).toEqual(['value']);
+    expect(serviceDiscoveryDocument(service)).toMatchObject({
+      abilities: [{ methods: { run: { inputSchema: { required: ['value'] } } } }],
+      callerAuth: { jwks: { keys: [{ key_ops: ['verify'], kid: 'caller' }] } },
+    });
+  });
+
   it('accepts the QUERY method for REST projections and rejects unknown methods', () => {
     const withMethod = (method: string) =>
       defineAbilityService({
@@ -479,7 +609,7 @@ describe('ability service discovery', () => {
     expect(serviceDiscoveryDocument(service).abilities[0]).toMatchObject({ access: 'plane', exposure: 'private' });
   });
 
-  it.each(['then', 'toJSON'])('rejects the implicitly invoked ability method name %s', (methodName) => {
+  it.each(['then', 'toJSON', '__proto__'])('rejects the reserved ability method name %s', (methodName) => {
     const method = ability.method({ scopes: ['example.search'], input: z.object({}), output: z.object({}), handler: () => ({}) });
 
     expect(() =>
@@ -497,6 +627,32 @@ describe('ability service discovery', () => {
         version: '0.1.0',
       }),
     ).toThrow(`Service-Plane ability method name is reserved: example.bad/${methodName}`);
+  });
+
+  it('rejects an ordinary __proto__ method literal instead of silently losing its typed method', () => {
+    expect(() =>
+      defineAbility({
+        id: 'example.bad',
+        methods: {
+          __proto__: ability.method({
+            handler: () => ({ ok: true as const }),
+            input: z.object({}),
+            output: z.object({ ok: z.literal(true) }),
+          }),
+        },
+      }),
+    ).toThrow('Service-Plane ability method name is reserved: example.bad/__proto__');
+  });
+
+  it('keeps valid own methods on a record with an application-defined prototype', () => {
+    const method = ability.method({
+      handler: () => ({ ok: true as const }),
+      input: z.object({}),
+      output: z.object({ ok: z.literal(true) }),
+    });
+    const methods = Object.assign(Object.create({ applicationMetadata: true }) as Record<string, typeof method>, { get: method });
+
+    expect(defineAbility({ id: 'example.custom-record', methods }).methods.get).toBe(method);
   });
 
   it('accepts natural JavaScript property names as ability methods', () => {

@@ -69,8 +69,10 @@ service implementation with `implementAbility`.
 
 Optional metadata is `idempotent`, `timeoutMs`, `rest`, `mcp`, `mcpResource`, and `mcpPrompt`.
 `stream` and `hibernationStream` output schemas describe one yielded item. Natural JavaScript names
-such as `call`, `apply`, `name`, `constructor`, and `toString` are valid method names. Only `then`
-and `toJSON` are reserved because Promise and JSON machinery invoke them implicitly.
+such as `call`, `apply`, `name`, `constructor`, and `toString` are valid method names. `then` and
+`toJSON` are reserved because Promise and JSON machinery invoke them implicitly; `__proto__` is
+reserved because its ordinary object-literal spelling changes the object's prototype instead of
+declaring an own method.
 
 An ordinary stream handler may return an async iterator, pure `AsyncIterable`, synchronous iterable
 object, or `ReadableStream`. `AbilityStreamSource<T>` names that union; `toAbilityStream(source)`
@@ -182,6 +184,8 @@ POST /mcp                                            `mcp: {}` enables
 `broker.path`, `mcp.path`, and `openapi.path` override defaults. `tokenMaxBodyBytes`,
 `rest.maxBodyBytes`, and `mcp.maxBodyBytes` each default to one MiB. `rest: false` removes the live
 REST facade and its wildcard dispatcher without removing REST metadata from OpenAPI.
+The token endpoint enforces its limit on the physical stream before passing a bounded byte-for-byte
+request snapshot to `authenticateCaller`.
 Broker paths are normalized, and their complete subtree is reserved; a published REST method cannot
 occupy a route that broker dispatch owns.
 `broker.maxRequestBodyBytes` also covers each broker WebSocket message. `mcp.streamLimits` defaults
@@ -232,7 +236,9 @@ Most applications use `ServicePlaneControlPlane`. Custom shells may call
 `handleControlPlaneRestRequest` or `handleControlPlaneMcpRequest` with a request-scoped registry and
 `ControlPlaneInvocationOptions`; the REST middleware hook must authenticate before invoking its
 `next` callback. `generateControlPlaneOpenApi` and `generateMcpDiscovery` project an already
-discovered snapshot without mounting routes.
+discovered snapshot without mounting routes. MCP's optional `onInvocation` receives a
+`ControlPlaneMcpInvocation`; its readonly scopes are a defensive observation copy and cannot change
+the scopes used for downstream token issuance.
 
 ## Service Endpoints
 
@@ -349,6 +355,10 @@ except a direct service WebSocket. See [transports](transports.md).
 and ability discovery. Every method includes scopes plus input/output JSON Schema, and may include
 REST/MCP metadata, `idempotent`, `timeoutMs`, or `stream: true`.
 
+`serviceDiscoveryDocument()` returns a defensive wire snapshot. Its caller keys and schema
+fragments can be transformed for serialization or tooling without mutating the frozen live service
+definition; call the helper again for a clean snapshot.
+
 The plane validates endpoint identity, duplicate paths/names/operation IDs, scope references, and
 projection shapes before using a snapshot.
 
@@ -381,6 +391,13 @@ authorization, and the handler. The service races the forwarded remainder agains
 ceiling. Values are capped at 10 minutes. Client local waits include a 250 ms grace so the service's
 classified timeout can arrive first.
 
+Fetch RPC decoding is bounded before a logical call exists. A service uses the nearer caller budget
+or its service-wide method default (10 seconds unless changed; `false` opts out when no caller budget
+exists). The public broker uses the nearer physical-request budget or a 10-second preparation
+ceiling, including physical batches whose per-call headers are still inside the unread body. The
+preparation timer stops at the first procedure entry; logical unary and stream rules then take over.
+Timed-out bodies are actively cancelled, including compressed requests.
+
 For client defaults and per-call `timeoutMs`, invalid values are rejected, `0` fails immediately,
 and values above the ten-minute wire maximum are clamped. Ability method metadata is definition
 policy instead: `0` disables that method ceiling and values above the JavaScript timer-safe maximum
@@ -397,6 +414,9 @@ must observe `context.signal` to stop external work promptly.
 Typed clients start the budget before token, proof, or caller-header resolution and forward only
 what remains. The control plane continues the same budget across discovery and issuance; its
 in-process client also keeps the local timer active for every ordinary stream pull.
+
+Native `invokeAbility` and manual `webSocketMessage` calls require the bindings argument whenever
+the service's typed environment requires bindings. Environment-neutral services may omit it.
 
 ## Idempotency
 
@@ -447,6 +467,28 @@ opaque handler failures.
 optional Hono context. Set the corresponding option to `false` to silence package logging. Log sinks
 are best-effort: a logger failure never changes the API result.
 
+Service events:
+
+- `service_plane.discovery.served`
+- `service_plane.request.completed`
+- `service_plane.request.failed`
+- `service_plane.ability.handler_failed`
+
+Control-plane events:
+
+- `service_plane.broker.call.completed` / `service_plane.broker.call.failed`
+- `service_plane.rest.completed` / `service_plane.rest.failed`
+- `service_plane.mcp.tool.completed` / `service_plane.mcp.tool.failed`
+- `service_plane.mcp.prompt.completed` / `service_plane.mcp.prompt.failed`
+- `service_plane.mcp.resource.completed` / `service_plane.mcp.resource.failed`
+- `service_plane.caller_auth.not_configured`
+
+Broker events are per ability invocation, not per Fetch or WebSocket connection. They carry the
+target service, ability, method, requested scopes, authenticated caller fields, request id, status,
+and duration when known. HMAC and JWK caller-auth middleware have their own log callbacks and emit
+`service_plane.caller_auth.hmac_unauthorized` and
+`service_plane.caller_auth.jwk_unauthorized` respectively.
+
 ## Errors
 
 Ability clients throw `ServicePlaneClientError`. Branch on `servicePlaneErrorInfo(error)` when code
@@ -457,7 +499,7 @@ also handles local failures.
 | `capability_auth` | Token, ingress, access, scope, or proof refused the call |
 | `ability_validation` | Input, output, or stream item failed its schema |
 | `cancelled` | The caller aborted; status 499 and never retryable |
-| `timeout` | A deadline elapsed |
+| `timeout` | An effective deadline or server-owned execution/preparation ceiling elapsed |
 | `handler` | Handler deliberately exposed a safe application failure |
 | `internal` | Transport or unshaped implementation failure |
 

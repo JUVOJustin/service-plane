@@ -59,6 +59,26 @@ describe('Service Plane wire errors', () => {
     ['SERVICE_UNAVAILABLE', 503],
     ['GATEWAY_TIMEOUT', 504],
   ] as const)('maps a private transport %s failure to status %s', (code, status) => {
-    expect(servicePlaneClientError({ code })).toMatchObject({ code: 'internal', status });
+    expect(servicePlaneClientError({ code })).toMatchObject({
+      code: status === 408 || status === 504 ? 'timeout' : 'internal',
+      status,
+    });
+  });
+
+  it('preserves the HTTP status from a malformed private RPC response', () => {
+    expect(servicePlaneClientError({ code: 'MALFORMED_ORPC_RESPONSE', data: { status: 404 } })).toMatchObject({
+      code: 'internal',
+      status: 404,
+    });
+    expect(servicePlaneClientError({ code: 'MALFORMED_ORPC_RESPONSE', data: { status: 200 } })).toMatchObject({ status: 500 });
+  });
+
+  it('preserves a timeout taxonomy when the peer times out before an RPC envelope exists', () => {
+    expect(servicePlaneClientError({ code: 'MALFORMED_ORPC_RESPONSE', data: { status: 504 } })).toMatchObject({
+      code: 'timeout',
+      message: 'Service Plane call timed out',
+      retryable: true,
+      status: 504,
+    });
   });
 });

@@ -15,10 +15,12 @@ authentication remains application-owned.
 The control plane alone signs tokens. Services receive only public JWKS. Never copy the signing
 secret into services or callers.
 
-The token endpoint authenticates first, then parses a separate request branch before resolving the
-catalog-backed issuer. This lets custom body-signature authenticators consume the original request,
-while malformed or oversized input never starts discovery or key derivation. The default body limit
-is one MiB; configure `tokenMaxBodyBytes` on `ServicePlaneControlPlane` or
+The token endpoint first reads the physical request into an exact, bounded byte snapshot. It exposes
+only that bounded request to `authenticateCaller`, then parses the same bytes before resolving the
+catalog-backed issuer. Custom body-signature authenticators can therefore consume the request
+without an unread cloned stream buffering beyond the STS limit. Oversized input never reaches
+authentication; malformed or unauthorized input never starts discovery or key derivation. The
+default body limit is one MiB; configure `tokenMaxBodyBytes` on `ServicePlaneControlPlane` or
 `maxBodyBytes` on `mountCapabilityTokenEndpoint`.
 
 ## Configure Signing

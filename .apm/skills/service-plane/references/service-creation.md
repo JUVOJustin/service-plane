@@ -69,6 +69,11 @@ Keep `TasksEnv` limited to portable TypeScript interfaces used by handlers. It i
 context, not client runtime state; avoid Cloudflare `Fetcher`, database-driver, or RPC-engine types
 in a contract that browser packages import.
 
+Use plain `createAbilityBuilder()` when no handler reads `context.env`; that contract can mount in
+any more specific Hono environment. Pass `createAbilityBuilder<TasksEnv>()` only when inline or
+separately attached handlers need those bindings. A service environment may add bindings, but must
+still contain every binding its mounted handlers require.
+
 `private` is the default exposure; use `published` only for a deliberate product surface. `plane`
 is the normal access mode. Use `service` only for authenticated service-to-service abilities.
 

@@ -29,6 +29,18 @@ export type ControlPlaneMcpServerInfo = {
   version: string;
 };
 
+/** Published MCP projection selected from one request-scoped discovery snapshot. */
+export type ControlPlaneMcpInvocation = {
+  /** Ability selected from the discovery snapshot used for MCP matching. */
+  readonly abilityId: string;
+  /** Method selected after resolving the tool, resource, or prompt identifier. */
+  readonly method: string;
+  /** Method scopes requested when the plane mints the downstream capability. */
+  readonly scopes: ReadonlyArray<string>;
+  /** Catalog service that owns the matched ability. */
+  readonly serviceId: string;
+};
+
 export type ControlPlaneMcpHandlerOptions = {
   /**
    * Browser requests must come from the MCP endpoint's own origin by default. Deployments
@@ -50,7 +62,7 @@ export type ControlPlaneMcpHandlerOptions = {
   /** Maximum accepted JSON-RPC request-body size. Defaults to one MiB. */
   maxBodyBytes?: number;
   /** Receives the projected target once a tool, resource, or prompt resolves to an ability method. */
-  onInvocation?: (invocation: { abilityId: string; method: string; scopes: string[]; serviceId: string }) => void;
+  onInvocation?: (invocation: ControlPlaneMcpInvocation) => void;
   /**
    * When the request reached the plane, for deadline accounting: the budget forwarded to a service
    * is what is left of `timeoutMs` after everything since this instant — JSON-RPC parsing, the
@@ -115,7 +127,7 @@ type JsonRpcId = string | number | null;
 type McpMethodMatch = {
   ability: DiscoveredServiceAbility;
   method: string;
-  scopes: string[];
+  scopes: ReadonlyArray<string>;
 };
 
 type IndexedMcpMethod<TProjection> = McpMethodMatch & {
@@ -139,7 +151,7 @@ function indexMcpProjections(snapshot: ServiceRegistrySnapshot): McpProjectionIn
   for (const ability of snapshot.abilities) {
     if (ability.exposure !== 'published') continue;
     for (const [method, definition] of Object.entries(ability.methods)) {
-      const match = { ability, definition, method, scopes: definition.scopes };
+      const match = { ability, definition, method, scopes: [...definition.scopes] };
       if (definition.mcp) {
         indexMcpProjection(tools, definition.mcp.name, 'tool name', { ...match, projection: definition.mcp });
       }
@@ -206,7 +218,7 @@ export function generateMcpDiscovery(snapshot: ServiceRegistrySnapshot): McpDisc
     const args = match.projection.arguments ?? derivePromptArguments(match.definition.inputSchema);
     prompts.push({
       _meta: mcpServicePlaneMeta(match),
-      ...(args ? { arguments: args } : {}),
+      ...(args ? { arguments: [...args] } : {}),
       ...(match.projection.description ? { description: match.projection.description } : {}),
       name: match.projection.name,
       ...(match.projection.title ? { title: match.projection.title } : {}),
@@ -221,7 +233,7 @@ function mcpServicePlaneMeta(match: IndexedMcpMethod<unknown>): McpServicePlaneM
     servicePlane: {
       abilityId: match.ability.id,
       method: match.method,
-      scopes: match.scopes,
+      scopes: [...match.scopes],
       serviceId: match.ability.serviceId,
       ...(match.definition.stream ? { stream: true as const } : {}),
     },
@@ -777,7 +789,7 @@ function notifyInvocation(match: McpMethodMatch, options: ControlPlaneMcpHandler
   options.onInvocation?.({
     abilityId: match.ability.id,
     method: match.method,
-    scopes: match.scopes,
+    scopes: [...match.scopes],
     serviceId: match.ability.serviceId,
   });
 }

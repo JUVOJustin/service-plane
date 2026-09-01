@@ -67,6 +67,8 @@ export type {
   McpToolDiscovery,
   OpenApiObject,
   PinnedCapabilityTokenInput,
+  ReadonlyOpenApiObject,
+  ReadonlyServiceCallerAuthDiscovery,
   ServiceAbilityDiscovery,
   ServiceAbilityMcpProjection,
   ServiceAbilityMcpPromptArgument,
@@ -95,6 +97,7 @@ export {
 export type {
   AbilityMethodContext,
   AbilityMethodDefinition,
+  AbilityMethodEnvironment,
   AbilityMethodHandlerFor,
   AbilityMethodKind,
   AbilityMethodMetadata,

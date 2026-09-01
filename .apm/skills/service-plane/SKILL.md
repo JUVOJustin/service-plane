@@ -92,9 +92,10 @@ ability clients fail fast.
 required scopes from the contract. Extra `scopes` are additive. Endpoint, grants, and issuer resolve
 per call; method calls may override request ID, idempotency key, and timeout.
 
-Defined `timeoutMs` values fail on invalid input, expire immediately at `0`, and clamp above the
-maximum. Caller aborts surface as `ServicePlaneClientError` with `code: 'cancelled'`, status 499,
-and `retryable: false`. `rest: false` disables the control-plane REST facade and catch-all only.
+Client-call `timeoutMs` values fail on invalid input, expire immediately at `0`, and clamp above the
+maximum. Ability-method `timeoutMs: 0` instead disables that method's ceiling. Caller aborts surface
+as `ServicePlaneClientError` with `code: 'cancelled'`, status 499, and `retryable: false`.
+`rest: false` disables the control-plane REST facade and catch-all only.
 
 ## References
 

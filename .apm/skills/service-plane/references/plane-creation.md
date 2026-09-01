@@ -67,7 +67,8 @@ the authenticator itself is constructed only once.
 Do not infer either identity from an unverified header. Authenticate first, then set the typed
 context value. Token request bodies are independently bounded to one MiB; set
 `tokenMaxBodyBytes` when a different STS limit is required. Body-signing authenticators may consume
-the request because Service Plane keeps a separate bounded parser branch.
+the request because Service Plane gives them an exact package-owned snapshot only after enforcing
+that limit.
 
 ## Routes And Defaults
 

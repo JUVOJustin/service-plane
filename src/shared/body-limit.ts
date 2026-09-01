@@ -24,6 +24,11 @@ export async function readBoundedRequestText(request: Request, maxBytes: number,
   return new TextDecoder().decode(await readBoundedRequestBytes(request, maxBytes, tooLargeMessage));
 }
 
+/** Reads one HTTP request body as exact bytes and cancels its reader at the configured limit. */
+export async function readBoundedRequestBytes(request: Request, maxBytes: number, tooLargeMessage: string): Promise<Uint8Array> {
+  return readBoundedBodyBytes(request, maxBytes, () => new ServicePlaneBodyTooLargeError(tooLargeMessage));
+}
+
 /** Reads a cloned request body for authentication without consuming the protocol parser's branch. */
 export async function boundedRequestBodyBytes(
   request: Request,
@@ -34,7 +39,7 @@ export async function boundedRequestBodyBytes(
   },
 ): Promise<Uint8Array> {
   if (maxBodyBytes !== undefined) validateBodyByteLimit(maxBodyBytes, options.invalidMaxBodyBytesMessage);
-  return readBoundedRequestBytes(request.clone(), maxBodyBytes, options.tooLargeMessage);
+  return readBoundedBodyBytes(request.clone(), maxBodyBytes, () => new ServicePlaneBodyTooLargeError(options.tooLargeMessage));
 }
 
 /** Reads and parses a trusted-network JSON response without buffering an unbounded body. */
@@ -50,10 +55,6 @@ export async function readBoundedResponseJson(
   } catch {
     throw new CapabilityAuthError(options.invalidJsonMessage, 500);
   }
-}
-
-async function readBoundedRequestBytes(request: Request, maxBytes: number | undefined, tooLargeMessage: string): Promise<Uint8Array> {
-  return readBoundedBodyBytes(request, maxBytes, () => new ServicePlaneBodyTooLargeError(tooLargeMessage));
 }
 
 async function readBoundedBodyBytes(

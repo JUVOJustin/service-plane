@@ -271,12 +271,21 @@ describe('MCP projection of ref-rooted schemas', () => {
   it('still hoists and rewrites $id-less streaming item schemas from older services', () => {
     // Discovery documents produced before schemas carried $id reach the registry unchanged;
     // their root-relative refs must keep being re-anchored to the wrapper.
-    const legacy = snapshotFromAbility(streamingServiceWith(refRootedSchema()).abilities[0]);
-    const method = legacy.abilities[0]?.methods.watch;
+    const current = snapshotFromAbility(streamingServiceWith(refRootedSchema()).abilities[0]);
+    const currentAbility = current.abilities[0];
+    const method = currentAbility?.methods.watch;
     if (!method) throw new Error('missing method');
     const { $id, ...withoutId } = method.outputSchema;
     void $id;
-    method.outputSchema = withoutId;
+    const legacy: ServiceRegistrySnapshot = {
+      ...current,
+      abilities: [
+        {
+          ...currentAbility,
+          methods: { ...currentAbility.methods, watch: { ...method, outputSchema: withoutId } },
+        },
+      ],
+    };
 
     const discovery = generateMcpDiscovery(legacy);
     const outputSchema = discovery.tools.find((entry) => entry.name === 'example_watch')?.outputSchema as OpenApiObject;

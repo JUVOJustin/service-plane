@@ -9,14 +9,14 @@ compression, and the underlying RPC engine stay implementation details of `servi
 ## Install
 
 ```sh
-npm install service-plane hono
+npm install service-plane hono zod
 ```
 
 `service-plane` requires Hono `>=4.13.5 <5.0.0`.
 
 Schemas must implement [Standard Schema](https://standardschema.dev) and
 [Standard JSON Schema](https://standardschema.dev/json-schema). Use the validation library you
-already have; the examples use Zod 4.
+already have; Zod 4 is installed above only so the examples work as written.
 
 ## 1. Share A Contract
 
@@ -51,6 +51,7 @@ The shared module contains schemas and metadata, but no handler and no private R
 ```ts
 // service.ts
 import {
+  type FetchLike,
   ServicePlaneService,
   defineCapabilities,
   implementAbility,
@@ -58,7 +59,7 @@ import {
 } from 'service-plane/service';
 import { tasksContract } from './tasks.contract';
 
-type Env = { CONTROL_PLANE: Fetcher };
+type Env = { CONTROL_PLANE: FetchLike };
 
 const tasks = implementAbility(tasksContract, {
   get: ({ input }) => loadTask(input.id),

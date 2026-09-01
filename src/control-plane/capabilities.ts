@@ -1,7 +1,7 @@
 import type { Context, Env, Handler } from 'hono';
 import { etag } from 'hono/etag';
 import { createFactory } from 'hono/factory';
-import { readBoundedRequestText, validateBodyByteLimit } from '../shared/body-limit.js';
+import { readBoundedRequestBytes, validateBodyByteLimit } from '../shared/body-limit.js';
 import {
   normalizeCapabilitySubject,
   publicJwkFromPrivateJwk,
@@ -11,6 +11,7 @@ import {
 import { CapabilityAuthError } from '../shared/errors.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
 import { generateServicePlaneJwkSigningKey } from '../shared/jwk-auth.js';
+import { preserveRuntimeRequestMetadata } from '../shared/request-preparation.js';
 import {
   type AbilityAccess,
   type CapabilityCatalog,
@@ -95,7 +96,7 @@ export type CreateCapabilitySigningAuthorityOptions = {
 };
 
 export type CreateCapabilityIssuerOptions = {
-  capabilities: CapabilityCatalog[];
+  capabilities: ReadonlyArray<CapabilityCatalog>;
   grants: ServiceGrantDefinition;
   issuer: string;
   now?: () => Date;
@@ -349,15 +350,17 @@ export function mountCapabilityTokenEndpoint<TEnv extends Env = Env, TAppEnv ext
       // Token responses carry bearer credentials; keep them out of shared caches (RFC 6749 §5.1).
       context.header('cache-control', 'no-store');
       context.header('pragma', 'no-cache');
-      // A custom authenticator may sign the body and consume the original request. Keep a bounded
-      // parser branch so authentication and protocol decoding never depend on one another's reads.
-      const parsingRequest = context.req.raw.clone();
+      // Bound the physical stream before exposing it to custom authentication. Cloning first would
+      // let a body-consuming authenticator make the unread parser branch buffer without limit.
+      const physicalRequest = context.req.raw;
 
       try {
+        const bodyBytes = await readBoundedRequestBytes(physicalRequest, maxBodyBytes, CAPABILITY_TOKEN_BODY_TOO_LARGE_MESSAGE);
+        context.req.raw = requestWithBufferedBody(physicalRequest, bodyBytes);
         const authenticated = await options.authenticateCaller(resolverContext);
         if (authenticated instanceof Response) return authenticated;
         const caller = typeof authenticated === 'string' ? { serviceId: authenticated } : authenticated;
-        const body = await readTokenRequest(parsingRequest, maxBodyBytes);
+        const body = readTokenRequest(bodyBytes);
         // Resolved inside the guard so an unavailable authorization catalog fails closed with the
         // issuer's own error instead of an opaque unhandled rejection. Body validation happens
         // first so malformed caller input never initiates service discovery or key derivation.
@@ -385,7 +388,6 @@ export function mountCapabilityTokenEndpoint<TEnv extends Env = Env, TAppEnv ext
         }
         throw error;
       } finally {
-        if (!parsingRequest.bodyUsed) void parsingRequest.body?.cancel().catch(() => undefined);
         if (!context.req.raw.bodyUsed) void context.req.raw.body?.cancel().catch(() => undefined);
       }
     }),
@@ -472,7 +474,7 @@ function normalizeGrant(grant: ServiceGrant): ServiceGrant {
 // not take token issuance down for the rest of the plane; the error is kept verbatim and rethrown
 // only when that target is the one actually requested.
 function validateGrantsByTarget(
-  grants: ServiceGrant[],
+  grants: ReadonlyArray<ServiceGrant>,
   capabilitiesByService: Map<string, Set<string>>,
 ): Map<string, ValidatedTargetGrants> {
   const byTarget = new Map<string, ValidatedTargetGrants>();
@@ -512,7 +514,7 @@ function grantsForTarget(byTarget: Map<string, ValidatedTargetGrants>, target: s
   return entry.grants;
 }
 
-function capabilityScopesByService(capabilities: CapabilityCatalog[]): Map<string, Set<string>> {
+function capabilityScopesByService(capabilities: ReadonlyArray<CapabilityCatalog>): Map<string, Set<string>> {
   const byService = new Map<string, Set<string>>();
   for (const catalog of capabilities) {
     if (byService.has(catalog.serviceId))
@@ -523,12 +525,12 @@ function capabilityScopesByService(capabilities: CapabilityCatalog[]): Map<strin
 }
 
 // Receives the requested target's grants only, so caller is the remaining dimension to match.
-function isGranted(grants: ServiceGrant[], caller: string, scopes: string[]): boolean {
+function isGranted(grants: ReadonlyArray<ServiceGrant>, caller: string, scopes: ReadonlyArray<string>): boolean {
   const matching = grants.filter((grant) => grant.caller === caller);
   return scopes.every((scope) => matching.some((grant) => grant.scopes.includes(scope)));
 }
 
-function normalizeScopes(scopes: string[], status: number): string[] {
+function normalizeScopes(scopes: ReadonlyArray<string>, status: number): string[] {
   if (!Array.isArray(scopes)) {
     throw new CapabilityAuthError('Service-Plane capability token scopes must be an array', status);
   }
@@ -552,10 +554,10 @@ function normalizeId(id: string, field: string): string {
   return normalized;
 }
 
-async function readTokenRequest(request: Request, maxBodyBytes: number): Promise<IssueCapabilityTokenInput> {
+function readTokenRequest(bodyBytes: Uint8Array): IssueCapabilityTokenInput {
   let body: unknown;
   try {
-    body = JSON.parse(await readBoundedRequestText(request, maxBodyBytes, CAPABILITY_TOKEN_BODY_TOO_LARGE_MESSAGE));
+    body = JSON.parse(new TextDecoder().decode(bodyBytes));
   } catch (error) {
     if (error instanceof CapabilityAuthError) throw error;
     throw new CapabilityAuthError('Invalid Service-Plane capability token request', 400);
@@ -578,6 +580,10 @@ async function readTokenRequest(request: Request, maxBodyBytes: number): Promise
     targetServiceId: record.targetServiceId,
     ...(typeof record.ttlSeconds === 'number' ? { ttlSeconds: record.ttlSeconds } : {}),
   };
+}
+
+function requestWithBufferedBody(request: Request, body: Uint8Array): Request {
+  return preserveRuntimeRequestMetadata(request, new Request(request, { body: body as BodyInit }));
 }
 
 function normalizeTtlSeconds(ttlSeconds: number, status: number): number {
