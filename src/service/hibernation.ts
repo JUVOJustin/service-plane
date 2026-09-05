@@ -1,7 +1,8 @@
 import { encodeHibernationRPCEvent } from '@orpc/hibernation';
 import type { StandardSchemaV1 } from '@standard-schema/spec';
-import { AbilityValidationError, type AbilityValidationIssue } from '../shared/errors.js';
+import { AbilityValidationError } from '../shared/errors.js';
 import type { AbilitySchema } from './ability.js';
+import { failClosedValidationResult, formatValidationIssues, normalizeValidationIssues } from './schema-validation.js';
 
 /** Options for an event emitted after a Durable Object hibernation cycle. */
 export type AbilityHibernationEventOptions = {
@@ -50,24 +51,4 @@ export async function encodeAbilityHibernationEvent<TOutput extends AbilitySchem
     encodedPayload = result.value;
   }
   return encodeHibernationRPCEvent(id, encodedPayload, options);
-}
-
-function failClosedValidationResult(result: unknown): StandardSchemaV1.Result<unknown> {
-  if (result && typeof result === 'object' && ('value' in result || (result as { issues?: unknown }).issues)) {
-    return result as StandardSchemaV1.Result<unknown>;
-  }
-  return { issues: [{ message: 'Standard Schema validator returned neither a value nor issues' }] };
-}
-
-function normalizeValidationIssues(issues: readonly StandardSchemaV1.Issue[]): AbilityValidationIssue[] {
-  return issues.map((issue) => ({
-    message: issue.message,
-    ...(issue.path ? { path: issue.path.map((segment) => (typeof segment === 'object' ? segment.key : segment)) } : {}),
-  }));
-}
-
-function formatValidationIssues(issues: AbilityValidationIssue[]): string {
-  return issues.length === 0
-    ? 'schema reported no issue detail'
-    : issues.map((issue) => `${issue.path?.length ? `${issue.path.join('.')}: ` : ''}${issue.message}`).join('; ');
 }

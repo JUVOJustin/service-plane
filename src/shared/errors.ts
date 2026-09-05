@@ -253,10 +253,11 @@ function cancellationMessage(reason: unknown): string {
   return 'Service Plane call was cancelled';
 }
 
-// Private transports may fail before Service Plane can attach its own error data. Keep their common
-// string codes at this boundary so callers still receive the correct HTTP-style status without the
-// underlying RPC package becoming part of the public API.
-const PRIVATE_TRANSPORT_ERROR_STATUSES = {
+/**
+ * The private transport's error codes and the HTTP-style status each maps to. Kept at this boundary
+ * so both directions of the mapping have one source and the RPC package stays out of the public API.
+ */
+export const PRIVATE_TRANSPORT_ERROR_STATUSES = {
   BAD_GATEWAY: 502,
   BAD_REQUEST: 400,
   CLIENT_CLOSED_REQUEST: 499,
@@ -298,6 +299,26 @@ function transportErrorStatus(error: unknown): number {
 
 function isErrorStatus(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 400 && value <= 599;
+}
+
+/** JSON error body for the HTTP surfaces that answer outside the private RPC codec. */
+export function servicePlaneErrorResponse(error: unknown, fallbackMessage: string): Response {
+  const info = servicePlaneErrorInfo(error);
+  if (!info) return Response.json({ error: { code: 'internal', message: fallbackMessage, retryable: false } }, { status: 500 });
+  return Response.json(
+    { error: { code: info.code, message: info.message, ...(info.reason ? { reason: info.reason } : {}), retryable: info.retryable } },
+    { status: info.status },
+  );
+}
+
+/**
+ * Refuses an empty or whitespace-only configuration value. Every definition-time check shares this
+ * one message shape so a misconfiguration reads the same wherever it surfaces.
+ */
+export function requireNonEmpty(value: string, what: string, status = 500): string {
+  const normalized = value.trim();
+  if (!normalized) throw new CapabilityAuthError(`Service-Plane ${what} cannot be empty`, status);
+  return normalized;
 }
 
 function servicePlaneValidationIssues(value: unknown): AbilityValidationIssue[] | undefined {

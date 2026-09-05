@@ -7,7 +7,7 @@ import { discardDisposableValue, raceDeadline } from '../shared/deadline.js';
 import {
   AbilityHandlerError,
   AbilityValidationError,
-  type AbilityValidationIssue,
+  PRIVATE_TRANSPORT_ERROR_STATUSES,
   rememberHandlerFailureCause,
   ServicePlaneError,
   type ServicePlaneErrorInfo,
@@ -25,6 +25,7 @@ import {
   abilityMethodHandler,
   toAbilityStream,
 } from './ability.js';
+import { failClosedValidationResult, formatValidationIssues, normalizeValidationIssues } from './schema-validation.js';
 
 type ServicePlaneRpcErrorData = {
   servicePlane: ServicePlaneErrorInfo;
@@ -51,30 +52,26 @@ const validatedStreamItemSchema = {
   },
 } satisfies StandardSchemaV1<unknown>;
 
-const servicePlaneErrorMap = {
-  BAD_REQUEST: { data: servicePlaneRpcErrorDataSchema },
-  BAD_GATEWAY: { data: servicePlaneRpcErrorDataSchema },
-  CLIENT_CLOSED_REQUEST: { data: servicePlaneRpcErrorDataSchema },
-  CONFLICT: { data: servicePlaneRpcErrorDataSchema },
-  FORBIDDEN: { data: servicePlaneRpcErrorDataSchema },
-  GATEWAY_TIMEOUT: { data: servicePlaneRpcErrorDataSchema },
-  GONE: { data: servicePlaneRpcErrorDataSchema },
-  INTERNAL_SERVER_ERROR: { data: servicePlaneRpcErrorDataSchema },
-  METHOD_NOT_SUPPORTED: { data: servicePlaneRpcErrorDataSchema },
-  NOT_ACCEPTABLE: { data: servicePlaneRpcErrorDataSchema },
-  NOT_FOUND: { data: servicePlaneRpcErrorDataSchema },
-  NOT_IMPLEMENTED: { data: servicePlaneRpcErrorDataSchema },
-  PAYMENT_REQUIRED: { data: servicePlaneRpcErrorDataSchema },
-  PAYLOAD_TOO_LARGE: { data: servicePlaneRpcErrorDataSchema },
-  PRECONDITION_FAILED: { data: servicePlaneRpcErrorDataSchema },
-  PRECONDITION_REQUIRED: { data: servicePlaneRpcErrorDataSchema },
-  SERVICE_UNAVAILABLE: { data: servicePlaneRpcErrorDataSchema },
-  TIMEOUT: { data: servicePlaneRpcErrorDataSchema },
-  TOO_MANY_REQUESTS: { data: servicePlaneRpcErrorDataSchema },
-  UNAUTHORIZED: { data: servicePlaneRpcErrorDataSchema },
-  UNPROCESSABLE_CONTENT: { data: servicePlaneRpcErrorDataSchema },
-  UNSUPPORTED_MEDIA_TYPE: { data: servicePlaneRpcErrorDataSchema },
-} as const;
+// Every private transport code carries the same typed Service Plane payload, and the status table
+// is the one source for both directions of the code mapping.
+const servicePlaneErrorMap = Object.fromEntries(
+  Object.keys(PRIVATE_TRANSPORT_ERROR_STATUSES).map((code) => [code, { data: servicePlaneRpcErrorDataSchema }]),
+) as Record<keyof typeof PRIVATE_TRANSPORT_ERROR_STATUSES, { data: typeof servicePlaneRpcErrorDataSchema }>;
+const ORPC_ERROR_CODES_BY_STATUS = new Map<number, string>(
+  Object.entries(PRIVATE_TRANSPORT_ERROR_STATUSES).map(([code, status]) => [status, code]),
+);
+
+const hibernationIteratorSchema: StandardSchemaV1<HibernationAsyncIteratorClass<unknown>> = {
+  '~standard': {
+    validate(value) {
+      return value instanceof HibernationAsyncIteratorClass
+        ? { value }
+        : { issues: [{ message: 'Expected a Service-Plane hibernation iterator' }] };
+    },
+    vendor: 'service-plane',
+    version: 1,
+  },
+};
 
 type AuthorizeAbilityMethodInput = {
   headers?: Headers;
@@ -109,16 +106,14 @@ type AbilityRpcRuntimeContext<TEnv extends Env = Env> = {
 
 const ABILITY_RUNTIME = Symbol('service-plane.ability-runtime');
 
-// Handler failures cross this private wrapper before oRPC can classify them. That provenance is
-// what lets the outer boundary distinguish an application-created ORPCError from one created by
-// Service Plane itself without trusting a forgeable message, code, or data shape.
-const abilityHandlerFailureCauses = new WeakMap<object, unknown>();
-
+// Handler failures cross this private wrapper before oRPC can classify them. Its identity is what
+// lets the outer boundary distinguish an application-created ORPCError from one created by Service
+// Plane itself without trusting a forgeable message, code, or data shape. It never leaves the
+// middleware, so the original failure can ride along as `cause`.
 class AbilityHandlerFailure extends Error {
   constructor(failure: unknown) {
-    super('Service-Plane ability handler failed');
+    super('Service-Plane ability handler failed', { cause: failure });
     this.name = 'AbilityHandlerFailure';
-    abilityHandlerFailureCauses.set(this, failure);
   }
 }
 
@@ -235,7 +230,7 @@ export function compileAbilityMethod<TEnv extends Env>(method: AnyAbilityMethodD
   if (method.kind === 'hibernation') {
     return base
       .input(input)
-      .output(hibernationIteratorSchema())
+      .output(hibernationIteratorSchema)
       .handler(async ({ context, input: value }) => {
         const subscription = await invokeAbilityHandler(() =>
           handler({ context: context as unknown as AbilityMethodContext, input: value }),
@@ -358,39 +353,30 @@ export function createAbilityRpcRuntimeContext<TEnv extends Env>(options: Abilit
   return { [ABILITY_RUNTIME]: options };
 }
 
-function failClosedValidationResult(result: unknown): StandardSchemaV1.Result<unknown> {
-  if (result && typeof result === 'object' && ('value' in result || (result as { issues?: unknown }).issues)) {
-    return result as StandardSchemaV1.Result<unknown>;
-  }
-  return { issues: [{ message: 'Standard Schema validator returned neither a value nor issues' }] };
-}
-
 async function validateStreamResult(
   result: IteratorResult<unknown, unknown>,
   output: AbilitySchema,
   methodName: string,
 ): Promise<IteratorResult<unknown, unknown>> {
   if (result.done) return result;
-  let validated: StandardSchemaV1.Result<unknown>;
+  let validated: StandardSchemaV1.Result<unknown> | undefined;
   try {
     validated = failClosedValidationResult(await output['~standard'].validate(result.value));
   } catch {
-    throw servicePlaneOrpcError({
-      code: 'ability_validation',
-      message: `Service-Plane ability output for ${methodName} failed validation`,
-      retryable: false,
-      status: 500,
-    });
+    validated = undefined;
   }
-  if (validated.issues) {
-    throw servicePlaneOrpcError({
-      code: 'ability_validation',
-      message: `Service-Plane ability output for ${methodName} failed validation`,
-      retryable: false,
-      status: 500,
-    });
-  }
+  if (!validated || validated.issues) throw outputValidationError(methodName);
   return { done: false, value: validated.value };
+}
+
+// Output issues stay on the service: they describe the handler's data, not anything the caller sent.
+function outputValidationError(methodName: string): ORPCError<string, ServicePlaneRpcErrorData> {
+  return servicePlaneOrpcError({
+    code: 'ability_validation',
+    message: `Service-Plane ability output for ${methodName} failed validation`,
+    retryable: false,
+    status: 500,
+  });
 }
 
 function failClosedSchema<TSchema extends AbilitySchema>(schema: TSchema): TSchema {
@@ -402,20 +388,6 @@ function failClosedSchema<TSchema extends AbilitySchema>(schema: TSchema): TSche
   return new Proxy(schema, {
     get: (target, property) => (property === '~standard' ? guardedStandard : Reflect.get(target, property)),
   });
-}
-
-function hibernationIteratorSchema(): StandardSchemaV1<HibernationAsyncIteratorClass<unknown>> {
-  return {
-    '~standard': {
-      validate(value) {
-        return value instanceof HibernationAsyncIteratorClass
-          ? { value }
-          : { issues: [{ message: 'Expected a Service-Plane hibernation iterator' }] };
-      },
-      vendor: 'service-plane',
-      version: 1,
-    },
-  };
 }
 
 function resolveProcedureDeadline(
@@ -449,7 +421,7 @@ function normalizeMethodError<TEnv extends Env>(
   context?: AbilityMethodContext<TEnv>,
 ): ORPCError<string, unknown> {
   if (error instanceof AbilityHandlerFailure) {
-    const failure = abilityHandlerFailureCauses.get(error);
+    const failure = error.cause;
     if (failure instanceof AbilityHandlerError) {
       return servicePlaneOrpcError(servicePlaneErrorInfo(failure) as ServicePlaneErrorInfo);
     }
@@ -469,12 +441,7 @@ function normalizeMethodError<TEnv extends Env>(
           status: 422,
         });
       }
-      return servicePlaneOrpcError({
-        code: 'ability_validation',
-        message: `Service-Plane ability output for ${methodName} failed validation`,
-        retryable: false,
-        status: 500,
-      });
+      return outputValidationError(methodName);
     }
     return opaqueHandlerError(error, methodName, onHandlerFailure, context);
   }
@@ -517,65 +484,7 @@ export function orpcErrorFromServicePlane(error: unknown): ORPCError<string, Ser
 }
 
 function orpcErrorCode(status: number): string {
-  switch (status) {
-    case 400:
-      return 'BAD_REQUEST';
-    case 401:
-      return 'UNAUTHORIZED';
-    case 402:
-      return 'PAYMENT_REQUIRED';
-    case 403:
-      return 'FORBIDDEN';
-    case 404:
-      return 'NOT_FOUND';
-    case 405:
-      return 'METHOD_NOT_SUPPORTED';
-    case 406:
-      return 'NOT_ACCEPTABLE';
-    case 408:
-      return 'TIMEOUT';
-    case 409:
-      return 'CONFLICT';
-    case 410:
-      return 'GONE';
-    case 412:
-      return 'PRECONDITION_FAILED';
-    case 413:
-      return 'PAYLOAD_TOO_LARGE';
-    case 415:
-      return 'UNSUPPORTED_MEDIA_TYPE';
-    case 422:
-      return 'UNPROCESSABLE_CONTENT';
-    case 428:
-      return 'PRECONDITION_REQUIRED';
-    case 429:
-      return 'TOO_MANY_REQUESTS';
-    case 499:
-      return 'CLIENT_CLOSED_REQUEST';
-    case 501:
-      return 'NOT_IMPLEMENTED';
-    case 502:
-      return 'BAD_GATEWAY';
-    case 503:
-      return 'SERVICE_UNAVAILABLE';
-    case 504:
-      return 'GATEWAY_TIMEOUT';
-    default:
-      return 'INTERNAL_SERVER_ERROR';
-  }
-}
-
-function normalizeValidationIssues(issues: readonly StandardSchemaV1.Issue[]): AbilityValidationIssue[] {
-  return issues.map((issue) => ({
-    message: issue.message,
-    ...(issue.path ? { path: issue.path.map((segment) => (typeof segment === 'object' ? segment.key : segment)) } : {}),
-  }));
-}
-
-function formatValidationIssues(issues: AbilityValidationIssue[]): string {
-  return issues.length === 0
-    ? 'schema reported no issue detail'
-    : issues.map((issue) => `${issue.path?.length ? `${issue.path.join('.')}: ` : ''}${issue.message}`).join('; ');
+  return ORPC_ERROR_CODES_BY_STATUS.get(status) ?? 'INTERNAL_SERVER_ERROR';
 }
 
 function isServicePlaneRpcErrorData(value: unknown): value is ServicePlaneRpcErrorData {

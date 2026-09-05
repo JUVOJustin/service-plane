@@ -28,6 +28,7 @@ import {
 } from './wire-options.js';
 
 const SUPPORTED_COMPRESSION_ENCODINGS = ['gzip', 'deflate', 'deflate-raw'] as const satisfies readonly ServicePlaneCompressionEncoding[];
+const BATCH_SIZE_MESSAGE = 'Service-Plane batch maxSize must be a positive integer';
 
 /** Compiles stable client feature options into private engine plugins. */
 export function createRpcClientPlugins(options: ServicePlaneClientWireOptions): FetchLinkTransportPlugin<object>[] {
@@ -37,12 +38,12 @@ export function createRpcClientPlugins(options: ServicePlaneClientWireOptions): 
     plugins.push(
       new BatchLinkPlugin({
         groups: [{ condition: true, context: {} }],
-        ...(batch.maxSize === undefined ? {} : { maxSize: validateBatchSize(batch.maxSize) }),
+        ...(batch.maxSize === undefined ? {} : { maxSize: positiveInteger(batch.maxSize, BATCH_SIZE_MESSAGE) }),
       }),
     );
   }
 
-  const compression = normalizeClientCompression(options.compression);
+  const compression = normalizeCompression<Exclude<ServicePlaneClientCompressionOptions, boolean>>(options.compression);
   if (compression.request) {
     const request =
       typeof compression.request === 'boolean'
@@ -130,16 +131,21 @@ export function createRpcHandlerPlugins<TContext extends object = Record<Propert
   if (options.maxRequestBodyBytes !== false) {
     plugins.push(
       new RequestLimitHandlerPlugin({
-        maxBodySize: validateRequestBodySize(options.maxRequestBodyBytes ?? DEFAULT_SERVICE_PLANE_RPC_MAX_REQUEST_BODY_BYTES),
+        maxBodySize: positiveInteger(
+          options.maxRequestBodyBytes ?? DEFAULT_SERVICE_PLANE_RPC_MAX_REQUEST_BODY_BYTES,
+          'Service-Plane maxRequestBodyBytes must be a positive integer or false',
+        ),
       }),
     );
   }
   if (options.batch) {
     const batch = typeof options.batch === 'boolean' ? {} : options.batch;
-    plugins.push(new BatchHandlerPlugin(batch.maxSize === undefined ? {} : { maxSize: validateBatchSize(batch.maxSize) }));
+    plugins.push(
+      new BatchHandlerPlugin(batch.maxSize === undefined ? {} : { maxSize: positiveInteger(batch.maxSize, BATCH_SIZE_MESSAGE) }),
+    );
   }
 
-  const compression = normalizeServerCompression(options.compression);
+  const compression = normalizeCompression<Exclude<ServicePlaneServerCompressionOptions, boolean>>(options.compression);
   if (compression.request) plugins.push(new RequestCompressionHandlerPlugin());
   if (compression.response) {
     const response =
@@ -201,28 +207,17 @@ export function createRpcHandlerPlugins<TContext extends object = Record<Propert
   return plugins;
 }
 
-function normalizeClientCompression(
-  option: ServicePlaneClientCompressionOptions | undefined,
-): Exclude<ServicePlaneClientCompressionOptions, boolean> {
-  if (!option) return {};
-  return option === true ? { request: true, response: true } : option;
+// `true` enables both directions; an object names them individually.
+function normalizeCompression<TOptions extends { request?: unknown; response?: unknown }>(
+  option: boolean | TOptions | undefined,
+): TOptions {
+  if (!option) return {} as TOptions;
+  return option === true ? ({ request: true, response: true } as TOptions) : option;
 }
 
-function normalizeServerCompression(
-  option: ServicePlaneServerCompressionOptions | undefined,
-): Exclude<ServicePlaneServerCompressionOptions, boolean> {
-  if (!option) return {};
-  return option === true ? { request: true, response: true } : option;
-}
-
-function validateBatchSize(value: number): number {
+function positiveInteger(value: number, message: string): number {
   if (Number.isSafeInteger(value) && value > 0) return value;
-  throw new CapabilityAuthError('Service-Plane batch maxSize must be a positive integer', 500);
-}
-
-function validateRequestBodySize(value: number): number {
-  if (Number.isSafeInteger(value) && value > 0) return value;
-  throw new CapabilityAuthError('Service-Plane maxRequestBodyBytes must be a positive integer or false', 500);
+  throw new CapabilityAuthError(message, 500);
 }
 
 function validateCompressionThreshold(value: unknown): number {

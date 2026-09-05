@@ -4,17 +4,20 @@ import { createFactory } from 'hono/factory';
 import { readBoundedRequestBytes, validateBodyByteLimit } from '../shared/body-limit.js';
 import {
   normalizeCapabilitySubject,
-  publicJwkFromPrivateJwk,
+  normalizeCapabilityTokenTtlSeconds,
   signCapabilityToken,
+  signingJwkFingerprint,
   verifyCapabilityToken,
 } from '../shared/capability-tokens.js';
 import { timeoutMsFromRequest } from '../shared/deadline.js';
-import { CapabilityAuthError, ServicePlaneTimeoutError } from '../shared/errors.js';
+import { CapabilityAuthError, requireNonEmpty, ServicePlaneTimeoutError } from '../shared/errors.js';
+import { isAbilityAccess, isRecord } from '../shared/guards.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
-import { generateServicePlaneJwkSigningKey } from '../shared/jwk-auth.js';
+import { generateServicePlaneJwkSigningKey, publicJwkFromPrivateJwk } from '../shared/jwk-auth.js';
 import {
+  cancelUnusedRequestBody,
   createFetchRequestPreparation,
-  DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS,
+  preparationDeadlineAt,
   preserveRuntimeRequestMetadata,
 } from '../shared/request-preparation.js';
 import {
@@ -25,8 +28,6 @@ import {
   DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
   type IssueCapabilityTokenInput,
   type IssuedCapabilityToken,
-  isAbilityAccess,
-  MAX_CAPABILITY_TOKEN_TTL_SECONDS,
   SERVICE_PLANE_CAPABILITY_JWKS_PATH,
   SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
   type ServiceGrant,
@@ -220,49 +221,29 @@ export function createCapabilityIssuer(options: CreateCapabilityIssuerOptions): 
   const keyId = signingJwk.kid;
   const capabilitiesByService = capabilityScopesByService(options.capabilities);
   const grantsByTarget = validateGrantsByTarget(options.grants.grants, capabilitiesByService);
-  const maxTtlSeconds = normalizeTtlSeconds(options.ttlSeconds ?? DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS, 500);
+  const maxTtlSeconds = normalizeCapabilityTokenTtlSeconds(options.ttlSeconds ?? DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS, 500);
+  // Async so definition-time refusals inside surface as rejections, like every other issuer failure.
+  const issue = async (input: CapabilityIssuerInput, brokerServiceId?: string) =>
+    issueCapabilityToken({
+      ...(brokerServiceId ? { brokerServiceId } : {}),
+      input,
+      issuer: options.issuer,
+      grantsByTarget,
+      keyId,
+      maxTtlSeconds,
+      ...(options.now ? { now: options.now } : {}),
+      privateJwk: signingJwk,
+    });
 
   return {
-    async issueBrokeredCapabilityToken(input) {
-      return issueCapabilityToken({
-        brokerServiceId: normalizeId(input.brokerServiceId, 'broker service id'),
-        input,
-        issuer: options.issuer,
-        grantsByTarget,
-        keyId,
-        maxTtlSeconds,
-        ...(options.now ? { now: options.now } : {}),
-        privateJwk: signingJwk,
-      });
-    },
-    async issueCapabilityToken(input) {
-      return issueCapabilityToken({
-        input,
-        issuer: options.issuer,
-        grantsByTarget,
-        keyId,
-        maxTtlSeconds,
-        ...(options.now ? { now: options.now } : {}),
-        privateJwk: signingJwk,
-      });
-    },
+    issueBrokeredCapabilityToken: (input) => issue(input, requireNonEmpty(input.brokerServiceId, 'capability broker service id')),
+    issueCapabilityToken: (input) => issue(input),
     jwks: signingAuthority.jwks,
   };
 }
 
 function stableSigningJwk(source: CapabilitySigningJwk, normalized: CapabilitySigningJwk): CapabilitySigningJwk {
-  const fingerprint = JSON.stringify([
-    normalized.kid,
-    normalized.kty ?? null,
-    normalized.crv ?? null,
-    normalized.x ?? null,
-    normalized.y ?? null,
-    normalized.d ?? null,
-    normalized.alg ?? null,
-    normalized.use ?? null,
-    normalized.key_ops ?? null,
-    normalized.ext ?? null,
-  ]);
+  const fingerprint = JSON.stringify([normalized.kid, signingJwkFingerprint(normalized)]);
   const cached = stableSigningJwks.get(source);
   if (cached?.fingerprint === fingerprint) return cached.jwk;
   stableSigningJwks.set(source, { fingerprint, jwk: normalized });
@@ -287,7 +268,7 @@ function issueCapabilityToken(options: {
   const ttlSeconds =
     options.input.ttlSeconds === undefined
       ? options.maxTtlSeconds
-      : Math.min(normalizeTtlSeconds(options.input.ttlSeconds, 400), options.maxTtlSeconds);
+      : Math.min(normalizeCapabilityTokenTtlSeconds(options.input.ttlSeconds, 400), options.maxTtlSeconds);
   const subject = options.input.subject === undefined ? undefined : normalizeCapabilitySubject(options.input.subject);
   // A delegated subject exists only for callers the plane fronts, so it can never ride a
   // service-class token — the pair would hand an end user service-only reach at every service in
@@ -323,12 +304,7 @@ function issueCapabilityToken(options: {
 export async function createCapabilityIssuerFromPrivateJwk(
   options: CreateCapabilityIssuerFromPrivateJwkOptions,
 ): Promise<CapabilityIssuer> {
-  // Only the active key is round-tripped: retired entries are allowed to be public-only, so there is
-  // no private half left to check against them.
-  const signingJwk = normalizeSigningJwks(options.privateJwks)[0] as CapabilitySigningJwk;
-  if (options.validateKeyPair ?? true) {
-    await validateEs256KeyPair(signingJwk, publicJwkFromPrivateJwk(signingJwk, signingJwk.kid), signingJwk.kid);
-  }
+  if (options.validateKeyPair ?? true) await validateActiveSigningKey(normalizeSigningJwks(options.privateJwks));
   return createCapabilityIssuer(options);
 }
 
@@ -361,12 +337,7 @@ export function mountCapabilityTokenEndpoint<TEnv extends Env = Env, TAppEnv ext
 
       try {
         const preparation = createFetchRequestPreparation(physicalRequest, {
-          deadlineAt:
-            Date.now() +
-            Math.min(
-              timeoutMsFromRequest(context.req) ?? DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS,
-              DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS,
-            ),
+          deadlineAt: preparationDeadlineAt(Date.now(), timeoutMsFromRequest(context.req)),
           deadlineError: () => new ServicePlaneTimeoutError('Service-Plane capability token request decoding exceeded its deadline'),
         });
         const bodyBytes = await preparation.run(() =>
@@ -405,7 +376,7 @@ export function mountCapabilityTokenEndpoint<TEnv extends Env = Env, TAppEnv ext
         }
         throw error;
       } finally {
-        if (!context.req.raw.bodyUsed) void context.req.raw.body?.cancel().catch(() => undefined);
+        cancelUnusedRequestBody(context.req.raw);
       }
     }),
   );
@@ -473,16 +444,14 @@ function normalizeCallerAccess(callerAccess: AbilityAccess): AbilityAccess {
 }
 
 function normalizeConfirmation(confirmation: CapabilityConfirmation): CapabilityConfirmation {
-  const jkt = confirmation.jkt.trim();
-  if (!jkt) throw new CapabilityAuthError('Service-Plane capability confirmation thumbprint cannot be empty', 500);
-  return { jkt };
+  return { jkt: requireNonEmpty(confirmation.jkt, 'capability confirmation thumbprint') };
 }
 
 function normalizeGrant(grant: ServiceGrant): ServiceGrant {
   return {
-    caller: normalizeId(grant.caller, 'caller'),
+    caller: requireNonEmpty(grant.caller, 'capability caller'),
     scopes: normalizeScopes(grant.scopes, 500),
-    target: normalizeId(grant.target, 'target'),
+    target: requireNonEmpty(grant.target, 'capability target'),
   };
 }
 
@@ -565,23 +534,14 @@ function normalizeScope(scope: string, status = 500): string {
   return normalized;
 }
 
-function normalizeId(id: string, field: string): string {
-  const normalized = id.trim();
-  if (!normalized) throw new CapabilityAuthError(`Service-Plane capability ${field} cannot be empty`, 500);
-  return normalized;
-}
-
 function readTokenRequest(bodyBytes: Uint8Array): IssueCapabilityTokenInput {
-  let body: unknown;
+  let record: unknown;
   try {
-    body = JSON.parse(new TextDecoder().decode(bodyBytes));
-  } catch (error) {
-    if (error instanceof CapabilityAuthError) throw error;
+    record = JSON.parse(new TextDecoder().decode(bodyBytes));
+  } catch {
     throw new CapabilityAuthError('Invalid Service-Plane capability token request', 400);
   }
-
-  if (!body || typeof body !== 'object') throw new CapabilityAuthError('Invalid Service-Plane capability token request', 400);
-  const record = body as Record<string, unknown>;
+  if (!isRecord(record)) throw new CapabilityAuthError('Invalid Service-Plane capability token request', 400);
   rejectCallerAssertedSubject(record.subject);
   const scopes = record.scopes;
   if (typeof record.targetServiceId !== 'string' || !Array.isArray(scopes) || !scopes.every((scope) => typeof scope === 'string')) {
@@ -603,21 +563,6 @@ function requestWithBufferedBody(request: Request, body: Uint8Array): Request {
   return preserveRuntimeRequestMetadata(request, new Request(request, { body: body as BodyInit }));
 }
 
-function normalizeTtlSeconds(ttlSeconds: number, status: number): number {
-  if (
-    !Number.isFinite(ttlSeconds) ||
-    !Number.isSafeInteger(ttlSeconds) ||
-    ttlSeconds <= 0 ||
-    ttlSeconds > MAX_CAPABILITY_TOKEN_TTL_SECONDS
-  ) {
-    throw new CapabilityAuthError(
-      `Service-Plane capability token TTL must be a positive integer no greater than ${MAX_CAPABILITY_TOKEN_TTL_SECONDS} seconds`,
-      status,
-    );
-  }
-  return ttlSeconds;
-}
-
 // Rotation is only safe if a verifier can tell the published keys apart. A missing or duplicated key
 // id is refused at construction rather than published, because the failure it causes downstream — a
 // verifier picking the wrong key for a `kid` it has cached — surfaces as an unexplained signature
@@ -635,10 +580,16 @@ function normalizeSigningJwks(privateJwks: CapabilitySigningJwk[]): CapabilitySi
 }
 
 /**
- * Exported so a caller that memoizes derived key material can pay this round-trip once per key set
- * rather than once per issuer. Deliberately not re-exported from `index.ts`.
+ * Round-trips the active key only: retired entries may be public-only, so there is no private half
+ * left to check against them. Exported so a caller that memoizes derived key material can pay this
+ * once per key set rather than once per issuer. Deliberately not re-exported from `index.ts`.
  */
-export async function validateEs256KeyPair(privateJwk: JsonWebKey, publicJwk: JsonWebKey, keyId: string): Promise<void> {
+export async function validateActiveSigningKey(privateJwks: CapabilitySigningJwk[]): Promise<void> {
+  const signingJwk = privateJwks[0] as CapabilitySigningJwk;
+  await validateEs256KeyPair(signingJwk, publicJwkFromPrivateJwk(signingJwk, signingJwk.kid), signingJwk.kid);
+}
+
+async function validateEs256KeyPair(privateJwk: JsonWebKey, publicJwk: JsonWebKey, keyId: string): Promise<void> {
   try {
     const issued = await signCapabilityToken({
       claims: {

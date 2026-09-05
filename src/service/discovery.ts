@@ -2,8 +2,10 @@ import type { StandardJSONSchemaV1, StandardSchemaV1 } from '@standard-schema/sp
 import type { Env } from 'hono';
 import type { ConnInfo } from '../shared/conn-info.js';
 import { DEFAULT_ABILITY_TIMEOUT_MS } from '../shared/deadline.js';
-import { CapabilityAuthError } from '../shared/errors.js';
+import { CapabilityAuthError, requireNonEmpty } from '../shared/errors.js';
+import { isAbilityAccess, isAbilityExposure, isAbilityTransport, isServiceHttpMethod } from '../shared/guards.js';
 import { jsonSchemaRootProperties } from '../shared/json-schema.js';
+import { PRIVATE_JWK_MEMBERS } from '../shared/jwk-auth.js';
 import {
   hasOnlySimpleTemplateExpressions,
   isOriginRelativePath,
@@ -11,25 +13,23 @@ import {
   pathTemplateVariables,
 } from '../shared/paths.js';
 import { SERVICE_PLANE_RPC_PREFIX, SERVICE_PLANE_RPC_PROTOCOL } from '../shared/rpc-protocol.js';
-import {
-  type AbilityAccess,
-  type AbilityExposure,
-  type AbilityTransport,
-  type CapabilityCatalog,
-  isAbilityAccess,
-  type OpenApiObject,
-  type ReadonlyOpenApiObject,
-  type ReadonlyServiceCallerAuthDiscovery,
-  SERVICE_DISCOVERY_PATH,
-  type ServiceAbilityDiscovery,
-  type ServiceAbilityMcpProjection,
-  type ServiceAbilityMcpPromptProjection,
-  type ServiceAbilityMcpResourceProjection,
-  type ServiceAbilityMethodDiscovery,
-  type ServiceAbilityRestProjection,
-  type ServiceCallerAuthDiscovery,
-  type ServiceDiscoveryDocument,
-  type ServiceHttpMethod,
+import type {
+  AbilityAccess,
+  AbilityExposure,
+  AbilityTransport,
+  CapabilityCatalog,
+  OpenApiObject,
+  ReadonlyOpenApiObject,
+  ReadonlyServiceCallerAuthDiscovery,
+  ServiceAbilityDiscovery,
+  ServiceAbilityMcpProjection,
+  ServiceAbilityMcpPromptProjection,
+  ServiceAbilityMcpResourceProjection,
+  ServiceAbilityMethodDiscovery,
+  ServiceAbilityRestProjection,
+  ServiceCallerAuthDiscovery,
+  ServiceDiscoveryDocument,
+  ServiceHttpMethod,
 } from '../shared/types.js';
 import {
   type AbilityMethodDefinition,
@@ -57,8 +57,7 @@ const ABILITY_JSON_SCHEMA_TARGET: StandardJSONSchemaV1.Target = 'draft-2020-12';
 // public client is a flat null-prototype object rather than a recursive function proxy.
 const RESERVED_ABILITY_METHOD_NAMES = new Set(['then', 'toJSON', '__proto__']);
 
-/** Returns whether JavaScript machinery may invoke an ability method implicitly. */
-export function isReservedAbilityMethodName(name: string): boolean {
+function isReservedAbilityMethodName(name: string): boolean {
   return RESERVED_ABILITY_METHOD_NAMES.has(name);
 }
 
@@ -237,9 +236,9 @@ export function abilityClientScopesByMethod(
   additionalScopes: ReadonlyArray<string> | undefined,
 ): ReadonlyMap<string, string[]> {
   assertAbilityMethodRecord(ability.id, ability.methods);
-  const abilityScopes = normalizeClientScopes(ability.scopes ?? [], ability.id);
+  const abilityScopes = normalizeScopes(ability.scopes ?? [], ability.id);
   const allowedScopes = new Set(abilityScopes);
-  const additional = normalizeClientScopes(additionalScopes ?? [], ability.id);
+  const additional = normalizeScopes(additionalScopes ?? [], ability.id);
   for (const scope of additional) {
     if (!allowedScopes.has(scope)) {
       throw new CapabilityAuthError(`Service-Plane client scope is not declared by ability: ${ability.id} -> ${scope}`, 500);
@@ -251,7 +250,7 @@ export function abilityClientScopesByMethod(
       if (isReservedAbilityMethodName(methodName)) {
         throw new CapabilityAuthError(`Service-Plane ability method name is reserved: ${ability.id}/${methodName}`, 500);
       }
-      const required = normalizeClientScopes(method.metadata.scopes ?? [], `${ability.id}/${methodName}`);
+      const required = normalizeScopes(method.metadata.scopes ?? [], `${ability.id}/${methodName}`);
       for (const scope of required) {
         if (!allowedScopes.has(scope)) {
           throw new CapabilityAuthError(
@@ -274,17 +273,6 @@ export function abilityClientScopesForMethod(
   const scopes = scopesByMethod.get(methodName);
   if (!scopes) throw new CapabilityAuthError(`Service-Plane ability method not found: ${abilityId}/${methodName}`, 404);
   return scopes;
-}
-
-function normalizeClientScopes(scopes: ReadonlyArray<string>, source: string): string[] {
-  return [...new Set(scopes.map((scope) => normalizeClientScope(scope, source)))];
-}
-
-function normalizeClientScope(scope: string, source: string): string {
-  const normalized = scope.trim();
-  if (!normalized) throw new CapabilityAuthError(`Service-Plane client scope cannot be empty: ${source}`, 500);
-  if (normalized.includes('*')) throw new CapabilityAuthError(`Service-Plane client scope wildcard is not supported: ${source}`, 500);
-  return normalized;
 }
 
 /**
@@ -334,7 +322,7 @@ export function defineAbilityService<TEnv extends Env = Env>(
   input: DefineServiceInput<TEnv>,
   options: DefineServiceOptions = {},
 ): ServiceDefinition<TEnv> {
-  const serviceId = normalizeValue(input.id, 'service id');
+  const serviceId = requireNonEmpty(input.id, 'service id');
   const capabilities = input.capabilities ? defineCapabilities(input.capabilities) : undefined;
   if (capabilities && capabilities.serviceId !== serviceId) {
     throw new CapabilityAuthError(`Service-Plane capability catalog belongs to ${capabilities.serviceId}, not service ${serviceId}`, 500);
@@ -351,8 +339,8 @@ export function defineAbilityService<TEnv extends Env = Env>(
     ...(callerAuth ? { callerAuth } : {}),
     ...(capabilities ? { capabilities } : {}),
     id: serviceId,
-    title: normalizeValue(input.title, 'service title'),
-    version: normalizeValue(input.version, 'service version'),
+    title: requireNonEmpty(input.title, 'service title'),
+    version: requireNonEmpty(input.version, 'service version'),
   };
   validateCallerAuthDiscovery(service);
   return Object.freeze(service);
@@ -361,7 +349,7 @@ export function defineAbilityService<TEnv extends Env = Env>(
 export function serviceDiscoveryDocument<TEnv extends Env = Env>(service: ServiceDefinition<TEnv>): ServiceDiscoveryDocument {
   return {
     abilities: service.abilities.map(abilityDiscovery),
-    ...(service.callerAuth ? { callerAuth: mutableJsonSnapshot(service.callerAuth) as unknown as ServiceCallerAuthDiscovery } : {}),
+    ...(service.callerAuth ? { callerAuth: structuredClone(service.callerAuth) as unknown as ServiceCallerAuthDiscovery } : {}),
     ...(service.capabilities ? { capabilities: service.capabilities } : {}),
     id: service.id,
     title: service.title,
@@ -372,8 +360,6 @@ export function serviceDiscoveryDocument<TEnv extends Env = Env>(service: Servic
 export function defaultAbilityRpcPath(abilityId: string): string {
   return `${SERVICE_PLANE_RPC_PREFIX}/${abilityId}`;
 }
-
-export { SERVICE_DISCOVERY_PATH };
 
 function normalizeAbilities<TEnv extends Env>(
   serviceId: string,
@@ -392,7 +378,7 @@ function normalizeAbilities<TEnv extends Env>(
 
   return Object.freeze(
     abilities.map((ability) => {
-      const id = normalizeValue(ability.id, 'ability id');
+      const id = requireNonEmpty(ability.id, 'ability id');
       if (seenIds.has(id)) throw new CapabilityAuthError(`Duplicate Service-Plane ability: ${id}`, 500);
       seenIds.add(id);
       const scopes = normalizeScopes(ability.scopes ?? []);
@@ -464,7 +450,7 @@ function normalizeAbilityMethods<TEnv extends Env>(
   return Object.freeze(
     Object.fromEntries(
       names.map((methodName) => {
-        const name = normalizeValue(methodName, `method name for ${abilityId}`);
+        const name = requireNonEmpty(methodName, `method name for ${abilityId}`);
         if (isReservedAbilityMethodName(name)) {
           throw new CapabilityAuthError(`Service-Plane ability method name is reserved: ${abilityId}/${name}`, 500);
         }
@@ -618,11 +604,11 @@ function abilityDiscovery<TEnv extends Env>(ability: NormalizedServiceAbility<TE
       Object.entries(ability.methods).map(([methodName, method]) => [
         methodName,
         {
-          inputSchema: mutableJsonSnapshot(method.inputSchema) as unknown as OpenApiObject,
+          inputSchema: structuredClone(method.inputSchema) as unknown as OpenApiObject,
           ...(method.mcp ? { mcp: method.mcp } : {}),
           ...(method.mcpPrompt ? { mcpPrompt: method.mcpPrompt } : {}),
           ...(method.mcpResource ? { mcpResource: method.mcpResource } : {}),
-          outputSchema: mutableJsonSnapshot(method.outputSchema) as unknown as OpenApiObject,
+          outputSchema: structuredClone(method.outputSchema) as unknown as OpenApiObject,
           ...(method.idempotent ? { idempotent: true as const } : {}),
           ...(method.rest ? { rest: method.rest } : {}),
           scopes: [...method.scopes],
@@ -651,7 +637,7 @@ function normalizeRestProjection(
     ...rest,
     method: normalizeHttpMethod(rest.method),
     operationId: rest.operationId
-      ? normalizeValue(rest.operationId, `REST operation id for ${abilityId}/${methodName}`)
+      ? requireNonEmpty(rest.operationId, `REST operation id for ${abilityId}/${methodName}`)
       : `${serviceId}.${abilityId}.${methodName}`,
     path,
     ...(rest.status === undefined ? {} : { status: normalizeRestStatus(rest.status, abilityId, methodName) }),
@@ -696,7 +682,7 @@ function normalizeRestStatus(status: number, abilityId: string, methodName: stri
 function normalizeMcpProjection(abilityId: string, methodName: string, mcp: ServiceAbilityMcpProjection): ServiceAbilityMcpProjection {
   return Object.freeze({
     ...mcp,
-    name: normalizeValue(mcp.name, `MCP tool name for ${abilityId}/${methodName}`),
+    name: requireNonEmpty(mcp.name, `MCP tool name for ${abilityId}/${methodName}`),
   });
 }
 
@@ -713,13 +699,13 @@ function normalizeMcpPromptProjection(
             prompt.arguments.map((argument) =>
               Object.freeze({
                 ...argument,
-                name: normalizeValue(argument.name, `MCP prompt argument name for ${abilityId}/${methodName}`),
+                name: requireNonEmpty(argument.name, `MCP prompt argument name for ${abilityId}/${methodName}`),
               }),
             ),
           ),
         }
       : {}),
-    name: normalizeValue(prompt.name, `MCP prompt name for ${abilityId}/${methodName}`),
+    name: requireNonEmpty(prompt.name, `MCP prompt name for ${abilityId}/${methodName}`),
   });
 }
 
@@ -728,11 +714,11 @@ function normalizeMcpResourceProjection(
   methodName: string,
   resource: ServiceAbilityMcpResourceProjection,
 ): ServiceAbilityMcpResourceProjection {
-  const uri = normalizeValue(resource.uri, `MCP resource URI for ${abilityId}/${methodName}`);
+  const uri = requireNonEmpty(resource.uri, `MCP resource URI for ${abilityId}/${methodName}`);
   validateMcpResourceUriTemplate(uri, abilityId, methodName);
   return Object.freeze({
     ...resource,
-    name: normalizeValue(resource.name, `MCP resource name for ${abilityId}/${methodName}`),
+    name: requireNonEmpty(resource.name, `MCP resource name for ${abilityId}/${methodName}`),
     uri,
   });
 }
@@ -762,26 +748,14 @@ function validateCallerAuthDiscovery(service: Pick<ServiceDefinition, 'callerAut
 }
 
 function containsPrivateJwkMaterial(key: ReadonlyServiceCallerAuthDiscovery['jwks']['keys'][number]): boolean {
-  return (
-    typeof key.d === 'string' ||
-    typeof key.dp === 'string' ||
-    typeof key.dq === 'string' ||
-    typeof key.k === 'string' ||
-    key.oth !== undefined ||
-    typeof key.p === 'string' ||
-    typeof key.q === 'string' ||
-    typeof key.qi === 'string'
-  );
+  return PRIVATE_JWK_MEMBERS.some((member) => key[member] !== undefined);
 }
 
 function normalizeAbilityTransports(transports: ReadonlyArray<AbilityTransport>): AbilityTransport[] {
   if (transports.length === 0) throw new CapabilityAuthError('Service-Plane ability must enable at least one transport', 500);
   const normalized = [...new Set(transports)];
-  for (const transport of normalized) {
-    if (transport !== 'fetch' && transport !== 'service-binding' && transport !== 'websocket') {
-      throw new CapabilityAuthError(`Unknown Service-Plane ability transport: ${transport as string}`, 500);
-    }
-  }
+  const unknown = normalized.find((transport) => !isAbilityTransport(transport));
+  if (unknown !== undefined) throw new CapabilityAuthError(`Unknown Service-Plane ability transport: ${String(unknown)}`, 500);
   return normalized;
 }
 
@@ -798,22 +772,13 @@ function normalizePath(path: string, source: string): string {
 
 function normalizeHttpMethod(method: ServiceHttpMethod): ServiceHttpMethod {
   if (typeof method !== 'string') throw new CapabilityAuthError('Service-Plane REST method cannot be empty', 500);
-  const normalized = method.toLowerCase() as ServiceHttpMethod;
-  if (
-    normalized !== 'delete' &&
-    normalized !== 'get' &&
-    normalized !== 'patch' &&
-    normalized !== 'post' &&
-    normalized !== 'put' &&
-    normalized !== 'query'
-  ) {
-    throw new CapabilityAuthError(`Unknown Service-Plane REST method: ${method as string}`, 500);
-  }
+  const normalized = method.toLowerCase();
+  if (!isServiceHttpMethod(normalized)) throw new CapabilityAuthError(`Unknown Service-Plane REST method: ${method}`, 500);
   return normalized;
 }
 
 function normalizeAbilityExposure(exposure: AbilityExposure, abilityId: string): AbilityExposure {
-  if (exposure !== 'private' && exposure !== 'published') {
+  if (!isAbilityExposure(exposure)) {
     throw new CapabilityAuthError(`Unknown Service-Plane ability exposure for ${abilityId}: ${String(exposure)}`, 500);
   }
   return exposure;
@@ -827,19 +792,21 @@ function normalizeAbilityAccess(access: AbilityAccess, abilityId: string): Abili
 }
 
 function normalizeTags(tags: ReadonlyArray<string>, source: string): string[] {
-  const normalized = [...new Set(tags.map((tag) => normalizeValue(tag, `REST tag for ${source}`)))];
+  const normalized = [...new Set(tags.map((tag) => requireNonEmpty(tag, `REST tag for ${source}`)))];
   if (normalized.length === 0) throw new CapabilityAuthError(`Service-Plane REST projection has an empty tag list: ${source}`, 500);
   return normalized;
 }
 
-function normalizeScopes(scopes: ReadonlyArray<string>): string[] {
-  return [...new Set(scopes.map(normalizeScope))];
+// `source` names the ability or method a client-side check is validating, so the error can say where.
+function normalizeScopes(scopes: ReadonlyArray<string>, source?: string): string[] {
+  return [...new Set(scopes.map((scope) => normalizeScope(scope, source)))];
 }
 
-function normalizeScope(scope: string): string {
+function normalizeScope(scope: string, source?: string): string {
+  const where = source ? `: ${source}` : '';
   const normalized = scope.trim();
-  if (!normalized) throw new CapabilityAuthError('Service-Plane capability scope cannot be empty', 500);
-  if (normalized.includes('*')) throw new CapabilityAuthError('Service-Plane capability wildcards are not supported', 500);
+  if (!normalized) throw new CapabilityAuthError(`Service-Plane capability scope cannot be empty${where}`, 500);
+  if (normalized.includes('*')) throw new CapabilityAuthError(`Service-Plane capability wildcards are not supported${where}`, 500);
   return normalized;
 }
 
@@ -855,12 +822,6 @@ function validateKnownScopes(
   for (const scope of scopes) {
     if (!knownScopes.has(scope)) throw new CapabilityAuthError(`${message}: ${scope}`, 500);
   }
-}
-
-function normalizeValue(value: string, field: string): string {
-  const normalized = value.trim();
-  if (!normalized) throw new CapabilityAuthError(`Service-Plane ${field} cannot be empty`, 500);
-  return normalized;
 }
 
 // Both halves of the Standard Schema contract are checked here, at setup, so a schema that
@@ -932,12 +893,6 @@ function immutableJsonSnapshot<T>(value: T): T {
   if (Array.isArray(value)) return Object.freeze(value.map((entry) => immutableJsonSnapshot(entry))) as T;
   if (!value || typeof value !== 'object') return value;
   return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, immutableJsonSnapshot(entry)]))) as T;
-}
-
-function mutableJsonSnapshot<T>(value: T): T {
-  if (Array.isArray(value)) return value.map((entry) => mutableJsonSnapshot(entry)) as T;
-  if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, mutableJsonSnapshot(entry)])) as T;
 }
 
 // JSON Schema 2020-12 resource identity: a schema whose fragment `$ref`s point at itself

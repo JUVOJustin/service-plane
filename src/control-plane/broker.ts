@@ -1,29 +1,17 @@
 import { RPCLink } from '@orpc/client/fetch';
 import { asyncIteratorObject, ORPCError, os, type as typeSchema } from '@orpc/server';
+import type { StandardSchemaV1 } from '@standard-schema/spec';
 import { orpcErrorFromServicePlane } from '../service/orpc.js';
 import { createRpcClientPlugins } from '../service/orpc-features.js';
-import { servicePlaneAuthorization } from '../shared/capability-tokens.js';
-import { type ConnInfo, SERVICE_PLANE_CONN_INFO_HEADER, serializeConnInfo } from '../shared/conn-info.js';
-import {
-  discardDisposableValue,
-  normalizeTimeoutMs,
-  raceDeadline,
-  remainingTimeoutMs,
-  SERVICE_PLANE_TIMEOUT_HEADER,
-  serializeTimeoutMs,
-} from '../shared/deadline.js';
+import { applyForwardedCallHeaders, type ForwardedCallValues } from '../shared/call-headers.js';
+import type { ConnInfo } from '../shared/conn-info.js';
+import { discardDisposableValue, normalizeTimeoutMs, raceDeadline, remainingTimeoutMs } from '../shared/deadline.js';
 import { CapabilityAuthError, ServicePlaneTimeoutError, servicePlaneErrorInfo } from '../shared/errors.js';
-import { normalizeIdempotencyKey, SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER } from '../shared/idempotency.js';
-import { emitBestEffortServicePlaneLog, type ServicePlaneBrokerLogEvent } from '../shared/logging.js';
+import { isAsyncIterable } from '../shared/guards.js';
+import { normalizeIdempotencyKey } from '../shared/idempotency.js';
+import { emitBestEffortServicePlaneLog, logErrorFields, type ServicePlaneBrokerLogEvent } from '../shared/logging.js';
 import { assertServicePlaneRpcProtocol, SERVICE_PLANE_RPC_PROTOCOL } from '../shared/rpc-protocol.js';
-import type {
-  DiscoveredServiceAbility,
-  IssueCapabilityTokenInput,
-  IssuedCapabilityToken,
-  ServiceEndpoint,
-  ServiceRegistry,
-} from '../shared/types.js';
-import { SERVICE_PLANE_REQUEST_ID_HEADER } from '../shared/types.js';
+import type { DiscoveredServiceAbility, IssuedCapabilityToken, ServiceEndpoint, ServiceRegistry } from '../shared/types.js';
 import {
   type BrokerCaller,
   brokerCallerAccess,
@@ -34,31 +22,6 @@ import {
 } from './caller.js';
 import type { CapabilityIssuer } from './capabilities.js';
 import { createServiceRegistry } from './registry.js';
-
-/**
- * One token requester for broker and MCP so the brokered-vs-plain fork and the caller-class stamp
- * cannot drift between the two mounts — the same anti-drift contract as `brokerCallerLogFields`.
- * Minting brokered tokens for ingress-required targets and stamping the
- * resolver's caller class are both security-relevant, so they live in exactly one place.
- */
-export function brokerRequestToken(options: {
-  /** Discovered ability that determines ingress token shape. */
-  ability: DiscoveredServiceAbility;
-  /** Service id stamped into brokered capability tokens. */
-  brokerServiceId: string;
-  /** Authenticated caller that determines delegation and access class. */
-  caller: BrokerCaller | undefined;
-  /** Request-scoped capability issuer. */
-  issuer: CapabilityIssuer;
-}): (input: IssueCapabilityTokenInput) => Promise<IssuedCapabilityToken> {
-  const callerAccess = brokerCallerAccess(options.caller);
-  return (input) => {
-    const request = { ...input, callerAccess };
-    return options.ability.serviceIngress?.required
-      ? options.issuer.issueBrokeredCapabilityToken({ ...request, brokerServiceId: options.brokerServiceId })
-      : options.issuer.issueCapabilityToken(request);
-  };
-}
 
 export type CreateControlPlaneRpcBrokerOptions = {
   /** Product permission check run for each logical call before capability issuance; grants still apply. */
@@ -157,7 +120,7 @@ const controlPlaneBrokerProcedureInputSchema = {
     vendor: 'service-plane',
     version: 1,
   },
-} satisfies import('@standard-schema/spec').StandardSchemaV1<ControlPlaneBrokerProcedureInput>;
+} satisfies StandardSchemaV1<ControlPlaneBrokerProcedureInput>;
 
 /**
  * Generic public broker router. Typed ability clients adapt their method calls to `call` or
@@ -200,10 +163,6 @@ async function callBrokerProcedure(context: ControlPlaneBrokerProcedureContext, 
     if (error instanceof ORPCError) throw error;
     throw orpcErrorFromServicePlane(error) ?? new ORPCError('INTERNAL_SERVER_ERROR', { data: undefined });
   }
-}
-
-function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
-  return Boolean(value && typeof value === 'object' && Symbol.asyncIterator in value);
 }
 
 function isControlPlaneBrokerProcedureInput(value: unknown): value is ControlPlaneBrokerProcedureInput {
@@ -275,19 +234,7 @@ export function createControlPlaneRpcBroker(options: CreateControlPlaneRpcBroker
             });
             remainingBudget('during invocation authorization');
           }
-          const callerServiceId = input.caller?.kind === 'service' ? input.caller.id : options.controlPlaneServiceId;
-          const subject = brokerCallerSubject(input.caller);
-          const issued = await brokerRequestToken({
-            ability,
-            brokerServiceId: options.controlPlaneServiceId,
-            caller: input.caller,
-            issuer: options.issuer,
-          })({
-            callerServiceId,
-            scopes,
-            ...(subject ? { subject } : {}),
-            targetServiceId: ability.serviceId,
-          });
+          const issued = await issueBrokerToken(ability, input.caller, options, scopes);
           const remaining = remainingBudget('during capability issuance');
           const output = await callDiscoveredAbility(
             ability,
@@ -337,7 +284,7 @@ export function createControlPlaneRpcBroker(options: CreateControlPlaneRpcBroker
           abilityId: input.abilityId,
           ...brokerCallerLogFields(input.caller),
           durationMs: now() - callReceivedAt,
-          error: error instanceof Error ? { message: error.message, name: error.name } : { message: String(error), name: 'Error' },
+          error: logErrorFields(error),
           event: 'service_plane.broker.call.failed',
           level: 'warn',
           method: input.method,
@@ -350,6 +297,27 @@ export function createControlPlaneRpcBroker(options: CreateControlPlaneRpcBroker
       }
     },
   };
+}
+
+// Minting brokered tokens for ingress-required targets and stamping the caller's access class are
+// both security-relevant, so every brokered surface mints here and nowhere else.
+function issueBrokerToken(
+  ability: DiscoveredServiceAbility,
+  caller: BrokerCaller | undefined,
+  options: Pick<CreateControlPlaneRpcBrokerOptions, 'controlPlaneServiceId' | 'issuer'>,
+  scopes: ReadonlyArray<string>,
+): Promise<IssuedCapabilityToken> {
+  const subject = brokerCallerSubject(caller);
+  const request = {
+    callerAccess: brokerCallerAccess(caller),
+    callerServiceId: caller?.kind === 'service' ? caller.id : options.controlPlaneServiceId,
+    scopes,
+    ...(subject ? { subject } : {}),
+    targetServiceId: ability.serviceId,
+  };
+  return ability.serviceIngress?.required
+    ? options.issuer.issueBrokeredCapabilityToken({ ...request, brokerServiceId: options.controlPlaneServiceId })
+    : options.issuer.issueCapabilityToken(request);
 }
 
 // App policy receives a frozen copy so auditing or policy evaluation cannot rewrite dispatch authority.
@@ -393,7 +361,7 @@ async function callDiscoveredAbility(
   method: string,
   input: unknown,
   token: string,
-  forwarded: { connInfo?: ConnInfo; idempotencyKey?: string; requestId?: string; timeoutMs?: number },
+  forwarded: Pick<ForwardedCallValues, 'connInfo' | 'idempotencyKey' | 'requestId' | 'timeoutMs'>,
   signal?: AbortSignal,
 ): Promise<unknown> {
   const nativeBinding = ability.service.abilityRpc;
@@ -416,13 +384,7 @@ async function callDiscoveredAbility(
   if (!ability.rpc.transports.includes('fetch') && !ability.rpc.transports.includes('service-binding')) {
     throw new CapabilityAuthError(`Service-Plane ability has no Fetch transport: ${ability.serviceId}/${ability.id}`, 500);
   }
-  const headers = new Headers({ authorization: servicePlaneAuthorization(token) });
-  const connInfo = serializeConnInfo(forwarded.connInfo);
-  const timeout = serializeTimeoutMs(forwarded.timeoutMs);
-  if (connInfo) headers.set(SERVICE_PLANE_CONN_INFO_HEADER, connInfo);
-  if (forwarded.idempotencyKey) headers.set(SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER, forwarded.idempotencyKey);
-  if (forwarded.requestId) headers.set(SERVICE_PLANE_REQUEST_ID_HEADER, forwarded.requestId);
-  if (timeout) headers.set(SERVICE_PLANE_TIMEOUT_HEADER, timeout);
+  const headers = applyForwardedCallHeaders(new Headers(), { ...forwarded, token });
   const link = new RPCLink({
     plugins: createRpcClientPlugins({}),
     fetch: async (url, init) => ability.service.fetch(new Request(url, init)),

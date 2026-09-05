@@ -1,5 +1,5 @@
 import { wrapAsyncIteratorPreservingEventMeta } from '@orpc/client';
-import type { StandardHeaders, StandardLazyRequest } from '@orpc/server';
+import type { StandardLazyRequest } from '@orpc/server';
 import { RPCHandler as FetchRpcHandler } from '@orpc/server/fetch';
 import { RPCHandler as WebSocketRpcHandler } from '@orpc/server/websocket';
 import { Context, type Env, Hono, type MiddlewareHandler } from 'hono';
@@ -17,13 +17,7 @@ import {
 import { orpcErrorFromServicePlane } from '../service/orpc.js';
 import { createRpcHandlerPlugins } from '../service/orpc-features.js';
 import { DEFAULT_SERVICE_PLANE_RPC_MAX_REQUEST_BODY_BYTES, type ServicePlaneServerWireOptions } from '../service/wire-options.js';
-import {
-  closeOversizedWebSocket,
-  readBoundedWebSocketMessage,
-  resolveOptionalBodyByteLimit,
-  ServicePlaneBodyTooLargeError,
-  validateBodyByteLimit,
-} from '../shared/body-limit.js';
+import { resolveOptionalBodyByteLimit, type ServicePlaneBodyTooLargeError, validateBodyByteLimit } from '../shared/body-limit.js';
 import { type ConnInfo, normalizeConnInfo } from '../shared/conn-info.js';
 import {
   createDeadlineSignal,
@@ -39,8 +33,16 @@ import {
   timeoutMsFromRequest,
   validateTimeoutPolicy,
 } from '../shared/deadline.js';
-import { CapabilityAuthError, ServicePlaneTimeoutError, servicePlaneClientError, servicePlaneErrorInfo } from '../shared/errors.js';
+import {
+  CapabilityAuthError,
+  requireNonEmpty,
+  ServicePlaneTimeoutError,
+  servicePlaneClientError,
+  servicePlaneErrorResponse,
+} from '../shared/errors.js';
 import { createFlatAbilityClient } from '../shared/flat-ability-client.js';
+import { isAsyncIterator } from '../shared/guards.js';
+import { deriveRequestContext, mergedRequestHeaders, requestIdFromContext } from '../shared/hono-context.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
 import {
   idempotencyKeyFromRequest,
@@ -51,14 +53,15 @@ import {
 import {
   defaultServicePlaneLogSink,
   emitBestEffortServicePlaneLog,
+  type ServicePlaneBrokerLogEvent,
   type ServicePlaneControlPlaneLogEvent,
   type ServicePlaneLogSink,
 } from '../shared/logging.js';
 import { normalizeOriginRelativePath } from '../shared/paths.js';
 import {
+  cancelUnusedRequestBody,
   createFetchRequestPreparation,
-  DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS,
-  preserveRuntimeRequestMetadata,
+  preparationDeadlineAt,
   requestWithBoundedBody,
 } from '../shared/request-preparation.js';
 import { rpcProtocolExposedHeaders, rpcProtocolPreflight, SERVICE_PLANE_BROKER_RPC_PATH } from '../shared/rpc-protocol.js';
@@ -78,8 +81,13 @@ import {
 } from '../shared/types.js';
 import { OrderedWebSocketTasks } from '../shared/web-socket-tasks.js';
 import { runBestEffortCacheOperation } from './best-effort-cache.js';
-import { type ControlPlaneRpcBroker, controlPlaneBrokerRouter, createControlPlaneRpcBroker } from './broker.js';
-import type { BrokerCaller, ControlPlaneAuthorizationInvocation, ControlPlaneInvocationAuthorizer } from './caller.js';
+import {
+  type ControlPlaneBrokerProcedureContext,
+  type ControlPlaneRpcBroker,
+  controlPlaneBrokerRouter,
+  createControlPlaneRpcBroker,
+} from './broker.js';
+import type { BrokerCaller, ControlPlaneAuthorizationInvocation } from './caller.js';
 import {
   type CapabilityIssuer,
   type CapabilitySigningAuthority,
@@ -89,7 +97,12 @@ import {
   type MountCapabilityEndpointsOptions,
   mountCapabilityEndpoints,
 } from './capabilities.js';
-import { assertControlPlaneOperationCanStart, type ControlPlaneOperationDeadline, raceControlPlaneOperation } from './invocation.js';
+import {
+  assertControlPlaneOperationCanStart,
+  type ControlPlaneInvocationOptions,
+  type ControlPlaneOperationDeadline,
+  raceControlPlaneOperation,
+} from './invocation.js';
 import {
   type ControlPlaneMcpServerInfo,
   controlPlaneMcpErrorResponse,
@@ -194,25 +207,36 @@ export type ControlPlaneAbilityClient<TAbility extends AnyServiceAbilityDefiniti
   ControlPlaneAbilityClientCallOptions
 >;
 
-type BrokeredRequest = {
-  caller: BrokerCaller;
+/** What the plane forwards for one request and the caller it authenticated, fixed when the scope opens. */
+type ControlPlaneRequestFacts = {
+  caller: BrokerCaller | undefined;
   connInfo: ConnInfo | undefined;
   idempotencyKey: string | undefined;
-  issuer: CapabilityIssuer;
-  registry: ServiceRegistry;
+  receivedAt: number;
   requestId: string | undefined;
   timeoutMs: number | undefined;
 };
 
+/** One request's lazily resolved dependencies; see `requestScope`. */
+type ControlPlaneRequestScope = {
+  /** Calls abilities through this request's authorization and catalog; per-call headers may narrow the budget. */
+  broker(headers?: Headers): Promise<ControlPlaneRpcBroker>;
+  /** The facts a projected REST or MCP method dispatches with; the issuer inside resolves lazily. */
+  invocation(): ControlPlaneInvocationOptions;
+  log?: (event: ServicePlaneBrokerLogEvent) => void;
+  /** Discovery bound to this request's single snapshot. */
+  registry: Pick<ServiceRegistry, 'discover'>;
+};
+
 const BROKER_WEB_SOCKET_TOO_LARGE_MESSAGE = 'Service-Plane broker WebSocket message exceeds broker.maxRequestBodyBytes';
 
-// The two ways the catalog gets used, which is the only split worth configuring. `token` covers the
-// whole call path — issuing a token, brokering, MCP — because a brokered call *is* an issuance plus
-// a registry lookup and both must come from one snapshot. `openapi` is the projection path: cold,
-// infrequent, and happy on a store whose reads are slow.
-const DISCOVERY_CACHE_ROUTES = ['openapi', 'token'] as const;
-
-export type DiscoveryCacheRoute = (typeof DISCOVERY_CACHE_ROUTES)[number];
+/**
+ * The two ways the catalog gets used, which is the only split worth configuring. `token` covers the
+ * whole call path — issuing a token, brokering, MCP — because a brokered call *is* an issuance plus
+ * a registry lookup and both must come from one snapshot. `openapi` is the projection path: cold,
+ * infrequent, and happy on a store whose reads are slow.
+ */
+export type DiscoveryCacheRoute = 'openapi' | 'token';
 
 /**
  * `default` covers every route not named. A route set to `false` resolves the catalog fresh.
@@ -228,9 +252,6 @@ function discoveryCachesFor(
 ): Record<DiscoveryCacheRoute, RegistryCache | undefined> {
   // One instance for every route, so routes left on the default share a single warm snapshot
   // instead of each fetching the catalog into its own copy.
-  const sharedByAllRoutes = (cache: RegistryCache | undefined) =>
-    Object.fromEntries(DISCOVERY_CACHE_ROUTES.map((route) => [route, cache])) as Record<DiscoveryCacheRoute, RegistryCache | undefined>;
-
   if (option === undefined) return sharedByAllRoutes(memoryRegistryCache());
   if (option === false) return sharedByAllRoutes(undefined);
   if (isRegistryCache(option)) return sharedByAllRoutes(option);
@@ -238,12 +259,15 @@ function discoveryCachesFor(
   // Per-route object: `default` covers the routes not named, and a route set to `false` opts out
   // on its own.
   const fallback = option.default ?? memoryRegistryCache();
-  return Object.fromEntries(
-    DISCOVERY_CACHE_ROUTES.map((route) => {
-      const configured = option[route] ?? fallback;
-      return [route, configured === false ? undefined : configured];
-    }),
-  ) as Record<DiscoveryCacheRoute, RegistryCache | undefined>;
+  const routeCache = (route: DiscoveryCacheRoute) => {
+    const configured = option[route] ?? fallback;
+    return configured === false ? undefined : configured;
+  };
+  return { openapi: routeCache('openapi'), token: routeCache('token') };
+}
+
+function sharedByAllRoutes(cache: RegistryCache | undefined): Record<DiscoveryCacheRoute, RegistryCache | undefined> {
+  return { openapi: cache, token: cache };
 }
 
 export type ServicePlaneControlPlaneOptions<TEnv extends Env = Env> = {
@@ -350,8 +374,10 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   // process on Node, the granularity a process-local cache can actually have.
   private readonly discoveryCaches: Record<DiscoveryCacheRoute, RegistryCache | undefined>;
   private readonly discoveryMaxResponseBytes: number;
+  private readonly issuerName: string;
   private readonly log: ServicePlaneLogSink | undefined;
   private readonly reservedRestPaths: string[];
+  private readonly serviceId: string;
   // Single slot rather than a map: JWKS is a hot route, and the only reason the derived key set
   // changes is a rotation, which should replace the memo instead of growing it. The resolved key
   // set is kept alongside so a hit is a synchronous compare rather than an awaited digest; it holds
@@ -367,6 +393,8 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   constructor(private readonly options: ServicePlaneControlPlaneOptions<TEnv>) {
     this.app = (options.app ?? new Hono<ServicePlaneControlPlaneEnv<TEnv>>()) as Hono<ServicePlaneControlPlaneEnv<TEnv>>;
     this.log = options.log === false ? undefined : (options.log ?? defaultServicePlaneLogSink);
+    this.issuerName = options.issuer ?? 'control-plane';
+    this.serviceId = options.controlPlaneServiceId ?? 'control-plane';
     validateTimeoutPolicy(options.timeout);
     this.discoveryMaxResponseBytes = validateBodyByteLimit(
       options.discoveryMaxResponseBytes ?? DEFAULT_SERVICE_DISCOVERY_RESPONSE_MAX_BYTES,
@@ -391,7 +419,9 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     );
 
     mountCapabilityEndpoints(this.app, (context) => this.issuerFor(context as Context<TEnv>), {
-      authenticateCaller: options.authenticateCaller ?? ((context) => missingAuthenticateCaller(context, this.log)),
+      authenticateCaller:
+        options.authenticateCaller ?? ((context) => callerNotConfigured(context, this.log, AUTHENTICATE_CALLER_MISSING_MESSAGE)),
+
       ...(options.httpCache === undefined ? {} : { httpCache: options.httpCache }),
       // JWKS answers from the signing authority only. Verifiers must be able to refresh keys while
       // target services are unreachable, and the public key does not depend on the catalog.
@@ -430,50 +460,25 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     const connInfo = normalizeConnInfo(input.connInfo);
     const defaultRequestId = normalizeForwardedToken(input.requestId);
     validateAbilityClientTimeoutMs(input.timeoutMs, 'default');
-    const broker = async (
-      callOptions: ControlPlaneAbilityClientCallOptions,
-      receivedAt: number,
-      timeoutMs: number | undefined,
-    ): Promise<ControlPlaneRpcBroker> => {
-      // This object is only a typed in-process facade. Authorization remains per call so a grant
-      // revocation or endpoint change cannot stay hidden for the lifetime of a cached client.
+    // Authorization stays per call so a grant revocation or endpoint change cannot hide behind a
+    // cached client: every call opens its own request scope over a fresh native context.
+    const broker = (callOptions: ControlPlaneAbilityClientCallOptions, receivedAt: number, timeoutMs: number | undefined) => {
       const context = nativeControlPlaneContext<TEnv>(bindings);
-      const services = await this.options.services(context);
-      const cache = this.discoveryCaches.token;
-      const registry = requestScopedRegistry(
-        createRequestServiceRegistry(
-          {
-            ...(cache ? { cache } : {}),
-            maxResponseBytes: this.discoveryMaxResponseBytes,
-            reservedRestPaths: this.reservedRestPaths,
-            services,
-          },
-          requestDeadlineAt(receivedAt, timeoutMs),
-        ),
-      );
-      const requestId = normalizeForwardedToken(callOptions.requestId) ?? defaultRequestId ?? brokerRequestId(context);
-      const idempotencyKey = callOptions.idempotencyKey ?? input.idempotencyKey;
-      const log = this.log;
-      return createControlPlaneRpcBroker({
-        ...this.invocationAuthorization(context),
-        ...(connInfo ? { connInfo } : {}),
-        controlPlaneServiceId: this.options.controlPlaneServiceId ?? 'control-plane',
-        ...(idempotencyKey ? { idempotencyKey } : {}),
-        issuer: lazyCapabilityIssuer(() => this.issuerFor(context, services, registry)),
-        ...(log ? { log: (event) => log(event, context) } : {}),
+      return this.requestScope(context, 'in-process', {
+        caller: input.caller,
+        connInfo,
+        idempotencyKey: callOptions.idempotencyKey ?? input.idempotencyKey,
         receivedAt,
-        registry,
-        ...(requestId ? { requestId } : {}),
-        ...(timeoutMs === undefined ? {} : { timeoutMs }),
-      });
+        requestId: normalizeForwardedToken(callOptions.requestId) ?? defaultRequestId ?? brokerRequestId(context),
+        timeoutMs,
+      }).broker();
     };
     return controlPlaneAbilityClient(broker, input, scopesByMethod, this.options.timeout);
   }
 
   /** Creates the native STS surface for one deployment-pinned service identity. */
   capabilityTokenBinding(callerServiceId: string, bindings: TEnv['Bindings']): ControlPlaneRpcTokenBinding {
-    const pinnedCallerServiceId = callerServiceId.trim();
-    if (!pinnedCallerServiceId) throw new CapabilityAuthError('Service-Plane caller service id cannot be empty', 500);
+    const pinnedCallerServiceId = requireNonEmpty(callerServiceId, 'caller service id');
     return {
       issueCapabilityToken: async (input) => {
         const context = nativeControlPlaneContext<TEnv>(bindings);
@@ -494,8 +499,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       DEFAULT_SERVICE_PLANE_RPC_MAX_REQUEST_BODY_BYTES,
       'Service-Plane maxRequestBodyBytes must be a positive integer or false',
     );
-    const plugins = createRpcHandlerPlugins(brokerOptions, false);
-    const handlerOptions = plugins.length > 0 ? { plugins } : {};
+    const handlerOptions = { plugins: createRpcHandlerPlugins(brokerOptions, false) };
     const orpcHandler = new FetchRpcHandler(controlPlaneBrokerRouter, handlerOptions);
     const upgradeWebSocket = brokerOptions.upgradeWebSocket;
     if (upgradeWebSocket) {
@@ -505,65 +509,36 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
         if (context.req.header('upgrade')?.toLowerCase() !== 'websocket') {
           return new Response('Service-Plane broker WebSocket upgrade required', { status: 426 });
         }
-        const receivedAt = Date.now();
-        const timeoutMs = resolveTimeoutMs(timeoutMsFromRequest(context.req), this.options.timeout);
-        const deadline = { receivedAt, ...(timeoutMs === undefined ? {} : { timeoutMs }) };
+        const deadline = operationDeadline(Date.now(), resolveTimeoutMs(timeoutMsFromRequest(context.req), this.options.timeout));
         setControlPlaneInvocation(context, { surface: 'broker' });
         try {
           return await raceControlPlaneOperation(
             this.runInvocationMiddleware(
               context,
               async () => {
-                if (!controlPlaneCaller(context)) return invocationCallerNotConfigured(context, this.log);
+                if (!controlPlaneCaller(context)) return callerNotConfigured(context, this.log, INVOCATION_CALLER_MISSING_MESSAGE);
                 return upgradeWebSocket(context, {
                   onClose: (_event, socket) => {
                     void webSocketTasks.run(socket, () => websocketHandler.close(socket));
                   },
                   onMessage: (event, socket) => {
                     const receivedAt = Date.now();
-                    const delivery = webSocketTasks.run(socket, async () => {
-                      let data: string | ArrayBuffer;
-                      try {
-                        data = await readBoundedWebSocketMessage(event.data, maxRequestBodyBytes, BROKER_WEB_SOCKET_TOO_LARGE_MESSAGE);
-                      } catch (error) {
-                        if (!(error instanceof ServicePlaneBodyTooLargeError)) throw error;
-                        closeOversizedWebSocket(socket);
-                        return;
-                      }
-                      return {
-                        completion: websocketHandler.message(socket, data, {
+                    return webSocketTasks.deliver(socket, event.data, {
+                      closeOnOversized: true,
+                      maxBytes: maxRequestBodyBytes,
+                      send: (data) =>
+                        websocketHandler.message(socket, data, {
+                          // Each frame is its own logical request: it resolves the catalog once and
+                          // answers every call in its batch from that snapshot.
                           context: async (request: StandardLazyRequest) => {
                             const callContext = controlPlaneRpcMessageContext(context as unknown as Context<TEnv>, request);
-                            let resolving: Promise<Response | BrokeredRequest> | undefined;
-                            return {
-                              resolveBroker: async (headers?: Headers) => {
-                                const requestedTimeoutMs = headers?.has(SERVICE_PLANE_TIMEOUT_HEADER)
-                                  ? resolveTimeoutMs(parseTimeoutMs(headers.get(SERVICE_PLANE_TIMEOUT_HEADER)), this.options.timeout)
-                                  : resolveTimeoutMs(timeoutMsFromRequest(callContext.req), this.options.timeout);
-                                resolving ??= this.resolveBrokeredRequest(callContext, undefined, undefined, {
-                                  receivedAt,
-                                  ...(requestedTimeoutMs === undefined ? {} : { timeoutMs: requestedTimeoutMs }),
-                                });
-                                const resolved = await raceControlPlaneOperation(
-                                  resolving,
-                                  { receivedAt, ...(requestedTimeoutMs === undefined ? {} : { timeoutMs: requestedTimeoutMs }) },
-                                  'broker service resolution',
-                                );
-                                if (resolved instanceof Response) throw brokerCallerResolutionError(resolved);
-                                return {
-                                  broker: this.brokerForRequest(resolved, callContext, receivedAt, headers),
-                                  caller: resolved.caller,
-                                };
-                              },
-                            };
+                            const timeoutMs = resolveTimeoutMs(timeoutMsFromRequest(callContext.req), this.options.timeout);
+                            return { resolveBroker: this.brokerResolver(callContext, receivedAt, timeoutMs) };
                           },
                           prefix: path as `/${string}`,
                         }),
-                      };
+                      tooLargeMessage: BROKER_WEB_SOCKET_TOO_LARGE_MESSAGE,
                     });
-                    // Keep independent RPC calls concurrent after their frames have entered the private
-                    // peer; only the order-sensitive normalization and delivery step is serialized.
-                    return delivery.then((result) => result?.completion);
                   },
                 });
               },
@@ -574,7 +549,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
             'broker WebSocket invocation middleware',
           );
         } catch (error) {
-          return controlPlaneRouteErrorResponse(error);
+          return servicePlaneErrorResponse(error, CONTROL_PLANE_REQUEST_FAILED_MESSAGE);
         }
       });
     }
@@ -587,7 +562,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       // does. Stamping later would hand the service a budget the caller has already partly spent.
       const receivedAt = Date.now();
       const requestTimeoutMs = resolveTimeoutMs(timeoutMsFromRequest(context.req), this.options.timeout);
-      const deadline = { receivedAt, ...(requestTimeoutMs === undefined ? {} : { timeoutMs: requestTimeoutMs }) };
+      const deadline = operationDeadline(receivedAt, requestTimeoutMs);
       let rawRequest: Request;
       let physicalBodyError: ServicePlaneBodyTooLargeError | undefined;
       try {
@@ -600,17 +575,13 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
           },
         );
       } catch (error) {
-        return controlPlaneRouteErrorResponse(error);
+        return servicePlaneErrorResponse(error, CONTROL_PLANE_REQUEST_FAILED_MESSAGE);
       }
       // Product authentication may bind a signature to the body. Give the private decoder its own
       // branch so middleware can consume the original without making the RPC request unusable.
       const decodingSource = this.options.invocationMiddleware ? rawRequest.clone() : rawRequest;
-      const preparationTimeoutMs = Math.min(
-        requestTimeoutMs ?? DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS,
-        DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS,
-      );
       const preparation = createFetchRequestPreparation(decodingSource, {
-        deadlineAt: receivedAt + preparationTimeoutMs,
+        deadlineAt: preparationDeadlineAt(receivedAt, requestTimeoutMs),
         deadlineError: () => new ServicePlaneTimeoutError('Service-Plane broker request decoding exceeded its deadline'),
         ...(this.options.invocationMiddleware ? { linkedRequests: [rawRequest] } : {}),
       });
@@ -624,33 +595,14 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
               this.runInvocationMiddleware(
                 context,
                 async () => {
-                  if (!controlPlaneCaller(context)) return invocationCallerNotConfigured(context, this.log);
-                  let resolving: Promise<Response | BrokeredRequest> | undefined;
-                  const handled = await orpcHandler.handle(decodingRequest, {
-                    context: {
-                      resolveBroker: async (headers?: Headers) => {
-                        preparation.complete();
-                        const requestedTimeoutMs = headers?.has(SERVICE_PLANE_TIMEOUT_HEADER)
-                          ? resolveTimeoutMs(parseTimeoutMs(headers.get(SERVICE_PLANE_TIMEOUT_HEADER)), this.options.timeout)
-                          : requestTimeoutMs;
-                        resolving ??= this.resolveBrokeredRequest(context as Context<TEnv>, undefined, undefined, {
-                          receivedAt,
-                          ...(requestedTimeoutMs === undefined ? {} : { timeoutMs: requestedTimeoutMs }),
-                        });
-                        const resolved = await raceControlPlaneOperation(
-                          resolving,
-                          { receivedAt, ...(requestedTimeoutMs === undefined ? {} : { timeoutMs: requestedTimeoutMs }) },
-                          'broker service resolution',
-                        );
-                        if (resolved instanceof Response) throw brokerCallerResolutionError(resolved);
-                        return {
-                          broker: this.brokerForRequest(resolved, context as unknown as Context<TEnv>, receivedAt, headers),
-                          caller: resolved.caller,
-                        };
-                      },
-                    },
-                    prefix: path as `/${string}`,
-                  });
+                  if (!controlPlaneCaller(context)) return callerNotConfigured(context, this.log, INVOCATION_CALLER_MISSING_MESSAGE);
+                  const resolveBroker = this.brokerResolver(
+                    context as unknown as Context<TEnv>,
+                    receivedAt,
+                    requestTimeoutMs,
+                    preparation.complete,
+                  );
+                  const handled = await orpcHandler.handle(decodingRequest, { context: { resolveBroker }, prefix: path as `/${string}` });
                   if (physicalBodyError) throw physicalBodyError;
                   return handled.matched ? handled.response : new Response('Service-Plane broker method not found', { status: 404 });
                 },
@@ -663,12 +615,37 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
           discardDisposableValue,
         );
       } catch (error) {
-        return controlPlaneRouteErrorResponse(error);
+        return servicePlaneErrorResponse(error, CONTROL_PLANE_REQUEST_FAILED_MESSAGE);
       } finally {
         cancelUnusedRequestBody(decodingRequest);
         if (middlewareRequest) cancelUnusedRequestBody(middlewareRequest);
       }
     });
+  }
+
+  // Both broker transports resolve the caller's catalog once per physical request or frame and
+  // answer every logical call in it from that snapshot; per-call headers may only narrow the budget
+  // and relabel the attempt. The caller was checked before the private decoder ran, and is checked
+  // again here so a decoded call can never dispatch as plane-owned.
+  private brokerResolver(
+    context: Context<TEnv>,
+    receivedAt: number,
+    fallbackTimeoutMs: number | undefined,
+    onResolve?: () => void,
+  ): ControlPlaneBrokerProcedureContext['resolveBroker'] {
+    let scope: ControlPlaneRequestScope | undefined;
+    return async (headers) => {
+      onResolve?.();
+      const caller = controlPlaneCaller(context);
+      if (!caller) throw brokerCallerResolutionError(callerNotConfigured(context, this.log, INVOCATION_CALLER_MISSING_MESSAGE));
+      scope ??= this.requestScope(context, 'broker', {
+        ...forwardedRequestFacts(context),
+        caller,
+        receivedAt,
+        timeoutMs: fallbackTimeoutMs,
+      });
+      return { broker: await scope.broker(headers), caller };
+    };
   }
 
   private mountMcp(mcpOptions: Exclude<ServicePlaneControlPlaneOptions<TEnv>['mcp'], false | undefined>): void {
@@ -694,8 +671,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       // Authentication may bind a signature to the body. Parse a clone only after middleware has
       // inspected the untouched original request.
       const preparation = createFetchRequestPreparation(context.req.raw.clone(), {
-        deadlineAt:
-          receivedAt + Math.min(timeoutMs ?? DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS, DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS),
+        deadlineAt: preparationDeadlineAt(receivedAt, timeoutMs),
         deadlineError: () => new ServicePlaneTimeoutError('Service-Plane MCP request decoding exceeded its deadline'),
         linkedRequests: [context.req.raw],
       });
@@ -703,15 +679,15 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       context.req.raw = preparation.linkedRequests[0] as Request;
 
       setControlPlaneInvocation(context, { surface: 'mcp' });
+      const deadline = operationDeadline(receivedAt, timeoutMs);
       let parsedRequestId: string | number | null = null;
       try {
         return await preparation.run(async () => {
-          const deadline = { receivedAt, ...(timeoutMs === undefined ? {} : { timeoutMs }) };
           const invocation = this.runInvocationMiddleware(
             context,
             async () => {
               const caller = controlPlaneCaller(context);
-              if (!caller) return invocationCallerNotConfigured(context, this.log);
+              if (!caller) return callerNotConfigured(context, this.log, INVOCATION_CALLER_MISSING_MESSAGE);
               let prepared: PreparedControlPlaneMcpRequest | Response;
               try {
                 prepared = await raceControlPlaneOperation(
@@ -726,62 +702,19 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
               parsedRequestId = prepared.id;
               preparation.complete();
 
-              const typedContext = context as Context<TEnv>;
-              let resolvingServices: Promise<ServiceEndpoint[]> | undefined;
-              const resolveServices = () =>
-                (resolvingServices ??= raceControlPlaneOperation(
-                  (async () => this.options.services(typedContext))(),
-                  { receivedAt, ...(timeoutMs === undefined ? {} : { timeoutMs }) },
-                  'MCP service resolution',
-                ));
-              let resolvingRegistry: Promise<ServiceRegistry> | undefined;
-              const resolveRegistry = () =>
-                (resolvingRegistry ??= (async () => {
-                  const cache = this.discoveryCaches.token;
-                  return requestScopedRegistry(
-                    createRequestServiceRegistry(
-                      {
-                        ...(cache ? { cache } : {}),
-                        maxResponseBytes: this.discoveryMaxResponseBytes,
-                        reservedRestPaths: this.reservedRestPaths,
-                        services: await resolveServices(),
-                      },
-                      requestDeadlineAt(receivedAt, timeoutMs),
-                    ),
-                  );
-                })());
-              let resolvingIssuer: Promise<CapabilityIssuer> | undefined;
-              const resolveIssuer = () =>
-                (resolvingIssuer ??= raceControlPlaneOperation(
-                  (async () => {
-                    const [services, registry] = await Promise.all([resolveServices(), resolveRegistry()]);
-                    return this.issuerFor(typedContext, services, registry);
-                  })(),
-                  { receivedAt, ...(timeoutMs === undefined ? {} : { timeoutMs }) },
-                  'MCP issuer resolution',
-                ));
-
-              const connInfo = normalizeConnInfo(controlPlaneConnInfo(context));
-              const idempotencyKey = idempotencyKeyFromRequest(context.req);
-              const requestId = brokerRequestId(context);
-              const log = this.log;
-              return handlePreparedControlPlaneMcpRequest(prepared, {
-                ...this.invocationAuthorization(typedContext),
-                ...(mcpOptions.allowedOrigins ? { allowedOrigins: mcpOptions.allowedOrigins } : {}),
+              const scope = this.requestScope(context as Context<TEnv>, 'MCP', {
+                ...forwardedRequestFacts(context),
                 caller,
-                ...(connInfo ? { connInfo } : {}),
-                controlPlaneServiceId: this.options.controlPlaneServiceId ?? 'control-plane',
-                ...(idempotencyKey ? { idempotencyKey } : {}),
-                issuer: lazyCapabilityIssuer(resolveIssuer),
-                ...(log ? { log: (event) => log(event, context) } : {}),
-                ...(mcpOptions.maxBodyBytes === undefined ? {} : { maxBodyBytes: mcpOptions.maxBodyBytes }),
-                onInvocation: (invocation) => setControlPlaneInvocation(context, { ...invocation, surface: 'mcp' }),
-                registry: { discover: async () => (await resolveRegistry()).discover() },
-                ...(requestId ? { requestId } : {}),
-                ...(mcpOptions.serverInfo ? { serverInfo: mcpOptions.serverInfo } : {}),
                 receivedAt,
+                timeoutMs,
+              });
+              return handlePreparedControlPlaneMcpRequest(prepared, {
+                ...scope.invocation(),
+                ...(scope.log ? { log: scope.log } : {}),
+                onInvocation: (target) => setControlPlaneInvocation(context, { ...target, surface: 'mcp' }),
+                registry: scope.registry,
+                ...(mcpOptions.serverInfo ? { serverInfo: mcpOptions.serverInfo } : {}),
                 ...(mcpOptions.streamLimits ? { streamLimits: mcpOptions.streamLimits } : {}),
-                ...(timeoutMs === undefined ? {} : { timeoutMs }),
               });
             },
             deadline,
@@ -796,8 +729,8 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       } catch (error) {
         return controlPlaneMcpErrorResponse(error, parsedRequestId);
       } finally {
-        if (!parsingRequest.bodyUsed) void parsingRequest.body?.cancel().catch(() => undefined);
-        if (!context.req.raw.bodyUsed) void context.req.raw.body?.cancel().catch(() => undefined);
+        cancelUnusedRequestBody(parsingRequest);
+        cancelUnusedRequestBody(context.req.raw);
       }
     });
   }
@@ -810,28 +743,17 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       }
       const receivedAt = Date.now();
       const timeoutMs = resolveTimeoutMs(timeoutMsFromRequest(context.req), this.options.timeout);
-      const typedContext = context as Context<TEnv>;
-      let resolvingServices: Promise<ServiceEndpoint[]> | undefined;
-      const resolveServices = () =>
-        (resolvingServices ??= raceControlPlaneOperation(
-          (async () => this.options.services(typedContext))(),
-          { receivedAt, ...(timeoutMs === undefined ? {} : { timeoutMs }) },
-          'REST service resolution',
-        ));
-      let resolvingRegistry: Promise<ServiceRegistry> | undefined;
-      const resolveRegistry = () =>
-        (resolvingRegistry ??= (async () => {
-          const cache = this.discoveryCaches.token;
-          return createRequestServiceRegistry(
-            {
-              ...(cache ? { cache } : {}),
-              maxResponseBytes: this.discoveryMaxResponseBytes,
-              reservedRestPaths: this.reservedRestPaths,
-              services: await resolveServices(),
-            },
-            requestDeadlineAt(receivedAt, timeoutMs),
-          );
-        })());
+      const deadline = operationDeadline(receivedAt, timeoutMs);
+      // The caller is only known once invocation middleware has run, which the REST dispatcher
+      // drives itself; the scope therefore opens on first use inside dispatch.
+      let scope: ControlPlaneRequestScope | undefined;
+      const scopeForCaller = () =>
+        (scope ??= this.requestScope(context as Context<TEnv>, 'REST', {
+          ...forwardedRequestFacts(context),
+          caller: controlPlaneCaller(context),
+          receivedAt,
+          timeoutMs,
+        }));
       return handleControlPlaneRestRequest(context.req.raw, {
         ...(this.log ? { log: (event) => this.log?.(event, context) } : {}),
         ...(restOptions.maxBodyBytes === undefined ? {} : { maxBodyBytes: restOptions.maxBodyBytes }),
@@ -840,36 +762,21 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
           await next();
           return context.res;
         },
-        runInvocationMiddleware: (next, request) => {
+        runInvocationMiddleware: (dispatch, request) => {
           context.req.raw = request;
           return this.runInvocationMiddleware(
             context,
             async () => {
-              if (!controlPlaneCaller(context)) return invocationCallerNotConfigured(context, this.log);
-              return next();
+              if (!controlPlaneCaller(context)) return callerNotConfigured(context, this.log, INVOCATION_CALLER_MISSING_MESSAGE);
+              return dispatch();
             },
-            { receivedAt, ...(timeoutMs === undefined ? {} : { timeoutMs }) },
+            deadline,
             'REST request dispatch',
           );
         },
         receivedAt,
-        registry: { discover: async () => (await resolveRegistry()).discover() },
-        resolveInvocation: async (snapshot) => {
-          const [services, registry] = await Promise.all([resolveServices(), resolveRegistry()]);
-          const resolved = await this.resolveBrokeredRequest(typedContext, services, registryFromSnapshot(registry, snapshot));
-          if (resolved instanceof Response) return resolved;
-          return {
-            ...this.invocationAuthorization(typedContext),
-            caller: resolved.caller,
-            ...(resolved.connInfo ? { connInfo: resolved.connInfo } : {}),
-            controlPlaneServiceId: this.options.controlPlaneServiceId ?? 'control-plane',
-            ...(resolved.idempotencyKey ? { idempotencyKey: resolved.idempotencyKey } : {}),
-            issuer: resolved.issuer,
-            receivedAt,
-            ...(resolved.requestId ? { requestId: resolved.requestId } : {}),
-            ...(resolved.timeoutMs === undefined ? {} : { timeoutMs: resolved.timeoutMs }),
-          };
-        },
+        registry: { discover: () => scopeForCaller().registry.discover() },
+        resolveInvocation: async () => scopeForCaller().invocation(),
         ...(timeoutMs === undefined ? {} : { timeoutMs }),
       });
     });
@@ -919,83 +826,89 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     });
   }
 
-  // REST, broker, and MCP need the same request-scoped bundle: an authenticated caller, the request's
-  // endpoint set, an issuer over it, and a registry over it. This stays a plain method rather than
-  // middleware so each mount keeps deciding what it validates *before* caller resolution — MCP
-  // rejects non-POST first, which middleware ordering would invert.
-  private async resolveBrokeredRequest(
-    context: Context<TEnv>,
-    knownServices?: ServiceEndpoint[],
-    knownRegistry?: ServiceRegistry,
-    deadline?: ControlPlaneOperationDeadline,
-  ): Promise<Response | BrokeredRequest> {
-    const caller = controlPlaneCaller(context);
-    if (!caller) return invocationCallerNotConfigured(context, this.log);
-    const services = knownServices ?? (await this.options.services(context));
-    // Both halves from one store: a brokered call needs an issuer and a registry, and reading them
-    // from two caches would mean one request warming both and combining snapshots that need not
-    // agree. Brokering is the call path, so it shares `token`.
-    const cache = this.discoveryCaches.token;
-    const registry = requestScopedRegistry(
-      knownRegistry ??
-        createRequestServiceRegistry(
-          {
-            ...(cache ? { cache } : {}),
-            maxResponseBytes: this.discoveryMaxResponseBytes,
-            reservedRestPaths: this.reservedRestPaths,
-            services,
-          },
-          requestDeadlineAt(deadline?.receivedAt, deadline?.timeoutMs),
-        ),
-    );
-    let resolvingIssuer: Promise<CapabilityIssuer> | undefined;
-    const resolveIssuer = () => (resolvingIssuer ??= this.issuerFor(context, services, registry));
+  /**
+   * The plane's view of one inbound request: its deadline, the facts it forwards, and the catalog,
+   * registry, and issuer it resolves lazily and at most once. Broker, MCP, REST, and the in-process
+   * client all authorize and route against this one snapshot, and a cheap refusal never pays for it.
+   * Both halves of a brokered call, issuer and registry, read the `token` cache so one request never
+   * combines snapshots from two stores.
+   */
+  private requestScope(context: Context<TEnv>, surface: string, facts: ControlPlaneRequestFacts): ControlPlaneRequestScope {
+    const deadline = operationDeadline(facts.receivedAt, facts.timeoutMs);
+    const log = this.log;
+    const authorize = this.options.authorizeInvocation;
+    let services: Promise<ServiceEndpoint[]> | undefined;
+    let registry: Promise<ServiceRegistry> | undefined;
+    let issuer: Promise<CapabilityIssuer> | undefined;
+    const resolveServices = () =>
+      (services ??= raceControlPlaneOperation(
+        Promise.resolve().then(() => this.options.services(context)),
+        deadline,
+        `${surface} service resolution`,
+      ));
+    const resolveRegistry = () =>
+      (registry ??= resolveServices().then((resolved) => requestScopedRegistry(this.registryFor(resolved, deadline))));
+    const resolveIssuer = () =>
+      (issuer ??= raceControlPlaneOperation(
+        Promise.all([resolveServices(), resolveRegistry()]).then(([resolved, scoped]) => this.issuerFor(context, resolved, scoped)),
+        deadline,
+        `${surface} issuer resolution`,
+      ));
+    // Route and scope checks need no signing material; the issuer resolves only once a call has
+    // passed those cheaper guards.
+    const lazyIssuer = lazyCapabilityIssuer(resolveIssuer);
+    const base = () => ({
+      ...(authorize ? { authorizeInvocation: (target: ControlPlaneAuthorizationInvocation) => authorize(target, context) } : {}),
+      ...(facts.connInfo ? { connInfo: facts.connInfo } : {}),
+      controlPlaneServiceId: this.serviceId,
+      issuer: lazyIssuer,
+      receivedAt: facts.receivedAt,
+    });
     return {
-      caller,
-      // Normalized at the boundary so the plane never forwards a value the service would reject.
-      connInfo: normalizeConnInfo(controlPlaneConnInfo(context)),
-      // Route and scope checks do not need signing material. Resolve it only once a call has passed
-      // those cheaper guards; MCP follows the same dependency boundary.
-      issuer: lazyCapabilityIssuer(resolveIssuer),
-      registry,
-      idempotencyKey: idempotencyKeyFromRequest(context.req),
-      requestId: brokerRequestId(context),
-      // The caller states its own budget; the plane spends from it rather than granting one unless
-      // a defaultMs policy says otherwise.
-      timeoutMs: resolveTimeoutMs(timeoutMsFromRequest(context.req), this.options.timeout),
+      ...(log ? { log: (event: ServicePlaneBrokerLogEvent) => log(event, context) } : {}),
+
+      registry: { discover: async () => (await resolveRegistry()).discover() },
+      invocation: () => ({
+        ...base(),
+        ...(facts.caller ? { caller: facts.caller } : {}),
+        ...(facts.idempotencyKey ? { idempotencyKey: facts.idempotencyKey } : {}),
+        ...(facts.requestId ? { requestId: facts.requestId } : {}),
+        ...(facts.timeoutMs === undefined ? {} : { timeoutMs: facts.timeoutMs }),
+      }),
+      broker: async (headers) => {
+        const timeoutMs = headers?.has(SERVICE_PLANE_TIMEOUT_HEADER)
+          ? resolveTimeoutMs(parseTimeoutMs(headers.get(SERVICE_PLANE_TIMEOUT_HEADER)), this.options.timeout)
+          : facts.timeoutMs;
+        const requestId = normalizeForwardedToken(headers?.get(SERVICE_PLANE_REQUEST_ID_HEADER)) ?? facts.requestId;
+        const idempotencyKey = normalizeIdempotencyKey(headers?.get(SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER)) ?? facts.idempotencyKey;
+        const scoped = await raceControlPlaneOperation(
+          resolveRegistry(),
+          operationDeadline(facts.receivedAt, timeoutMs),
+          `${surface} service resolution`,
+        );
+        return createControlPlaneRpcBroker({
+          ...base(),
+          ...(idempotencyKey ? { idempotencyKey } : {}),
+          ...(log ? { log: (event) => log(event, context) } : {}),
+          registry: scoped,
+          ...(requestId ? { requestId } : {}),
+          ...(timeoutMs === undefined ? {} : { timeoutMs }),
+        });
+      },
     };
   }
 
-  private brokerForRequest(
-    resolved: BrokeredRequest,
-    context: Context<TEnv>,
-    receivedAt: number,
-    headers?: Headers,
-  ): ControlPlaneRpcBroker {
-    const requestId = normalizeForwardedToken(headers?.get(SERVICE_PLANE_REQUEST_ID_HEADER)) ?? resolved.requestId;
-    const idempotencyKey = normalizeIdempotencyKey(headers?.get(SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER)) ?? resolved.idempotencyKey;
-    const timeoutMs = headers?.has(SERVICE_PLANE_TIMEOUT_HEADER)
-      ? resolveTimeoutMs(parseTimeoutMs(headers.get(SERVICE_PLANE_TIMEOUT_HEADER)), this.options.timeout)
-      : resolved.timeoutMs;
-    const log = this.log;
-    return createControlPlaneRpcBroker({
-      ...this.invocationAuthorization(context),
-      ...(resolved.connInfo ? { connInfo: resolved.connInfo } : {}),
-      controlPlaneServiceId: this.options.controlPlaneServiceId ?? 'control-plane',
-      ...(idempotencyKey ? { idempotencyKey } : {}),
-      issuer: resolved.issuer,
-      ...(log ? { log: (event) => log(event, context) } : {}),
-      receivedAt,
-      registry: resolved.registry,
-      ...(requestId ? { requestId } : {}),
-      ...(timeoutMs === undefined ? {} : { timeoutMs }),
-    });
-  }
-
-  // Close over the request context once; each logical invocation supplies its own immutable target.
-  private invocationAuthorization(context: Context<TEnv>): { authorizeInvocation?: ControlPlaneInvocationAuthorizer } {
-    const authorize = this.options.authorizeInvocation;
-    return authorize ? { authorizeInvocation: (invocation) => authorize(invocation, context) } : {};
+  private registryFor(services: ServiceEndpoint[], deadline: ControlPlaneOperationDeadline): ServiceRegistry {
+    const cache = this.discoveryCaches.token;
+    return createRequestServiceRegistry(
+      {
+        ...(cache ? { cache } : {}),
+        maxResponseBytes: this.discoveryMaxResponseBytes,
+        reservedRestPaths: this.reservedRestPaths,
+        services,
+      },
+      requestDeadlineAt(deadline.receivedAt, deadline.timeoutMs),
+    );
   }
 
   private async runInvocationMiddleware(
@@ -1024,7 +937,6 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
   // Signing authority: key material only. Deliberately does not resolve `services`.
   private async signingAuthorityFor(context: Context<TEnv>): Promise<CapabilitySigningAuthority> {
     const keys = await this.options.signingKeys(context.env, context);
-    const issuer = this.options.issuer ?? 'control-plane';
     // The whole ordered key set is the identity: rotating the active key, retiring an old one, and
     // reordering after a rollback must each invalidate the memo. Compared directly rather than
     // through a digest, because this is the JWKS hit path and a compare keeps it synchronous.
@@ -1036,10 +948,10 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     // verification against the published set.
     const resolved = snapshotSigningKeys(keys);
     const memo = this.signingAuthority;
-    if (memo && memo.issuer === issuer && sameCapabilitySigningKeys(memo.keys, resolved)) return memo.authority;
+    if (memo && memo.issuer === this.issuerName && sameCapabilitySigningKeys(memo.keys, resolved)) return memo.authority;
 
-    const authority = createCapabilitySigningAuthority({ issuer, privateJwks: await this.signingMaterialFor(resolved) });
-    this.signingAuthority = { authority, issuer, keys: resolved };
+    const authority = createCapabilitySigningAuthority({ issuer: this.issuerName, privateJwks: await this.signingMaterialFor(resolved) });
+    this.signingAuthority = { authority, issuer: this.issuerName, keys: resolved };
     return authority;
   }
 
@@ -1079,40 +991,22 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     resolvingMaterial.catch(() => undefined);
     const resolvingCatalog = (async () => {
       const resolvedServices = services ?? (await this.options.services(context));
-      const capabilities = registry
-        ? (await registry.discover()).services.flatMap((service) => (service.capabilities ? [service.capabilities] : []))
-        : await discoverServiceCapabilities(
-            resolvedServices,
-            this.discoveryCaches.token,
-            undefined,
-            this.reservedRestPaths,
-            this.discoveryMaxResponseBytes,
-          );
+      const snapshot = await (registry ?? this.registryFor(resolvedServices, {})).discover();
+      const capabilities = snapshot.services.flatMap((service) => (service.capabilities ? [service.capabilities] : []));
       return { capabilities, resolvedServices };
     })();
     resolvingCatalog.catch(() => undefined);
     const [privateJwks, { capabilities, resolvedServices }] = await Promise.all([resolvingMaterial, resolvingCatalog]);
-    const grantDefinition = {
-      grants: serviceGrantsFromEndpoints(resolvedServices),
-    };
     // The issuer itself is deliberately NOT cached. Everything expensive about building one lives in
-    // the signing material memoized above — deriving each private JWK is a P-256 scalar
-    // multiplication and proving the pair is a sign/verify round-trip, ~9.5ms together — while what
-    // is left here is assembling a catalog and a grant map. Measured end to end against a variant
-    // that did cache the issuer, rebuilding per request costs +0.5% at one service, +1.5% at 20,
-    // +2.4% at 50 and +5.7% at 200 (`npm run bench`, and the component benchmarks that pin the
-    // ratio). A cache for that would need a bound, an eviction policy, an expiry and a key that must
-    // not leak the signing secret — four things to get right for single-digit microseconds.
-    //
-    // Revisit if a plane carries a catalog large enough to move that number: the assembly cost is
-    // what scales with the number of services, and it is benchmarked so the tradeoff stays visible.
+    // the signing material memoized above; what is left here is assembling a catalog and a grant
+    // map, measured at +0.5% per request at one service and +5.7% at 200 (`npm run bench`). A cache
+    // for that would need a bound, an eviction policy, an expiry and a key that must not leak the
+    // signing secret — four things to get right for single-digit microseconds.
     return createCapabilityIssuerFromPrivateJwk({
       capabilities,
-      grants: grantDefinition,
+      grants: { grants: serviceGrantsFromEndpoints(resolvedServices) },
       privateJwks,
-      // Defaults were previously filled by the from-signing-keys wrapper; applied here so building
-      // straight from derived material keeps the same issuer identity and token lifetime.
-      issuer: this.options.issuer ?? 'control-plane',
+      issuer: this.issuerName,
       ttlSeconds: this.options.ttlSeconds ?? DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
       // Already proven when this key set's material was derived, and that memo is keyed on the exact
       // key set, so re-checking the same pair here would repeat work that cannot have changed.
@@ -1120,6 +1014,10 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
     });
   }
 }
+
+const AUTHENTICATE_CALLER_MISSING_MESSAGE = 'Service-Plane caller authentication is not configured';
+const INVOCATION_CALLER_MISSING_MESSAGE = 'Service-Plane Hono invocation context is missing servicePlaneCaller';
+const CONTROL_PLANE_REQUEST_FAILED_MESSAGE = 'Service-Plane request failed';
 
 function nativeControlPlaneContext<TEnv extends Env>(bindings: TEnv['Bindings']): Context<TEnv> {
   const requestId = crypto.randomUUID();
@@ -1133,65 +1031,44 @@ function nativeControlPlaneContext<TEnv extends Env>(bindings: TEnv['Bindings'])
   return context as unknown as Context<TEnv>;
 }
 
+// One frame of a broker socket becomes its own logical request, keeping the authenticated caller,
+// connection info, and invocation variables the upgrade request established.
 function controlPlaneRpcMessageContext<TEnv extends Env>(base: Context<TEnv>, message: StandardLazyRequest): Context<TEnv> {
-  const headers = new Headers(base.req.raw.headers);
-  applyStandardHeaders(headers, message.headers);
+  const headers = mergedRequestHeaders(base.req.raw.headers, message.headers);
   const requestId = normalizeForwardedToken(headers.get(SERVICE_PLANE_REQUEST_ID_HEADER)) ?? brokerRequestId(base);
   if (requestId) headers.set(SERVICE_PLANE_REQUEST_ID_HEADER, requestId);
-  const request = preserveRuntimeRequestMetadata(
-    base.req.raw,
-    new Request(base.req.url, {
-      headers,
-      method: message.method,
-      ...(message.signal ? { signal: message.signal } : {}),
-    }),
-  );
-  const context = new Context<ServicePlaneControlPlaneEnv<TEnv>>(request, {
-    env: base.env,
-    ...contextExecutionOptions(base),
-    path: base.req.path,
-  });
-  for (const [name, value] of Object.entries(base.var)) context.set(name as never, value as never);
-  if (requestId) context.set('requestId', requestId);
-  const caller = controlPlaneCaller(base);
-  if (caller) context.set('servicePlaneCaller', caller);
-  const connInfo = controlPlaneConnInfo(base);
-  if (connInfo) context.set('servicePlaneConnInfo', connInfo);
-  context.set('servicePlaneInvocation' as never, { surface: 'broker' } as never);
-  return context as unknown as Context<TEnv>;
+  return deriveRequestContext(base, { headers, method: message.method, signal: message.signal }, requestId);
 }
 
-function contextExecutionOptions(context: Context): { executionCtx?: Context['executionCtx'] } {
-  try {
-    return { executionCtx: context.executionCtx };
-  } catch {
-    return {};
-  }
+// What an HTTP surface forwards downstream, read once from the authenticated request.
+function forwardedRequestFacts(context: Context): Pick<ControlPlaneRequestFacts, 'connInfo' | 'idempotencyKey' | 'requestId'> {
+  return {
+    // Normalized at the boundary so the plane never forwards a value the service would reject.
+    connInfo: normalizeConnInfo(controlPlaneConnInfo(context)),
+    idempotencyKey: idempotencyKeyFromRequest(context.req),
+    requestId: brokerRequestId(context),
+  };
 }
 
-function applyStandardHeaders(target: Headers, source: StandardHeaders): void {
-  for (const [name, value] of Object.entries(source)) {
-    if (value === undefined) continue;
-    target.delete(name);
-    for (const item of Array.isArray(value) ? value : [value]) target.append(name, item);
-  }
+function operationDeadline(receivedAt: number, timeoutMs: number | undefined): ControlPlaneOperationDeadline {
+  return { receivedAt, ...(timeoutMs === undefined ? {} : { timeoutMs }) };
 }
 
-function missingAuthenticateCaller(context: Context, log: ServicePlaneLogSink | undefined): Response {
+function callerNotConfigured(context: Context, log: ServicePlaneLogSink | undefined, message: string): Response {
   const requestId = brokerRequestId(context);
   const event: ServicePlaneControlPlaneLogEvent = {
     event: 'service_plane.caller_auth.not_configured',
     level: 'error',
-    message: 'Service-Plane caller authentication is not configured',
+    message,
     path: new URL(context.req.url).pathname,
     ...(requestId ? { requestId } : {}),
   };
   emitBestEffortServicePlaneLog(log, event, context);
-  return context.json({ error: 'Service-Plane caller authentication is not configured' }, 500);
+  return context.json({ error: message }, 500);
 }
 
 function brokerRequestId(context: Context): string | undefined {
-  return requestIdFromContext(context) ?? context.req.header(SERVICE_PLANE_REQUEST_ID_HEADER)?.trim() ?? undefined;
+  return requestIdFromContext(context) ?? context.req.header(SERVICE_PLANE_REQUEST_ID_HEADER)?.trim();
 }
 
 function controlPlaneCaller(context: Context): BrokerCaller | undefined {
@@ -1204,41 +1081,6 @@ function controlPlaneConnInfo(context: Context): ConnInfo | undefined {
 
 function setControlPlaneInvocation(context: Context, invocation: ServicePlaneControlPlaneInvocation): void {
   context.set('servicePlaneInvocation' as never, invocation as never);
-}
-
-function invocationCallerNotConfigured(context: Context, log: ServicePlaneLogSink | undefined): Response {
-  const requestId = requestIdFromContext(context) ?? context.req.header(SERVICE_PLANE_REQUEST_ID_HEADER) ?? undefined;
-  const event: ServicePlaneControlPlaneLogEvent = {
-    event: 'service_plane.caller_auth.not_configured',
-    level: 'error',
-    message: 'Service-Plane Hono invocation context is missing servicePlaneCaller',
-    path: new URL(context.req.url).pathname,
-    ...(requestId ? { requestId } : {}),
-  };
-  emitBestEffortServicePlaneLog(log, event, context);
-  return context.json({ error: event.message }, 500);
-}
-
-function controlPlaneRouteErrorResponse(error: unknown): Response {
-  const info = servicePlaneErrorInfo(error);
-  if (!info)
-    return Response.json({ error: { code: 'internal', message: 'Service-Plane request failed', retryable: false } }, { status: 500 });
-  return Response.json(
-    {
-      error: {
-        code: info.code,
-        message: info.message,
-        ...(info.reason ? { reason: info.reason } : {}),
-        retryable: info.retryable,
-      },
-    },
-    { status: info.status },
-  );
-}
-
-function requestIdFromContext(context: Context): string | undefined {
-  const value = context.get('requestId' as never) as unknown;
-  return typeof value === 'string' ? value : undefined;
 }
 
 function registryFromSnapshot(registry: ServiceRegistry, snapshot: ServiceRegistrySnapshot): ServiceRegistry {
@@ -1267,10 +1109,6 @@ function lazyCapabilityIssuer(resolve: () => Promise<CapabilityIssuer>): Capabil
   };
 }
 
-function cancelUnusedRequestBody(request: Request): void {
-  if (!request.bodyUsed) void request.body?.cancel().catch(() => undefined);
-}
-
 function requestDeadlineAt(receivedAt: number | undefined, timeoutMs: number | undefined): number | undefined {
   return timeoutMs === undefined ? undefined : (receivedAt ?? Date.now()) + timeoutMs;
 }
@@ -1293,24 +1131,6 @@ function hasLaterApplicationRoute(context: Context): boolean {
   return matchedRoutes(context)
     .slice(context.req.routeIndex + 1)
     .some((route) => (route.path !== '*' && route.path !== '/*') || route.handler.length < 2);
-}
-
-async function discoverServiceCapabilities(
-  services: ServiceEndpoint[],
-  cache?: RegistryCache,
-  cacheKey?: string,
-  reservedRestPaths?: string[],
-  maxResponseBytes?: number,
-) {
-  const registry = createServiceRegistry({
-    ...(cache ? { cache } : {}),
-    ...(cacheKey ? { cacheKey } : {}),
-    ...(maxResponseBytes === undefined ? {} : { maxResponseBytes }),
-    ...(reservedRestPaths ? { reservedRestPaths } : {}),
-    services,
-  });
-  const snapshot = await registry.discover();
-  return snapshot.services.flatMap((service) => (service.capabilities ? [service.capabilities] : []));
 }
 
 function controlPlaneReservedRestPaths<TEnv extends Env>(options: ServicePlaneControlPlaneOptions<TEnv>): string[] {
@@ -1409,10 +1229,6 @@ function controlPlaneAbilityClient<TAbility extends AnyServiceAbilityDefinition>
 
 function brokerCallerResolutionError(response: Response): Error {
   return orpcErrorFromServicePlane(new CapabilityAuthError('Service-Plane broker caller authentication failed', response.status)) as Error;
-}
-
-function isAsyncIterator(value: unknown): value is AsyncIterator<unknown> {
-  return Boolean(value && typeof value === 'object' && typeof (value as { next?: unknown }).next === 'function');
 }
 
 function validateAbilityClientTimeoutMs(value: number | undefined, source: 'call' | 'default'): void {

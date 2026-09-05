@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { publicJwkFromPrivateJwk } from './capability-tokens.js';
-import { servicePlaneJwkThumbprint } from './jwk-auth.js';
+import { publicJwkFromPrivateJwk, servicePlaneJwkThumbprint } from './jwk-auth.js';
 import { signCapabilityProof, verifyCapabilityProof } from './proof-of-possession.js';
 
 const TOKEN = 'header.payload.signature';

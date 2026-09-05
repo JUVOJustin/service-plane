@@ -99,6 +99,11 @@ export function emitBestEffortServicePlaneLog<TEvent extends ServicePlaneLoggabl
   }
 }
 
+/** The serializable view of a thrown value for structured log events. */
+export function logErrorFields(error: unknown): { message: string; name: string } {
+  return error instanceof Error ? { message: error.message, name: error.name } : { message: String(error), name: 'Error' };
+}
+
 function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
   return (
     (typeof value === 'object' || typeof value === 'function') &&

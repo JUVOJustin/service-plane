@@ -12,9 +12,9 @@ import {
 import { createAbilityClient } from '../service/client.js';
 import { defineAbility } from '../service/discovery.js';
 import { ServicePlaneService } from '../service/service.js';
-import { decodeCapabilityTokenPayload, publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
+import { decodeCapabilityTokenPayload } from '../shared/capability-tokens.js';
 import { ServicePlaneClientError } from '../shared/errors.js';
-import { servicePlaneJwkThumbprint } from '../shared/jwk-auth.js';
+import { publicJwkFromPrivateJwk, servicePlaneJwkThumbprint } from '../shared/jwk-auth.js';
 import { signCapabilityProof } from '../shared/proof-of-possession.js';
 import { type CapabilityTokenCacheEntry, SERVICE_PLANE_CAPABILITY_JWKS_PATH } from '../shared/types.js';
 import { testKeys } from '../test-support/index.js';

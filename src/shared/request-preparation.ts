@@ -2,7 +2,7 @@ import { ServicePlaneBodyTooLargeError } from './body-limit.js';
 
 type FetchRequestPreparationOptions = {
   /** Absolute deadline measured from request entry. Undefined leaves preparation unbounded. */
-  deadlineAt?: number;
+  deadlineAt?: number | undefined;
   /** Classified failure returned when the request has not decoded before the deadline. */
   deadlineError: () => Error;
   /** Other body branches, such as the request exposed to authentication middleware. */
@@ -11,6 +11,24 @@ type FetchRequestPreparationOptions = {
 
 /** Internal ceiling for turning one physical Fetch request into logical RPC calls. */
 export const DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS = 10_000;
+
+/**
+ * When protocol decoding must be done: the caller's budget when it sent one, capped by the
+ * preparation ceiling. A ceiling of `false` leaves decoding bounded only by the caller.
+ */
+export function preparationDeadlineAt(
+  receivedAt: number,
+  callerTimeoutMs: number | undefined,
+  ceilingMs: false | number = DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS,
+): number | undefined {
+  const bounds = [callerTimeoutMs, ceilingMs === false ? undefined : ceilingMs].filter((value): value is number => value !== undefined);
+  return bounds.length === 0 ? undefined : receivedAt + Math.min(...bounds);
+}
+
+/** Releases a body branch nobody read, so a refused or timed-out request does not pin its stream. */
+export function cancelUnusedRequestBody(request: Request): void {
+  if (!request.bodyUsed) void request.body?.cancel().catch(() => undefined);
+}
 
 /** Bounds the physical body before authentication and protocol decoding can create separate branches. */
 export function requestWithBoundedBody(

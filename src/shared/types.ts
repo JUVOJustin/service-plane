@@ -21,16 +21,8 @@ export const SERVICE_PLANE_PROOF_HEADER = 'X-Service-Plane-Proof';
 export const SERVICE_PLANE_REQUEST_ID_QUERY_PARAM = 'request_id';
 
 export type AbilityAccess = 'plane' | 'service';
-
-/**
- * The one membership test for `AbilityAccess`. Registry validation, discovery normalization, token
- * issuance, and claim parsing all gate on this union; a single predicate next to the type keeps a
- * future widening from needing four synchronized hand-written checks.
- */
-export function isAbilityAccess(value: unknown): value is AbilityAccess {
-  return value === 'plane' || value === 'service';
-}
 export type AbilityExposure = 'private' | 'published';
+
 export type AbilityTransport = 'fetch' | 'service-binding' | 'websocket';
 /**
  * `query` is the HTTP QUERY method (RFC 10008): a safe, idempotent request that carries its

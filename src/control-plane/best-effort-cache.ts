@@ -1,7 +1,7 @@
 // A remote cache slower than fresh work is no longer helping the call. This is deliberately short
 // and internal: cache implementations retain their own retry policy while the plane retains its
 // availability boundary.
-export const DEFAULT_BEST_EFFORT_CACHE_TIMEOUT_MS = 1_000;
+const DEFAULT_BEST_EFFORT_CACHE_TIMEOUT_MS = 1_000;
 
 const CACHE_OPERATION_TIMED_OUT = Symbol('service-plane.cache-operation-timed-out');
 
