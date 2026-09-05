@@ -17,7 +17,7 @@ describe('service registry', () => {
             scopes: ['example.sync.run'],
           },
         },
-        rpc: { path: '/rpc/example.sync', transports: ['fetch'] },
+        rpc: { path: '/rpc/v1/example.sync', transports: ['fetch'] },
         scopes: ['example.sync.run'],
       },
     ],
@@ -45,7 +45,7 @@ describe('service registry', () => {
     const snapshot = await registry.discover();
     expect(snapshot.services).toHaveLength(1);
     expect(snapshot.abilities).toMatchObject([{ id: 'example.sync', serviceId: 'example', exposure: 'private' }]);
-    await expect(registry.ability('example', 'example.sync')).resolves.toMatchObject({ rpc: { path: '/rpc/example.sync' } });
+    await expect(registry.ability('example', 'example.sync')).resolves.toMatchObject({ rpc: { path: '/rpc/v1/example.sync' } });
     expect(registry.endpoint('example')?.id).toBe('example');
   });
 
@@ -480,7 +480,7 @@ describe('service registry', () => {
                   exposure: 'published',
                   id: 'bad.sync',
                   methods: { runSync: { ...method, ...projection, scopes: ['bad.use'] } },
-                  rpc: { path: '/rpc/bad.sync', transports: ['fetch'] },
+                  rpc: { path: '/rpc/v1/bad.sync', transports: ['fetch'] },
                   scopes: ['bad.use'],
                 },
               ],
@@ -520,8 +520,8 @@ describe('service registry', () => {
     await expect(exactOnly.discover()).resolves.toMatchObject({ services: [{ id: 'example' }] });
 
     const withDescendants = createServiceRegistry({
-      reservedRestPaths: ['/rpc/broker', '/rpc/broker/*'],
-      services: [httpsService({ baseUrl: 'https://example.internal', discovery: projected('/rpc/broker/shadow'), id: 'example' })],
+      reservedRestPaths: ['/rpc/v1/broker', '/rpc/v1/broker/*'],
+      services: [httpsService({ baseUrl: 'https://example.internal', discovery: projected('/rpc/v1/broker/shadow'), id: 'example' })],
     });
     await expect(withDescendants.discover()).resolves.toMatchObject({ abilities: [], services: [] });
   });

@@ -61,6 +61,12 @@ type Expect<T extends true> = T;
 type Equal<TLeft, TRight> =
   (<T>() => T extends TLeft ? 1 : 2) extends <T>() => T extends TRight ? 1 : 2 ? true : false;
 type ReadonlySchemaIndexIncludesUndefined = Expect<undefined extends ReadonlyOpenApiObject[string] ? true : false>;
+// JSON Schema legitimately carries null defaults, const values, and enum members.
+const nullableSchema: ReadonlyOpenApiObject = { default: null, const: null, enum: [null, 'value'] };
+void nullableSchema;
+// Importing this library must preserve TypeScript's native Array.isArray narrowing in app code.
+declare const applicationArrayOrString: string | readonly string[];
+if (Array.isArray(applicationArrayOrString)) applicationArrayOrString.push('application-owned');
 declare const schema: AbilitySchema;
 declare const ordinaryUnknown: unknown;
 if (Array.isArray(ordinaryUnknown)) ordinaryUnknown.push('ordinary arrays remain mutable');
@@ -207,10 +213,11 @@ const normalizedRequired = normalizedBound.inputSchema.required;
 if (Array.isArray(normalizedRequired)) {
   const firstRequiredValue = normalizedRequired[0];
   normalizedRequired.map((value) => value);
-  // @ts-expect-error Deep-frozen JSON Schema arrays remain immutable after Array.isArray narrowing.
-  normalizedRequired.push('changed');
   void firstRequiredValue;
 }
+declare const normalizedSchemaArray: Extract<ReadonlyOpenApiObject[string], ReadonlyArray<unknown>>;
+// @ts-expect-error Schema array declarations remain readonly without changing global Array.isArray.
+normalizedSchemaArray.push('changed');
 // @ts-expect-error Normalized REST projection policy cannot diverge from mounted routes.
 normalizedBound.rest!.path = '/changed';
 // @ts-expect-error Capability catalogs attached to the live service are immutable snapshots.

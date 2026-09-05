@@ -1,7 +1,12 @@
-import { readBoundedRequestText } from '../shared/body-limit.js';
-import { CapabilityAuthError, servicePlaneErrorInfo } from '../shared/errors.js';
+import { readBoundedRequestText, validateBodyByteLimit } from '../shared/body-limit.js';
+import { CapabilityAuthError, ServicePlaneTimeoutError, servicePlaneErrorInfo } from '../shared/errors.js';
 import { jsonSchemaRootProperties } from '../shared/json-schema.js';
 import { emitBestEffortServicePlaneLog, type ServicePlaneBrokerLogEvent } from '../shared/logging.js';
+import {
+  createFetchRequestPreparation,
+  DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS,
+  requestWithBoundedBody,
+} from '../shared/request-preparation.js';
 import type {
   DiscoveredServiceAbility,
   OpenApiObject,
@@ -56,8 +61,8 @@ export type ControlPlaneRestHandlerOptions = {
   registry: Pick<ServiceRegistry, 'discover'>;
   /** Lazily resolves authenticated invocation facts from the snapshot that matched the route. */
   resolveInvocation: (snapshot: ServiceRegistrySnapshot) => Promise<ControlPlaneInvocationOptions | Response>;
-  /** Runs authentication before discovery; matched invocation metadata is available after `next()`. */
-  runInvocationMiddleware?: (next: () => Promise<Response>) => Promise<Response>;
+  /** Runs authentication before discovery. Body-bound authentication reads the provided request; metadata is available after `next()`. */
+  runInvocationMiddleware?: (next: () => Promise<Response>, request: Request) => Promise<Response>;
   /** Effective request-entry deadline used while the public route is still being resolved. */
   timeoutMs?: number;
 };
@@ -113,7 +118,29 @@ export async function handleControlPlaneRestRequest(request: Request, options: C
   };
   // Authentication may bind a signature to the body. Give the decoder a separate branch before
   // middleware runs, and release both branches on every miss, refusal, timeout, or invocation.
-  const decodingRequest = options.runInvocationMiddleware ? request.clone() : request;
+  let physicalRequest: Request;
+  try {
+    physicalRequest = requestWithBoundedBody(
+      request,
+      validateBodyByteLimit(
+        options.maxBodyBytes ?? DEFAULT_REST_MAX_BODY_BYTES,
+        'Service-Plane REST maxBodyBytes must be a positive safe integer',
+      ),
+      REST_BODY_TOO_LARGE_MESSAGE,
+    );
+  } catch (error) {
+    return failureResponse(error);
+  }
+  const decodingSource = options.runInvocationMiddleware ? physicalRequest.clone() : physicalRequest;
+  const preparation = createFetchRequestPreparation(decodingSource, {
+    deadlineAt:
+      (options.receivedAt ?? startedAt) +
+      Math.min(options.timeoutMs ?? DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS, DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS),
+    deadlineError: () => new ServicePlaneTimeoutError('Service-Plane REST request decoding exceeded its deadline'),
+    ...(options.runInvocationMiddleware ? { linkedRequests: [physicalRequest] } : {}),
+  });
+  const decodingRequest = preparation.request;
+  const middlewareRequest = preparation.linkedRequests[0] ?? decodingRequest;
   const dispatch = async (): Promise<Response> => {
     try {
       // Middleware may call next after the outer deadline race has already returned a 504. Refuse
@@ -133,7 +160,7 @@ export async function handleControlPlaneRestRequest(request: Request, options: C
         abilityId: match.ability.id,
         method: match.method,
         path: match.ability.methods[match.method]?.rest?.path ?? url.pathname,
-        scopes: match.scopes,
+        scopes: [...match.scopes],
         serviceId: match.ability.serviceId,
         surface: 'rest',
       });
@@ -151,6 +178,7 @@ export async function handleControlPlaneRestRequest(request: Request, options: C
         options,
         'REST request decoding',
       );
+      preparation.complete();
       const result = await invokeControlPlaneMethod(match, input, invocationOptions);
       const status = match.ability.methods[match.method]?.rest?.status ?? 200;
       emitBestEffortServicePlaneLog(options.log, {
@@ -172,16 +200,18 @@ export async function handleControlPlaneRestRequest(request: Request, options: C
     }
   };
   try {
-    return await raceControlPlaneOperation(
-      options.runInvocationMiddleware ? options.runInvocationMiddleware(dispatch) : dispatch(),
-      options,
-      'REST request invocation',
+    return await preparation.run(() =>
+      raceControlPlaneOperation(
+        options.runInvocationMiddleware ? options.runInvocationMiddleware(dispatch, middlewareRequest) : dispatch(),
+        options,
+        'REST request invocation',
+      ),
     );
   } catch (error) {
     return failureResponse(error);
   } finally {
     cancelUnusedRequestBody(decodingRequest);
-    if (decodingRequest !== request) cancelUnusedRequestBody(request);
+    if (decodingRequest !== middlewareRequest) cancelUnusedRequestBody(middlewareRequest);
   }
 }
 
@@ -218,7 +248,7 @@ function restMatches(snapshot: ServiceRegistrySnapshot, pathname: string): RestM
       httpMethod: definition.rest.method,
       method: route.method,
       params,
-      scopes: definition.scopes,
+      scopes: [...definition.scopes],
       staticSegments: route.staticSegments,
     });
   }

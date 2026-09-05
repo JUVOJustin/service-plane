@@ -44,6 +44,7 @@ import {
   DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS,
   preserveRuntimeRequestMetadata,
 } from '../shared/request-preparation.js';
+import { assertServicePlaneRpcProtocol, rpcProtocolExposedHeaders, rpcProtocolPreflight } from '../shared/rpc-protocol.js';
 import {
   type CapabilityIdentity,
   type CapabilityJwksResolver,
@@ -105,7 +106,9 @@ export type ServicePlaneServiceAuthOptions<TEnv extends Env> = ServicePlaneServi
       }
   );
 
+/** Restricts signed broker capabilities to the control planes trusted by this service. */
 export type ServicePlaneServiceIngressOptions<TEnv extends Env> = {
+  /** Allowed broker identities. Defaults to `['control-plane']`, independently of the token issuer. */
   brokerServiceIds?: string[] | ((bindings: TEnv['Bindings'], context: Context<TEnv>) => Promise<string[]> | string[]);
 };
 
@@ -125,6 +128,7 @@ export type ServicePlaneServiceOptions<TEnv extends Env = Env> = DefineServiceIn
     auth: ServicePlaneServiceAuthOptions<TEnv>;
     discoveryPath?: string;
     httpCache?: ServicePlaneHttpCacheOption;
+    /** Requires brokered capabilities by default. `false` explicitly permits ordinary direct capabilities. */
     ingress?: false | ServicePlaneServiceIngressOptions<TEnv>;
     logger?: false | ServicePlaneLoggerOptions;
     middleware?: MiddlewareHandler<TEnv>[];
@@ -166,6 +170,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
   // the first request they silently loosen.
   private readonly timeoutPolicy: ServicePlaneTimeoutPolicy | undefined;
   private readonly rpcMaxRequestBodyBytes: false | number;
+  private readonly ingress: false | ServicePlaneServiceIngressOptions<TEnv>;
   private readonly logHandlerFailure: ((event: ServicePlaneHandlerFailureLogEvent, context: Context<TEnv>) => void) | undefined;
   private readonly abilitiesById = new Map<string, NormalizedServiceAbility<TEnv>>();
   private readonly rpcRouters = new Map<string, Record<string, AnyProcedure>>();
@@ -173,6 +178,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
   private readonly webSocketTasks = new OrderedWebSocketTasks();
 
   constructor(private readonly options: ServicePlaneServiceOptions<TEnv>) {
+    this.ingress = options.ingress ?? {};
     this.app = (options.app ?? new Hono<ServicePlaneServiceEnv<TEnv>>()) as Hono<ServicePlaneServiceEnv<TEnv>>;
     this.timeoutPolicy = validateTimeoutPolicy(options.timeout);
     this.rpcMaxRequestBodyBytes = resolveOptionalBodyByteLimit(
@@ -244,6 +250,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
    * The bindings argument is required when this service's typed environment requires bindings.
    */
   async invokeAbility(input: NativeAbilityCall, ...[bindings]: ServicePlaneBindingsArgument<TEnv>): Promise<unknown> {
+    assertServicePlaneRpcProtocol(input.protocol);
     const ability = this.abilitiesById.get(input.abilityId);
     if (!ability) throw new CapabilityAuthError(`Service-Plane ability not found: ${input.abilityId}`, 404);
     if (!ability.rpc.transports.includes('service-binding')) {
@@ -326,7 +333,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
       applyHttpCacheHeaders(cacheHeaders, (name, value) => context.header(name, value));
       return context.json({
         ...serviceDiscoveryDocument(this.definition),
-        ...(this.options.ingress ? { ingress: { required: true as const } } : {}),
+        ...(this.ingress ? { ingress: { required: true as const } } : {}),
       });
     });
   }
@@ -336,12 +343,19 @@ export class ServicePlaneService<TEnv extends Env = Env> {
   }
 
   private mountRpcAbility(ability: NormalizedServiceAbility<TEnv>): void {
+    this.app.use(`${ability.rpc.path}/*`, async (context, next) => {
+      await next();
+      const exposed = rpcProtocolExposedHeaders(context.res.headers);
+      if (exposed) context.header('access-control-expose-headers', exposed);
+    });
     const router = this.rpcRouter(ability);
     const plugins = this.rpcHandlerPlugins(ability, false);
     const handlerOptions = plugins.length > 0 ? { plugins } : {};
     const fetchHandler = new FetchRpcHandler(router, handlerOptions);
 
     const handleFetch = async (context: Context<ServicePlaneServiceEnv<TEnv>>) => {
+      const protocolError = rpcProtocolPreflight(context.req.raw);
+      if (protocolError) return protocolError;
       if (!ability.rpc.transports.includes('fetch') && !ability.rpc.transports.includes('service-binding')) {
         return new Response('Fetch RPC is not enabled for this ability', { status: 405 });
       }
@@ -520,7 +534,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
           abilityId: ability.id,
           ...(proof ? { proof } : {}),
         });
-        await verifyServiceIngress(this.options.ingress, identity, callContext);
+        await verifyServiceIngress(this.ingress, identity, callContext);
         verifyAbilityAccess(ability, identity);
         requireAbilityMethodScopes(identity, method.scopes);
         if (method.method.kind === 'hibernation' && !webSocket) {
@@ -530,7 +544,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
           );
         }
 
-        const connInfo = this.options.ingress && identity.brokerServiceId ? normalizeConnInfo(forwardedConnInfo(callContext)) : undefined;
+        const connInfo = this.ingress && identity.brokerServiceId ? normalizeConnInfo(forwardedConnInfo(callContext)) : undefined;
         const remaining = timeoutMs === undefined ? undefined : () => remainingTimeoutMs(timeoutMs, Date.now() - receivedAt) as number;
         const idempotencyKey = idempotencyKeyFromRequest(callContext.req);
         const procedureContext: AbilityMethodContext<TEnv> = {

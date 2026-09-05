@@ -5,13 +5,16 @@ import { createAbilityBuilder, defineAbility, defineCapabilities, ServicePlaneSe
 import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
 import type { ConnInfo } from '../shared/conn-info.js';
 import type { ServicePlaneLogSink } from '../shared/logging.js';
-import { SERVICE_DISCOVERY_PATH } from '../shared/types.js';
+import { SERVICE_PLANE_RPC_PROTOCOL } from '../shared/rpc-protocol.js';
+import { type DiscoveredServiceAbility, SERVICE_DISCOVERY_PATH } from '../shared/types.js';
+import type { CapabilityIssuer } from './capabilities.js';
 import {
   ServicePlaneControlPlane,
   type ServicePlaneControlPlaneInvocation,
   type ServicePlaneControlPlaneVariables,
 } from './control-plane.js';
 import { cloudflareServiceBinding } from './endpoints.js';
+import { handleControlPlaneRestRequest } from './rest.js';
 import { generateCapabilitySigningSecret, privateJwkFromCapabilitySigningSecret } from './signing-keys.js';
 
 const PLANE_ORIGIN = 'https://plane.internal';
@@ -22,6 +25,53 @@ type TestEnv = {
 };
 
 describe('control-plane REST facade', () => {
+  it('keeps REST invocation observers from changing dispatch or catalog scopes', async () => {
+    const invokeAbility = vi.fn(async () => ({ ok: true }));
+    const ability: DiscoveredServiceAbility = {
+      access: 'plane',
+      exposure: 'published',
+      id: 'tasks',
+      methods: {
+        get: {
+          inputSchema: { type: 'object' },
+          outputSchema: { type: 'object' },
+          rest: { method: 'get', path: '/tasks' },
+          scopes: ['tasks.read'],
+        },
+      },
+      rpc: { path: '/rpc/v1/tasks', protocol: SERVICE_PLANE_RPC_PROTOCOL, transports: ['service-binding'] },
+      scopes: ['tasks.read', 'tasks.admin'],
+      service: {
+        abilityRpc: { invokeAbility },
+        fetch: async () => new Response(null, { status: 500 }),
+        id: 'tasks-service',
+        origin: 'https://tasks.internal',
+      },
+      serviceId: 'tasks-service',
+      serviceTitle: 'Tasks',
+      serviceVersion: '1.0.0',
+    };
+    const issueCapabilityToken = vi.fn(async () => ({ expiresAt: new Date(Date.now() + 60_000), token: 'unused' }));
+    const issuer: CapabilityIssuer = {
+      issueBrokeredCapabilityToken: issueCapabilityToken,
+      issueCapabilityToken,
+      jwks: async () => ({ keys: [] }),
+    };
+
+    const response = await handleControlPlaneRestRequest(new Request(`${PLANE_ORIGIN}/tasks`), {
+      onInvocation: (invocation) => {
+        (invocation.scopes as string[]).push('tasks.admin');
+      },
+      registry: { discover: async () => ({ abilities: [ability], discoveredAt: new Date(0).toISOString(), services: [] }) },
+      resolveInvocation: async () => ({ controlPlaneServiceId: 'control-plane', issuer }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(issueCapabilityToken).toHaveBeenCalledWith(expect.objectContaining({ scopes: ['tasks.read'] }));
+    expect(ability.methods.get?.scopes).toEqual(['tasks.read']);
+    expect(invokeAbility).toHaveBeenCalledOnce();
+  });
+
   it('rejects an invalid body limit when the plane is constructed', () => {
     expect(
       () =>

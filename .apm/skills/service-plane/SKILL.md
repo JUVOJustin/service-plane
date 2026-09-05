@@ -55,12 +55,14 @@ existing schema library; never add one to Service Plane itself.
 
 - The control plane alone signs capabilities; services verify issuer, audience, expiry, signature,
   ingress, access, proof, and method scopes before input validation.
-- Enable `ingress: {}` when only the broker may reach a service.
+- Broker-protected ingress is the default (`ingress: {}`). `ingress: false` explicitly permits direct capabilities.
 - `exposure` controls projection; `access` controls caller class; `scopes` control capability
   authorization. Do not substitute one for another.
 - `access: 'service'` means an authenticated service caller, not an end user.
 - Product REST/MCP/broker auth belongs in `invocationMiddleware`. It must authenticate and set
   `servicePlaneCaller`, or return its own refusal before `next()`.
+- Use `authorizeInvocation` for product-level per-method permissions across RPC, REST, MCP, and
+  in-process clients. Only literal `true` permits when configured; grants remain mandatory.
 - `BrokeredAbilityTransport.headers` authenticates Fetch only. Authenticate a broker WebSocket's
   physical HTTP upgrade with a browser cookie, short-lived URL ticket, or runtime-owned
   `createWebSocket` closure that sets headers.
@@ -85,8 +87,8 @@ for an intentional, caller-safe message.
 
 Batching combines only concurrent unary calls on one Fetch hop. For broker clients it reduces only
 caller-to-plane round trips; downstream calls remain individual. Streams and WebSockets are never
-batched. Hibernation requires a direct service WebSocket/Durable Object; broker and in-process
-ability clients fail fast.
+batched. Hibernation is experimental and requires a separately secured direct WebSocket/Durable Object
+with `ingress: false`; broker and in-process clients fail fast. Use ordinary streams through the plane.
 
 `plane.abilityClient({ ability, targetServiceId, caller?, scopes? }, bindings)` infers methods and
 required scopes from the contract. Extra `scopes` are additive. Endpoint, grants, and issuer resolve
@@ -96,6 +98,11 @@ Client-call `timeoutMs` values fail on invalid input, expire immediately at `0`,
 maximum. Ability-method `timeoutMs: 0` instead disables that method's ceiling. Caller aborts surface
 as `ServicePlaneClientError` with `code: 'cancelled'`, status 499, and `retryable: false`.
 `rest: false` disables the control-plane REST facade and catch-all only.
+
+RPC uses versioned `/rpc/v1/*` defaults and `rpc.protocol: 'service-plane-rpc/1'` in discovery.
+Clients supply the protocol marker; incompatible peers fail with `incompatible_protocol` / 426.
+Use parallel fleets and route cutover for incompatible rollouts; never point new clients at legacy
+unversioned mutation endpoints. The current package and exact-pinned oRPC engine are prereleases.
 
 ## References
 

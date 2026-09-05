@@ -377,6 +377,7 @@ function isAbilityDiscovery(value: unknown, reservedRestPaths: Set<string>): val
     !!ability.rpc &&
     typeof ability.rpc === 'object' &&
     typeof ability.rpc.path === 'string' &&
+    (ability.rpc.protocol === undefined || typeof ability.rpc.protocol === 'string') &&
     isOriginRelativePath(ability.rpc.path) &&
     Array.isArray(ability.rpc.transports) &&
     ability.rpc.transports.every(isAbilityTransport) &&

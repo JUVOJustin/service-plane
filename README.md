@@ -1,6 +1,6 @@
 # service-plane
 
-Ability-first APIs for TypeScript services.
+One public control plane for TypeScript services on Cloudflare Workers, Node.js, Bun, and Deno.
 
 Define a method once, then use the same contract for runtime validation, typed clients, service
 discovery, REST/OpenAPI, and MCP. Hono remains the HTTP shell. Fetch, WebSocket, batching,
@@ -9,10 +9,13 @@ compression, and the underlying RPC engine stay implementation details of `servi
 ## Install
 
 ```sh
-npm install service-plane hono zod
+npm install service-plane@next hono zod
 ```
 
-`service-plane` requires Hono `>=4.13.5 <5.0.0`.
+`service-plane` requires Hono `>=4.13.7 <5.0.0`.
+
+This branch prepares `0.4.0-beta.1`. The private oRPC engine is still a prerelease; keep deployments
+on the `next` channel until the release has been exercised in your target runtimes.
 
 Schemas must implement [Standard Schema](https://standardschema.dev) and
 [Standard JSON Schema](https://standardschema.dev/json-schema). Use the validation library you
@@ -32,6 +35,7 @@ export const tasksContract = defineAbility({
   title: 'Tasks',
   exposure: 'published',
   scopes: ['tasks.read'],
+  rpc: { transports: ['fetch', 'service-binding'] },
   methods: {
     get: ability.method({
       input: z.object({ id: z.string() }),
@@ -50,8 +54,10 @@ The shared module contains schemas and metadata, but no handler and no private R
 
 ```ts
 // service.ts
+import { WorkerEntrypoint } from 'cloudflare:workers';
 import {
   type FetchLike,
+  type NativeAbilityCall,
   ServicePlaneService,
   defineCapabilities,
   implementAbility,
@@ -65,7 +71,7 @@ const tasks = implementAbility(tasksContract, {
   get: ({ input }) => loadTask(input.id),
 });
 
-export default new ServicePlaneService<{ Bindings: Env }>({
+const service = new ServicePlaneService<{ Bindings: Env }>({
   id: 'tasks-service',
   title: 'Tasks Service',
   version: '1.0.0',
@@ -78,13 +84,28 @@ export default new ServicePlaneService<{ Bindings: Env }>({
     issuer: 'control-plane',
     jwks: (c) => jwksFromServiceBinding(c.env.CONTROL_PLANE),
   },
-  ingress: {},
 });
+
+export default class extends WorkerEntrypoint<Env> {
+  fetch(request: Request) {
+    return service.fetch(request, this.env, this.ctx);
+  }
+  invokeAbility(input: NativeAbilityCall) {
+    return service.invokeAbility(input, this.env);
+  }
+}
 ```
 
 For a small service, put `handler` directly in `ability.method({ ... })` and skip
 `implementAbility`. Keeping the contract separate is preferable when browsers or other packages
 import it.
+
+The entrypoint above enables Cloudflare native unary RPC. [Self-hosted runtimes](docs/nodejs.md)
+serve the same `service.fetch` through their Hono adapter or runtime server.
+
+Services require a signed control-plane broker claim by default. Only the control plane should be
+public. An internal ability uses `access: 'service'`; `exposure: 'private'` alone only hides its
+REST/MCP projection and does not grant or deny RPC access.
 
 ## 3. Mount The Control Plane
 
@@ -94,6 +115,7 @@ import {
   type FetchLike,
   ServicePlaneControlPlane,
   cloudflareServiceBinding,
+  httpsService,
 } from 'service-plane/control-plane';
 
 type ControlPlaneEnv = {
@@ -112,6 +134,11 @@ export default new ServicePlaneControlPlane<ControlPlaneEnv>({
       abilityRpc: true,
       grants: [{ caller: 'control-plane', scopes: ['tasks.read'] }],
     }),
+    httpsService({
+      id: 'reports-service',
+      baseUrl: 'https://reports.internal.example',
+      grants: [{ caller: 'control-plane', scopes: ['reports.read'] }],
+    }),
   ],
   invocationMiddleware: async (c, next) => {
     const caller = await authenticateProductRequest(c.req.raw);
@@ -119,15 +146,24 @@ export default new ServicePlaneControlPlane<ControlPlaneEnv>({
     c.set('servicePlaneCaller', { id: caller.id, kind: 'user' });
     await next();
   },
+  authorizeInvocation: (invocation, c) => canInvoke(c.env, invocation),
   broker: {},
   mcp: {},
 });
 ```
 
 The plane always mounts capability-token/JWKS endpoints and OpenAPI unless disabled. Published REST
-routes are on by default; `rest: false` removes their catch-all. `broker: {}` adds `/rpc/broker` and
+routes are on by default; `rest: false` removes their catch-all. `broker: {}` adds `/rpc/v1/broker` and
 `mcp: {}` adds `/mcp`. Every product-facing surface fails closed unless trusted middleware sets
 `servicePlaneCaller`.
+
+The second endpoint may run on Node, Bun, or Deno behind TLS or a private tunnel. Hosting location
+does not determine exposure: every service owns its ability metadata and verifies brokered tokens.
+Public RPC, REST, and MCP all use the same discovery, grants, schemas, and execution boundary.
+
+`authenticateProductRequest` and `canInvoke` are application functions. Authentication identifies
+the caller; `authorizeInvocation` decides which method and scopes that caller may use before a
+capability is minted. Service handlers still enforce tenant ownership and other input-level rules.
 
 ## 4. Call Through The Plane
 

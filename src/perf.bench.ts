@@ -11,9 +11,12 @@ import { createAbilityClient, createBrokeredAbilityClient } from './service/clie
 import { defineAbility, serviceDiscoveryDocument } from './service/discovery.js';
 import { compileAbilityMethod, createAbilityRpcRuntimeContext } from './service/orpc.js';
 import { ServicePlaneService } from './service/service.js';
+import { SERVICE_PLANE_RPC_PROTOCOL } from './shared/rpc-protocol.js';
 import type { CapabilityIdentity } from './shared/types.js';
 import { testKeys } from './test-support/index.js';
 
+// All adapters below run in the same Node process. These measurements isolate library overhead;
+// they include neither network latency nor Cloudflare's RPC serialization, scheduling, or billing.
 const keys = await testKeys();
 const signingSecret = keys.privateJwk.d;
 if (!signingSecret) throw new Error('benchmark signing key is missing private material');
@@ -78,6 +81,7 @@ const service = new ServicePlaneService({
   auth: { issuer: 'control-plane', jwks: { keys: [keys.publicJwk] } },
   capabilities,
   id: 'llm',
+  ingress: false,
   logger: false,
   rpc: { batch: true },
   title: 'LLM',
@@ -90,7 +94,7 @@ const runtime = createAbilityRpcRuntimeContext({
       context: {} as never,
       env: {},
       identity,
-      request: new Request('https://llm.internal/rpc/llm.completion/complete'),
+      request: new Request('https://llm.internal/rpc/v1/llm.completion/complete'),
     },
   }),
 });
@@ -193,26 +197,27 @@ describe('Service Plane RPC throughput', () => {
     verifyCompletion(await call(compiledCompletion, input, { context: runtime }));
   });
 
-  bench('ServicePlaneService native invokeAbility', async () => {
+  bench('ServicePlaneService.invokeAbility (in-process)', async () => {
     verifyCompletion(
       await service.invokeAbility({
         abilityId: completion.id,
         input,
         method: 'complete',
+        protocol: SERVICE_PLANE_RPC_PROTOCOL,
         token: issued.token,
       }),
     );
   });
 
-  bench('typed client -> Cloudflare native RPC', async () => {
+  bench('typed client -> local JS service-binding adapter', async () => {
     verifyCompletion(await nativeClient.complete(input));
   });
 
-  bench('typed client -> Service Plane Fetch', async () => {
+  bench('typed client -> local Service Plane Fetch', async () => {
     verifyCompletion(await fetchClient.complete(input));
   });
 
-  bench('control plane -> native service RPC', async () => {
+  bench('control plane -> local JS service-binding adapter', async () => {
     verifyCompletion(
       await broker.callAbility({
         abilityId: completion.id,
@@ -225,17 +230,29 @@ describe('Service Plane RPC throughput', () => {
     );
   });
 
-  bench('typed public client -> control-plane Fetch -> native service RPC', async () => {
+  bench('typed public client -> local plane Fetch -> local JS binding', async () => {
     verifyCompletion(await publicBrokerClient.complete(input));
   });
+});
 
-  bench('10 typed calls in one Service Plane batch', async () => {
+describe('Service Plane local batch throughput (10 logical calls per sample)', () => {
+  bench('10 concurrent typed calls over separate local Fetch requests', async () => {
+    const values = await Promise.all(Array.from({ length: 10 }, () => fetchClient.complete(input)));
+    for (const value of values) verifyCompletion(value);
+  });
+
+  bench('10 concurrent typed calls in one local Fetch batch', async () => {
     const values = await Promise.all(Array.from({ length: 10 }, () => batchClient.complete(input)));
     if (values.length !== 10) throw new Error('benchmark batch produced no samples');
     for (const value of values) verifyCompletion(value);
   });
 
-  bench('10 typed public calls in one control-plane batch', async () => {
+  bench('10 concurrent public calls over separate local plane Fetch requests', async () => {
+    const values = await Promise.all(Array.from({ length: 10 }, () => publicBrokerClient.complete(input)));
+    for (const value of values) verifyCompletion(value);
+  });
+
+  bench('10 concurrent public calls in one local plane Fetch batch', async () => {
     const values = await Promise.all(Array.from({ length: 10 }, () => publicBrokerBatchClient.complete(input)));
     if (values.length !== 10) throw new Error('benchmark public broker batch produced no samples');
     for (const value of values) verifyCompletion(value);
@@ -244,7 +261,7 @@ describe('Service Plane RPC throughput', () => {
 
 describe('Service Plane streaming throughput', () => {
   bench(
-    '1,000 validated items over Service Plane Fetch',
+    '1,000 validated items over local Service Plane Fetch',
     async () => {
       const stream = await fetchClient.tokens({ count: 1_000 });
       let count = 0;

@@ -1,6 +1,5 @@
 import { os } from '@orpc/server';
 import { RPCHandler } from '@orpc/server/fetch';
-import { BatchHandlerPlugin } from '@orpc/server/plugins';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { SERVICE_PLANE_CONN_INFO_HEADER } from '../shared/conn-info.js';
@@ -17,6 +16,7 @@ import {
   createBrokeredAbilityClient,
 } from './client.js';
 import { defineAbility } from './discovery.js';
+import { createRpcHandlerPlugins } from './orpc-features.js';
 
 const builder = createAbilityBuilder();
 const metadataOutput = z.object({
@@ -108,7 +108,7 @@ describe('stable ability client call options', () => {
         batch: true,
         fetch: async (url, init) => {
           fetches += 1;
-          return handle(handler, new Request(url, init), '/rpc/client.metadata');
+          return handle(handler, new Request(url, init), '/rpc/v1/client.metadata');
         },
         origin: 'https://metadata.internal',
         type: 'fetch',
@@ -171,7 +171,7 @@ describe('stable ability client call options', () => {
       transport: {
         fetch: async (url, init) => {
           transportSignal = init?.signal;
-          return handle(handler, new Request(url, init), '/rpc/client.metadata');
+          return handle(handler, new Request(url, init), '/rpc/v1/client.metadata');
         },
         origin: 'https://metadata.internal',
         type: 'fetch',
@@ -196,7 +196,7 @@ describe('stable ability client call options', () => {
     const directAbility = defineAbility({
       ...clientAbility,
       id: 'client.normalized',
-      rpc: { path: ' /rpc/client.normalized/// ', transports: ['fetch'] },
+      rpc: { path: ' /rpc/v1/client.normalized/// ', transports: ['fetch'] },
     });
     const directHandler = metadataHandler(false);
     let directPath = '';
@@ -207,14 +207,14 @@ describe('stable ability client call options', () => {
       transport: {
         fetch: async (url, init) => {
           directPath = new URL(new Request(url).url).pathname;
-          return handle(directHandler, new Request(url, init), '/rpc/client.normalized');
+          return handle(directHandler, new Request(url, init), '/rpc/v1/client.normalized');
         },
         origin: 'https://metadata.internal',
         type: 'fetch',
       },
     });
     await expect(direct.inspect({ label: 'direct' })).resolves.toMatchObject({ label: 'direct' });
-    expect(directPath).toBe('/rpc/client.normalized/inspect');
+    expect(directPath).toBe('/rpc/v1/client.normalized/inspect');
 
     const brokerHandler = metadataHandler(true);
     let brokerPath = '';
@@ -251,7 +251,7 @@ describe('stable ability client call options', () => {
       createBrokeredAbilityClient({
         ability: clientAbility,
         targetServiceId: 'metadata',
-        transport: { path: '/rpc/broker?target=other' },
+        transport: { path: '/rpc/v1/broker?target=other' },
       }),
     ).toThrow('Service-Plane RPC path must be origin-relative: control-plane broker');
   });
@@ -323,7 +323,7 @@ describe('stable ability client call options', () => {
         batch: true,
         fetch: async (url, init) => {
           fetches += 1;
-          return handle(handler, new Request(url, init), '/rpc/broker');
+          return handle(handler, new Request(url, init), '/rpc/v1/broker');
         },
         origin: 'https://plane.internal',
       },
@@ -419,7 +419,7 @@ describe('stable ability client call options', () => {
           .handler(({ input }) => `${methodName}:${input.value}`),
       ]),
     );
-    const directHandler = new RPCHandler(directRouter);
+    const directHandler = new RPCHandler(directRouter, { plugins: createRpcHandlerPlugins({}, false) });
     let directFetches = 0;
     const direct = createAbilityClient({
       ability: naturalNames,
@@ -428,26 +428,29 @@ describe('stable ability client call options', () => {
       transport: {
         fetch: async (url, init) => {
           directFetches += 1;
-          return handle(directHandler, new Request(url, init), '/rpc/client.natural-names');
+          return handle(directHandler, new Request(url, init), '/rpc/v1/client.natural-names');
         },
         origin: 'https://metadata.internal',
         type: 'fetch',
       },
     });
-    const brokerHandler = new RPCHandler({
-      call: os
-        .$context<RequestContext>()
-        .input(z.unknown())
-        .handler(({ input }) => {
-          const envelope = input as { input: { value: string }; method: string };
-          return `${envelope.method}:${envelope.input.value}`;
-        }),
-    });
+    const brokerHandler = new RPCHandler(
+      {
+        call: os
+          .$context<RequestContext>()
+          .input(z.unknown())
+          .handler(({ input }) => {
+            const envelope = input as { input: { value: string }; method: string };
+            return `${envelope.method}:${envelope.input.value}`;
+          }),
+      },
+      { plugins: createRpcHandlerPlugins({}, false) },
+    );
     const brokered = createBrokeredAbilityClient({
       ability: naturalNames,
       targetServiceId: 'metadata',
       transport: {
-        fetch: async (url, init) => handle(brokerHandler, new Request(url, init), '/rpc/broker'),
+        fetch: async (url, init) => handle(brokerHandler, new Request(url, init), '/rpc/v1/broker'),
         origin: 'https://plane.internal',
       },
     });
@@ -501,7 +504,7 @@ describe('stable ability client call options', () => {
       // @ts-expect-error WebSocket handshake authentication belongs in the URL or socket factory.
       headers: { authorization: 'Bearer test' },
       type: 'websocket',
-      url: 'wss://plane.example/rpc/broker/ws',
+      url: 'wss://plane.example/rpc/v1/broker/ws',
     };
 
     expect(fetchTransport.headers).toBeDefined();
@@ -573,7 +576,7 @@ describe('stable ability client call options', () => {
           throw new Error('socket must not be created');
         },
         type: 'websocket',
-        url: 'wss://plane.example/rpc/broker/ws',
+        url: 'wss://plane.example/rpc/v1/broker/ws',
       },
     });
 
@@ -603,7 +606,7 @@ describe('stable ability client call options', () => {
         batch: true,
         fetch: async (url, init) => {
           directFetches += 1;
-          return handle(directHandler, new Request(url, init), '/rpc/client.metadata');
+          return handle(directHandler, new Request(url, init), '/rpc/v1/client.metadata');
         },
         type: 'fetch',
       },
@@ -618,7 +621,7 @@ describe('stable ability client call options', () => {
         binding: {
           fetch: async (request) => {
             bindingFetches += 1;
-            return handle(bindingHandler, request, '/rpc/client.metadata');
+            return handle(bindingHandler, request, '/rpc/v1/client.metadata');
           },
           invokeAbility: () => undefined,
         },
@@ -634,7 +637,7 @@ describe('stable ability client call options', () => {
         batch: true,
         fetch: async (url, init) => {
           brokerFetches += 1;
-          return handle(brokerHandler, new Request(url, init), '/rpc/broker');
+          return handle(brokerHandler, new Request(url, init), '/rpc/v1/broker');
         },
       },
     });
@@ -712,7 +715,7 @@ describe('stable ability client call options', () => {
       ability: clientAbility,
       targetServiceId: 'metadata',
       transport: {
-        fetch: (url, init) => handle(handler, new Request(url, init), '/rpc/broker'),
+        fetch: (url, init) => handle(handler, new Request(url, init), '/rpc/v1/broker'),
       },
     });
 
@@ -924,26 +927,29 @@ describe('stable ability client call options', () => {
     const started = new Promise<void>((resolve) => {
       pullStarted = resolve;
     });
-    const handler = new RPCHandler({
-      stream: os.input(z.unknown()).handler(async function* () {
-        yield {
-          connInfo: '',
-          idempotencyKey: '',
-          label: 'ready',
-          requestId: '',
-          scopes: [],
-          timeoutMs: '',
-        };
-        pullStarted?.();
-        await new Promise(() => undefined);
-      }),
-    });
+    const handler = new RPCHandler(
+      {
+        stream: os.input(z.unknown()).handler(async function* () {
+          yield {
+            connInfo: '',
+            idempotencyKey: '',
+            label: 'ready',
+            requestId: '',
+            scopes: [],
+            timeoutMs: '',
+          };
+          pullStarted?.();
+          await new Promise(() => undefined);
+        }),
+      },
+      { plugins: createRpcHandlerPlugins({}, false) },
+    );
     const client = createBrokeredAbilityClient({
       ability: clientAbility,
       targetServiceId: 'metadata',
       timeoutMs: 5_000,
       transport: {
-        fetch: (url, init) => handle(handler, new Request(url, init), '/rpc/broker'),
+        fetch: (url, init) => handle(handler, new Request(url, init), '/rpc/v1/broker'),
       },
     });
     const controller = new AbortController();
@@ -965,26 +971,29 @@ describe('stable ability client call options', () => {
       const started = new Promise<void>((resolve) => {
         pullStarted = resolve;
       });
-      const handler = new RPCHandler({
-        stream: os.input(z.unknown()).handler(async function* () {
-          yield {
-            connInfo: '',
-            idempotencyKey: '',
-            label: 'ready',
-            requestId: '',
-            scopes: [],
-            timeoutMs: '',
-          };
-          pullStarted?.();
-          await new Promise(() => undefined);
-        }),
-      });
+      const handler = new RPCHandler(
+        {
+          stream: os.input(z.unknown()).handler(async function* () {
+            yield {
+              connInfo: '',
+              idempotencyKey: '',
+              label: 'ready',
+              requestId: '',
+              scopes: [],
+              timeoutMs: '',
+            };
+            pullStarted?.();
+            await new Promise(() => undefined);
+          }),
+        },
+        { plugins: createRpcHandlerPlugins({}, false) },
+      );
       const client = createBrokeredAbilityClient({
         ability: clientAbility,
         targetServiceId: 'metadata',
         timeoutMs: 1,
         transport: {
-          fetch: (url, init) => handle(handler, new Request(url, init), '/rpc/broker'),
+          fetch: (url, init) => handle(handler, new Request(url, init), '/rpc/v1/broker'),
         },
       });
       const stream = await client.watch({ label: 'ready' });
@@ -1045,7 +1054,7 @@ function metadataHandler(brokered: boolean): RPCHandler<RequestContext> {
   const router = brokered ? { call: procedure, stream: streamProcedure } : { inspect: procedure, watch: streamProcedure };
   return new RPCHandler(router, {
     interceptors: [({ request, next, ...options }) => next({ ...options, context: { headers: request.headers }, request })],
-    plugins: [new BatchHandlerPlugin()],
+    plugins: createRpcHandlerPlugins({ batch: true }, false),
   });
 }
 

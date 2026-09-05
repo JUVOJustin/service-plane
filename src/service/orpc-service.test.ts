@@ -47,6 +47,7 @@ describe('ServicePlaneService private RPC runtime', () => {
     expect(
       () =>
         new ServicePlaneService({
+          ingress: false,
           abilities: [
             defineAbility({
               id: 'tasks.events',
@@ -176,6 +177,7 @@ describe('ServicePlaneService private RPC runtime', () => {
       scopes: ['tasks.read'],
     });
     const service = new ServicePlaneService({
+      ingress: false,
       abilities: [tasks, naturalNames],
       auth: {
         issuer: 'control-plane',
@@ -192,9 +194,9 @@ describe('ServicePlaneService private RPC runtime', () => {
     const createClient = (authorization?: string) => {
       const link = new RPCLink({
         fetch: async (url, init) => service.fetch(new Request(url, init)),
-        ...(authorization ? { headers: { authorization } } : {}),
+        headers: { 'x-service-plane-rpc-protocol': 'service-plane-rpc/1', ...(authorization ? { authorization } : {}) },
         origin: 'https://tasks.internal',
-        url: '/rpc/tasks.items',
+        url: '/rpc/v1/tasks.items',
       });
       return createORPCClient<AnyNestedClient>(link) as unknown as AbilityClient<typeof tasks>;
     };
@@ -218,9 +220,9 @@ describe('ServicePlaneService private RPC runtime', () => {
           Object.defineProperty(request, 'cf', { configurable: true, enumerable: true, value: { colo: 'FRA' } });
           return service.fetch(request);
         },
-        headers: { authorization: servicePlaneAuthorization(issued.token) },
+        headers: { authorization: servicePlaneAuthorization(issued.token), 'x-service-plane-rpc-protocol': 'service-plane-rpc/1' },
         origin: 'https://tasks.internal',
-        url: '/rpc/tasks.items',
+        url: '/rpc/v1/tasks.items',
       }),
     ) as unknown as AbilityClient<typeof tasks>;
     await expect(cloudflareClient.cloudflareMetadata({})).resolves.toEqual({ colo: 'FRA' });
@@ -247,6 +249,7 @@ describe('ServicePlaneService private RPC runtime', () => {
     });
     await expect(
       service.invokeAbility({
+        protocol: 'service-plane-rpc/1',
         abilityId: naturalNames.id,
         input: { id: 'task-constructor' },
         method: 'constructor',
@@ -272,6 +275,7 @@ describe('ServicePlaneService private RPC runtime', () => {
     for (const method of ['constructor', 'hasOwnProperty', 'toString', '__proto__']) {
       await expect(
         service.invokeAbility({
+          protocol: 'service-plane-rpc/1',
           abilityId: tasks.id,
           input: {},
           method,
@@ -321,8 +325,8 @@ describe('ServicePlaneService private RPC runtime', () => {
     const webSocketClient = createORPCClient<AnyNestedClient>(
       new WebSocketRpcLink({
         connect: () => clientSocket,
-        headers: { authorization: servicePlaneAuthorization(issued.token) },
-        url: '/rpc/tasks.items',
+        headers: { authorization: servicePlaneAuthorization(issued.token), 'x-service-plane-rpc-protocol': 'service-plane-rpc/1' },
+        url: '/rpc/v1/tasks.items',
       }),
     ) as unknown as AbilityClient<typeof tasks>;
     await expect(webSocketClient.get({ id: 'task-ws' })).resolves.toEqual({ caller: 'headless-front', id: 'task-ws' });
@@ -450,6 +454,7 @@ describe('ServicePlaneService private RPC runtime', () => {
       scopes: ['tasks.read'],
     });
     const service = new ServicePlaneService({
+      ingress: false,
       abilities: [current],
       auth: { issuer: 'control-plane', jwks: { keys: [] } },
       capabilities,

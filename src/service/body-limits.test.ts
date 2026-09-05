@@ -22,7 +22,7 @@ const lazyRequest = {
   headers: {},
   method: 'POST',
   resolveBody: async () => undefined,
-  url: '/rpc/test',
+  url: '/rpc/v1/test',
 } satisfies StandardLazyRequest;
 
 function deferredBlobFrame(value: string): { blob: Blob; resolve(): void } {
@@ -42,6 +42,7 @@ function deferredBlobFrame(value: string): { blob: Blob; resolve(): void } {
 function webSocketService(rpc: NonNullable<ConstructorParameters<typeof ServicePlaneService>[0]['rpc']>) {
   const ability = createAbilityBuilder();
   return new ServicePlaneService({
+    ingress: false,
     abilities: [
       defineAbility({
         id: 'limits.echo',
@@ -85,7 +86,7 @@ describe('service WebSocket body limits', () => {
     }) as unknown as UpgradeWebSocket;
     const service = webSocketService({ maxRequestBodyBytes: 3, upgradeWebSocket });
     await service.fetch(
-      new Request('https://service.internal/rpc/limits.echo', {
+      new Request('https://service.internal/rpc/v1/limits.echo', {
         headers: { connection: 'upgrade', upgrade: 'websocket' },
       }),
     );
@@ -107,7 +108,7 @@ describe('service WebSocket body limits', () => {
     }) as unknown as UpgradeWebSocket;
     const service = webSocketService({ upgradeWebSocket });
     await service.fetch(
-      new Request('https://service.internal/rpc/limits.echo', {
+      new Request('https://service.internal/rpc/v1/limits.echo', {
         headers: { connection: 'upgrade', upgrade: 'websocket' },
       }),
     );

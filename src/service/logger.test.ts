@@ -106,6 +106,7 @@ async function serveFailingAbility(log: NonNullable<ServicePlaneLoggerOptions['l
     scopes: ['catalog.read'],
   });
   const service = new ServicePlaneService({
+    ingress: false,
     abilities: [ability],
     auth: { issuer: 'control-plane', jwks: { keys: [keys.publicJwk] }, now: () => VERIFIED_AT },
     capabilities,

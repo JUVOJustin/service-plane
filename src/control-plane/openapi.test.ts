@@ -21,7 +21,7 @@ function publishedAbility(overrides: Partial<DiscoveredServiceAbility> = {}): Di
         scopes: ['example.search'],
       },
     },
-    rpc: { path: '/rpc/example.search', transports: ['fetch'] },
+    rpc: { path: '/rpc/v1/example.search', transports: ['fetch'] },
     scopes: ['example.search'],
     service: endpoint,
     serviceId: 'example',
@@ -166,7 +166,7 @@ describe('generateControlPlaneOpenApi', () => {
         publishedAbility({
           id: 'example.rpc-only',
           methods: { run: { inputSchema: { type: 'object' }, outputSchema: { type: 'object' }, scopes: [] } },
-          rpc: { path: '/rpc/example.rpc-only', transports: ['fetch'] },
+          rpc: { path: '/rpc/v1/example.rpc-only', transports: ['fetch'] },
           scopes: [],
         }),
       ]),
@@ -253,7 +253,7 @@ describe('generateControlPlaneOpenApi operation ids', () => {
           scopes: [],
         },
       },
-      rpc: { path: '/rpc/example.other', transports: ['fetch'] },
+      rpc: { path: '/rpc/v1/example.other', transports: ['fetch'] },
     });
 
     expect(() => generateControlPlaneOpenApi({ snapshot: snapshotOf([publishedAbility(), other]) })).toThrow(
@@ -284,8 +284,8 @@ describe('controlPlaneOpenApiCacheKey', () => {
 
   it('namespaces and normalizes reserved REST routes', () => {
     expect(controlPlaneOpenApiCacheKey([endpoint], {}, ['/mcp'])).not.toBe(controlPlaneOpenApiCacheKey([endpoint], {}));
-    expect(controlPlaneOpenApiCacheKey([endpoint], {}, ['/rpc/', ' /mcp'])).toBe(
-      controlPlaneOpenApiCacheKey([endpoint], {}, ['/mcp/', '/rpc']),
+    expect(controlPlaneOpenApiCacheKey([endpoint], {}, ['/rpc/v1/', ' /mcp'])).toBe(
+      controlPlaneOpenApiCacheKey([endpoint], {}, ['/mcp/', '/rpc/v1']),
     );
   });
 });

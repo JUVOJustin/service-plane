@@ -10,6 +10,7 @@ import {
   normalizeOriginRelativePath,
   pathTemplateVariables,
 } from '../shared/paths.js';
+import { SERVICE_PLANE_RPC_PREFIX, SERVICE_PLANE_RPC_PROTOCOL } from '../shared/rpc-protocol.js';
 import {
   type AbilityAccess,
   type AbilityExposure,
@@ -369,7 +370,7 @@ export function serviceDiscoveryDocument<TEnv extends Env = Env>(service: Servic
 }
 
 export function defaultAbilityRpcPath(abilityId: string): string {
-  return `/rpc/${abilityId}`;
+  return `${SERVICE_PLANE_RPC_PREFIX}/${abilityId}`;
 }
 
 export { SERVICE_DISCOVERY_PATH };
@@ -492,6 +493,9 @@ function normalizeAbilityMethods<TEnv extends Env>(
         }
         validateKnownScopes(scopes, knownScopes, capabilities, `Service-Plane ability method requires unknown scope`);
         validateMethodScopesDeclaredByAbility(abilityId, name, scopes, abilityScopes);
+        if (method.kind === 'hibernation' && definition.mcp) {
+          throw new CapabilityAuthError(`Service-Plane hibernation method cannot project an MCP tool: ${abilityId}/${name}`, 500);
+        }
         if (stream && (definition.mcpPrompt || definition.mcpResource)) {
           throw new CapabilityAuthError(
             `Service-Plane streaming method cannot project an MCP prompt or resource: ${abilityId}/${name}`,
@@ -627,7 +631,7 @@ function abilityDiscovery<TEnv extends Env>(ability: NormalizedServiceAbility<TE
         } satisfies ServiceAbilityMethodDiscovery,
       ]),
     ),
-    rpc: { path: ability.rpc.path, transports: [...ability.rpc.transports] },
+    rpc: { path: ability.rpc.path, protocol: SERVICE_PLANE_RPC_PROTOCOL, transports: [...ability.rpc.transports] },
     scopes: [...ability.scopes],
     ...(ability.title ? { title: ability.title } : {}),
   };

@@ -1,8 +1,18 @@
-import { type CapabilitySigningJwk, createCapabilityIssuer, defineServiceGrants } from '../control-plane/index.js';
+import {
+  type CapabilitySigningJwk,
+  cloudflareServiceBinding,
+  createCapabilityIssuer,
+  defineServiceGrants,
+  generateCapabilitySigningSecret,
+  httpsService,
+  ServicePlaneControlPlane,
+} from '../control-plane/index.js';
 import {
   type AbilitySchema,
+  type CapabilityJwks,
   createAbilityBuilder,
   createAbilityClient,
+  createBrokeredAbilityClient,
   defineAbility,
   defineCapabilities,
   jwkCapabilityProofSigner,
@@ -54,6 +64,7 @@ export async function runSmoke(): Promise<string[]> {
     scopes: ['smoke.run', 'smoke.stream'],
   });
   const service = new ServicePlaneService({
+    ingress: false,
     abilities: [jobs],
     auth: { issuer: 'control-plane', jwks: { keys: [keys.publicJwk] } },
     capabilities,
@@ -160,7 +171,134 @@ export async function runSmoke(): Promise<string[]> {
   assert(refused instanceof Error, `missing scope was not refused: ${String(refused)}`);
   step('missing scope refused');
 
+  passed.push(...(await runPlaneSmoke()));
+
   return passed;
+}
+
+// Exercises the public product boundary through both downstream adapters on every smoke runtime.
+async function runPlaneSmoke(): Promise<string[]> {
+  const secret = await generateCapabilitySigningSecret();
+  let plane: ServicePlaneControlPlane;
+  const builder = createAbilityBuilder();
+  const targets = ['bound', 'hosted'].map((id) => {
+    const contract = defineAbility({
+      id: `${id}.public`,
+      exposure: 'published',
+      scopes: ['smoke.run'],
+      rpc: { transports: ['fetch', 'service-binding'] },
+      methods: {
+        echo: builder.method({
+          input: objectSchema('name', 'string'),
+          output: recordSchema(),
+          scopes: ['smoke.run'],
+          rest: { method: 'post', path: `/${id}/echo` },
+          mcp: { name: `${id}_echo` },
+          handler: ({ context, input }) => ({ input, service: id, broker: context.identity.brokerServiceId }),
+        }),
+      },
+    });
+    const internal = defineAbility({
+      id: `${id}.internal`,
+      access: 'service',
+      scopes: ['smoke.run'],
+      methods: {
+        echo: builder.method({
+          input: recordSchema(),
+          output: recordSchema(),
+          scopes: ['smoke.run'],
+          mcp: { name: `${id}_internal` },
+          handler: () => ({ internal: true }),
+        }),
+      },
+    });
+    const service = new ServicePlaneService({
+      id,
+      title: id,
+      version: '1.0.0',
+      abilities: [contract, internal],
+      capabilities: defineCapabilities({ scopes: [{ id: 'smoke.run' }], serviceId: id }),
+      auth: {
+        jwks: async () => {
+          const response = await plane.fetch(new Request('https://plane.internal/.well-known/service-plane/jwks.json'));
+          return response.json() as Promise<CapabilityJwks>;
+        },
+      },
+      logger: false,
+    });
+    const grants = [{ caller: 'control-plane', scopes: ['smoke.run'] }];
+    const endpoint =
+      id === 'bound'
+        ? cloudflareServiceBinding({
+            id,
+            binding: { fetch: async (request) => service.fetch(request), invokeAbility: (input) => service.invokeAbility(input) },
+            abilityRpc: true,
+            grants,
+          })
+        : httpsService({
+            id,
+            baseUrl: 'https://hosted.internal',
+            fetch: async (url, init) => service.fetch(new Request(url, init)),
+            grants,
+          });
+    return { contract, endpoint, internal };
+  });
+  plane = new ServicePlaneControlPlane({
+    signingKeys: () => [{ kid: 'smoke-plane', secret }],
+    services: () => targets.map((target) => target.endpoint),
+    broker: {},
+    mcp: {},
+    log: false,
+    invocationMiddleware: async (context, next) => {
+      if (context.req.header('authorization') !== 'Bearer smoke-product-caller') return context.text('Unauthorized', 401);
+      context.set('servicePlaneCaller', { id: 'smoke-user', kind: 'user' });
+      await next();
+    },
+  });
+  const transport = {
+    fetch: async (url: RequestInfo | URL, init?: RequestInit) => plane.fetch(new Request(url, init)),
+    headers: { authorization: 'Bearer smoke-product-caller' },
+  };
+  for (const target of targets) {
+    const client = createBrokeredAbilityClient({ ability: target.contract, targetServiceId: target.endpoint.id, transport });
+    const result = (await client.echo({ name: 'mixed-runtime' })) as Record<string, unknown>;
+    assert(result.service === target.endpoint.id && result.broker === 'control-plane', 'broker did not preserve target and ingress');
+    const internal = createBrokeredAbilityClient({ ability: target.internal, targetServiceId: target.endpoint.id, transport });
+    const refused = await internal.echo({}).then(
+      () => false,
+      () => true,
+    );
+    assert(refused, 'product user reached service-only ability');
+    const response = await plane.fetch(
+      new Request(`https://plane.internal/${target.endpoint.id}/echo`, {
+        method: 'POST',
+        headers: { ...transport.headers, 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'rest' }),
+      }),
+    );
+    assert(response.status === 200, 'projected REST did not reach protected service');
+    await response.body?.cancel();
+  }
+  const tools = await plane.fetch(
+    new Request('https://plane.internal/mcp', {
+      method: 'POST',
+      headers: { ...transport.headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    }),
+  );
+  const listing = (await tools.json()) as { result?: { tools?: Array<{ name: string }> } };
+  const names = listing.result?.tools?.map((tool) => tool.name).sort();
+  assert(JSON.stringify(names) === JSON.stringify(['bound_echo', 'hosted_echo']), 'MCP exposed private abilities or missed public tools');
+  const invocation = await plane.fetch(
+    new Request('https://plane.internal/mcp', {
+      method: 'POST',
+      headers: { ...transport.headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'hosted_echo', arguments: { name: 'mcp' } } }),
+    }),
+  );
+  const mcp = (await invocation.json()) as { error?: unknown; result?: { isError?: boolean } };
+  assert(invocation.status === 200 && !mcp.error && mcp.result !== undefined && !mcp.result.isError, 'MCP invocation failed');
+  return ['protected mixed-adapter broker and REST', 'private abilities refused and hidden', 'MCP discovery and protected invocation'];
 }
 
 function assert(condition: boolean, message: string): asserts condition {

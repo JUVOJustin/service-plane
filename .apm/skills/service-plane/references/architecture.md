@@ -79,8 +79,11 @@ For a local-only ability, an inline `handler` in `ability.method({ ... })` is th
   service caller. It is not end-user authentication.
 - `scopes` control what a signed capability may do. Ability scopes are the maximum; method scopes
   are the minimum for one operation.
-- `ingress` controls network trust. `ingress: {}` requires a brokered token and prevents a caller
+- `ingress` controls network trust. The default, `ingress: {}`, requires a brokered token and prevents a caller
   from bypassing the control plane with an ordinary valid token.
+
+`ingress: false` explicitly permits direct capability holders; use it only for a separately secured
+direct-service deployment. Hosting a service on another runtime does not require this opt-out.
 
 Product authentication belongs in control-plane `invocationMiddleware`. Provider credentials and
 tenant data belong in service-owned storage or validated method input, never in the capability
@@ -124,10 +127,15 @@ need no shared runtime session state. A process-local discovery cache is enabled
 default. Use a shared `RegistryCache` only when avoiding one cold fan-out per isolate or process is
 worth the extra infrastructure.
 
-WebSocket connections are stateful and owned by the accepting runtime. Durable Object hibernation
-is a direct service-WebSocket feature: the public broker and an in-process control-plane
+WebSocket connections are stateful and owned by the accepting runtime. Experimental Durable Object
+hibernation is outside the central-plane topology: the public broker and an in-process control-plane
 `abilityClient` both reject hibernating methods before opening a downstream call. Use an
-application-owned Durable Object endpoint when that topology is required.
+application-owned, explicitly secured Durable Object endpoint only when that separate topology is
+required. Ordinary `ability.stream` works through the public plane.
+
+Wire revisions are advertised independently of service versions and checked before broker dispatch.
+Use the [staged rollout](migration-rpc-boundary.md#roll-out-without-mixing-protocols) for incompatible
+revisions; swapping one endpoint in a live fleet does not convert existing sessions or frames.
 
 ## Observability
 

@@ -63,6 +63,7 @@ async function serve<TMethods extends AbilityMethodDefinitions>(methods: TMethod
   });
   const notes = defineAbility({ id: 'notes.items', methods, rpc: { transports: ['fetch'] }, scopes: ['notes.read'] });
   const service = new ServicePlaneService({
+    ingress: false,
     abilities: [notes],
     auth: { issuer: 'control-plane', jwks: { keys: [keys.publicJwk] }, now: () => VERIFIED_AT },
     capabilities,

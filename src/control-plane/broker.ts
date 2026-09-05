@@ -1,6 +1,7 @@
 import { RPCLink } from '@orpc/client/fetch';
 import { asyncIteratorObject, ORPCError, os, type as typeSchema } from '@orpc/server';
 import { orpcErrorFromServicePlane } from '../service/orpc.js';
+import { createRpcClientPlugins } from '../service/orpc-features.js';
 import { servicePlaneAuthorization } from '../shared/capability-tokens.js';
 import { type ConnInfo, SERVICE_PLANE_CONN_INFO_HEADER, serializeConnInfo } from '../shared/conn-info.js';
 import {
@@ -14,6 +15,7 @@ import {
 import { CapabilityAuthError, ServicePlaneTimeoutError, servicePlaneErrorInfo } from '../shared/errors.js';
 import { normalizeIdempotencyKey, SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER } from '../shared/idempotency.js';
 import { emitBestEffortServicePlaneLog, type ServicePlaneBrokerLogEvent } from '../shared/logging.js';
+import { assertServicePlaneRpcProtocol, SERVICE_PLANE_RPC_PROTOCOL } from '../shared/rpc-protocol.js';
 import type {
   DiscoveredServiceAbility,
   IssueCapabilityTokenInput,
@@ -22,7 +24,14 @@ import type {
   ServiceRegistry,
 } from '../shared/types.js';
 import { SERVICE_PLANE_REQUEST_ID_HEADER } from '../shared/types.js';
-import { type BrokerCaller, brokerCallerAccess, brokerCallerLogFields, brokerCallerSubject } from './caller.js';
+import {
+  type BrokerCaller,
+  brokerCallerAccess,
+  brokerCallerLogFields,
+  brokerCallerSubject,
+  type ControlPlaneAuthorizationInvocation,
+  type ControlPlaneInvocationAuthorizer,
+} from './caller.js';
 import type { CapabilityIssuer } from './capabilities.js';
 import { createServiceRegistry } from './registry.js';
 
@@ -52,6 +61,8 @@ export function brokerRequestToken(options: {
 }
 
 export type CreateControlPlaneRpcBrokerOptions = {
+  /** Product permission check run for each logical call before capability issuance; grants still apply. */
+  authorizeInvocation?: ControlPlaneInvocationAuthorizer;
   /**
    * Advisory connection info about the original client, forwarded to the target service. Services
    * surface it to handlers only for brokered calls with ingress enabled.
@@ -244,6 +255,7 @@ export function createControlPlaneRpcBroker(options: CreateControlPlaneRpcBroker
             throw new CapabilityAuthError(`Service-Plane broker has no ability: ${input.targetServiceId}/${input.abilityId}`, 404);
           }
           remainingBudget('during discovery');
+          assertServicePlaneRpcProtocol(ability.rpc.protocol);
           authorizeAbility(ability, input.caller);
           const method = Object.hasOwn(ability.methods, input.method) ? ability.methods[input.method] : undefined;
           if (!method) {
@@ -253,6 +265,16 @@ export function createControlPlaneRpcBroker(options: CreateControlPlaneRpcBroker
             );
           }
           const scopes = validateBrokerScopes(ability, input.method, input.scopes);
+          if (options.authorizeInvocation) {
+            await authorizeInvocation(options.authorizeInvocation, {
+              abilityId: ability.id,
+              ...(input.caller ? { caller: input.caller } : {}),
+              method: input.method,
+              scopes,
+              serviceId: ability.serviceId,
+            });
+            remainingBudget('during invocation authorization');
+          }
           const callerServiceId = input.caller?.kind === 'service' ? input.caller.id : options.controlPlaneServiceId;
           const subject = brokerCallerSubject(input.caller);
           const issued = await brokerRequestToken({
@@ -330,6 +352,25 @@ export function createControlPlaneRpcBroker(options: CreateControlPlaneRpcBroker
   };
 }
 
+// App policy receives a frozen copy so auditing or policy evaluation cannot rewrite dispatch authority.
+async function authorizeInvocation(
+  authorizer: ControlPlaneInvocationAuthorizer,
+  invocation: ControlPlaneAuthorizationInvocation,
+): Promise<void> {
+  const snapshot = Object.freeze({
+    ...invocation,
+    ...(invocation.caller ? { caller: Object.freeze({ ...invocation.caller }) } : {}),
+    scopes: Object.freeze([...invocation.scopes]),
+  });
+  let allowed = false;
+  try {
+    allowed = (await authorizer(snapshot)) === true;
+  } catch {
+    // Application exceptions can contain provider credentials or policy internals.
+  }
+  if (!allowed) throw new CapabilityAuthError('Service-Plane invocation is not permitted', 403);
+}
+
 function validateBrokerScopes(ability: DiscoveredServiceAbility, methodName: string, scopes: ReadonlyArray<string>): string[] {
   const requested = [...new Set(scopes.map((scope) => scope.trim()).filter(Boolean))];
   if (requested.length === 0) throw new CapabilityAuthError('Service-Plane broker call requires at least one scope', 400);
@@ -360,6 +401,7 @@ async function callDiscoveredAbility(
   const streams = definition?.stream === true;
   if (nativeBinding?.invokeAbility && !streams && ability.rpc.transports.includes('service-binding')) {
     return nativeBinding.invokeAbility({
+      protocol: SERVICE_PLANE_RPC_PROTOCOL,
       abilityId: ability.id,
       ...(forwarded.connInfo ? { connInfo: forwarded.connInfo } : {}),
       ...(forwarded.idempotencyKey ? { idempotencyKey: forwarded.idempotencyKey } : {}),
@@ -382,6 +424,7 @@ async function callDiscoveredAbility(
   if (forwarded.requestId) headers.set(SERVICE_PLANE_REQUEST_ID_HEADER, forwarded.requestId);
   if (timeout) headers.set(SERVICE_PLANE_TIMEOUT_HEADER, timeout);
   const link = new RPCLink({
+    plugins: createRpcClientPlugins({}),
     fetch: async (url, init) => ability.service.fetch(new Request(url, init)),
     headers,
     origin: ability.service.origin,

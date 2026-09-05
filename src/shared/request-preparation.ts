@@ -1,3 +1,5 @@
+import { ServicePlaneBodyTooLargeError } from './body-limit.js';
+
 type FetchRequestPreparationOptions = {
   /** Absolute deadline measured from request entry. Undefined leaves preparation unbounded. */
   deadlineAt?: number;
@@ -9,6 +11,37 @@ type FetchRequestPreparationOptions = {
 
 /** Internal ceiling for turning one physical Fetch request into logical RPC calls. */
 export const DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS = 10_000;
+
+/** Bounds the physical body before authentication and protocol decoding can create separate branches. */
+export function requestWithBoundedBody(
+  request: Request,
+  maxBytes: false | number,
+  tooLargeMessage: string,
+  onTooLarge?: (error: ServicePlaneBodyTooLargeError) => void,
+): Request {
+  if (maxBytes === false || !request.body) return request;
+  const declaredBytes = Number(request.headers.get('content-length'));
+  if (Number.isFinite(declaredBytes) && declaredBytes > maxBytes) {
+    void request.body.cancel().catch(() => undefined);
+    throw new ServicePlaneBodyTooLargeError(tooLargeMessage);
+  }
+
+  let bytes = 0;
+  const body = request.body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        bytes += chunk.byteLength;
+        if (bytes > maxBytes) {
+          const error = new ServicePlaneBodyTooLargeError(tooLargeMessage);
+          onTooLarge?.(error);
+          throw error;
+        }
+        controller.enqueue(chunk);
+      },
+    }),
+  );
+  return runtimePreservingRequest(request, { body, duplex: 'half' } as RequestInit & { duplex: 'half' });
+}
 
 /**
  * Bounds protocol decoding before an RPC procedure exists to enforce its own deadline. The timer is

@@ -1,5 +1,6 @@
+import { ORPCError, RPCSerializer } from '@orpc/client';
+import type { FetchLinkTransportPlugin } from '@orpc/client/fetch';
 import { BatchLinkPlugin, RequestCompressionLinkPlugin, ResponseCompressionLinkPlugin } from '@orpc/client/plugins';
-import type { StandardLinkPlugin } from '@orpc/client/standard';
 import { HibernationHandlerPlugin } from '@orpc/hibernation';
 import {
   BatchHandlerPlugin,
@@ -12,6 +13,12 @@ import {
 import type { StandardHandlerPlugin } from '@orpc/server/standard';
 import { CapabilityAuthError } from '../shared/errors.js';
 import {
+  assertServicePlaneRpcProtocol,
+  incompatibleRpcProtocolError,
+  SERVICE_PLANE_RPC_PROTOCOL,
+  SERVICE_PLANE_RPC_PROTOCOL_HEADER,
+} from '../shared/rpc-protocol.js';
+import {
   DEFAULT_SERVICE_PLANE_RPC_MAX_REQUEST_BODY_BYTES,
   type ServicePlaneClientCompressionOptions,
   type ServicePlaneClientWireOptions,
@@ -23,8 +30,8 @@ import {
 const SUPPORTED_COMPRESSION_ENCODINGS = ['gzip', 'deflate', 'deflate-raw'] as const satisfies readonly ServicePlaneCompressionEncoding[];
 
 /** Compiles stable client feature options into private engine plugins. */
-export function createRpcClientPlugins(options: ServicePlaneClientWireOptions): StandardLinkPlugin<object>[] {
-  const plugins: StandardLinkPlugin<object>[] = [];
+export function createRpcClientPlugins(options: ServicePlaneClientWireOptions): FetchLinkTransportPlugin<object>[] {
+  const plugins: FetchLinkTransportPlugin<object>[] = [];
   if (options.batch) {
     const batch = typeof options.batch === 'boolean' ? {} : options.batch;
     plugins.push(
@@ -59,17 +66,62 @@ export function createRpcClientPlugins(options: ServicePlaneClientWireOptions): 
           };
     plugins.push(new ResponseCompressionLinkPlugin(response));
   }
+  plugins.push({
+    name: 'service-plane-protocol',
+    initFetchLinkTransportOptions: (transport) => ({
+      ...transport,
+      fetchInterceptors: [
+        ...(transport.fetchInterceptors ?? []),
+        async ({ next }) => {
+          const response = await next();
+          try {
+            assertRpcResponseProtocol(response.status, response.headers.get(SERVICE_PLANE_RPC_PROTOCOL_HEADER));
+          } catch (error) {
+            // Never decode or retain a potentially infinite body from an incompatible peer.
+            void response.body?.cancel().catch(() => undefined);
+            throw error;
+          }
+          return response;
+        },
+      ],
+    }),
+    init: (link) => ({
+      ...link,
+      // After batching: the physical request must carry the marker even if a batch shares no
+      // application headers. WebSocket links run this same guard for each logical request.
+      transportInterceptors: [
+        ...(link.transportInterceptors ?? []),
+        async (call) => {
+          const response = await call.next({
+            ...call,
+            request: {
+              ...call.request,
+              headers: { ...call.request.headers, [SERVICE_PLANE_RPC_PROTOCOL_HEADER]: SERVICE_PLANE_RPC_PROTOCOL },
+            },
+          });
+          assertRpcResponseProtocol(response.status, response.headers[SERVICE_PLANE_RPC_PROTOCOL_HEADER]);
+          return response;
+        },
+      ],
+    }),
+  });
   return plugins;
 }
 
+/** Gateway errors remain meaningful even when a proxy did not preserve our response marker. */
+function assertRpcResponseProtocol(status: number, protocol: unknown): void {
+  if (status === 426 && protocol === SERVICE_PLANE_RPC_PROTOCOL) throw incompatibleRpcProtocolError();
+  if (status < 400) assertServicePlaneRpcProtocol(protocol);
+}
+
 /** Compiles stable server feature options into private engine plugins. */
-export function createRpcHandlerPlugins(
+export function createRpcHandlerPlugins<TContext extends object = Record<PropertyKey, unknown>>(
   options: ServicePlaneServerWireOptions,
   hibernation: boolean,
-): StandardHandlerPlugin<Record<PropertyKey, unknown>>[] {
+): StandardHandlerPlugin<TContext>[] {
   // These guards apply before decoded values reach schemas or application code. oRPC orders the
   // byte limit around complete batches and after request decompression.
-  const plugins: StandardHandlerPlugin<Record<PropertyKey, unknown>>[] = [
+  const plugins: StandardHandlerPlugin<TContext>[] = [
     new PrototypePollutionProtectionHandlerPlugin(),
     // A batch is split before handler interceptors run, so this exposes the headers belonging to
     // the individual logical call rather than only the outer Fetch request.
@@ -104,6 +156,48 @@ export function createRpcHandlerPlugins(
     plugins.push(new ResponseCompressionHandlerPlugin(response));
   }
   if (hibernation) plugins.push(new HibernationHandlerPlugin());
+  const serializer = new RPCSerializer();
+  plugins.push({
+    name: 'service-plane-protocol',
+    init: (handler) => ({
+      ...handler,
+      // Before routing and batch decoding, including frames forwarded manually by Durable Objects.
+      routingInterceptors: [
+        async ({ request, next }) => {
+          if (request.headers[SERVICE_PLANE_RPC_PROTOCOL_HEADER] !== SERVICE_PLANE_RPC_PROTOCOL) {
+            const error = incompatibleRpcProtocolError();
+            return {
+              matched: true,
+              response: {
+                status: error.status,
+                headers: {
+                  [SERVICE_PLANE_RPC_PROTOCOL_HEADER]: SERVICE_PLANE_RPC_PROTOCOL,
+                  'access-control-expose-headers': SERVICE_PLANE_RPC_PROTOCOL_HEADER,
+                },
+                body: serializer.serialize(
+                  new ORPCError('UPGRADE_REQUIRED', {
+                    message: error.message,
+                    data: { servicePlane: { code: error.code, message: error.message, retryable: error.retryable, status: error.status } },
+                  }).toJSON(),
+                ),
+              },
+            };
+          }
+          const result = await next();
+          if (result.matched) {
+            const exposed = result.response.headers['access-control-expose-headers'];
+            result.response.headers[SERVICE_PLANE_RPC_PROTOCOL_HEADER] = SERVICE_PLANE_RPC_PROTOCOL;
+            result.response.headers['access-control-expose-headers'] = [
+              ...(Array.isArray(exposed) ? exposed : exposed ? [exposed] : []),
+              SERVICE_PLANE_RPC_PROTOCOL_HEADER,
+            ].join(', ');
+          }
+          return result;
+        },
+        ...(handler.routingInterceptors ?? []),
+      ],
+    }),
+  });
   return plugins;
 }
 

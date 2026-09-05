@@ -35,8 +35,8 @@ export type AbilityTransport = 'fetch' | 'service-binding' | 'websocket';
 /**
  * `query` is the HTTP QUERY method (RFC 10008): a safe, idempotent request that carries its
  * parameters in a body. OpenAPI 3.2 gives it a fixed `query` field on the Path Item Object,
- * and Hono 4.13+ routes it first-class (`app.query()`). The peer floor is 4.13.5 so consumers also
- * receive the current query-parser and request-body security fixes.
+ * and Hono 4.13+ routes it first-class (`app.query()`). The peer floor includes the query-parser,
+ * request-body, and JSX escaping security fixes available in Hono 4.13.7.
  */
 export type ServiceHttpMethod = 'delete' | 'get' | 'patch' | 'post' | 'put' | 'query';
 
@@ -53,50 +53,27 @@ export type CapabilityCatalog = {
 
 export type OpenApiObject = Record<string, unknown>;
 
-type ImmutableArrayMutationGuards = {
-  readonly copyWithin?: never;
-  readonly fill?: never;
-  readonly pop?: never;
-  readonly push?: never;
-  readonly reverse?: never;
-  readonly shift?: never;
-  readonly sort?: never;
-  readonly splice?: never;
-  readonly unshift?: never;
-};
-
-type ImmutableArray<T> = ReadonlyArray<T> & ImmutableArrayMutationGuards;
-
 type DeepReadonly<T> = T extends (...args: never[]) => unknown
   ? T
   : T extends ReadonlyArray<infer TItem>
-    ? ImmutableArray<DeepReadonly<TItem>>
+    ? ReadonlyArray<DeepReadonly<TItem>>
     : T extends object
       ? { readonly [TKey in keyof T]: DeepReadonly<T[TKey]> }
       : T;
 
-// Every union member carries the guards because TypeScript's `Array.isArray` otherwise narrows a
-// readonly union to mutable `any[]` and permits code that the runtime-frozen value would reject.
-type ReadonlyJsonElement = (string | number | boolean | null | ReadonlyOpenApiObject | ReadonlyJsonArray) & ImmutableArrayMutationGuards;
-
-interface ReadonlyJsonArray extends ReadonlyArray<ReadonlyJsonElement>, ImmutableArrayMutationGuards {}
+type ReadonlyJsonElement = string | number | boolean | null | ReadonlyOpenApiObject | ReadonlyArray<ReadonlyJsonElement>;
 
 /** Deeply immutable JSON Schema or OpenAPI fragment owned by a live Service Plane definition. */
 export type ReadonlyOpenApiObject = {
   readonly [key: string]: ReadonlyJsonElement | undefined;
 };
 
-declare global {
-  interface ArrayConstructor {
-    /** Preserves readonly JSON-array methods when narrowing a live Service Plane schema value. */
-    isArray(value: ReadonlyJsonElement | undefined): value is ReadonlyJsonArray;
-  }
-}
-
 type ReadonlyJsonWebKey = DeepReadonly<JsonWebKey & { kid?: string }>;
 
 export type ServiceAbilityRpcDiscovery = {
   readonly path: string;
+  /** Wire revision advertised by the service; absent legacy catalogs cannot be invoked. */
+  readonly protocol?: string;
   readonly transports: ReadonlyArray<AbilityTransport>;
 };
 
@@ -191,7 +168,7 @@ export type ServiceCallerAuthDiscovery = {
 /** Caller-auth discovery held by a live service after defensive snapshotting. */
 export type ReadonlyServiceCallerAuthDiscovery = {
   readonly jwks: {
-    readonly keys: ImmutableArray<ReadonlyJsonWebKey>;
+    readonly keys: ReadonlyArray<ReadonlyJsonWebKey>;
   };
 };
 
@@ -225,6 +202,8 @@ export type ServiceGrantDefinition = {
 
 /** One unary method invocation sent through a Cloudflare native service binding. */
 export type ServiceAbilityNativeCall = {
+  /** Wire revision supplied automatically by Service Plane clients and brokers. */
+  protocol: string;
   /** Stable contract id the target service resolves before selecting a method. */
   abilityId: string;
   /** Advisory original-client metadata forwarded only across the authenticated service boundary. */

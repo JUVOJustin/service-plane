@@ -223,7 +223,7 @@ function mcpDispatchFixture(projections: readonly [McpProjectionMetadata, McpPro
           scopes: ['duplicate.read'],
         },
       },
-      rpc: { path: `/rpc/${serviceId}`, transports: ['service-binding'] },
+      rpc: { path: `/rpc/v1/${serviceId}`, protocol: 'service-plane-rpc/1', transports: ['service-binding'] },
       scopes: ['duplicate.read'],
       service: {
         abilityRpc: { invokeAbility: invocations },

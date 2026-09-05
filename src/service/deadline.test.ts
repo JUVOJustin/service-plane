@@ -35,6 +35,7 @@ describe('service authorization deadlines', () => {
       rpc: { transports: ['fetch'] },
     });
     const service = new ServicePlaneService({
+      ingress: false,
       abilities: [tasks],
       auth: {
         jwks: () => {
@@ -57,10 +58,10 @@ describe('service authorization deadlines', () => {
     });
 
     const response = await service.fetch(
-      new Request('https://tasks.internal/rpc/tasks.items/get', {
+      new Request('https://tasks.internal/rpc/v1/tasks.items/get', {
         body,
         duplex: 'half',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', 'x-service-plane-rpc-protocol': 'service-plane-rpc/1' },
         method: 'POST',
       } as RequestInit & { duplex: 'half' }),
     );
@@ -88,6 +89,7 @@ describe('service authorization deadlines', () => {
     let bodyCancels = 0;
     let fetches = 0;
     const service = new ServicePlaneService({
+      ingress: false,
       abilities: [tasks],
       auth: { jwks: { keys: [] } },
       id: 'tasks',
@@ -182,6 +184,7 @@ describe('service authorization deadlines', () => {
       scopes: ['tasks.read'],
     });
     const service = new ServicePlaneService({
+      ingress: false,
       abilities: [tasks],
       auth: {
         issuer: 'control-plane',
@@ -201,6 +204,7 @@ describe('service authorization deadlines', () => {
 
     const error = await service
       .invokeAbility({
+        protocol: 'service-plane-rpc/1',
         abilityId: 'tasks.items',
         input: {},
         method: 'get',
@@ -243,7 +247,7 @@ describe('service authorization deadlines', () => {
       env: {},
       identity,
       methodName: 'watch',
-      request: new Request('https://tasks.internal/rpc/tasks.items/watch'),
+      request: new Request('https://tasks.internal/rpc/v1/tasks.items/watch'),
     } satisfies AbilityMethodContext;
     let resolveAuthorization: ((value: { context: typeof methodContext; deadlineAt: number }) => void) | undefined;
     const authorization = new Promise<{ context: typeof methodContext; deadlineAt: number }>((resolve) => {

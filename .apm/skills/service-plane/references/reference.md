@@ -38,7 +38,7 @@ const contract = defineAbility({
     }),
   },
   rpc: {
-    path: '/rpc/tasks',
+    path: '/rpc/v1/tasks',
     transports: ['fetch', 'service-binding'],
   },
 });
@@ -50,7 +50,7 @@ Ability defaults:
 | --- | --- |
 | `exposure` | `private` |
 | `access` | `plane` |
-| `rpc.path` | `/rpc/<abilityId>` |
+| `rpc.path` | `/rpc/v1/<abilityId>` |
 | `rpc.transports` | `['fetch']` |
 
 `scopes` is the maximum scope surface. By default, every ability and method needs at least one
@@ -134,11 +134,12 @@ Routes:
 
 ```text
 GET /.well-known/service-plane/service.json
-ALL /rpc/<abilityId>/*
-ALL /rpc/<abilityId>       # WebSocket upgrade when declared and configured
+ALL /rpc/v1/<abilityId>/*
+ALL /rpc/v1/<abilityId>       # WebSocket upgrade when declared and configured
 ```
 
-`ingress: {}` requires a signed broker claim. `rpc.maxRequestBodyBytes` defaults to 1 MiB for decoded
+Omitting `ingress` is equivalent to `ingress: {}`: a signed broker claim is required. Only
+`ingress: false` permits ordinary direct capabilities. `rpc.maxRequestBodyBytes` defaults to 1 MiB for decoded
 Fetch bodies and individual WebSocket messages. `rpc.upgradeWebSocket` lets Hono own upgrades;
 `manualWebSocket` enables the Durable Object event-forwarding methods.
 
@@ -157,6 +158,7 @@ new ServicePlaneControlPlane({
   services,
   authenticateCaller?,
   invocationMiddleware?,
+  authorizeInvocation?,
   broker?,
   mcp?,
   openapi?,
@@ -176,8 +178,8 @@ POST /.well-known/service-plane/capability-token     always
 GET  /.well-known/service-plane/jwks.json            always
 GET  /openapi.json                                   default; `openapi: false` disables
 *    <published rest.path>                           default; `rest: false` disables catch-all
-ALL  /rpc/broker/*                                   `broker: {}` enables
-ALL  /rpc/broker/ws                                  when broker WebSocket upgrade is configured
+ALL  /rpc/v1/broker/*                                `broker: {}` enables
+ALL  /rpc/v1/broker/ws                               when broker WebSocket upgrade is configured
 POST /mcp                                            `mcp: {}` enables
 ```
 
@@ -219,6 +221,19 @@ its own authenticated `401` or authorized `403`. Invocation middleware is inside
 deadline: a late `next()` is refused before parsing, discovery, or dispatch can start background
 work after the caller has already received a timeout.
 
+`authorizeInvocation(invocation, context)` is the optional per-method permission check, after
+authentication and method resolution but before token issuance. Its `ControlPlaneAuthorizationInvocation`
+contains readonly `caller?`, `serviceId`, `abilityId`, `method`, and exact token `scopes` (including
+extras). When configured it must return `true`; every other result or exception denies with 403.
+The same hook covers REST, MCP, broker batch items, WebSocket calls, and `plane.abilityClient`.
+An absent caller denotes a trusted plane-owned call. Service grants remain enforced afterward.
+
+Body-reading `invocationMiddleware` receives exact raw bytes, bounded before its stream is cloned
+for decoding. Each surface's body limit therefore covers authentication too; compressed broker
+requests are bounded both physically and after decompression. Header-only refusal does not wait for
+the body. Middleware registered earlier on a supplied Hono app remains application-owned and must
+enforce its own body limits if it consumes requests before Service Plane runs.
+
 For a broker WebSocket, this middleware authenticates the physical HTTP upgrade. Browser clients
 use a secure cookie or short-lived URL ticket; server runtimes may supply upgrade headers inside a
 custom `createWebSocket` closure. Logical call metadata remains per call.
@@ -235,7 +250,8 @@ resolving a downstream endpoint because they require a direct service WebSocket.
 Most applications use `ServicePlaneControlPlane`. Custom shells may call
 `handleControlPlaneRestRequest` or `handleControlPlaneMcpRequest` with a request-scoped registry and
 `ControlPlaneInvocationOptions`; the REST middleware hook must authenticate before invoking its
-`next` callback. `generateControlPlaneOpenApi` and `generateMcpDiscovery` project an already
+`next` callback and read the second `request` argument when authenticating raw bytes.
+`generateControlPlaneOpenApi` and `generateMcpDiscovery` project an already
 discovered snapshot without mounting routes. MCP's optional `onInvocation` receives a
 `ControlPlaneMcpInvocation`; its readonly scopes are a defensive observation copy and cannot change
 the scopes used for downstream token issuance.
@@ -282,7 +298,7 @@ createBrokeredAbilityClient({
 ```
 
 Use `{ type: 'websocket', url, createWebSocket?, reconnect?, path? }` for the broker socket. The
-physical default is `/rpc/broker/ws`; the logical prefix is `/rpc/broker`. `headers` exists only on
+physical default is `/rpc/v1/broker/ws`; the logical prefix is `/rpc/v1/broker`. `headers` exists only on
 the Fetch variant. Authenticate WebSocket on its HTTP upgrade with a browser cookie, short-lived
 URL ticket, or a runtime-specific `createWebSocket` closure that can set headers.
 
@@ -344,16 +360,25 @@ type ServicePlaneClientWireOptions = {
 };
 ```
 
-Server compression reverses the request/response direction and adds a response threshold. Batching
+Server compression reverses the request/response direction and adds a response threshold. Requests,
+including batches, and ordinary unary responses can be compressed; batch and stream responses cannot.
+Batching
 combines only concurrent unary Fetch calls; streams and WebSockets never enter a batch.
-Hibernating streams reject the broker, in-process `abilityClient`, batching, and every transport
-except a direct service WebSocket. See [transports](transports.md).
+Experimental hibernating streams reject the broker, in-process `abilityClient`, batching, REST/MCP
+metadata, and every transport except a separately secured direct service WebSocket with
+`ingress: false`. See [transports](transports.md).
 
 ## Discovery
 
 `ServiceDiscoveryDocument` contains service identity, optional capability catalog and caller JWKS,
 and ability discovery. Every method includes scopes plus input/output JSON Schema, and may include
 REST/MCP metadata, `idempotent`, `timeoutMs`, or `stream: true`.
+
+Ability RPC discovery advertises `rpc.protocol: 'service-plane-rpc/1'`. Fetch and WebSocket calls
+carry the owned revision marker; native envelopes carry `protocol`. Missing or unsupported revisions
+fail with `incompatible_protocol` (426), without automatic retry. The service entry point exports
+`SERVICE_PLANE_RPC_PROTOCOL`, `SERVICE_PLANE_RPC_PROTOCOL_HEADER`, and
+`SERVICE_PLANE_BROKER_RPC_PATH`. See the [rollout guide](migration-rpc-boundary.md) before mixing versions.
 
 `serviceDiscoveryDocument()` returns a defensive wire snapshot. Its caller keys and schema
 fragments can be transformed for serialization or tooling without mutating the frozen live service
@@ -396,7 +421,9 @@ or its service-wide method default (10 seconds unless changed; `false` opts out 
 exists). The public broker uses the nearer physical-request budget or a 10-second preparation
 ceiling, including physical batches whose per-call headers are still inside the unread body. The
 preparation timer stops at the first procedure entry; logical unary and stream rules then take over.
-Timed-out bodies are actively cancelled, including compressed requests.
+Timed-out bodies are actively cancelled, including compressed requests. STS, REST, and MCP also
+apply a 10-second physical request-preparation ceiling; shorter caller budgets win. These timers
+stop when body preparation is complete and do not impose a new ten-second limit on stream execution.
 
 For client defaults and per-call `timeoutMs`, invalid values are rejected, `0` fails immediately,
 and values above the ten-minute wire maximum are clamped. Ability method metadata is definition
@@ -497,6 +524,7 @@ also handles local failures.
 | `code` | Meaning |
 | --- | --- |
 | `capability_auth` | Token, ingress, access, scope, or proof refused the call |
+| `incompatible_protocol` | Missing or unsupported RPC wire revision; status 426 and never retryable |
 | `ability_validation` | Input, output, or stream item failed its schema |
 | `cancelled` | The caller aborted; status 499 and never retryable |
 | `timeout` | An effective deadline or server-owned execution/preparation ceiling elapsed |

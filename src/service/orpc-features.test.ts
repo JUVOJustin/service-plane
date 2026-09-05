@@ -31,6 +31,7 @@ function featureAbility(transports: AbilityTransport[]) {
 
 function featureService(transports: AbilityTransport[], rpc: ServicePlaneServerWireOptions = {}): ServicePlaneService {
   return new ServicePlaneService({
+    ingress: false,
     abilities: [featureAbility(transports)],
     auth: { issuer: 'control-plane', jwks: { keys: [] } },
     capabilities: features,
@@ -130,6 +131,7 @@ describe('private RPC feature configuration', () => {
   it('applies the request limit after decompression', async () => {
     const ability = featureAbility(['fetch']);
     const service = new ServicePlaneService({
+      ingress: false,
       abilities: [ability],
       auth: { issuer: 'control-plane', jwks: { keys: [] } },
       capabilities: features,

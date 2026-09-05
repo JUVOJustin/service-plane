@@ -14,11 +14,11 @@ describe('path matching', () => {
   });
 
   it('distinguishes service-local routes from host-replacing URL references', () => {
-    expect(isOriginRelativePath('/rpc/example.sync')).toBe(true);
+    expect(isOriginRelativePath('/rpc/v1/example.sync')).toBe(true);
     expect(isOriginRelativePath('//other.example/rpc')).toBe(false);
     expect(isOriginRelativePath('/\\other.example/rpc')).toBe(false);
-    expect(isOriginRelativePath('/rpc/example.sync?token=x')).toBe(false);
-    expect(isOriginRelativePath('/rpc/example.sync#fragment')).toBe(false);
+    expect(isOriginRelativePath('/rpc/v1/example.sync?token=x')).toBe(false);
+    expect(isOriginRelativePath('/rpc/v1/example.sync#fragment')).toBe(false);
   });
 
   it('rejects paths whose control characters the URL parser strips into a host reference', () => {
@@ -27,7 +27,7 @@ describe('path matching', () => {
       expect(new URL(path, 'https://hub.internal').origin).toBe('https://attacker.example');
       expect(isOriginRelativePath(path)).toBe(false);
     }
-    expect(isOriginRelativePath('/rpc/example sync')).toBe(false);
+    expect(isOriginRelativePath('/rpc/v1/example sync')).toBe(false);
     expect(isOriginRelativePath(' //attacker.example/rpc')).toBe(false);
   });
 });

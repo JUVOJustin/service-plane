@@ -64,6 +64,7 @@ async function createDirectFixture() {
     handlerRuns += 1;
   });
   const service = new ServicePlaneService({
+    ingress: false,
     abilities: [sync],
     auth: {
       issuer: 'control-plane',
@@ -111,6 +112,7 @@ async function createPlaneFixture(caller: BrokerCaller) {
   const sync = defineSyncAbility();
   let plane: ServicePlaneControlPlane | undefined;
   const service = new ServicePlaneService({
+    ingress: false,
     abilities: [sync],
     auth: {
       issuer: 'control-plane',

@@ -20,7 +20,7 @@ import {
   type ServiceRegistry,
   type ServiceRegistrySnapshot,
 } from '../shared/types.js';
-import { type BrokerCaller, brokerCallerLogFields } from './caller.js';
+import { type BrokerCaller, brokerCallerLogFields, type ControlPlaneInvocationAuthorizer } from './caller.js';
 import type { CapabilityIssuer } from './capabilities.js';
 import { invokeControlPlaneMethod, raceControlPlaneOperation } from './invocation.js';
 
@@ -42,6 +42,8 @@ export type ControlPlaneMcpInvocation = {
 };
 
 export type ControlPlaneMcpHandlerOptions = {
+  /** Product permission check applied to tool, resource, and prompt method invocations. */
+  authorizeInvocation?: ControlPlaneInvocationAuthorizer;
   /**
    * Browser requests must come from the MCP endpoint's own origin by default. Deployments
    * intentionally serving browser clients from another origin can allow exact origins here.
@@ -357,6 +359,9 @@ export async function handlePreparedControlPlaneMcpRequest(
 
 /** Formats a route-entry failure, preserving a JSON-RPC id once parsing reached it. */
 export function controlPlaneMcpErrorResponse(error: unknown, id: string | number | null = null): Response {
+  if (error instanceof ServicePlaneBodyTooLargeError) {
+    return jsonRpcError(id, JSON_RPC_INVALID_REQUEST, error.message, 413, { status: 413 });
+  }
   return protocolError(id, error, JSON_RPC_INTERNAL_ERROR);
 }
 

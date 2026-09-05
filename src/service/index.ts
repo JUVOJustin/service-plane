@@ -39,6 +39,7 @@ export {
   type ServicePlaneLoggableEvent,
   type ServicePlaneLogSink,
 } from '../shared/logging.js';
+export { SERVICE_PLANE_BROKER_RPC_PATH, SERVICE_PLANE_RPC_PROTOCOL, SERVICE_PLANE_RPC_PROTOCOL_HEADER } from '../shared/rpc-protocol.js';
 export type {
   AbilityAccess,
   AbilityExposure,

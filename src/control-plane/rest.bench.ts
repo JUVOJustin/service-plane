@@ -27,7 +27,7 @@ const definitions: ServiceAbilityDiscovery[] = Array.from({ length: ROUTES }, (_
       scopes: [],
     },
   },
-  rpc: { path: `/rpc/resource-${index}`, transports: ['fetch'] },
+  rpc: { path: `/rpc/v1/resource-${index}`, transports: ['fetch'] },
   scopes: [],
 }));
 const document: ServiceDiscoveryDocument = {

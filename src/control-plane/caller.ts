@@ -16,6 +16,23 @@ export type BrokerCaller = {
   principalKind?: string;
 };
 
+/** Immutable authenticated target evaluated before a logical invocation may mint a capability. */
+export type ControlPlaneAuthorizationInvocation = {
+  /** Service-owned ability selected from the current catalog. */
+  readonly abilityId: string;
+  /** Authenticated caller; absent for a trusted plane-owned invocation. */
+  readonly caller?: Readonly<BrokerCaller>;
+  /** Resolved method name, without unvalidated input. */
+  readonly method: string;
+  /** Exact scopes requested for this invocation, including required method scopes. */
+  readonly scopes: ReadonlyArray<string>;
+  /** Service selected from the current catalog. */
+  readonly serviceId: string;
+};
+
+/** Optional application policy; when configured, only literal `true` permits dispatch. */
+export type ControlPlaneInvocationAuthorizer = (invocation: ControlPlaneAuthorizationInvocation) => boolean | Promise<boolean>;
+
 /** Maps a product caller to the delegated subject signed into downstream capability tokens. */
 export function brokerCallerSubject(caller: BrokerCaller | undefined): CapabilitySubject | undefined {
   if (caller?.kind !== 'user') return undefined;

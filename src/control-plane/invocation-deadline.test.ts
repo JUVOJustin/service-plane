@@ -17,7 +17,7 @@ describe('shared REST and MCP invocation deadlines', () => {
           scopes: ['tasks.read'],
         },
       },
-      rpc: { path: '/rpc/tasks.items', transports: ['service-binding'] },
+      rpc: { path: '/rpc/v1/tasks.items', protocol: 'service-plane-rpc/1', transports: ['service-binding'] },
       scopes: ['tasks.read'],
       service: {
         abilityRpc: {

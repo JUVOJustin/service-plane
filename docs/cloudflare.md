@@ -14,9 +14,9 @@ downstream calls use native RPC; streams use binding Fetch.
 }
 ```
 
-Give service Workers a `CONTROL_PLANE` binding so they can load JWKS. Keep service routes private
-when the platform topology permits it, and enable `ingress: {}` regardless so the method runtime
-requires a brokered token.
+Give service Workers a `CONTROL_PLANE` binding so they can load JWKS. Disable public service routes
+when the platform topology permits it. Service ingress requires a brokered token by default, even
+when a service must remain reachable over HTTPS from another runtime.
 
 ## Expose Fetch And Native RPC
 
@@ -51,6 +51,9 @@ cloudflareServiceBinding({
 })
 ```
 
+The ability contract must also opt in with `rpc: { transports: ['fetch', 'service-binding'] }`.
+Without that declaration, the broker uses Fetch even when the binding exposes `invokeAbility`.
+
 The explicit `abilityRpc` matters: a service-binding proxy returns a callable property for any
 name, so runtime feature probing would produce false positives. Set it to `true` only when that same
 binding exposes `invokeAbility`; a separate `ServiceAbilityNativeRpcBinding` adapter also remains
@@ -68,7 +71,7 @@ and [RPC serialization rules](https://developers.cloudflare.com/workers/runtime-
 
 ## Direct Service-To-Service Calls
 
-A trusted Worker may use a direct client when the target is not ingress-protected:
+A trusted Worker may use a direct client only when the target explicitly sets `ingress: false`:
 
 ```ts
 const tasks = createAbilityClient({
@@ -129,7 +132,7 @@ ability receives a validated connection ID and verified delegated subject, then 
 Never put provider credentials in a capability token, workflow payload, or browser bundle.
 
 Use a Durable Object as the service endpoint itself only when it must own a hibernating WebSocket.
-See [streaming](streaming.md#durable-object-hibernation).
+See [streaming](streaming.md#experimental-direct-durable-object-hibernation).
 
 ## Cache Discovery Deliberately
 

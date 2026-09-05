@@ -26,7 +26,7 @@ const discovery = (id: string): ServiceDiscoveryDocument => ({
       exposure: 'published',
       id: `${id}.run`,
       methods: { go: { inputSchema: { type: 'object' }, outputSchema: { type: 'object' }, scopes: [`${id}.use`] } },
-      rpc: { path: `/rpc/${id}.run`, transports: ['fetch'] },
+      rpc: { path: `/rpc/v1/${id}.run`, transports: ['fetch'] },
       scopes: [`${id}.use`],
     },
   ],
@@ -399,7 +399,7 @@ describe('discovery cache on the token path', () => {
   });
 
   it.each([
-    { broker: {}, brokerPath: '/rpc/broker' },
+    { broker: {}, brokerPath: '/rpc/v1/broker' },
     { broker: { path: '/custom-broker/' }, brokerPath: '/custom-broker' },
   ])('keeps REST projections out of the $brokerPath broker namespace', async ({ broker, brokerPath }) => {
     const projectedDiscovery = (id: string, path: string): ServiceDiscoveryDocument => {
@@ -603,7 +603,7 @@ describe('discovery cache on the token path', () => {
                       methods: {
                         go: { inputSchema: { type: 'object' }, outputSchema: { type: 'object' }, scopes: [`svc0.${tenant}`] },
                       },
-                      rpc: { path: '/rpc/svc0.run', transports: ['fetch' as const] },
+                      rpc: { path: '/rpc/v1/svc0.run', transports: ['fetch' as const] },
                       scopes: [`svc0.${tenant}`],
                     },
                   ],

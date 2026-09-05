@@ -8,6 +8,7 @@ import { memoryWebSocketPair } from '../test-support/index.js';
 import { createAbilityBuilder } from './ability.js';
 import { createAbilityClient, createBrokeredAbilityClient, disposeAbilityClient } from './client.js';
 import { defineAbility } from './discovery.js';
+import { createRpcHandlerPlugins } from './orpc-features.js';
 
 const ability = createAbilityBuilder();
 const lifecycleContract = defineAbility({
@@ -32,33 +33,36 @@ describe('ability client lifecycle', () => {
     const started = new Promise<void>((resolve) => {
       pendingStarted = resolve;
     });
-    const handler = new WebSocketRpcHandler({
-      ping: os.input(z.object({ value: z.string() })).handler(({ input }) => {
-        if (input.value !== 'pending') return input.value;
-        pendingStarted?.();
-        return new Promise<string>(() => undefined);
-      }),
-      watch: os.input(z.object({ value: z.string() })).handler(({ input }) => {
-        let first = true;
-        const stream: AsyncIterableIterator<string> = {
-          [Symbol.asyncIterator]() {
-            return stream;
-          },
-          next() {
-            if (first) {
-              first = false;
-              return Promise.resolve({ done: false, value: input.value });
-            }
-            return new Promise(() => undefined);
-          },
-          return() {
-            streamClosed += 1;
-            return Promise.resolve({ done: true, value: undefined });
-          },
-        };
-        return stream;
-      }),
-    });
+    const handler = new WebSocketRpcHandler(
+      {
+        ping: os.input(z.object({ value: z.string() })).handler(({ input }) => {
+          if (input.value !== 'pending') return input.value;
+          pendingStarted?.();
+          return new Promise<string>(() => undefined);
+        }),
+        watch: os.input(z.object({ value: z.string() })).handler(({ input }) => {
+          let first = true;
+          const stream: AsyncIterableIterator<string> = {
+            [Symbol.asyncIterator]() {
+              return stream;
+            },
+            next() {
+              if (first) {
+                first = false;
+                return Promise.resolve({ done: false, value: input.value });
+              }
+              return new Promise(() => undefined);
+            },
+            return() {
+              streamClosed += 1;
+              return Promise.resolve({ done: true, value: undefined });
+            },
+          };
+          return stream;
+        }),
+      },
+      { plugins: createRpcHandlerPlugins({}, false) },
+    );
     let connections = 0;
     let closeCalls = 0;
     let physicalSocket: ReturnType<typeof memoryWebSocketPair>[0] | undefined;
@@ -84,7 +88,7 @@ describe('ability client lifecycle', () => {
           onClose: { delay: 0, enabled: true },
         },
         type: 'websocket',
-        url: 'wss://lifecycle.internal/rpc/client.lifecycle',
+        url: 'wss://lifecycle.internal/rpc/v1/client.lifecycle',
       },
     });
 
@@ -124,7 +128,7 @@ describe('ability client lifecycle', () => {
         },
         reconnect: { enabled: true, onClose: { enabled: true } },
         type: 'websocket',
-        url: 'wss://plane.internal/rpc/broker/ws',
+        url: 'wss://plane.internal/rpc/v1/broker/ws',
       },
     });
 
@@ -155,7 +159,7 @@ describe('ability client lifecycle', () => {
           },
           reconnect: { delay: () => 10, enabled: true, maxAttempt: 100 },
           type: 'websocket',
-          url: 'wss://plane.internal/rpc/broker/ws',
+          url: 'wss://plane.internal/rpc/v1/broker/ws',
         },
       });
       const call = client.ping({ value: 'pending' });
@@ -178,29 +182,32 @@ describe('ability client lifecycle', () => {
     vi.useFakeTimers();
     try {
       let returnCalls = 0;
-      const handler = new WebSocketRpcHandler({
-        ping: os.input(z.object({ value: z.string() })).handler(({ input }) => input.value),
-        watch: os.input(z.object({ value: z.string() })).handler(({ input }) => {
-          let first = true;
-          const stream: AsyncIterableIterator<string> = {
-            [Symbol.asyncIterator]() {
-              return stream;
-            },
-            next() {
-              if (first) {
-                first = false;
-                return Promise.resolve({ done: false, value: input.value });
-              }
-              return new Promise(() => undefined);
-            },
-            return() {
-              returnCalls += 1;
-              return Promise.resolve({ done: true, value: undefined });
-            },
-          };
-          return stream;
-        }),
-      });
+      const handler = new WebSocketRpcHandler(
+        {
+          ping: os.input(z.object({ value: z.string() })).handler(({ input }) => input.value),
+          watch: os.input(z.object({ value: z.string() })).handler(({ input }) => {
+            let first = true;
+            const stream: AsyncIterableIterator<string> = {
+              [Symbol.asyncIterator]() {
+                return stream;
+              },
+              next() {
+                if (first) {
+                  first = false;
+                  return Promise.resolve({ done: false, value: input.value });
+                }
+                return new Promise(() => undefined);
+              },
+              return() {
+                returnCalls += 1;
+                return Promise.resolve({ done: true, value: undefined });
+              },
+            };
+            return stream;
+          }),
+        },
+        { plugins: createRpcHandlerPlugins({}, false) },
+      );
       const client = createAbilityClient({
         ability: lifecycleContract,
         targetServiceId: 'lifecycle',
@@ -213,7 +220,7 @@ describe('ability client lifecycle', () => {
             return clientSocket;
           },
           type: 'websocket',
-          url: 'wss://lifecycle.internal/rpc/client.lifecycle',
+          url: 'wss://lifecycle.internal/rpc/v1/client.lifecycle',
         },
       });
 
@@ -237,29 +244,32 @@ describe('ability client lifecycle', () => {
     vi.useFakeTimers();
     try {
       let returnCalls = 0;
-      const handler = new WebSocketRpcHandler({
-        ping: os.input(z.object({ value: z.string() })).handler(({ input }) => input.value),
-        watch: os.input(z.object({ value: z.string() })).handler(({ input }) => {
-          let first = true;
-          const stream: AsyncIterableIterator<string> = {
-            [Symbol.asyncIterator]() {
-              return stream;
-            },
-            next() {
-              if (first) {
-                first = false;
-                return Promise.resolve({ done: false, value: input.value });
-              }
-              return new Promise(() => undefined);
-            },
-            return() {
-              returnCalls += 1;
-              return Promise.resolve({ done: true, value: undefined });
-            },
-          };
-          return stream;
-        }),
-      });
+      const handler = new WebSocketRpcHandler(
+        {
+          ping: os.input(z.object({ value: z.string() })).handler(({ input }) => input.value),
+          watch: os.input(z.object({ value: z.string() })).handler(({ input }) => {
+            let first = true;
+            const stream: AsyncIterableIterator<string> = {
+              [Symbol.asyncIterator]() {
+                return stream;
+              },
+              next() {
+                if (first) {
+                  first = false;
+                  return Promise.resolve({ done: false, value: input.value });
+                }
+                return new Promise(() => undefined);
+              },
+              return() {
+                returnCalls += 1;
+                return Promise.resolve({ done: true, value: undefined });
+              },
+            };
+            return stream;
+          }),
+        },
+        { plugins: createRpcHandlerPlugins({}, false) },
+      );
       const client = createAbilityClient({
         ability: lifecycleContract,
         targetServiceId: 'lifecycle',
@@ -272,7 +282,7 @@ describe('ability client lifecycle', () => {
             return clientSocket;
           },
           type: 'websocket',
-          url: 'wss://lifecycle.internal/rpc/client.lifecycle',
+          url: 'wss://lifecycle.internal/rpc/v1/client.lifecycle',
         },
       });
 
@@ -300,32 +310,35 @@ describe('ability client lifecycle', () => {
       returnStarted = resolve;
     });
     let finishReturn: (() => void) | undefined;
-    const handler = new WebSocketRpcHandler({
-      ping: os.input(z.object({ value: z.string() })).handler(({ input }) => input.value),
-      watch: os.input(z.object({ value: z.string() })).handler(({ input }) => {
-        let first = true;
-        const stream: AsyncIterableIterator<string> = {
-          [Symbol.asyncIterator]() {
-            return stream;
-          },
-          next() {
-            if (first) {
-              first = false;
-              return Promise.resolve({ done: false, value: input.value });
-            }
-            return new Promise(() => undefined);
-          },
-          return() {
-            returnCalls += 1;
-            returnStarted?.();
-            return new Promise((resolve) => {
-              finishReturn = () => resolve({ done: true, value: undefined });
-            });
-          },
-        };
-        return stream;
-      }),
-    });
+    const handler = new WebSocketRpcHandler(
+      {
+        ping: os.input(z.object({ value: z.string() })).handler(({ input }) => input.value),
+        watch: os.input(z.object({ value: z.string() })).handler(({ input }) => {
+          let first = true;
+          const stream: AsyncIterableIterator<string> = {
+            [Symbol.asyncIterator]() {
+              return stream;
+            },
+            next() {
+              if (first) {
+                first = false;
+                return Promise.resolve({ done: false, value: input.value });
+              }
+              return new Promise(() => undefined);
+            },
+            return() {
+              returnCalls += 1;
+              returnStarted?.();
+              return new Promise((resolve) => {
+                finishReturn = () => resolve({ done: true, value: undefined });
+              });
+            },
+          };
+          return stream;
+        }),
+      },
+      { plugins: createRpcHandlerPlugins({}, false) },
+    );
     const client = createAbilityClient({
       ability: lifecycleContract,
       targetServiceId: 'lifecycle',
@@ -337,7 +350,7 @@ describe('ability client lifecycle', () => {
           return clientSocket;
         },
         type: 'websocket',
-        url: 'wss://lifecycle.internal/rpc/client.lifecycle',
+        url: 'wss://lifecycle.internal/rpc/v1/client.lifecycle',
       },
     });
     const stream = await client.watch({ value: 'event' });
@@ -370,15 +383,18 @@ describe('ability client lifecycle', () => {
         type: 'service-binding',
       },
     });
-    const brokerHandler = new FetchRpcHandler({
-      call: os.input(z.unknown()).handler(({ input }) => (input as { input: { value: string } }).input.value),
-    });
+    const brokerHandler = new FetchRpcHandler(
+      {
+        call: os.input(z.unknown()).handler(({ input }) => (input as { input: { value: string } }).input.value),
+      },
+      { plugins: createRpcHandlerPlugins({}, false) },
+    );
     const broker = createBrokeredAbilityClient({
       ability: lifecycleContract,
       targetServiceId: 'lifecycle',
       transport: {
         fetch: async (url, init) => {
-          const handled = await brokerHandler.handle(new Request(url, init), { prefix: '/rpc/broker' });
+          const handled = await brokerHandler.handle(new Request(url, init), { prefix: '/rpc/v1/broker' });
           return handled.matched ? handled.response : new Response('Not found', { status: 404 });
         },
       },

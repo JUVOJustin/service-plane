@@ -12,7 +12,7 @@ export type ServicePlaneBatchOptions =
       maxSize?: number;
     };
 
-/** Compression policy for an outgoing Service Plane client connection. */
+/** Fetch compression policy. Requires CompressionStream and DecompressionStream in the runtime. */
 export type ServicePlaneClientCompressionOptions =
   | boolean
   | {
@@ -25,7 +25,7 @@ export type ServicePlaneClientCompressionOptions =
             /** Minimum request size in bytes. */
             threshold?: number;
           };
-      /** Advertises and decodes response compression. */
+      /** Negotiates response compression. Service Plane compresses non-batched unary responses only. */
       response?:
         | boolean
         | {
@@ -34,13 +34,13 @@ export type ServicePlaneClientCompressionOptions =
           };
     };
 
-/** Compression policy for an incoming Service Plane endpoint. */
+/** Fetch compression policy. Framed batch responses and event streams remain uncompressed. */
 export type ServicePlaneServerCompressionOptions =
   | boolean
   | {
       /** Accepts compressed request bodies. */
       request?: boolean;
-      /** Compresses eligible responses. */
+      /** Compresses eligible non-batched unary responses; never buffers batches or event streams. */
       response?:
         | boolean
         | {
@@ -55,7 +55,7 @@ export type ServicePlaneServerCompressionOptions =
 export type ServicePlaneClientWireOptions = {
   /** Combines concurrent unary calls into one physical Fetch request. */
   batch?: ServicePlaneBatchOptions;
-  /** Compresses Fetch request and response bodies. */
+  /** Compresses Fetch requests, including batches, and negotiates non-batched unary response compression. */
   compression?: ServicePlaneClientCompressionOptions;
 };
 
@@ -63,7 +63,7 @@ export type ServicePlaneClientWireOptions = {
 export type ServicePlaneServerWireOptions = {
   /** Accepts batched Fetch requests. */
   batch?: ServicePlaneBatchOptions;
-  /** Accepts compressed requests and/or compresses responses. */
+  /** Accepts compressed Fetch requests and/or compresses non-batched unary responses. */
   compression?: ServicePlaneServerCompressionOptions;
   /** Maximum decoded Fetch body or WebSocket message size. Defaults to one MiB; `false` disables the limit. */
   maxRequestBodyBytes?: false | number;

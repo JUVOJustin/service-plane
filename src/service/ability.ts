@@ -149,7 +149,7 @@ const hibernationCallbacks = new WeakMap<object, (id: string) => Promisable<void
 export class AbilityHibernationStream<T> {
   // The generic is deliberately carried only in the class type; values arrive after the original
   // handler returned and are validated by encodeAbilityHibernationEvent.
-  private declare readonly output: T;
+  declare private readonly output: T;
 
   constructor(onSubscribe: (id: string) => Promisable<void>) {
     hibernationCallbacks.set(this, onSubscribe);
@@ -233,7 +233,7 @@ export type AbilityMethodHandlerFor<TMethod extends AnyAbilityMethodDefinition<n
 
 /** Transport-neutral method factory for portable contracts and optional inline implementations. */
 export type AbilityBuilder<TEnv extends Env> = {
-  /** Declares a hibernating stream, optionally with an inline implementation. */
+  /** Experimental direct-Durable-Object stream; unavailable through the control-plane broker. */
   hibernationStream<TInput extends AbilitySchema, TOutput extends AbilitySchema>(
     options: AbilityStreamMethodOptions<TEnv, TInput, TOutput, 'hibernation'>,
   ): AbilityMethodDefinition<TEnv, TInput, TOutput, 'hibernation'>;

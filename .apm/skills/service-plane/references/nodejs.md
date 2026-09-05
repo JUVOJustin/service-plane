@@ -25,7 +25,6 @@ const service = new ServicePlaneService<TasksEnv>({
       'https://plane.example.com/.well-known/service-plane/jwks.json',
     ),
   },
-  ingress: {},
 });
 
 const fetch = (request: Request) =>
@@ -34,10 +33,22 @@ const fetch = (request: Request) =>
 serve({ fetch, port: 8787 });
 ```
 
-Put TLS and any network-level allowlist in the reverse proxy or platform. `ingress: {}` remains the
-application-level guarantee that only a brokered capability reaches handlers. The Node adapter does
+Put TLS and any network-level allowlist in the reverse proxy or platform. Protected ingress is the
+default application-level guarantee that only a brokered capability reaches handlers. The Node adapter does
 not create Hono bindings: the `fetch` wrapper supplies the same `TASKS` repository declared by
 `TasksEnv` on every request.
+
+Bun and Deno serve the same wrapper without a Node adapter:
+
+```ts
+Bun.serve({ fetch, port: 8787 });
+// Or in Deno:
+Deno.serve({ port: 8787 }, fetch);
+```
+
+Only the control plane needs a public URL. A Cloudflare plane can reach the self-hosted service
+through HTTPS, mTLS, or a private tunnel; register it alongside bound Workers in the same `services`
+array. All targets use the same capability verification and ability contract.
 
 ## Register It At The Plane
 
@@ -54,7 +65,7 @@ custom `fetch` in `httpsService` for mTLS, an internal DNS client, or test trans
 
 ## Direct Fetch Client
 
-Use a direct client for trusted service-to-service calls only when service ingress allows it:
+Use a direct client only for a separately secured service explicitly configured with `ingress: false`:
 
 ```ts
 const tasks = createAbilityClient({
@@ -115,7 +126,7 @@ const client = createAbilityClient({
   // ...
   transport: {
     type: 'websocket',
-    url: 'wss://tasks.internal.example/rpc/tasks',
+    url: 'wss://tasks.internal.example/rpc/v1/tasks',
     createWebSocket,
   },
 });

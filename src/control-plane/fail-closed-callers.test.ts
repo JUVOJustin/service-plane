@@ -16,7 +16,7 @@ import { ServicePlaneControlPlane } from './control-plane.js';
 import { cloudflareServiceBinding } from './endpoints.js';
 import { generateCapabilitySigningSecret } from './signing-keys.js';
 
-const BROKER_PATH = 'https://plane.internal/rpc/broker/call';
+const BROKER_PATH = 'https://plane.internal/rpc/v1/broker/call';
 const MCP_PATH = `https://plane.internal${SERVICE_PLANE_MCP_PATH}`;
 
 const discovery: ServiceDiscoveryDocument = {
@@ -33,7 +33,7 @@ const discovery: ServiceDiscoveryDocument = {
           scopes: ['tasks.read'],
         },
       },
-      rpc: { path: '/rpc/tasks.items', transports: ['fetch'] },
+      rpc: { path: '/rpc/v1/tasks.items', transports: ['fetch'] },
       scopes: ['tasks.read'],
     },
   ],
@@ -75,7 +75,9 @@ describe('fail-closed caller resolution', () => {
         },
       });
 
-      const broker = await plane.fetch(new Request(BROKER_PATH, { method: 'POST' }));
+      const broker = await plane.fetch(
+        new Request(BROKER_PATH, { headers: { 'x-service-plane-rpc-protocol': 'service-plane-rpc/1' }, method: 'POST' }),
+      );
       expect(broker.status).toBe(500);
       await expect(broker.json()).resolves.toEqual({ error: 'Service-Plane Hono invocation context is missing servicePlaneCaller' });
       expect(serviceCalls).toBe(0);
@@ -113,7 +115,9 @@ describe('fail-closed caller resolution', () => {
       signingKeys: async () => [{ kid: 'test-key', secret: await generateCapabilitySigningSecret() }],
     });
 
-    const broker = await plane.fetch(new Request(BROKER_PATH, { method: 'POST' }));
+    const broker = await plane.fetch(
+      new Request(BROKER_PATH, { headers: { 'x-service-plane-rpc-protocol': 'service-plane-rpc/1' }, method: 'POST' }),
+    );
     const mcp = await plane.fetch(
       new Request(MCP_PATH, {
         body: JSON.stringify({ id: 1, jsonrpc: '2.0', method: 'ping' }),
@@ -150,7 +154,9 @@ describe('fail-closed caller resolution', () => {
       },
     });
 
-    const broker = await plane.fetch(new Request(BROKER_PATH, { method: 'POST' }));
+    const broker = await plane.fetch(
+      new Request(BROKER_PATH, { headers: { 'x-service-plane-rpc-protocol': 'service-plane-rpc/1' }, method: 'POST' }),
+    );
     const mcp = await plane.fetch(
       new Request(MCP_PATH, {
         body: JSON.stringify({ id: 1, jsonrpc: '2.0', method: 'ping' }),

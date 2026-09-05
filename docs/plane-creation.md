@@ -61,6 +61,10 @@ The two authentication hooks serve different boundaries:
 - `authenticateCaller` protects the capability-token endpoint for services requesting tokens.
 - `invocationMiddleware` protects product-facing REST, MCP, and broker routes.
 
+For per-user method permissions, add `authorizeInvocation(invocation, context)`. It covers RPC,
+REST, MCP, and in-process clients before issuing a capability; only `true` permits the call when
+configured. It complements service grants rather than replacing them. See [method authorization](auth.md#authorize-individual-methods).
+
 The auth helpers carry the plane's Hono environment generic, so a resolver can read `c.env` while
 the authenticator itself is constructed only once.
 
@@ -78,7 +82,7 @@ that limit.
 | `GET /.well-known/service-plane/jwks.json` | On |
 | `GET /openapi.json` | On; disable with `openapi: false` |
 | Published `rest.path` routes | On; `rest: false` removes the facade and catch-all |
-| `/rpc/broker` and `/rpc/broker/ws` | Off; enable with `broker: {}` |
+| `/rpc/v1/broker` and `/rpc/v1/broker/ws` | Off; enable with `broker: {}` |
 | `POST /mcp` | Off; enable with `mcp: {}` |
 
 Only methods on `exposure: 'published'` abilities become REST/OpenAPI or MCP surfaces. Streaming
@@ -207,7 +211,6 @@ broker route:
 const tasks = plane.abilityClient({
   ability: tasksContract,
   targetServiceId: 'tasks-service',
-  caller: { id: 'control-plane-job', kind: 'service' },
 }, env);
 
 await tasks.get(
@@ -218,6 +221,8 @@ await tasks.get(
 
 The contract infers the method signatures and required method scopes. Optional `scopes` only adds
 ability-level scopes. This is a trusted server-side helper, not a public authentication bypass.
+Omitting `caller` uses the plane's own grant. An explicit service caller needs its own matching grant;
+the configured `authorizeInvocation` policy also runs for in-process calls.
 Construction performs no I/O. Every call resolves the current endpoint, grants, and issuer, then
 repeats token, service authorization, and schema checks; the facade does not pin security state.
 Hibernating methods fail before a downstream call because they require a direct service WebSocket.

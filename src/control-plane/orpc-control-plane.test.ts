@@ -7,6 +7,7 @@ import { type AbilityStream, createAbilityBuilder } from '../service/ability.js'
 import { defineCapabilities } from '../service/capabilities.js';
 import { type AbilityNativeBinding, createAbilityClient, createBrokeredAbilityClient } from '../service/client.js';
 import { defineAbility, defineAbilityService, serviceDiscoveryDocument } from '../service/discovery.js';
+import { createRpcHandlerPlugins } from '../service/orpc-features.js';
 import { ServicePlaneService } from '../service/service.js';
 import { SERVICE_PLANE_TIMEOUT_GRACE_MS } from '../shared/deadline.js';
 import { AbilityHandlerError, ServicePlaneClientError } from '../shared/errors.js';
@@ -53,10 +54,10 @@ describe('Service Plane control-plane broker', () => {
         pull: () => new Promise<void>(() => undefined),
       });
       const responsePromise = plane.fetch(
-        new Request('https://plane.internal/rpc/broker', {
+        new Request('https://plane.internal/rpc/v1/broker', {
           body,
           duplex: 'half',
-          headers: { 'content-type': 'application/json', 'orpc-batch': 'streaming' },
+          headers: { 'content-type': 'application/json', 'orpc-batch': 'streaming', 'x-service-plane-rpc-protocol': 'service-plane-rpc/1' },
           method: 'POST',
         } as RequestInit & { duplex: 'half' }),
       );
@@ -186,7 +187,6 @@ describe('Service Plane control-plane broker', () => {
       },
       capabilities,
       id: 'tasks',
-      ingress: {},
       logger: false,
       title: 'Tasks',
       version: '1.0.0',
@@ -277,13 +277,16 @@ describe('Service Plane control-plane broker', () => {
     const started = new Promise<void>((resolve) => {
       pullStarted = resolve;
     });
-    const handler = new RPCHandler({
-      watch: os.input(z.unknown()).handler(async function* () {
-        yield 'ready';
-        pullStarted?.();
-        await new Promise(() => undefined);
-      }),
-    });
+    const handler = new RPCHandler(
+      {
+        watch: os.input(z.unknown()).handler(async function* () {
+          yield 'ready';
+          pullStarted?.();
+          await new Promise(() => undefined);
+        }),
+      },
+      { plugins: createRpcHandlerPlugins({}, false) },
+    );
     const discovery = serviceDiscoveryDocument(
       defineAbilityService({ abilities: [tasks], capabilities, id: 'tasks', title: 'Tasks', version: '1.0.0' }),
     );
@@ -296,7 +299,7 @@ describe('Service Plane control-plane broker', () => {
         cloudflareServiceBinding({
           binding: {
             fetch: async (request) => {
-              const handled = await handler.handle(request, { prefix: '/rpc/tasks.deadline-stream' });
+              const handled = await handler.handle(request, { prefix: '/rpc/v1/tasks.deadline-stream' });
               return handled.matched ? handled.response : new Response('Not found', { status: 404 });
             },
           },
@@ -495,7 +498,7 @@ describe('Service Plane control-plane broker', () => {
         ];
       },
       signingKeys: (_bindings, context) => {
-        if (new URL(context.req.url).pathname.startsWith('/rpc/broker')) brokerSigningKeyResolutions += 1;
+        if (new URL(context.req.url).pathname.startsWith('/rpc/v1/broker')) brokerSigningKeyResolutions += 1;
         return [{ kid: 'test-key', secret: signingSecret }];
       },
     });
@@ -510,9 +513,9 @@ describe('Service Plane control-plane broker', () => {
     });
 
     const malformedBrokerCall = await plane.fetch(
-      new Request('https://plane.internal/rpc/broker/call', {
+      new Request('https://plane.internal/rpc/v1/broker/call', {
         body: '{}',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', 'x-service-plane-rpc-protocol': 'service-plane-rpc/1' },
         method: 'POST',
       }),
     );
@@ -574,7 +577,7 @@ describe('Service Plane control-plane broker', () => {
     for await (const value of stream) values.push(value);
     expect(values).toEqual([{ sequence: 9 }, { sequence: 10 }]);
 
-    const webSocketUpgradeRequest = new Request('https://plane.internal/rpc/broker/ws', {
+    const webSocketUpgradeRequest = new Request('https://plane.internal/rpc/v1/broker/ws', {
       headers: { connection: 'upgrade', upgrade: 'websocket' },
     });
     Object.defineProperty(webSocketUpgradeRequest, 'cf', {
@@ -590,7 +593,7 @@ describe('Service Plane control-plane broker', () => {
       transport: {
         createWebSocket: () => planeClientSocket,
         type: 'websocket',
-        url: 'wss://plane.internal/rpc/broker/ws',
+        url: 'wss://plane.internal/rpc/v1/broker/ws',
       },
     });
     await expect(webSocketClient.get({ id: 'task-ws' })).resolves.toEqual({ caller: 'headless-front', id: 'task-ws' });

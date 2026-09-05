@@ -12,24 +12,24 @@ transports.
 | Node, another account, or another runtime | Fetch | Universal, stateless, easy to observe |
 | Browser/headless client → control plane | Broker Fetch, REST, or MCP | Keeps services and capability tokens private |
 | Interactive, long-lived session | WebSocket | Reuses one connection and supports streams |
-| Durable Object that must sleep | Direct hibernating WebSocket | Runtime owns socket state across wake-ups |
+| Separate, directly reachable Durable Object | Experimental hibernating WebSocket | Outside the central-plane topology |
 
 Do not expose private services merely to avoid one control-plane hop. On Cloudflare, keep the plane
 public and use service bindings for its downstream calls.
 
 ## Fetch
 
-Fetch is the default ability transport and the right baseline for most deployments:
+Fetch is the default ability transport and the baseline for cross-runtime deployments. Most callers
+use the public broker, which chooses the downstream service transport from discovery:
 
 ```ts
-const client = createAbilityClient({
+const client = createBrokeredAbilityClient({
   ability: tasksContract,
-  requestToken,
-  callerServiceId: 'workflow-service',
   targetServiceId: 'tasks-service',
   transport: {
     type: 'fetch',
-    origin: 'https://tasks.internal.example',
+    origin: 'https://api.example.com',
+    headers: () => ({ authorization: `Bearer ${readProductToken()}` }),
   },
 });
 ```
@@ -79,7 +79,7 @@ const client = createBrokeredAbilityClient({
   targetServiceId: 'events-service',
   transport: {
     type: 'websocket',
-    url: 'wss://api.example.com/rpc/broker/ws',
+    url: 'wss://api.example.com/rpc/v1/broker/ws',
     reconnect: { enabled: true, maxAttempt: 5 },
   },
 });
@@ -95,7 +95,7 @@ implementation that adds upgrade headers in `createWebSocket`. `transport.header
 broker Fetch only. Request ID, idempotency key, and timeout remain per-call metadata after the
 socket is accepted.
 
-Hibernation is a special direct-service WebSocket mode; see [streaming](streaming.md). It is never
+Hibernation is an experimental direct-service WebSocket mode; see [streaming](streaming.md). It is never
 brokered, opened by `plane.abilityClient`, or batched; those clients fail fast.
 
 ## Batch Concurrent Fetch Calls
@@ -159,6 +159,10 @@ Supported Service Plane encodings are `gzip`, `deflate`, and `deflate-raw`; choo
 available in the target runtime. Compression helps large JSON or text payloads and usually hurts
 small requests through extra CPU and latency. Measure with realistic payloads.
 
+Compression applies to request bodies, including batches, and ordinary unary responses. Framed
+batch responses and streamed responses stay uncompressed. They intentionally avoid the buffering
+and Node-specific compression dependencies that would otherwise change portability or latency.
+
 Every RPC server rejects decoded request bodies and individual WebSocket messages larger than one
 MiB by default, including compressed and batched requests. Change `maxRequestBodyBytes`
 deliberately; `false` disables the guard.
@@ -174,11 +178,26 @@ The useful ordering is stable even when absolute numbers change by machine:
 5. Batching amortizes the first Fetch hop; it does not erase downstream work.
 
 `npm run bench` measures the current engine, Service Plane middleware, token signing, discovery,
-REST matching, native calls, Fetch, broker calls, batching, and streams. Treat those as regression
-benchmarks, not production latency claims: network, runtime placement, payload size, schema
-complexity, cold starts, and storage usually dominate microbenchmarks. The project does not publish
-an apples-to-apples Cap'n Web benchmark, so do not infer a protocol speedup from the framework
-migration alone.
+REST matching, local JS binding adapters, in-process Fetch, broker calls, batching, and streams.
+The binding measurements do not exercise Cloudflare scheduling or cross-isolate serialization.
+These are regression benchmarks; deployment latency also depends on placement, network, payloads,
+schemas, cold starts, and storage. Ten-call batch measurements count groups; multiply by ten for
+logical calls per second and compare against the matching ten-call unbatched workload.
+
+A Node 22 loopback HTTP comparison on 2026-09-05 found similar unary median latency for oRPC
+beta.33 and Cap'n Web 0.12 (about 0.4 ms). Ten-call batches took 1.891 versus 0.331 ms for 16-byte
+values, and 2.665 versus 1.121 ms for 8 KiB values: Cap'n Web won both. Five alternating rounds used
+200 samples after 100 warmups, identical validation, one HTTP request per sample, and no compression
+or TLS. This excludes Service Plane authorization, distributed network latency, and deployed
+Cloudflare behavior. Reproduce with an independently unpacked Cap'n Web package:
+
+```sh
+node scripts/compare-rpc.mjs /absolute/path/to/capnweb/package
+```
+
+The migration is not a general speed improvement: portable typed Fetch streams are its main
+transport benefit. Even the local Service Plane benchmark runs faster without batching; opt in only
+when measured network/request savings justify its scheduling and framing overhead.
 
 ## Practical Defaults
 

@@ -72,14 +72,14 @@ describe('ability service discovery', () => {
               scopes: ['example.search'],
             },
           },
-          rpc: { path: '/rpc/example.search', transports: ['fetch'] },
+          rpc: { path: '/rpc/v1/example.search', transports: ['fetch'] },
           scopes: ['example.search'],
         },
         {
           access: 'plane',
           exposure: 'private',
           id: 'example.sync',
-          rpc: { path: '/rpc/example.sync', transports: ['fetch', 'websocket'] },
+          rpc: { path: '/rpc/v1/example.sync', transports: ['fetch', 'websocket'] },
         },
       ],
       id: 'example',
@@ -436,7 +436,7 @@ describe('ability service discovery', () => {
         });
 
     expect(defineWithPaths('//other.example/rpc')).toThrow('path must be origin-relative');
-    expect(defineWithPaths('/rpc/example.search', '/\\other.example/rest')).toThrow('path must be origin-relative');
+    expect(defineWithPaths('/rpc/v1/example.search', '/\\other.example/rest')).toThrow('path must be origin-relative');
   });
 
   it('normalizes the capability catalog and rejects one owned by another service', () => {
@@ -461,9 +461,9 @@ describe('ability service discovery', () => {
   });
 
   it.each([
-    ['/rpc/items', '/rpc/items/admin'],
-    ['/rpc/items/admin', '/rpc/items'],
-    ['/', '/rpc/items'],
+    ['/rpc/v1/items', '/rpc/v1/items/admin'],
+    ['/rpc/v1/items/admin', '/rpc/v1/items'],
+    ['/', '/rpc/v1/items'],
   ])('rejects overlapping ability RPC paths %s and %s', (firstPath, secondPath) => {
     const withPath = (id: string, path: string) =>
       defineAbility({
@@ -494,8 +494,8 @@ describe('ability service discovery', () => {
   it('allows ability RPC paths that merely share a string prefix', () => {
     const service = defineAbilityService({
       abilities: [
-        { ...searchAbility, rpc: { path: '/rpc/item', transports: ['fetch'] } },
-        { ...searchAbility, id: 'example.search-more', rpc: { path: '/rpc/items', transports: ['fetch'] } },
+        { ...searchAbility, rpc: { path: '/rpc/v1/item', transports: ['fetch'] } },
+        { ...searchAbility, id: 'example.search-more', rpc: { path: '/rpc/v1/items', transports: ['fetch'] } },
       ],
       capabilities,
       id: 'example',
@@ -503,7 +503,7 @@ describe('ability service discovery', () => {
       version: '0.1.0',
     });
 
-    expect(service.abilities.map((entry) => entry.rpc.path)).toEqual(['/rpc/item', '/rpc/items']);
+    expect(service.abilities.map((entry) => entry.rpc.path)).toEqual(['/rpc/v1/item', '/rpc/v1/items']);
   });
 
   it('rejects duplicate ability ids, unknown scopes, and unscoped abilities', () => {

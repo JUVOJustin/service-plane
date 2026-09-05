@@ -36,7 +36,7 @@ const context = {
   context: {} as AbilityMethodContext['context'],
   env: {},
   identity,
-  request: new Request('https://tasks.internal/rpc/example.tasks/get'),
+  request: new Request('https://tasks.internal/rpc/v1/example.tasks/get'),
 } satisfies AbilityMethodContext;
 
 const runtimeContext = createAbilityRpcRuntimeContext({ authorize: () => ({ context }) });

@@ -21,7 +21,7 @@ function discoveredAbility(service: ServiceEndpoint = endpoint): DiscoveredServi
         scopes: ['tasks.read'],
       },
     },
-    rpc: { path: '/rpc/tasks.items', transports: service.abilityRpc ? ['service-binding'] : ['fetch'] },
+    rpc: { path: '/rpc/v1/tasks.items', protocol: 'service-plane-rpc/1', transports: service.abilityRpc ? ['service-binding'] : ['fetch'] },
     scopes: ['tasks.read'],
     service,
     serviceId: 'tasks',
@@ -60,6 +60,36 @@ function callInput() {
 }
 
 describe('control-plane broker deadlines', () => {
+  it.each([undefined, 'service-plane-rpc/0', 'service-plane-rpc/2'])(
+    'rejects discovered wire revision %s before issuing capabilities',
+    async (protocol) => {
+      let issued = 0;
+      let invoked = 0;
+      const ability = discoveredAbility({
+        ...endpoint,
+        abilityRpc: {
+          invokeAbility: () => {
+            invoked += 1;
+          },
+        },
+      });
+      const incompatible = {
+        ...ability,
+        rpc: { path: ability.rpc.path, transports: ability.rpc.transports, ...(protocol ? { protocol } : {}) },
+      };
+      const broker = createControlPlaneRpcBroker({
+        controlPlaneServiceId: 'control-plane',
+        issuer: issuer(async () => {
+          issued += 1;
+          return { expiresAt: new Date(), token: 'token' };
+        }),
+        registry: registryWithAbility(async () => incompatible),
+      });
+      await expect(broker.callAbility(callInput())).rejects.toMatchObject({ code: 'incompatible_protocol', status: 426, retryable: false });
+      expect(issued).toBe(0);
+      expect(invoked).toBe(0);
+    },
+  );
   it.each(['constructor', 'hasOwnProperty', 'toString', '__proto__'])(
     'rejects inherited method name %s before capability issuance or service dispatch',
     async (method) => {

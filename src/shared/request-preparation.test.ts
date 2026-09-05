@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ServicePlaneTimeoutError } from './errors.js';
-import { createFetchRequestPreparation } from './request-preparation.js';
+import { createFetchRequestPreparation, requestWithBoundedBody } from './request-preparation.js';
 
 function streamingRequest(body: ReadableStream<Uint8Array>, signal?: AbortSignal): Request {
-  return new Request('https://service.internal/rpc/tasks/get', {
+  return new Request('https://service.internal/rpc/v1/tasks/get', {
     body,
     duplex: 'half',
     method: 'POST',
@@ -12,8 +12,44 @@ function streamingRequest(body: ReadableStream<Uint8Array>, signal?: AbortSignal
 }
 
 describe('Fetch request preparation', () => {
+  it('preserves exact signed bytes and runtime metadata while bounding both body branches', async () => {
+    const bytes = Uint8Array.from([0, 255, 239, 187, 191, 32, 13, 10]);
+    const request = new Request('https://service.internal/request?raw=true', {
+      body: bytes,
+      headers: { 'content-type': 'application/octet-stream', 'x-signature': 'signed' },
+      method: 'POST',
+    });
+    const cf = { colo: 'FRA' };
+    Object.defineProperty(request, 'cf', { value: cf });
+    const bounded = requestWithBoundedBody(request, bytes.length, 'oversized');
+    const decoding = bounded.clone();
+
+    expect(new Uint8Array(await bounded.arrayBuffer())).toEqual(bytes);
+    expect(new Uint8Array(await decoding.arrayBuffer())).toEqual(bytes);
+    expect(bounded.url).toBe(request.url);
+    expect(bounded.headers.get('x-signature')).toBe('signed');
+    expect((bounded as Request & { cf?: unknown }).cf).toBe(cf);
+  });
+
+  it('rejects a declared oversized physical request without reading or cloning it', () => {
+    let cancelled = false;
+    const request = new Request('https://service.internal/request', {
+      body: new ReadableStream<Uint8Array>({
+        cancel() {
+          cancelled = true;
+        },
+      }),
+      duplex: 'half',
+      headers: { 'content-length': '4' },
+      method: 'POST',
+    } as RequestInit);
+
+    expect(() => requestWithBoundedBody(request, 3, 'oversized')).toThrow('oversized');
+    expect(cancelled).toBe(true);
+  });
+
   it('preserves Cloudflare request metadata on decoder and middleware branches', () => {
-    const request = new Request('https://service.internal/rpc/tasks/get');
+    const request = new Request('https://service.internal/rpc/v1/tasks/get');
     const cf = { colo: 'FRA' };
     Object.defineProperty(request, 'cf', { configurable: true, enumerable: true, value: cf });
     const linked = request.clone();
@@ -71,7 +107,7 @@ describe('Fetch request preparation', () => {
     let resolveOperation: ((value: string) => void) | undefined;
     let discarded: string | undefined;
     try {
-      const preparation = createFetchRequestPreparation(new Request('https://service.internal/rpc/tasks/get'), {
+      const preparation = createFetchRequestPreparation(new Request('https://service.internal/rpc/v1/tasks/get'), {
         deadlineAt: Date.now() + 20,
         deadlineError: () => new ServicePlaneTimeoutError('decode timed out'),
       });
@@ -99,7 +135,7 @@ describe('Fetch request preparation', () => {
 
   it('refuses an already-expired budget before synchronous decoder dispatch can start', async () => {
     let started = false;
-    const preparation = createFetchRequestPreparation(new Request('https://service.internal/rpc/tasks/get'), {
+    const preparation = createFetchRequestPreparation(new Request('https://service.internal/rpc/v1/tasks/get'), {
       deadlineAt: Date.now() - 1,
       deadlineError: () => new ServicePlaneTimeoutError('decode already timed out'),
     });
@@ -120,7 +156,7 @@ describe('Fetch request preparation', () => {
     const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now);
     let discarded: string | undefined;
     try {
-      const preparation = createFetchRequestPreparation(new Request('https://service.internal/rpc/tasks/get'), {
+      const preparation = createFetchRequestPreparation(new Request('https://service.internal/rpc/v1/tasks/get'), {
         deadlineAt: 1_010,
         deadlineError: () => new ServicePlaneTimeoutError('decode settled too late'),
       });

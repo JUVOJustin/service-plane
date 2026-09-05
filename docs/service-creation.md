@@ -154,12 +154,11 @@ export default new ServicePlaneService<TasksEnv>({
       'https://plane.example.com/.well-known/service-plane/jwks.json',
     ),
   },
-  ingress: {},
 });
 ```
 
 The service exposes discovery at `/.well-known/service-plane/service.json` and one private RPC path
-per ability, `/rpc/<ability-id>` by default. `ingress: {}` requires the signed broker claim; an
+per ability, `/rpc/v1/<ability-id>` by default. Protected ingress is on by default and requires the signed broker claim; an
 ordinary valid capability token cannot bypass the control plane.
 
 ## Handler Context

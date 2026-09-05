@@ -198,7 +198,7 @@ describe('control-plane MCP request preflight', () => {
               scopes: ['tasks.read'],
             },
           },
-          rpc: { path: '/rpc/tasks', transports: ['fetch'] },
+          rpc: { path: '/rpc/v1/tasks', transports: ['fetch'] },
           scopes: ['tasks.read'],
         },
       ],

@@ -63,7 +63,7 @@ combined with the forwarded deadline at the service. Upstream work should observ
 | Plane → same-account Worker | Service-binding Fetch |
 | Plane → HTTPS service | Fetch streaming |
 | Direct long-lived session | WebSocket |
-| Durable Object that must sleep | Hibernating WebSocket |
+| Separate direct Durable Object deployment | Experimental hibernating WebSocket |
 
 Cloudflare native RPC is unary-only in Service Plane. A `service-binding` client automatically uses
 native `invokeAbility` for unary methods and `binding.fetch` for ordinary streams.
@@ -83,7 +83,7 @@ const service = new ServicePlaneService({
 ```
 
 For the public plane, use `broker: { upgradeWebSocket }`; clients connect to
-`wss://<plane>/rpc/broker/ws`. Caller authentication still runs in `invocationMiddleware`, and
+`wss://<plane>/rpc/v1/broker/ws`. Caller authentication still runs in `invocationMiddleware`, and
 logical calls carry their own request ID, idempotency key, and deadline.
 
 The middleware authenticates the physical HTTP upgrade once. In a browser, use a secure cookie or
@@ -101,7 +101,7 @@ Client reconnect is explicit:
 ```ts
 transport: {
   type: 'websocket',
-  url: 'wss://api.example.com/rpc/broker/ws',
+  url: 'wss://api.example.com/rpc/v1/broker/ws',
   reconnect: { enabled: true, maxAttempt: 5 },
 },
 ```
@@ -119,12 +119,17 @@ This cancels its active iterators, closes every physical socket, and prevents co
 from opening another one. Disposal is idempotent. Breaking out of a stream remains the prompt way
 to release that individual iterator; client disposal owns the physical WebSocket lifetime.
 
-## Durable Object Hibernation
+## Experimental Direct Durable Object Hibernation
 
 A hibernating method is a direct service WebSocket feature. It cannot use Fetch, native unary RPC,
 batching, the control-plane broker, or `plane.abilityClient`. Brokered and in-process clients
 fail before opening a downstream call; only the Durable Object that owns the direct service socket
 can restore the subscription.
+
+This is outside the normal single-public-plane architecture. Default broker-protected ingress rejects
+ordinary direct capabilities. A direct deployment must explicitly choose `ingress: false`, secure
+its upgrade endpoint, and own subscription expiry and revocation after wake-up. Hibernation methods
+cannot be projected as REST/MCP. Use `ability.stream` for portable, brokered subscriptions.
 
 Declare the contract:
 
@@ -155,6 +160,7 @@ const events = implementAbility(eventsContract, {
 
 const service = new ServicePlaneService({
   abilities: [events],
+  ingress: false, // Deliberate direct-service topology; not the public-plane production default.
   rpc: { manualWebSocket: true },
   // ...
 });

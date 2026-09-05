@@ -19,6 +19,7 @@ import { CapabilityAuthError, ServicePlaneClientError, ServicePlaneTimeoutError,
 import { createFlatAbilityClient } from '../shared/flat-ability-client.js';
 import { normalizeIdempotencyKey, SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER } from '../shared/idempotency.js';
 import { normalizeOriginRelativePath } from '../shared/paths.js';
+import { SERVICE_PLANE_BROKER_RPC_PATH, SERVICE_PLANE_RPC_PROTOCOL, SERVICE_PLANE_RPC_PROTOCOL_HEADER } from '../shared/rpc-protocol.js';
 import type {
   CapabilitySubject,
   CapabilityTokenCache,
@@ -34,6 +35,7 @@ import {
   type AnyServiceAbilityDefinition,
   abilityClientScopesByMethod,
   abilityClientScopesForMethod,
+  defaultAbilityRpcPath,
 } from './discovery.js';
 import { createRpcClientPlugins } from './orpc-features.js';
 import type { ServicePlaneClientWireOptions } from './wire-options.js';
@@ -158,7 +160,7 @@ export type BrokeredAbilityTransport =
       headers?: HeadersInit | (() => HeadersInit | Promise<HeadersInit>);
       /** Public control-plane origin. */
       origin?: string;
-      /** Logical broker prefix, normally `/rpc/broker`. */
+      /** Logical broker prefix, normally `/rpc/v1/broker`. */
       path?: string;
       /** Selects ordinary Fetch when omitted or set to `fetch`. */
       type?: 'fetch';
@@ -166,7 +168,7 @@ export type BrokeredAbilityTransport =
   | {
       /** Creates the physical socket and owns any WebSocket handshake authentication. */
       createWebSocket?: (url: string) => AbilityClientWebSocket;
-      /** Logical broker prefix, normally `/rpc/broker`. */
+      /** Logical broker prefix, normally `/rpc/v1/broker`. */
       path?: string;
       /** Reconnect policy owned by the public caller. */
       reconnect?: ServicePlaneWebSocketReconnectOptions;
@@ -320,6 +322,7 @@ export function createAbilityClient<TAbility extends AnyServiceAbilityDefinition
     const token = await callWithSignal(tokenProvider(methodNameFromPath(options.ability, path)), callOptions.signal);
     const proof = await callWithSignal(capabilityProof(options, token), callOptions.signal);
     const result = new Headers({ authorization: servicePlaneAuthorization(token) });
+    result.set(SERVICE_PLANE_RPC_PROTOCOL_HEADER, SERVICE_PLANE_RPC_PROTOCOL);
     const metadata = resolveForwardedCallMetadata(defaults, callOptions, path.join('.'));
     const connInfo = serializeConnInfo(metadata.connInfo);
     const idempotencyKey = normalizeIdempotencyKey(metadata.idempotencyKey);
@@ -355,6 +358,7 @@ export function createBrokeredAbilityClient<TAbility extends AnyServiceAbilityDe
       callOptions.signal,
     );
     const headers = new Headers(configured);
+    headers.set(SERVICE_PLANE_RPC_PROTOCOL_HEADER, SERVICE_PLANE_RPC_PROTOCOL);
     const metadata = resolveForwardedCallMetadata(defaults, callOptions, 'control-plane broker');
     const idempotencyKey = normalizeIdempotencyKey(metadata.idempotencyKey);
     const timeout = serializeTimeoutMs(metadata.timeoutMs);
@@ -363,7 +367,7 @@ export function createBrokeredAbilityClient<TAbility extends AnyServiceAbilityDe
     if (timeout) headers.set(SERVICE_PLANE_TIMEOUT_HEADER, timeout);
     return headers;
   };
-  const brokerPath = normalizeClientRpcPath(transport.path ?? '/rpc/broker', 'control-plane broker');
+  const brokerPath = normalizeClientRpcPath(transport.path ?? SERVICE_PLANE_BROKER_RPC_PATH, 'control-plane broker');
   let brokerLink: AbilityClientLink;
   let brokerStreamLink: AbilityClientLink;
   const lifecycle = transport.type === 'websocket' ? new WebSocketAbilityClientLifecycle() : undefined;
@@ -372,6 +376,7 @@ export function createBrokeredAbilityClient<TAbility extends AnyServiceAbilityDe
     brokerLink = new WebSocketRpcLink({
       connect: () => lifecycle.connect(() => (transport.createWebSocket ?? ((url: string) => new WebSocket(url)))(transport.url)),
       headers: brokerHeaders,
+      plugins: createRpcClientPlugins({}),
       ...(transport.reconnect ? { reconnect: transport.reconnect } : {}),
       url: brokerPath,
     });
@@ -671,7 +676,7 @@ function abilityClientLink<TAbility extends AnyServiceAbilityDefinition>(
   defaults: ClientMetadataDefaults,
   lifecycle?: WebSocketAbilityClientLifecycle,
 ): AbilityClientLink {
-  const path = normalizeClientRpcPath(options.ability.rpc?.path ?? `/rpc/${options.ability.id}`, options.ability.id);
+  const path = normalizeClientRpcPath(options.ability.rpc?.path ?? defaultAbilityRpcPath(options.ability.id), options.ability.id);
   switch (options.transport.type) {
     case 'fetch': {
       const unaryLink = fetchAbilityLink(path, options.transport.fetch, options.transport.origin, headers, options.transport);
@@ -696,6 +701,7 @@ function abilityClientLink<TAbility extends AnyServiceAbilityDefinition>(
       return new WebSocketRpcLink({
         connect: () => lifecycle.connect(() => createWebSocket(transport.url)),
         headers,
+        plugins: createRpcClientPlugins({}),
         ...(transport.reconnect ? { reconnect: transport.reconnect } : {}),
         url: path as `/${string}`,
       });
@@ -774,6 +780,7 @@ function nativeAbilityLink<TAbility extends AnyServiceAbilityDefinition>(
         const proof = callHeaders.get(SERVICE_PLANE_PROOF_HEADER) ?? undefined;
         const timeoutMs = parseTimeoutMs(callHeaders.get(SERVICE_PLANE_TIMEOUT_HEADER));
         return options.transport.binding.invokeAbility({
+          protocol: SERVICE_PLANE_RPC_PROTOCOL,
           abilityId: options.ability.id,
           ...(connInfo ? { connInfo } : {}),
           ...(idempotencyKey ? { idempotencyKey } : {}),

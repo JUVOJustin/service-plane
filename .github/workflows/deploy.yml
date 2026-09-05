@@ -28,17 +28,7 @@ jobs:
         id: version
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: |
-          node --input-type=module -e '
-          import { appendFileSync, readFileSync } from "node:fs";
-          const tag = process.env.RELEASE_TAG ?? "";
-          const taggedVersion = tag.startsWith("v") ? tag.slice(1) : tag;
-          const packageVersion = JSON.parse(readFileSync("package.json", "utf8")).version;
-          if (taggedVersion !== packageVersion) {
-            throw new Error(`Release tag ${tag} does not match package.json version ${packageVersion}`);
-          }
-          appendFileSync(process.env.GITHUB_OUTPUT, `NPM_TAG=${taggedVersion.includes("-") ? "next" : "latest"}\n`);
-          '
+        run: node scripts/check-release.mjs
 
       - name: Install dependencies
         run: npm ci

@@ -1,4 +1,4 @@
-# Migrate To The Stable Ability API
+# Migrate To The Owned Ability API
 
 This release removes the public Cap'n Web surface and the temporary public oRPC surface. The wire
 engine is now private. Typed methods, capabilities, discovery, OpenAPI, MCP, streaming, batching,
@@ -12,15 +12,49 @@ stream lifecycle and hibernation.
 
 ```sh
 npm remove capnweb @hono/capnweb @orpc/client @orpc/contract @orpc/server
-npm install hono@^4.13.5
+npm install hono@^4.13.7
 ```
 
-Hono `>=4.13.5 <5.0.0` and Node.js 22+ are now required. Node 20 reached end of life before this
+Hono `>=4.13.7 <5.0.0` and Node.js 22+ are now required. Node 20 reached end of life before this
 release. Remove every application import from `capnweb`, `@hono/capnweb`, and `@orpc/*`; Service
 Plane owns and pins its private RPC packages.
 
-Deploy migrated clients and servers together. The private wire format is not a compatibility
-contract with the previous release.
+This branch is `0.4.0-beta.1`; publish prereleases to `next` while the pinned oRPC v2 engine is in
+beta. A private engine reduces consumer API coupling but does not remove upstream runtime risk.
+
+## Roll Out Without Mixing Protocols
+
+RPC discovery now advertises `rpc.protocol: 'service-plane-rpc/1'`. Default service paths are
+`/rpc/v1/<ability-id>`; the public broker uses `/rpc/v1/broker` and `/rpc/v1/broker/ws`. Fetch and
+logical WebSocket calls carry `x-service-plane-rpc-protocol`; native calls include `protocol`.
+SDK clients supply these automatically. Missing or unsupported revisions fail with
+`incompatible_protocol` / HTTP 426. Application `service.version` is independent of the wire revision.
+
+Use a staged deployment:
+
+1. Deploy new service instances alongside the old fleet, with separate bindings or origins.
+2. Deploy a new control plane whose registry points only at the new instances. Verify discovery,
+   grants, RPC, REST, and MCP before routing traffic to it.
+3. Route `/rpc/v1/*` to the new plane and keep legacy RPC paths on the old plane while clients
+   migrate. Cut over REST/MCP at the gateway or use a separate origin during verification.
+4. Drain old clients and sockets before retiring the old plane and services. Rollback routes traffic
+   back to that intact fleet.
+
+No Cap'n Web compatibility runtime is included. Default versioned paths prevent new clients from
+accidentally invoking old handlers. If you override paths, version those routes too: a response
+marker can detect an old server only after it has processed the request. It cannot undo a mutation.
+Do not retry `incompatible_protocol` automatically. Clear stale discovery caches at cutover.
+
+## Keep The Plane As The Public Boundary
+
+Service ingress is protected by default, equivalent to `ingress: {}`. Ordinary direct capability
+tokens now fail even when their signatures and scopes are valid. Route service-to-service calls
+through the plane, with an authenticated service caller. If the broker id differs from
+`control-plane`, set `ingress: { brokerServiceIds: ['your-plane-id'] }`.
+
+`ingress: false` is an explicit opt-out for separately designed direct-service deployments, not the
+normal production setup. Hibernation is experimental and direct-Durable-Object-only; it cannot be
+brokered or published through REST/MCP. Use `ability.stream` in the central-plane topology.
 
 ## Define Contracts And Handlers
 
@@ -206,7 +240,7 @@ rotates. This partitions both the provider's in-memory entry and any supplied sh
 Breaking route and configuration changes:
 
 - top-level `rpc` becomes opt-in `broker`; service-side `rpc` remains;
-- the broker defaults to `/rpc/broker` and `/rpc/broker/ws`;
+- the broker defaults to `/rpc/v1/broker` and `/rpc/v1/broker/ws`;
 - MCP is no longer implicit—add `mcp: {}` to mount `/mcp`;
 - published REST routes remain enabled; `rest: false` removes the facade and catch-all;
 - OpenAPI remains enabled by default;
@@ -294,7 +328,7 @@ the token endpoint's `tokenMaxBodyBytes` request limit.
 
 ## Final Checks
 
-- No application imports Cap'n Web or oRPC, Hono is `>=4.13.5`, and Node.js is 22+.
+- No application imports Cap'n Web or oRPC, Hono is `>=4.13.7`, and Node.js is 22+.
 - Native STS bindings pin the caller; custom proof requesters partition caches with `cacheBinding`.
 - The plane uses `broker` and `invocationMiddleware`; MCP is enabled explicitly when required.
 - WebSocket auth moved to the upgrade, and stream/error/TanStack consumers use stable APIs.

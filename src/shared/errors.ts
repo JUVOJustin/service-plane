@@ -12,6 +12,8 @@ export type ServicePlaneErrorCode =
   | 'capability_auth'
   /** The ability handler failed deliberately and chose what the caller sees. */
   | 'handler'
+  /** The peer uses an unsupported Service Plane RPC wire revision. */
+  | 'incompatible_protocol'
   /** Anything else, including a handler failure the service did not shape for callers. */
   | 'internal'
   /** An effective caller deadline or server-owned execution/preparation ceiling elapsed. */
@@ -182,6 +184,7 @@ const SERVICE_PLANE_ERROR_CODE_ROWS: Record<ServicePlaneErrorCode, true> = {
   cancelled: true,
   capability_auth: true,
   handler: true,
+  incompatible_protocol: true,
   internal: true,
   timeout: true,
 };

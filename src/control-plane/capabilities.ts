@@ -8,10 +8,15 @@ import {
   signCapabilityToken,
   verifyCapabilityToken,
 } from '../shared/capability-tokens.js';
-import { CapabilityAuthError } from '../shared/errors.js';
+import { timeoutMsFromRequest } from '../shared/deadline.js';
+import { CapabilityAuthError, ServicePlaneTimeoutError } from '../shared/errors.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
 import { generateServicePlaneJwkSigningKey } from '../shared/jwk-auth.js';
-import { preserveRuntimeRequestMetadata } from '../shared/request-preparation.js';
+import {
+  createFetchRequestPreparation,
+  DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS,
+  preserveRuntimeRequestMetadata,
+} from '../shared/request-preparation.js';
 import {
   type AbilityAccess,
   type CapabilityCatalog,
@@ -355,7 +360,18 @@ export function mountCapabilityTokenEndpoint<TEnv extends Env = Env, TAppEnv ext
       const physicalRequest = context.req.raw;
 
       try {
-        const bodyBytes = await readBoundedRequestBytes(physicalRequest, maxBodyBytes, CAPABILITY_TOKEN_BODY_TOO_LARGE_MESSAGE);
+        const preparation = createFetchRequestPreparation(physicalRequest, {
+          deadlineAt:
+            Date.now() +
+            Math.min(
+              timeoutMsFromRequest(context.req) ?? DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS,
+              DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS,
+            ),
+          deadlineError: () => new ServicePlaneTimeoutError('Service-Plane capability token request decoding exceeded its deadline'),
+        });
+        const bodyBytes = await preparation.run(() =>
+          readBoundedRequestBytes(preparation.request, maxBodyBytes, CAPABILITY_TOKEN_BODY_TOO_LARGE_MESSAGE),
+        );
         context.req.raw = requestWithBufferedBody(physicalRequest, bodyBytes);
         const authenticated = await options.authenticateCaller(resolverContext);
         if (authenticated instanceof Response) return authenticated;
@@ -383,6 +399,7 @@ export function mountCapabilityTokenEndpoint<TEnv extends Env = Env, TAppEnv ext
         });
         return context.json(issuedCapabilityTokenRpcResponse(issued));
       } catch (error) {
+        if (error instanceof ServicePlaneTimeoutError) return context.json({ error: error.message }, 504);
         if (error instanceof CapabilityAuthError) {
           return context.json({ error: error.message }, error.status as 400 | 401 | 403 | 413 | 500);
         }

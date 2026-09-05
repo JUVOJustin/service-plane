@@ -1,8 +1,114 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { SERVICE_PLANE_TIMEOUT_HEADER } from '../shared/deadline.js';
+import { SERVICE_PLANE_CAPABILITY_TOKEN_PATH } from '../shared/types.js';
 import { ServicePlaneControlPlane } from './control-plane.js';
 
 describe('public control-plane route deadlines', () => {
+  it.each(['broker', 'mcp', 'rest', 'token'] as const)(
+    'cancels locked %s body readers at the default preparation deadline',
+    async (surface) => {
+      vi.useFakeTimers();
+      let cancelled = false;
+      let resolved: (() => void) | undefined;
+      const started = new Promise<void>((resolve) => {
+        resolved = resolve;
+      });
+      const body = new ReadableStream<Uint8Array>({
+        cancel() {
+          cancelled = true;
+        },
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{'));
+        },
+        pull() {
+          resolved?.();
+        },
+      });
+      const authenticateCaller = vi.fn(() => 'caller');
+      const services = vi.fn(() => []);
+      const plane = new ServicePlaneControlPlane({
+        authenticateCaller,
+        broker: {},
+        invocationMiddleware: async (context, next) => {
+          await context.req.raw.text();
+          context.set('servicePlaneCaller', { id: 'user-1', kind: 'user' });
+          await next();
+        },
+        log: false,
+        mcp: {},
+        openapi: false,
+        services,
+        signingKeys: () => [],
+      });
+      const path =
+        surface === 'broker'
+          ? '/rpc/v1/broker/call'
+          : surface === 'mcp'
+            ? '/mcp'
+            : surface === 'token'
+              ? SERVICE_PLANE_CAPABILITY_TOKEN_PATH
+              : '/not-published';
+      try {
+        const pending = plane.fetch(
+          new Request(`https://plane.internal${path}`, {
+            body,
+            duplex: 'half',
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-service-plane-rpc-protocol': 'service-plane-rpc/1' },
+          } as RequestInit),
+        );
+        await started;
+        await vi.advanceTimersByTimeAsync(10_000);
+        const response = await pending;
+
+        expect(response.status).toBe(surface === 'mcp' ? 200 : 504);
+        expect(await response.text()).toContain('deadline');
+        await vi.waitFor(() => expect(cancelled).toBe(true));
+        expect(services).not.toHaveBeenCalled();
+        expect(authenticateCaller).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it('cancels the MCP protocol parser at a shorter caller deadline', async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelled = true;
+      },
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{'));
+      },
+    });
+    const services = vi.fn(() => []);
+    const plane = new ServicePlaneControlPlane({
+      invocationMiddleware: async (context, next) => {
+        context.set('servicePlaneCaller', { id: 'user-1', kind: 'user' });
+        await next();
+      },
+      log: false,
+      mcp: {},
+      openapi: false,
+      rest: false,
+      services,
+      signingKeys: () => [],
+    });
+    const response = await plane.fetch(
+      new Request('https://plane.internal/mcp', {
+        body,
+        duplex: 'half',
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [SERVICE_PLANE_TIMEOUT_HEADER]: '20' },
+      } as RequestInit),
+    );
+
+    expect(await response.text()).toContain('deadline');
+    await vi.waitFor(() => expect(cancelled).toBe(true));
+    expect(services).not.toHaveBeenCalled();
+  });
+
   it('bounds invocation middleware without starting late broker, MCP, or REST work', async () => {
     let serviceResolutions = 0;
     const plane = new ServicePlaneControlPlane({
@@ -21,10 +127,10 @@ describe('public control-plane route deadlines', () => {
       },
       signingKeys: () => [],
     });
-    const deadlineHeaders = { [SERVICE_PLANE_TIMEOUT_HEADER]: '10' };
+    const deadlineHeaders = { [SERVICE_PLANE_TIMEOUT_HEADER]: '10', 'x-service-plane-rpc-protocol': 'service-plane-rpc/1' };
 
     const [broker, mcp, rest] = await Promise.all([
-      plane.fetch(new Request('https://plane.internal/rpc/broker/call', { headers: deadlineHeaders, method: 'POST' })),
+      plane.fetch(new Request('https://plane.internal/rpc/v1/broker/call', { headers: deadlineHeaders, method: 'POST' })),
       plane.fetch(
         new Request('https://plane.internal/mcp', {
           body: JSON.stringify({ id: 1, jsonrpc: '2.0', method: 'tools/list' }),

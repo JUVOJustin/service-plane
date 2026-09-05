@@ -3,7 +3,7 @@ import { discardDisposableValue, normalizeTimeoutMs, raceDeadline, remainingTime
 import { CapabilityAuthError, ServicePlaneTimeoutError } from '../shared/errors.js';
 import type { DiscoveredServiceAbility, ServiceRegistry } from '../shared/types.js';
 import { createControlPlaneRpcBroker } from './broker.js';
-import { type BrokerCaller, brokerCallerAccess } from './caller.js';
+import { type BrokerCaller, brokerCallerAccess, type ControlPlaneInvocationAuthorizer } from './caller.js';
 import type { CapabilityIssuer } from './capabilities.js';
 
 /** One already-matched catalog method passed to the shared control-plane dispatcher. */
@@ -18,6 +18,8 @@ export type ControlPlaneMethodInvocation = {
 
 /** Authenticated request facts needed to authorize and dispatch one projected method. */
 export type ControlPlaneInvocationOptions = {
+  /** Optional product permission check shared by every projected invocation. */
+  authorizeInvocation?: ControlPlaneInvocationAuthorizer;
   /** Authenticated product or service caller. */
   caller?: BrokerCaller;
   /** Original-client connection information forwarded to the service. */
@@ -70,6 +72,7 @@ export async function invokeControlPlaneMethod(
 ): Promise<unknown> {
   authorizePublishedAbility(invocation.ability, options.caller);
   const broker = createControlPlaneRpcBroker({
+    ...(options.authorizeInvocation ? { authorizeInvocation: options.authorizeInvocation } : {}),
     ...(options.connInfo ? { connInfo: options.connInfo } : {}),
     controlPlaneServiceId: options.controlPlaneServiceId,
     ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),

@@ -161,8 +161,11 @@ The client derives required scopes from each contract method, caches tokens unti
 window, and sends per-call metadata. Add `scopes` only for ability-level scopes beyond the method's
 minimum.
 
-An ingress-protected service refuses an ordinary direct token. Route that call through the control
+Services are ingress-protected by default and refuse ordinary direct tokens. Route calls through the control
 plane broker, which mints a token containing a signed broker claim.
+
+`ingress: false` explicitly permits direct capability holders. Hosting on Node, Bun, or Deno does
+not require that opt-out; the default protected service works over HTTPS as well as bound Workers.
 
 ## Authenticate Product Invocations
 
@@ -209,6 +212,37 @@ set of transport-auth headers.
 Use `principalKind` to distinguish `api-key`, `automation`, or `anonymous` without promoting that
 principal to service access. Anonymous access is an explicit authenticated application decision,
 never a fallback.
+
+## Authorize Individual Methods
+
+Authentication alone does not define product permissions. Without an `authorizeInvocation` hook,
+authenticated product callers may reach plane-callable methods permitted by the control plane's
+service grants. Those grants are service permissions, not per-user roles.
+
+Use one policy across RPC, REST, MCP, and trusted `plane.abilityClient` calls:
+
+```ts
+authorizeInvocation: async (invocation, c) => {
+  if (!invocation.caller) return false;
+  return permissionStore(c.env).mayInvoke({
+    caller: invocation.caller,
+    serviceId: invocation.serviceId,
+    abilityId: invocation.abilityId,
+    method: invocation.method,
+    scopes: invocation.scopes,
+  });
+},
+```
+
+When configured, only `true` allows a call. `false`, missing returns, and exceptions all deny with
+403 before token signing or service dispatch. Every batch item is checked independently; a
+WebSocket's authenticated caller is checked again for each logical call. Service grants and the
+service's own ingress, access, and scope checks still apply.
+
+The invocation and its caller/scopes are immutable snapshots. Scopes are the exact token scopes,
+including requested extras. No unvalidated method input reaches this hook. Enforce tenant ownership,
+resource access, and business rules in the service handler after schema validation. An absent caller
+means a trusted plane-owned invocation; handle that case explicitly in your policy.
 
 ## Identity In A Handler
 
@@ -271,7 +305,7 @@ terminates.
 
 ## Fail-Closed Checklist
 
-- Enable `ingress: {}` on private services.
+- Keep the default broker-protected ingress on private services.
 - Authenticate before setting `servicePlaneCaller`.
 - Set `kind: 'service'` only for a proven service identity.
 - Declare every ability and method scope; do not repeat scope checks in handlers.

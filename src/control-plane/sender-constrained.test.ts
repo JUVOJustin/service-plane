@@ -228,6 +228,7 @@ async function deployment(caller: Awaited<ReturnType<typeof callerKeys>>) {
   });
 
   const service = new ServicePlaneService({
+    ingress: false,
     abilities: [ability],
     auth: {
       issuer: 'control-plane',

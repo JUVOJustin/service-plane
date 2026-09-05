@@ -2,6 +2,7 @@ import type { StandardLazyRequest } from '@orpc/server';
 import { RPCHandler as WebSocketRpcHandler } from '@orpc/server/websocket';
 import type { UpgradeWebSocket } from 'hono/ws';
 import { describe, expect, it, vi } from 'vitest';
+import { SERVICE_PLANE_RPC_PROTOCOL, SERVICE_PLANE_RPC_PROTOCOL_HEADER } from '../shared/rpc-protocol.js';
 import { ServicePlaneControlPlane } from './control-plane.js';
 
 type TestSocket = {
@@ -17,7 +18,7 @@ const lazyRequest = {
   headers: {},
   method: 'POST',
   resolveBody: async () => undefined,
-  url: '/rpc/test',
+  url: '/rpc/v1/test',
 } satisfies StandardLazyRequest;
 
 function deferredBlobFrame(value: string): { blob: Blob; resolve(): void } {
@@ -35,6 +36,58 @@ function deferredBlobFrame(value: string): { blob: Blob; resolve(): void } {
 }
 
 describe('control-plane RPC body limits', () => {
+  it.each(['mcp', 'broker', 'rest'] as const)(
+    'bounds the physical %s body before body-reading authentication can buffer it',
+    async (surface) => {
+      let pulls = 0;
+      let cancelled = false;
+      let serviceResolutions = 0;
+      let authenticatedBytes: number | undefined;
+      const body = new ReadableStream<Uint8Array>({
+        cancel() {
+          cancelled = true;
+        },
+        pull(controller) {
+          pulls += 1;
+          if (pulls > 512) controller.close();
+          else controller.enqueue(new Uint8Array(65_536));
+        },
+      });
+      const plane = new ServicePlaneControlPlane({
+        broker: surface === 'broker' ? { maxRequestBodyBytes: 1024 } : false,
+        invocationMiddleware: async (context, next) => {
+          authenticatedBytes = (await context.req.raw.arrayBuffer()).byteLength;
+          context.set('servicePlaneCaller', { id: 'signed-client', kind: 'service' });
+          await next();
+        },
+        log: false,
+        mcp: surface === 'mcp' ? { maxBodyBytes: 1024 } : false,
+        openapi: false,
+        rest: surface === 'rest' ? { maxBodyBytes: 1024 } : false,
+        services: () => {
+          serviceResolutions += 1;
+          return [];
+        },
+        signingKeys: () => [],
+      });
+      const path = surface === 'mcp' ? '/mcp' : surface === 'broker' ? '/rpc/v1/broker/call' : '/unknown';
+      const response = await plane.fetch(
+        new Request(`https://plane.internal${path}`, {
+          body,
+          duplex: 'half',
+          headers: { 'content-type': 'application/json', [SERVICE_PLANE_RPC_PROTOCOL_HEADER]: SERVICE_PLANE_RPC_PROTOCOL },
+          method: 'POST',
+        } as RequestInit),
+      );
+
+      expect(response.status).toBe(413);
+      expect(authenticatedBytes).toBeUndefined();
+      expect(serviceResolutions).toBe(0);
+      expect(pulls).toBeLessThan(5);
+      await vi.waitFor(() => expect(cancelled).toBe(true));
+    },
+  );
+
   it('rejects an oversized MCP body before service discovery or issuer work', async () => {
     let middlewareCalls = 0;
     let serviceResolutions = 0;
@@ -58,7 +111,7 @@ describe('control-plane RPC body limits', () => {
     const response = await plane.fetch(
       new Request('https://plane.internal/mcp', {
         body: '1234',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', [SERVICE_PLANE_RPC_PROTOCOL_HEADER]: SERVICE_PLANE_RPC_PROTOCOL },
         method: 'POST',
       }),
     );
@@ -87,9 +140,9 @@ describe('control-plane RPC body limits', () => {
     });
 
     const response = await plane.fetch(
-      new Request('https://plane.internal/rpc/broker/call', {
+      new Request('https://plane.internal/rpc/v1/broker/call', {
         body: '1234',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', [SERVICE_PLANE_RPC_PROTOCOL_HEADER]: SERVICE_PLANE_RPC_PROTOCOL },
         method: 'POST',
       }),
     );
@@ -119,9 +172,9 @@ describe('control-plane RPC body limits', () => {
     });
 
     const response = await plane.fetch(
-      new Request('https://plane.internal/rpc/broker/call', {
+      new Request('https://plane.internal/rpc/v1/broker/call', {
         body,
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', [SERVICE_PLANE_RPC_PROTOCOL_HEADER]: SERVICE_PLANE_RPC_PROTOCOL },
         method: 'POST',
         duplex: 'half',
       } as RequestInit),
@@ -150,7 +203,7 @@ describe('control-plane RPC body limits', () => {
       signingKeys: () => [],
     });
     await plane.fetch(
-      new Request('https://plane.internal/rpc/broker/ws', {
+      new Request('https://plane.internal/rpc/v1/broker/ws', {
         headers: { connection: 'upgrade', upgrade: 'websocket' },
       }),
     );
@@ -183,7 +236,7 @@ describe('control-plane RPC body limits', () => {
       signingKeys: () => [],
     });
     await plane.fetch(
-      new Request('https://plane.internal/rpc/broker/ws', {
+      new Request('https://plane.internal/rpc/v1/broker/ws', {
         headers: { connection: 'upgrade', upgrade: 'websocket' },
       }),
     );
