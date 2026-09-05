@@ -250,22 +250,20 @@ export type AbilityBuilder<TEnv extends Env> = {
 /** Creates transport-neutral method definitions from one explicit options object per method. */
 export function createAbilityBuilder<TEnv extends Env = Env>(): AbilityBuilder<TEnv> {
   return {
-    hibernationStream<TInput extends AbilitySchema, TOutput extends AbilitySchema>(
-      options: AbilityStreamMethodOptions<TEnv, TInput, TOutput, 'hibernation'>,
-    ) {
-      const { handler, input, output, ...metadata } = options;
-      return defineMethod('hibernation', metadata, input, output, handler as AbilityMethodHandler | undefined);
-    },
-    method<TInput extends AbilitySchema, TOutput extends AbilitySchema>(options: AbilityUnaryMethodOptions<TEnv, TInput, TOutput>) {
-      const { handler, input, output, ...metadata } = options;
-      return defineMethod('unary', metadata, input, output, handler as AbilityMethodHandler | undefined);
-    },
-    stream<TInput extends AbilitySchema, TOutput extends AbilitySchema>(
-      options: AbilityStreamMethodOptions<TEnv, TInput, TOutput, 'stream'>,
-    ) {
-      const { handler, input, output, ...metadata } = options;
-      return defineMethod('stream', metadata, input, output, handler as AbilityMethodHandler | undefined);
-    },
+    hibernationStream: methodDefiner<TEnv, 'hibernation'>('hibernation'),
+    method: methodDefiner<TEnv, 'unary'>('unary'),
+    stream: methodDefiner<TEnv, 'stream'>('stream'),
+  };
+}
+
+// The builder methods differ only in the kind they stamp; each keeps its own precise handler type
+// through AbilityBuilder while sharing this one implementation.
+function methodDefiner<TEnv extends Env, TKind extends AbilityMethodKind>(kind: TKind) {
+  return <TInput extends AbilitySchema, TOutput extends AbilitySchema>(
+    options: AbilityMethodMetadata & { readonly handler?: unknown; readonly input: TInput; readonly output: TOutput },
+  ): AbilityMethodDefinition<TEnv, TInput, TOutput, TKind> => {
+    const { handler, input, output, ...metadata } = options;
+    return defineMethod(kind, metadata, input, output, handler as AbilityMethodHandler | undefined);
   };
 }
 

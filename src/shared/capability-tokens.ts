@@ -1,24 +1,18 @@
 import { decodeBase64Url, encodeBase64Url } from 'hono/utils/encode';
 import { signing, verifying } from 'hono/utils/jwt/jws';
+import { credentialFromAuthorization } from './authorization.js';
 import { CapabilityAuthError } from './errors.js';
-import {
-  decodeServicePlaneJwkToken,
-  publicJwkFromPrivateJwk,
-  randomServicePlaneJwkId,
-  SERVICE_PLANE_JWK_ALGORITHM,
-  servicePlaneJwkSigningKey,
-} from './jwk-auth.js';
+import { isAbilityAccess, isRecord } from './guards.js';
+import { decodeServicePlaneJwkToken, randomServicePlaneJwkId, SERVICE_PLANE_JWK_ALGORITHM, servicePlaneJwkSigningKey } from './jwk-auth.js';
 import { verifyCapabilityProof } from './proof-of-possession.js';
 import {
   type CapabilityActorClaim,
   type CapabilityClaims,
   type CapabilityConfirmation,
   type CapabilityIdentity,
-  type CapabilityJwks,
   type CapabilitySubject,
   DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
   type IssuedCapabilityToken,
-  isAbilityAccess,
   MAX_CAPABILITY_TOKEN_TTL_SECONDS,
   SERVICE_PLANE_AUTHORIZATION_SCHEME,
   type VerifyCapabilityTokenOptions,
@@ -27,8 +21,7 @@ import {
 const MAX_CAPABILITY_TOKEN_LENGTH = 8192;
 const MAX_CAPABILITY_CLAIM_STRING_LENGTH = 512;
 const MAX_CAPABILITY_SCOPE_COUNT = 128;
-
-export { publicJwkFromPrivateJwk };
+const CAPABILITY_TOKEN_ENCODING_MESSAGE = 'Invalid Service-Plane capability token encoding';
 
 export type SignCapabilityTokenOptions = {
   claims: Omit<CapabilityClaims, 'exp' | 'iat' | 'jti' | 'nbf'> & Partial<Pick<CapabilityClaims, 'jti'>>;
@@ -49,7 +42,7 @@ export async function signCapabilityToken(options: SignCapabilityTokenOptions): 
   }
   const now = options.now ?? new Date();
   const issuedAt = Math.floor(now.getTime() / 1000);
-  const ttlSeconds = normalizeTtlSeconds(options.ttlSeconds ?? DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS);
+  const ttlSeconds = normalizeCapabilityTokenTtlSeconds(options.ttlSeconds ?? DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS);
   const expiresAtSeconds = issuedAt + ttlSeconds;
   const claims: CapabilityClaims = {
     ...options.claims,
@@ -71,14 +64,14 @@ export async function verifyCapabilityToken(token: string, options: VerifyCapabi
   const parts = token.split('.');
   if (parts.length !== 3 || !parts[0] || !parts[1] || !parts[2]) throw new CapabilityAuthError('Invalid Service-Plane capability token');
 
-  const { header, payload } = decodeCapabilityToken(token);
+  const { header, payload } = decodeServicePlaneJwkToken(token, CAPABILITY_TOKEN_ENCODING_MESSAGE);
   if (!isRecord(header) || header.alg !== SERVICE_PLANE_JWK_ALGORITHM || typeof header.kid !== 'string') {
     throw new CapabilityAuthError('Invalid Service-Plane capability token header');
   }
 
   // Authenticate the compact JWS before using any claim for authorization or error selection.
   // The unverified header is used only to select the advertised key id and pinned algorithm.
-  const jwks = await resolveJwks(options.jwks);
+  const jwks = typeof options.jwks === 'function' ? await options.jwks() : options.jwks;
   const key = jwks.keys.find((candidate) => candidate.kid === header.kid);
   if (!key) throw new CapabilityAuthError('Unknown Service-Plane capability key id');
   await verifyTokenSignature(token, key);
@@ -159,26 +152,14 @@ export function servicePlaneAuthorization(token: string): string {
 }
 
 export function extractServicePlaneToken(request: Request): string {
-  const authorization = request.headers.get('authorization')?.trim();
-  if (!authorization) throw new CapabilityAuthError('Missing Service-Plane capability token');
-  const parts = authorization.split(/\s+/u);
-  const [scheme, token] = parts;
-  if (parts.length !== 2 || scheme?.toLowerCase() !== SERVICE_PLANE_AUTHORIZATION_SCHEME.toLowerCase() || !token) {
-    throw new CapabilityAuthError('Invalid Service-Plane authorization scheme');
-  }
-  return token;
+  return credentialFromAuthorization(request, SERVICE_PLANE_AUTHORIZATION_SCHEME, {
+    invalid: 'Invalid Service-Plane authorization scheme',
+    missing: 'Missing Service-Plane capability token',
+  });
 }
 
 export function decodeCapabilityTokenPayload(token: string): CapabilityClaims {
-  return parseCapabilityClaims(decodeCapabilityToken(token).payload);
-}
-
-async function resolveJwks(jwks: VerifyCapabilityTokenOptions['jwks']): Promise<CapabilityJwks> {
-  return typeof jwks === 'function' ? jwks() : jwks;
-}
-
-function decodeCapabilityToken(token: string): { header: unknown; payload: unknown } {
-  return decodeServicePlaneJwkToken(token, 'Invalid Service-Plane capability token encoding');
+  return parseCapabilityClaims(decodeServicePlaneJwkToken(token, CAPABILITY_TOKEN_ENCODING_MESSAGE).payload);
 }
 
 function parseCapabilityClaims(value: unknown): CapabilityClaims {
@@ -269,10 +250,6 @@ function parseActorClaim(value: unknown): CapabilityActorClaim | undefined {
   return { sub };
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
-}
-
 function isBoundedClaimString(value: string): boolean {
   return value.length > 0 && value.length <= MAX_CAPABILITY_CLAIM_STRING_LENGTH;
 }
@@ -316,7 +293,7 @@ function encodeJwtPart(value: unknown): string {
 
 function importedSigningKey(privateJwk: JsonWebKey, keyId: string): Promise<CryptoKey> {
   const signingJwk = servicePlaneJwkSigningKey(privateJwk, keyId);
-  const fingerprint = signingKeyFingerprint(signingJwk);
+  const fingerprint = signingJwkFingerprint(signingJwk);
   const cached = signingKeyCache.get(privateJwk);
   if (cached?.fingerprint === fingerprint) return cached.key;
 
@@ -329,7 +306,8 @@ function importedSigningKey(privateJwk: JsonWebKey, keyId: string): Promise<Cryp
   return key;
 }
 
-function signingKeyFingerprint(key: JsonWebKey): string {
+/** Identity of a signing JWK's material and policy members, for memos that must notice in-place rotation. */
+export function signingJwkFingerprint(key: JsonWebKey): string {
   return JSON.stringify([
     key.kty ?? null,
     key.crv ?? null,
@@ -385,15 +363,12 @@ function importedVerificationKey(key: JsonWebKey & { kid?: string }): Promise<Cr
   return imported;
 }
 
-function normalizeTtlSeconds(ttlSeconds: number): number {
-  if (
-    !Number.isFinite(ttlSeconds) ||
-    !Number.isSafeInteger(ttlSeconds) ||
-    ttlSeconds <= 0 ||
-    ttlSeconds > MAX_CAPABILITY_TOKEN_TTL_SECONDS
-  ) {
+/** Bounds a token lifetime; the status says whether a caller or the plane's own configuration asked for it. */
+export function normalizeCapabilityTokenTtlSeconds(ttlSeconds: number, status = 401): number {
+  if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds <= 0 || ttlSeconds > MAX_CAPABILITY_TOKEN_TTL_SECONDS) {
     throw new CapabilityAuthError(
       `Service-Plane capability token TTL must be a positive integer no greater than ${MAX_CAPABILITY_TOKEN_TTL_SECONDS} seconds`,
+      status,
     );
   }
   return ttlSeconds;

@@ -244,15 +244,15 @@ describe('control-plane RPC body limits', () => {
 
     const delivered: string[] = [];
     const receivedAt: number[] = [];
+    // Each frame opens its own request scope; its entry timestamp is what the scope receives.
     const internals = plane as unknown as {
-      brokerForRequest(...args: unknown[]): unknown;
-      resolveBrokeredRequest(): Promise<{ caller: { id: string; kind: 'user' } }>;
+      requestScope(context: unknown, surface: string, facts: { receivedAt: number }): unknown;
     };
-    internals.resolveBrokeredRequest = async () => ({ caller: { id: 'browser', kind: 'user' } });
-    internals.brokerForRequest = (...args) => {
-      receivedAt.push(args[2] as number);
-      return {};
+    internals.requestScope = (_context, _surface, facts) => {
+      receivedAt.push(facts.receivedAt);
+      return { broker: async () => ({}) };
     };
+
     const message = vi.spyOn(WebSocketRpcHandler.prototype, 'message').mockImplementation(async (...args) => {
       delivered.push(new TextDecoder().decode(args[1] as ArrayBuffer));
       const runtime = await (args[2] as { context(request: StandardLazyRequest): Promise<unknown> }).context(lazyRequest);

@@ -1,8 +1,9 @@
 import { type ClientLink, type ClientOptions, DynamicLink, wrapAsyncIteratorPreservingEventMeta } from '@orpc/client';
 import { RPCLink as FetchRpcLink } from '@orpc/client/fetch';
 import { RPCLink as WebSocketRpcLink } from '@orpc/client/websocket';
-import { decodeCapabilityTokenPayload, servicePlaneAuthorization } from '../shared/capability-tokens.js';
-import { type ConnInfo, normalizeConnInfo, SERVICE_PLANE_CONN_INFO_HEADER, serializeConnInfo } from '../shared/conn-info.js';
+import { applyForwardedCallHeaders } from '../shared/call-headers.js';
+import { decodeCapabilityTokenPayload } from '../shared/capability-tokens.js';
+import { type ConnInfo, normalizeConnInfo } from '../shared/conn-info.js';
 import {
   createDeadlineSignal,
   discardDisposableValue,
@@ -12,12 +13,12 @@ import {
   remainingTimeoutMs,
   SERVICE_PLANE_TIMEOUT_GRACE_MS,
   SERVICE_PLANE_TIMEOUT_HEADER,
-  serializeTimeoutMs,
   signalBoundAsyncIterator,
 } from '../shared/deadline.js';
 import { CapabilityAuthError, ServicePlaneClientError, ServicePlaneTimeoutError, servicePlaneClientError } from '../shared/errors.js';
 import { createFlatAbilityClient } from '../shared/flat-ability-client.js';
-import { normalizeIdempotencyKey, SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER } from '../shared/idempotency.js';
+import { isAsyncIterator } from '../shared/guards.js';
+import { normalizeIdempotencyKey } from '../shared/idempotency.js';
 import { normalizeOriginRelativePath } from '../shared/paths.js';
 import { SERVICE_PLANE_BROKER_RPC_PATH, SERVICE_PLANE_RPC_PROTOCOL, SERVICE_PLANE_RPC_PROTOCOL_HEADER } from '../shared/rpc-protocol.js';
 import type {
@@ -25,9 +26,11 @@ import type {
   CapabilityTokenCache,
   CapabilityTokenProvider,
   FetchLike,
+  IssueCapabilityTokenInput,
+  IssuedCapabilityToken,
   ServiceAbilityNativeCall,
 } from '../shared/types.js';
-import { SERVICE_PLANE_PROOF_HEADER, SERVICE_PLANE_REQUEST_ID_HEADER } from '../shared/types.js';
+import { SERVICE_PLANE_PROOF_HEADER } from '../shared/types.js';
 import { type CapabilityProofSigner, type CapabilityTokenRequester, createCapabilityTokenProvider } from './capabilities.js';
 import {
   type AbilityCallOptions,
@@ -118,9 +121,7 @@ type AbilityClientTokenOptions =
       /** Refreshes a cached token this many seconds before expiry. */
       refreshSkewSeconds?: number;
       /** Requests a capability token from the control plane; the client caches it until refresh. */
-      requestToken: (
-        input: import('../shared/types.js').IssueCapabilityTokenInput,
-      ) => Promise<import('../shared/types.js').IssuedCapabilityToken | { expiresAt: Date | string; token: string }>;
+      requestToken: (input: IssueCapabilityTokenInput) => Promise<IssuedCapabilityToken | { expiresAt: Date | string; token: string }>;
       /** Delegated subject for trusted direct callers. */
       subject?: CapabilitySubject;
       /** Discriminates this requester-owned branch from an existing provider. */
@@ -207,6 +208,13 @@ type AbilityClientContext = Omit<AbilityCallOptions, 'signal'> & {
 type AbilityORPCCallOptions = ClientOptions<AbilityClientContext>;
 type AbilityClientLink = ClientLink<AbilityClientContext>;
 type AbilityHeadersResolver = (options: AbilityORPCCallOptions, path: string[]) => Promise<Headers>;
+type AbilityClientLinks = {
+  /** Present only for WebSocket transports, which own sockets and active streams. */
+  lifecycle?: WebSocketAbilityClientLifecycle;
+  link: AbilityClientLink;
+  /** The link streams use; batching Fetch transports keep an unbatched twin for them. */
+  streamLink: AbilityClientLink;
+};
 type ClientMetadataDefaults = {
   connInfo?: ConnInfo;
   idempotencyKey?: string;
@@ -319,24 +327,20 @@ export function createAbilityClient<TAbility extends AnyServiceAbilityDefinition
   const tokenProvider = abilityTokenProvider(options, scopesByMethod);
   const defaults = clientMetadataDefaults(options);
   const headers: AbilityHeadersResolver = async (callOptions, path): Promise<Headers> => {
-    const token = await callWithSignal(tokenProvider(methodNameFromPath(options.ability, path)), callOptions.signal);
+    const token = await callWithSignal(tokenProvider(abilityMethodFromPath(options.ability, path).methodName), callOptions.signal);
     const proof = await callWithSignal(capabilityProof(options, token), callOptions.signal);
-    const result = new Headers({ authorization: servicePlaneAuthorization(token) });
-    result.set(SERVICE_PLANE_RPC_PROTOCOL_HEADER, SERVICE_PLANE_RPC_PROTOCOL);
     const metadata = resolveForwardedCallMetadata(defaults, callOptions, path.join('.'));
-    const connInfo = serializeConnInfo(metadata.connInfo);
-    const idempotencyKey = normalizeIdempotencyKey(metadata.idempotencyKey);
-    const timeout = serializeTimeoutMs(metadata.timeoutMs);
-    if (connInfo) result.set(SERVICE_PLANE_CONN_INFO_HEADER, connInfo);
-    if (idempotencyKey) result.set(SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER, idempotencyKey);
-    if (proof) result.set(SERVICE_PLANE_PROOF_HEADER, proof);
-    if (metadata.requestId) result.set(SERVICE_PLANE_REQUEST_ID_HEADER, metadata.requestId);
-    if (timeout) result.set(SERVICE_PLANE_TIMEOUT_HEADER, timeout);
-    return result;
+    return applyForwardedCallHeaders(new Headers({ [SERVICE_PLANE_RPC_PROTOCOL_HEADER]: SERVICE_PLANE_RPC_PROTOCOL }), {
+      connInfo: metadata.connInfo,
+      idempotencyKey: metadata.idempotencyKey,
+      proof,
+      requestId: metadata.requestId,
+      timeoutMs: metadata.timeoutMs,
+      token,
+    });
   };
-  const lifecycle = options.transport.type === 'websocket' ? new WebSocketAbilityClientLifecycle() : undefined;
-  const baseLink = abilityClientLink(options, headers, defaults, lifecycle);
-  return createTypedAbilityClient(options.ability, deadlineClientLink(baseLink, defaults, lifecycle), lifecycle);
+  const { lifecycle, link } = abilityClientLink(options, headers, defaults);
+  return createTypedAbilityClient(options.ability, deadlineClientLink(link, defaults, lifecycle), lifecycle);
 }
 
 /**
@@ -360,46 +364,27 @@ export function createBrokeredAbilityClient<TAbility extends AnyServiceAbilityDe
     const headers = new Headers(configured);
     headers.set(SERVICE_PLANE_RPC_PROTOCOL_HEADER, SERVICE_PLANE_RPC_PROTOCOL);
     const metadata = resolveForwardedCallMetadata(defaults, callOptions, 'control-plane broker');
-    const idempotencyKey = normalizeIdempotencyKey(metadata.idempotencyKey);
-    const timeout = serializeTimeoutMs(metadata.timeoutMs);
-    if (idempotencyKey) headers.set(SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER, idempotencyKey);
-    if (metadata.requestId) headers.set(SERVICE_PLANE_REQUEST_ID_HEADER, metadata.requestId);
-    if (timeout) headers.set(SERVICE_PLANE_TIMEOUT_HEADER, timeout);
-    return headers;
+    // Never connection info: the plane attests the original client itself.
+    return applyForwardedCallHeaders(headers, {
+      idempotencyKey: metadata.idempotencyKey,
+      requestId: metadata.requestId,
+      timeoutMs: metadata.timeoutMs,
+    });
   };
   const brokerPath = normalizeClientRpcPath(transport.path ?? SERVICE_PLANE_BROKER_RPC_PATH, 'control-plane broker');
-  let brokerLink: AbilityClientLink;
-  let brokerStreamLink: AbilityClientLink;
-  const lifecycle = transport.type === 'websocket' ? new WebSocketAbilityClientLifecycle() : undefined;
-  if (transport.type === 'websocket') {
-    if (!lifecycle) throw new CapabilityAuthError('Service-Plane WebSocket client lifecycle is required', 500);
-    brokerLink = new WebSocketRpcLink({
-      connect: () => lifecycle.connect(() => (transport.createWebSocket ?? ((url: string) => new WebSocket(url)))(transport.url)),
-      headers: brokerHeaders,
-      plugins: createRpcClientPlugins({}),
-      ...(transport.reconnect ? { reconnect: transport.reconnect } : {}),
-      url: brokerPath,
-    });
-    brokerStreamLink = brokerLink;
-  } else {
-    const fetchLink = (wire: ServicePlaneClientWireOptions): AbilityClientLink =>
-      new FetchRpcLink({
-        ...(transport.fetch
-          ? {
-              fetch: async (url, init) =>
-                typeof transport.fetch === 'function'
-                  ? transport.fetch(url, init)
-                  : (transport.fetch as FetchLike).fetch(new Request(url, init)),
-            }
-          : {}),
-        headers: brokerHeaders,
-        origin: transport.origin ?? 'https://service-plane-control-plane.internal',
-        plugins: createRpcClientPlugins(wire),
-        url: brokerPath,
-      });
-    brokerLink = fetchLink(transport);
-    brokerStreamLink = transport.batch ? fetchLink({ ...transport, batch: false }) : brokerLink;
-  }
+  const {
+    lifecycle,
+    link: brokerLink,
+    streamLink: brokerStreamLink,
+  } = transport.type === 'websocket'
+    ? webSocketAbilityLinks(brokerPath, transport, brokerHeaders)
+    : fetchAbilityLinks(
+        brokerPath,
+        transport.fetch,
+        transport.origin ?? 'https://service-plane-control-plane.internal',
+        brokerHeaders,
+        transport,
+      );
   const abilityLink: AbilityClientLink = {
     call(path, input, callOptions) {
       const { definition, methodName } = abilityMethodFromPath(options.ability, path);
@@ -642,10 +627,6 @@ function callWithSignal<T>(call: Promise<T>, signal: AbortSignal | undefined): P
   return signal ? raceAbortSignal(call, signal) : call;
 }
 
-function methodNameFromPath(ability: AnyServiceAbilityDefinition, path: string[]): string {
-  return abilityMethodFromPath(ability, path).methodName;
-}
-
 function abilityMethodFromPath(ability: AnyServiceAbilityDefinition, path: string[]) {
   const methodName = path.at(-1) ?? '';
   const definition = Object.hasOwn(ability.methods, methodName) ? ability.methods[methodName] : undefined;
@@ -666,73 +647,74 @@ function brokeredHibernationTransportError(abilityId: string, methodName: string
   );
 }
 
-function isAsyncIterator(value: unknown): value is AsyncIterator<unknown> {
-  return Boolean(value && typeof value === 'object' && typeof (value as { next?: unknown }).next === 'function');
-}
-
 function abilityClientLink<TAbility extends AnyServiceAbilityDefinition>(
   options: CreateAbilityClientOptions<TAbility>,
   headers: AbilityHeadersResolver,
   defaults: ClientMetadataDefaults,
-  lifecycle?: WebSocketAbilityClientLifecycle,
-): AbilityClientLink {
+): AbilityClientLinks {
   const path = normalizeClientRpcPath(options.ability.rpc?.path ?? defaultAbilityRpcPath(options.ability.id), options.ability.id);
-  switch (options.transport.type) {
+  const transport = options.transport;
+  // Routes each method to the link its kind needs; hibernation only ever runs on a direct WebSocket.
+  const byMethodKind = (unary: AbilityClientLink, stream: AbilityClientLink | undefined): AbilityClientLinks => {
+    const link = new DynamicLink<AbilityClientContext>((_callOptions, methodPath) => {
+      const { definition, methodName } = abilityMethodFromPath(options.ability, methodPath);
+      if (definition.kind === 'hibernation') throw hibernationTransportError(options.ability.id, methodName);
+      if (definition.kind === 'unary') return unary;
+      if (!stream) throw new CapabilityAuthError('Service-Plane streaming over a service binding requires binding.fetch', 500);
+      return stream;
+    });
+    return { link, streamLink: link };
+  };
+  switch (transport.type) {
     case 'fetch': {
-      const unaryLink = fetchAbilityLink(path, options.transport.fetch, options.transport.origin, headers, options.transport);
-      const streamLink = options.transport.batch
-        ? fetchAbilityLink(path, options.transport.fetch, options.transport.origin, headers, {
-            ...options.transport,
-            batch: false,
-          })
-        : unaryLink;
-      return new DynamicLink((_callOptions, methodPath) => {
-        const { definition, methodName } = abilityMethodFromPath(options.ability, methodPath);
-        if (definition.kind === 'hibernation') {
-          throw hibernationTransportError(options.ability.id, methodName);
-        }
-        return definition.kind === 'unary' ? unaryLink : streamLink;
-      });
+      const { link, streamLink } = fetchAbilityLinks(path, transport.fetch, transport.origin, headers, transport);
+      return byMethodKind(link, streamLink);
     }
-    case 'websocket': {
-      const transport = options.transport;
-      const createWebSocket = transport.createWebSocket ?? ((url: string) => new WebSocket(url));
-      if (!lifecycle) throw new CapabilityAuthError('Service-Plane WebSocket client lifecycle is required', 500);
-      return new WebSocketRpcLink({
-        connect: () => lifecycle.connect(() => createWebSocket(transport.url)),
-        headers,
-        plugins: createRpcClientPlugins({}),
-        ...(transport.reconnect ? { reconnect: transport.reconnect } : {}),
-        url: path as `/${string}`,
-      });
-    }
+    case 'websocket':
+      return webSocketAbilityLinks(path, transport, headers);
     case 'service-binding': {
-      const transport = options.transport;
-      const native = nativeAbilityLink(options, headers, defaults);
-      const fetchFallback = transport.binding.fetch
+      const binding = transport.binding;
+      const fetchFallback = binding.fetch
         ? fetchAbilityLink(
             path,
-            { fetch: (request) => (transport.binding.fetch as NonNullable<AbilityNativeBinding['fetch']>)(request) },
+            { fetch: (request) => (binding as Required<AbilityNativeBinding>).fetch(request) },
             transport.origin,
             headers,
             { ...transport, batch: false },
           )
         : undefined;
-      return new DynamicLink((_callOptions, methodPath) => {
-        const { definition, methodName } = abilityMethodFromPath(options.ability, methodPath);
-        if (definition.kind === 'hibernation') {
-          throw hibernationTransportError(options.ability.id, methodName);
-        }
-        if (definition.kind === 'stream') {
-          if (!fetchFallback) {
-            throw new CapabilityAuthError('Service-Plane streaming over a service binding requires binding.fetch', 500);
-          }
-          return fetchFallback;
-        }
-        return native;
-      });
+      return byMethodKind(nativeAbilityLink(binding, options.ability.id, headers, defaults), fetchFallback);
     }
   }
+}
+
+/** Fetch links for unary calls and, when batching is on, an unbatched twin for streams. */
+function fetchAbilityLinks(
+  path: string,
+  fetcher: FetchLike | typeof fetch | undefined,
+  origin: string | undefined,
+  headers: AbilityHeadersResolver,
+  wire: ServicePlaneClientWireOptions,
+): AbilityClientLinks {
+  const link = fetchAbilityLink(path, fetcher, origin, headers, wire);
+  return { link, streamLink: wire.batch ? fetchAbilityLink(path, fetcher, origin, headers, { ...wire, batch: false }) : link };
+}
+
+function webSocketAbilityLinks(
+  path: string,
+  transport: { createWebSocket?: (url: string) => AbilityClientWebSocket; reconnect?: ServicePlaneWebSocketReconnectOptions; url: string },
+  headers: AbilityHeadersResolver,
+): AbilityClientLinks {
+  const lifecycle = new WebSocketAbilityClientLifecycle();
+  const createWebSocket = transport.createWebSocket ?? ((url: string) => new WebSocket(url));
+  const link = new WebSocketRpcLink({
+    connect: () => lifecycle.connect(() => createWebSocket(transport.url)),
+    headers,
+    plugins: createRpcClientPlugins({}),
+    ...(transport.reconnect ? { reconnect: transport.reconnect } : {}),
+    url: path as `/${string}`,
+  });
+  return { lifecycle, link, streamLink: link };
 }
 
 function normalizeClientRpcPath(path: string, source: string): `/${string}` {
@@ -763,8 +745,10 @@ function fetchAbilityLink(
   });
 }
 
-function nativeAbilityLink<TAbility extends AnyServiceAbilityDefinition>(
-  options: CreateAbilityClientOptions<TAbility>,
+// The headers resolver already minted and bound everything; the native envelope just carries it.
+function nativeAbilityLink(
+  binding: AbilityNativeBinding,
+  abilityId: string,
   headers: AbilityHeadersResolver,
   defaults: ClientMetadataDefaults,
 ): AbilityClientLink {
@@ -773,26 +757,23 @@ function nativeAbilityLink<TAbility extends AnyServiceAbilityDefinition>(
       const callHeaders = await headers(callOptions, path);
       const token = callHeaders.get('authorization')?.replace(/^ServicePlane\s+/iu, '');
       if (!token) throw new CapabilityAuthError('Service-Plane capability token is required', 401);
-      if (options.transport.type === 'service-binding') {
-        const metadata = resolveCallMetadata(defaults, callOptions);
-        const connInfo = normalizeConnInfo(metadata.connInfo);
-        const idempotencyKey = normalizeIdempotencyKey(metadata.idempotencyKey);
-        const proof = callHeaders.get(SERVICE_PLANE_PROOF_HEADER) ?? undefined;
-        const timeoutMs = parseTimeoutMs(callHeaders.get(SERVICE_PLANE_TIMEOUT_HEADER));
-        return options.transport.binding.invokeAbility({
-          protocol: SERVICE_PLANE_RPC_PROTOCOL,
-          abilityId: options.ability.id,
-          ...(connInfo ? { connInfo } : {}),
-          ...(idempotencyKey ? { idempotencyKey } : {}),
-          input,
-          method: path.at(-1) ?? '',
-          ...(proof ? { proof } : {}),
-          ...(metadata.requestId ? { requestId: metadata.requestId } : {}),
-          ...(timeoutMs === undefined ? {} : { timeoutMs }),
-          token,
-        });
-      }
-      throw new CapabilityAuthError('Service-Plane native binding transport is required', 500);
+      const metadata = resolveCallMetadata(defaults, callOptions);
+      const connInfo = normalizeConnInfo(metadata.connInfo);
+      const idempotencyKey = normalizeIdempotencyKey(metadata.idempotencyKey);
+      const proof = callHeaders.get(SERVICE_PLANE_PROOF_HEADER) ?? undefined;
+      const timeoutMs = parseTimeoutMs(callHeaders.get(SERVICE_PLANE_TIMEOUT_HEADER));
+      return binding.invokeAbility({
+        protocol: SERVICE_PLANE_RPC_PROTOCOL,
+        abilityId,
+        ...(connInfo ? { connInfo } : {}),
+        ...(idempotencyKey ? { idempotencyKey } : {}),
+        input,
+        method: path.at(-1) ?? '',
+        ...(proof ? { proof } : {}),
+        ...(metadata.requestId ? { requestId: metadata.requestId } : {}),
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+        token,
+      });
     },
   };
 }

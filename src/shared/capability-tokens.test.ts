@@ -1,8 +1,8 @@
 import { decode, sign } from 'hono/jwt';
 import { describe, expect, it, vi } from 'vitest';
-import { extractServicePlaneToken, publicJwkFromPrivateJwk, signCapabilityToken, verifyCapabilityToken } from './capability-tokens.js';
+import { extractServicePlaneToken, signCapabilityToken, verifyCapabilityToken } from './capability-tokens.js';
 import { CapabilityAuthError } from './errors.js';
-import { SERVICE_PLANE_JWK_ALGORITHM, servicePlaneJwkSigningKey } from './jwk-auth.js';
+import { publicJwkFromPrivateJwk, SERVICE_PLANE_JWK_ALGORITHM, servicePlaneJwkSigningKey } from './jwk-auth.js';
 
 const NOW = new Date('2026-05-09T12:00:00.000Z');
 

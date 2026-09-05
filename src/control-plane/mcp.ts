@@ -1,8 +1,11 @@
+import { toAbilityStream } from '../service/ability.js';
 import { readBoundedRequestText, ServicePlaneBodyTooLargeError, validateBodyByteLimit } from '../shared/body-limit.js';
 import type { ConnInfo } from '../shared/conn-info.js';
 import { CapabilityAuthError, servicePlaneErrorInfo } from '../shared/errors.js';
+import { isAsyncIterable, isRecord } from '../shared/guards.js';
 import { inlineJsonSchemaRoot as inlineSchemaRoot } from '../shared/json-schema.js';
-import { emitBestEffortServicePlaneLog, type ServicePlaneBrokerLogEvent } from '../shared/logging.js';
+import { emitBestEffortServicePlaneLog, logErrorFields, type ServicePlaneBrokerLogEvent } from '../shared/logging.js';
+import { escapeRegExp, templateVariableName } from '../shared/paths.js';
 import {
   type DiscoveredServiceAbility,
   type McpDiscoveryDocument,
@@ -89,7 +92,7 @@ export type ControlPlaneMcpHandlerOptions = {
 };
 
 /** Cheap request-boundary options needed before registry and issuer resolution. */
-export type ControlPlaneMcpPreflightOptions = Pick<ControlPlaneMcpHandlerOptions, 'allowedOrigins' | 'maxBodyBytes'>;
+type ControlPlaneMcpPreflightOptions = Pick<ControlPlaneMcpHandlerOptions, 'allowedOrigins' | 'maxBodyBytes'>;
 
 /** A validated MCP request whose body can be dispatched without reading the Request again. */
 export type PreparedControlPlaneMcpRequest = {
@@ -333,7 +336,7 @@ export async function prepareControlPlaneMcpRequest(
  * body-bound authentication can still read the original request.
  */
 export function preflightControlPlaneMcpRequest(request: Request, options: ControlPlaneMcpPreflightOptions = {}): Response | undefined {
-  const transportError = validateControlPlaneMcpTransportRequest(request, options.allowedOrigins);
+  const transportError = validateMcpTransportRequest(request, options.allowedOrigins);
   if (transportError) return transportError;
   if (request.method !== 'POST') return new Response(null, { headers: { allow: 'POST' }, status: 405 });
 
@@ -394,7 +397,7 @@ async function dispatchPreparedControlPlaneMcpRequest(
   }
 }
 
-export function validateControlPlaneMcpTransportRequest(request: Request, configuredOrigins: string[] | undefined): Response | undefined {
+function validateMcpTransportRequest(request: Request, configuredOrigins: string[] | undefined): Response | undefined {
   const protocolVersion = request.headers.get('mcp-protocol-version')?.trim();
   if (protocolVersion && !SUPPORTED_MCP_PROTOCOL_VERSIONS.includes(protocolVersion)) {
     return new Response('Unsupported MCP-Protocol-Version', { status: 400 });
@@ -492,10 +495,7 @@ async function callTool(
       if (error instanceof CapabilityAuthError) throw error;
       // Tool execution failures are reported in-band per the MCP spec, not as protocol errors.
       logMcpFailed(options, 'service_plane.mcp.tool.failed', { tool: name }, error, startedAt);
-      return jsonRpcResult(id, {
-        content: [{ text: publicMcpErrorMessage(error), type: 'text' }],
-        isError: true,
-      });
+      return toolFailureResult(id, error);
     }
 
     logMcpCompleted(options, 'service_plane.mcp.tool.completed', { tool: name }, match, startedAt);
@@ -528,10 +528,7 @@ async function streamToolCall(
   } catch (error) {
     if (error instanceof CapabilityAuthError) throw error;
     logMcpFailed(options, 'service_plane.mcp.tool.failed', { tool: name }, error, startedAt);
-    return jsonRpcResult(id, {
-      content: [{ text: publicMcpErrorMessage(error), type: 'text' }],
-      isError: true,
-    });
+    return toolFailureResult(id, error);
   }
   const state = { deliveryAborted: false };
   return sseResponse(streamToolEvents(id, name, match, options, limits, iterator, state, progressTokenOf(params), startedAt), (reason) => {
@@ -614,23 +611,15 @@ async function* streamToolEvents(
   }
 }
 
-function streamIterator(value: unknown, name: string): AsyncIterator<unknown> {
-  if (isAsyncIterable(value)) return value[Symbol.asyncIterator]();
-  if (isReadableStream(value)) {
-    const reader = value.getReader();
-    return {
-      next: () => reader.read(),
-      async return(reason) {
-        await reader.cancel(reason);
-        return { done: true, value: undefined };
-      },
-    };
-  }
-  throw new Error(`Service-Plane streaming tool did not return a stream: ${name}`);
+// In-band per the MCP spec: a tool that ran and failed is a result, not a protocol error.
+function toolFailureResult(id: JsonRpcId, error: unknown): Response {
+  return jsonRpcResult(id, { content: [{ text: publicMcpErrorMessage(error), type: 'text' }], isError: true });
 }
 
-function isReadableStream(value: unknown): value is ReadableStream<unknown> {
-  return Boolean(value && typeof value === 'object' && typeof (value as { getReader?: unknown }).getReader === 'function');
+function streamIterator(value: unknown, name: string): AsyncIterator<unknown> {
+  const readable = isRecord(value) && typeof value.getReader === 'function';
+  if (!isAsyncIterable(value) && !readable) throw new Error(`Service-Plane streaming tool did not return a stream: ${name}`);
+  return toAbilityStream(value as AsyncIterable<unknown> | ReadableStream<unknown>);
 }
 
 function progressTokenOf(params: unknown): string | number | undefined {
@@ -799,10 +788,6 @@ function notifyInvocation(match: McpMethodMatch, options: ControlPlaneMcpHandler
   });
 }
 
-function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
-  return Boolean(value && typeof value === 'object' && Symbol.asyncIterator in value);
-}
-
 type McpResourceMatch = McpMethodMatch & {
   input: Record<string, string>;
   resource: ServiceAbilityMcpResourceProjection;
@@ -839,7 +824,10 @@ function isResourceTemplateUri(uri: string): boolean {
 function matchResourceTemplate(template: string, uri: string): Record<string, string> | undefined {
   const pattern = template
     .split(/(\{[A-Za-z_]\w*\})/gu)
-    .map((part) => (/^\{[A-Za-z_]\w*\}$/u.test(part) ? `(?<${part.slice(1, -1)}>[^/?#]+)` : escapeRegExp(part)))
+    .map((part) => {
+      const variable = templateVariableName(part);
+      return variable ? `(?<${variable}>[^/?#]+)` : escapeRegExp(part);
+    })
     .join('');
   const matched = new RegExp(`^${pattern}$`, 'u').exec(uri);
   if (!matched) return undefined;
@@ -852,10 +840,6 @@ function decodeUriComponentSafe(value: string): string {
   } catch {
     return value;
   }
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
 }
 
 // String outputs are served as-is, `{ blob }` outputs pass through as binary, everything else is JSON text.
@@ -926,7 +910,7 @@ function logMcpFailed(
   emitBestEffortServicePlaneLog(options.log, {
     ...brokerCallerLogFields(options.caller),
     durationMs: Date.now() - startedAt,
-    error: error instanceof Error ? { message: error.message, name: error.name } : { message: String(error), name: 'Error' },
+    error: logErrorFields(error),
     event,
     level: 'warn',
     ...(options.requestId ? { requestId: options.requestId } : {}),
@@ -962,8 +946,4 @@ function publicMcpErrorMessage(error: unknown): string {
 
 function jsonRpcError(id: JsonRpcId, code: number, message: string, status = 200, data?: Record<string, unknown>): Response {
   return Response.json({ error: { code, ...(data ? { data } : {}), message }, id, jsonrpc: '2.0' }, { status });
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

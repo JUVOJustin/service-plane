@@ -1,14 +1,12 @@
 import { readBoundedResponseJson, validateBodyByteLimit } from '../shared/body-limit.js';
+import { isAbilityAccess, isAbilityExposure, isAbilityTransport, isRecord, isServiceHttpMethod } from '../shared/guards.js';
 import { jsonSchemaRootProperties } from '../shared/json-schema.js';
 import { hasOnlySimpleTemplateExpressions, isOriginRelativePath, normalizePath, pathTemplateVariables } from '../shared/paths.js';
 import {
-  type AbilityExposure,
-  type AbilityTransport,
   type CapabilityCatalog,
   type CapabilityScopeDefinition,
   DEFAULT_REGISTRY_CACHE_TTL_SECONDS,
   type DiscoveredServiceAbility,
-  isAbilityAccess,
   type RegistryCache,
   SERVICE_DISCOVERY_PATH,
   type ServiceAbilityDiscovery,
@@ -16,7 +14,6 @@ import {
   type ServiceDiscoveryDocument,
   type ServiceDiscoverySnapshot,
   type ServiceEndpoint,
-  type ServiceHttpMethod,
   type ServiceRegistry,
   type ServiceRegistrySnapshot,
 } from '../shared/types.js';
@@ -44,15 +41,11 @@ export type CreateServiceRegistryOptions = {
 };
 
 export function createServiceRegistry(options: CreateServiceRegistryOptions): ServiceRegistry {
-  return createServiceRegistryInternal(options);
+  return createRequestServiceRegistry(options);
 }
 
 /** Builds a request-owned registry whose caller deadline can release a shared stuck fill. */
 export function createRequestServiceRegistry(options: CreateServiceRegistryOptions, deadlineAt?: number): ServiceRegistry {
-  return createServiceRegistryInternal(options, deadlineAt);
-}
-
-function createServiceRegistryInternal(options: CreateServiceRegistryOptions, deadlineAt?: number): ServiceRegistry {
   const discoveryPath = options.discoveryPath ?? SERVICE_DISCOVERY_PATH;
   const reservedRestPaths = normalizedReservedRestPaths(options.reservedRestPaths);
   const maxResponseBytes = validateBodyByteLimit(
@@ -121,13 +114,17 @@ export function serviceRegistryCacheKey(
     namespace: 'service-plane:registry:v5',
     maxResponseBytes,
     reservedRestPaths: normalizedReservedRestPaths(reservedRestPaths),
-    services: services
-      .map((service) => ({
-        id: service.id,
-        origin: service.origin,
-      }))
-      .sort((left, right) => `${left.id}\u0000${left.origin}`.localeCompare(`${right.id}\u0000${right.origin}`)),
+    services: sortedServiceIdentities(services),
   });
+}
+
+/** The cache identity of a service set: ids and origins, ordered so equal sets key equally. */
+export function sortedServiceIdentities(
+  services: Array<Pick<ServiceEndpoint, 'id' | 'origin'>>,
+): Array<Pick<ServiceEndpoint, 'id' | 'origin'>> {
+  return services
+    .map((service) => ({ id: service.id, origin: service.origin }))
+    .sort((left, right) => `${left.id}\u0000${left.origin}`.localeCompare(`${right.id}\u0000${right.origin}`));
 }
 
 type DiscoveredDocument = {
@@ -323,12 +320,8 @@ function isServiceDiscoveryDocument(value: unknown, reservedRestPaths: Set<strin
     document.abilities.every((ability) => isAbilityDiscovery(ability, reservedRestPaths)) &&
     (document.capabilities === undefined || isCapabilityCatalog(document.capabilities)) &&
     (!document.callerAuth ||
-      (!!document.callerAuth &&
-        typeof document.callerAuth === 'object' &&
-        !!document.callerAuth.jwks &&
-        typeof document.callerAuth.jwks === 'object' &&
-        Array.isArray(document.callerAuth.jwks.keys))) &&
-    (document.ingress === undefined || (!!document.ingress && typeof document.ingress === 'object' && document.ingress.required === true))
+      (isRecord(document.callerAuth) && isRecord(document.callerAuth.jwks) && Array.isArray(document.callerAuth.jwks.keys))) &&
+    (document.ingress === undefined || (isRecord(document.ingress) && document.ingress.required === true))
   );
 }
 
@@ -443,7 +436,7 @@ function isMcpResourceProjection(value: unknown): boolean {
 function isValidRestDiscovery(rest: unknown, inputSchema: Record<string, unknown>, reservedRestPaths: Set<string>): boolean {
   if (
     !isRecord(rest) ||
-    !isHttpMethod(rest.method) ||
+    !isServiceHttpMethod(rest.method) ||
     typeof rest.path !== 'string' ||
     !isOriginRelativePath(rest.path) ||
     isReservedRestPath(normalizePath(rest.path), reservedRestPaths) ||
@@ -472,23 +465,8 @@ function isReservedRestPath(path: string, rules: ReadonlySet<string>): boolean {
   return false;
 }
 
-function isAbilityExposure(value: unknown): value is AbilityExposure {
-  return value === 'private' || value === 'published';
-}
-
-function isAbilityTransport(value: unknown): value is AbilityTransport {
-  return value === 'fetch' || value === 'service-binding' || value === 'websocket';
-}
-
-function isHttpMethod(value: unknown): value is ServiceHttpMethod {
-  return value === 'delete' || value === 'get' || value === 'patch' || value === 'post' || value === 'put' || value === 'query';
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === 'object' && !Array.isArray(value);
-}
-
-function normalizedReservedRestPaths(paths: string[] | undefined): string[] {
+/** Reserved control-plane paths in canonical form, so two spellings of one route compare equal. */
+export function normalizedReservedRestPaths(paths: string[] | undefined): string[] {
   return [...new Set((paths ?? []).map(normalizePath))].sort();
 }
 

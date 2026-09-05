@@ -1,6 +1,7 @@
 import { decode, sign, verify } from 'hono/jwt';
-import { CapabilityAuthError } from './errors.js';
-import { sha256Base64Url } from './hmac-auth.js';
+import { sha256Base64Url } from './encoding.js';
+import { CapabilityAuthError, requireNonEmpty } from './errors.js';
+import { isRecord } from './guards.js';
 import { randomServicePlaneJwkId, SERVICE_PLANE_JWK_ALGORITHM, servicePlaneJwkSigningKey, servicePlaneJwkThumbprint } from './jwk-auth.js';
 import type { CapabilityConfirmation } from './types.js';
 
@@ -47,9 +48,9 @@ export async function signCapabilityProof(options: SignCapabilityProofOptions): 
 
   return sign(
     {
-      abl: normalizeProofField(options.abilityId, 'proof of possession ability id'),
+      abl: requireNonEmpty(options.abilityId, 'proof of possession ability id'),
       ath: await capabilityTokenHash(options.token),
-      aud: normalizeProofField(options.targetServiceId, 'proof of possession audience'),
+      aud: requireNonEmpty(options.targetServiceId, 'proof of possession audience'),
       cnk: proofPublicJwk(options.privateJwk),
       exp: issuedAt + ttlSeconds,
       iat: issuedAt,
@@ -193,14 +194,4 @@ function normalizeProofTtlSeconds(ttlSeconds: number): number {
     );
   }
   return ttlSeconds;
-}
-
-function normalizeProofField(value: string, field: string): string {
-  const normalized = value.trim();
-  if (!normalized) throw new CapabilityAuthError(`Service-Plane ${field} cannot be empty`, 500);
-  return normalized;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
 }

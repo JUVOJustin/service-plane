@@ -1,11 +1,3 @@
-export function joinPaths(prefix: string, path: string): string {
-  const normalizedPrefix = normalizePath(prefix);
-  const normalizedPath = normalizePath(path);
-  if (normalizedPrefix === '/') return normalizedPath;
-  if (normalizedPath === '/') return normalizedPrefix;
-  return `${normalizedPrefix}${normalizedPath}`;
-}
-
 export function normalizePath(path: string): string {
   const trimmed = path.trim();
   if (!trimmed || trimmed === '/') return '/';
@@ -22,7 +14,12 @@ export function hasOnlySimpleTemplateExpressions(value: string): boolean {
     if (char === '}') balance -= 1;
     if (balance < 0) return false;
   }
-  return balance === 0 && expressions.every((expression) => /^\{[A-Za-z_]\w*\}$/u.test(expression));
+  return balance === 0 && expressions.every((expression) => templateVariableName(expression) !== undefined);
+}
+
+/** The variable a whole `{name}` template segment declares, or undefined for any other text. */
+export function templateVariableName(segment: string): string | undefined {
+  return /^\{([A-Za-z_]\w*)\}$/u.exec(segment)?.[1];
 }
 
 /** Returns unique whole-segment `{name}` variables, or `undefined` for an invalid template. */
@@ -30,9 +27,9 @@ export function pathTemplateVariables(path: string): string[] | undefined {
   const names = new Set<string>();
   for (const segment of path.split('/')) {
     if (!segment.includes('{') && !segment.includes('}')) continue;
-    const match = /^\{([A-Za-z_]\w*)\}$/u.exec(segment);
-    if (!match?.[1] || names.has(match[1])) return undefined;
-    names.add(match[1]);
+    const name = templateVariableName(segment);
+    if (!name || names.has(name)) return undefined;
+    names.add(name);
   }
   return [...names];
 }
@@ -64,39 +61,6 @@ export function normalizeOriginRelativePath(path: string): string | undefined {
   return isOriginRelativePath(trimmed) ? normalizePath(trimmed) : undefined;
 }
 
-export function pathAndQuery(request: Request): string {
-  const url = new URL(request.url);
-  return `${url.pathname}${url.search}`;
-}
-
-export function pathMatches(routePath: string, requestPath: string): boolean {
-  const pattern = pathPattern(normalizePath(routePath));
-  if (!pattern) return false;
-  return new RegExp(`^${pattern}$`, 'u').test(normalizePath(requestPath));
-}
-
-function escapeRegExp(value: string): string {
+export function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
-}
-
-function pathPattern(path: string): string | undefined {
-  const patterns = path.split('/').map(pathPartPattern);
-  return patterns.includes(undefined) ? undefined : patterns.join('/');
-}
-
-function pathPartPattern(part: string): string | undefined {
-  if (part === '*') return '.*';
-
-  const param = /^:([^{}]+)(?:\{(.+)\})?$/u.exec(part);
-  if (!param) return escapeRegExp(part);
-
-  const constraint = param[2];
-  if (!constraint) return '[^/]+';
-
-  try {
-    new RegExp(`^(?:${constraint})$`, 'u');
-  } catch {
-    return undefined;
-  }
-  return `(?:${constraint})`;
 }

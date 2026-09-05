@@ -1,48 +1,37 @@
-import { type AnyProcedure, call, type StandardHeaders, type StandardLazyRequest } from '@orpc/server';
+import { type AnyProcedure, call, type StandardLazyRequest } from '@orpc/server';
 import { RPCHandler as FetchRpcHandler } from '@orpc/server/fetch';
 import { RPCHandler as WebSocketRpcHandler } from '@orpc/server/websocket';
 import { Context, type Env, Hono, type MiddlewareHandler } from 'hono';
 import { etag } from 'hono/etag';
 import { type RequestIdVariables, requestId } from 'hono/request-id';
 import type { UpgradeWebSocket } from 'hono/ws';
-import {
-  closeOversizedWebSocket,
-  readBoundedWebSocketMessage,
-  resolveOptionalBodyByteLimit,
-  ServicePlaneBodyTooLargeError,
-} from '../shared/body-limit.js';
-import { extractServicePlaneToken, servicePlaneAuthorization } from '../shared/capability-tokens.js';
+import { resolveOptionalBodyByteLimit } from '../shared/body-limit.js';
+import { applyForwardedCallHeaders } from '../shared/call-headers.js';
+import { extractServicePlaneToken } from '../shared/capability-tokens.js';
 import {
   type ConnInfo,
   normalizeConnInfo,
   parseConnInfo,
   SERVICE_PLANE_CONN_INFO_HEADER,
   SERVICE_PLANE_CONN_INFO_QUERY_PARAM,
-  serializeConnInfo,
 } from '../shared/conn-info.js';
 import {
   DEFAULT_ABILITY_TIMEOUT_MS,
   remainingTimeoutMs,
   resolveTimeoutMs,
-  SERVICE_PLANE_TIMEOUT_HEADER,
   type ServicePlaneTimeoutPolicy,
-  serializeTimeoutMs,
   timeoutMsFromRequest,
   validateTimeoutPolicy,
 } from '../shared/deadline.js';
-import { CapabilityAuthError, ServicePlaneTimeoutError, servicePlaneErrorInfo } from '../shared/errors.js';
+import { CapabilityAuthError, ServicePlaneTimeoutError, servicePlaneErrorInfo, servicePlaneErrorResponse } from '../shared/errors.js';
+import { deriveRequestContext, mergedRequestHeaders, requestIdFromContext } from '../shared/hono-context.js';
 import { applyHttpCacheHeaders, type ServicePlaneHttpCacheOption, servicePlaneHttpCacheHeaders } from '../shared/http-cache.js';
-import {
-  idempotencyKeyFromRequest,
-  normalizeForwardedToken,
-  normalizeIdempotencyKey,
-  SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER,
-} from '../shared/idempotency.js';
-import { defaultServicePlaneLogSink, emitBestEffortServicePlaneLog } from '../shared/logging.js';
+import { idempotencyKeyFromRequest, normalizeForwardedToken } from '../shared/idempotency.js';
+import { defaultServicePlaneLogSink, emitBestEffortServicePlaneLog, logErrorFields } from '../shared/logging.js';
 import {
   createFetchRequestPreparation,
   DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS,
-  preserveRuntimeRequestMetadata,
+  preparationDeadlineAt,
 } from '../shared/request-preparation.js';
 import { assertServicePlaneRpcProtocol, rpcProtocolExposedHeaders, rpcProtocolPreflight } from '../shared/rpc-protocol.js';
 import {
@@ -222,8 +211,9 @@ export class ServicePlaneService<TEnv extends Env = Env> {
     this.app.use(
       '*',
       requestId({
-        // Adopt the id the broker sent; WebSocket upgrades carry it as a query parameter.
-        generator: (context) => brokeredRequestId(context) ?? crypto.randomUUID(),
+        // Adopt the id the broker sent; WebSocket upgrades carry it as a query parameter, validated
+        // like every other forwarded token so it cannot smuggle arbitrary characters into logs.
+        generator: (context) => normalizeForwardedToken(context.req.query(SERVICE_PLANE_REQUEST_ID_QUERY_PARAM)) ?? crypto.randomUUID(),
         headerName: SERVICE_PLANE_REQUEST_ID_HEADER,
         ...options.requestId,
       }),
@@ -239,7 +229,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
 
     this.mountDiscovery();
     for (const ability of this.definition.abilities) {
-      this.mountAbility(ability);
+      this.mountRpcAbility(ability);
     }
   }
 
@@ -266,14 +256,13 @@ export class ServicePlaneService<TEnv extends Env = Env> {
         405,
       );
     }
-    const headers = new Headers({ authorization: servicePlaneAuthorization(input.token) });
-    const connInfo = serializeConnInfo(input.connInfo);
-    const idempotencyKey = normalizeIdempotencyKey(input.idempotencyKey);
-    const timeout = serializeTimeoutMs(input.timeoutMs);
-    if (connInfo) headers.set(SERVICE_PLANE_CONN_INFO_HEADER, connInfo);
-    if (idempotencyKey) headers.set(SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER, idempotencyKey);
-    if (input.proof) headers.set(SERVICE_PLANE_PROOF_HEADER, input.proof);
-    if (timeout) headers.set(SERVICE_PLANE_TIMEOUT_HEADER, timeout);
+    const headers = applyForwardedCallHeaders(new Headers(), {
+      connInfo: input.connInfo,
+      idempotencyKey: input.idempotencyKey,
+      proof: input.proof,
+      timeoutMs: input.timeoutMs,
+      token: input.token,
+    });
     const context = nativeBindingContext<TEnv>(ability.rpc.path, bindings, input.requestId, headers);
     const router = this.rpcRouter(ability);
     const procedure = Object.hasOwn(router, input.method) ? router[input.method] : undefined;
@@ -301,19 +290,12 @@ export class ServicePlaneService<TEnv extends Env = Env> {
     const receivedAt = Date.now();
     const ability = this.orpcWebSocketAbility(abilityId);
     const base = nativeBindingContext<TEnv>(ability.rpc.path, bindings, undefined);
-    const delivery = await this.webSocketTasks.run(webSocket, async () => {
-      const boundedMessage = await readBoundedWebSocketMessage(message, this.rpcMaxRequestBodyBytes, SERVICE_WEB_SOCKET_TOO_LARGE_MESSAGE);
-      return {
-        completion: this.orpcWebSocketHandler(ability).message(webSocket, boundedMessage, {
-          context: (request) => {
-            const callContext = rpcMessageContext(base, request);
-            return this.createRpcRuntime(ability, callContext, this.timeoutPolicy, request.signal, webSocket, receivedAt);
-          },
-          prefix: ability.rpc.path as `/${string}`,
-        }),
-      };
+    await this.webSocketTasks.deliver(webSocket, message, {
+      maxBytes: this.rpcMaxRequestBodyBytes,
+      send: (data) =>
+        this.orpcWebSocketHandler(ability).message(webSocket, data, this.webSocketMessageOptions(ability, base, webSocket, receivedAt)),
+      tooLargeMessage: SERVICE_WEB_SOCKET_TOO_LARGE_MESSAGE,
     });
-    await delivery.completion;
   }
 
   /** Delivers queued frames, then releases private RPC peer state after a manual socket closes. */
@@ -338,20 +320,13 @@ export class ServicePlaneService<TEnv extends Env = Env> {
     });
   }
 
-  private mountAbility(ability: NormalizedServiceAbility<TEnv>): void {
-    this.mountRpcAbility(ability);
-  }
-
   private mountRpcAbility(ability: NormalizedServiceAbility<TEnv>): void {
     this.app.use(`${ability.rpc.path}/*`, async (context, next) => {
       await next();
       const exposed = rpcProtocolExposedHeaders(context.res.headers);
       if (exposed) context.header('access-control-expose-headers', exposed);
     });
-    const router = this.rpcRouter(ability);
-    const plugins = this.rpcHandlerPlugins(ability, false);
-    const handlerOptions = plugins.length > 0 ? { plugins } : {};
-    const fetchHandler = new FetchRpcHandler(router, handlerOptions);
+    const fetchHandler = new FetchRpcHandler(this.rpcRouter(ability), { plugins: this.rpcHandlerPlugins(ability, false) });
 
     const handleFetch = async (context: Context<ServicePlaneServiceEnv<TEnv>>) => {
       const protocolError = rpcProtocolPreflight(context.req.raw);
@@ -360,14 +335,13 @@ export class ServicePlaneService<TEnv extends Env = Env> {
         return new Response('Fetch RPC is not enabled for this ability', { status: 405 });
       }
       const receivedAt = Date.now();
-      const callerTimeoutMs = resolveTimeoutMs(timeoutMsFromRequest(context.req), this.timeoutPolicy);
-      const configuredPreparationMs = this.options.timeout?.methodMs ?? DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS;
-      const preparationTimeoutMs = minimumDefinedTimeout(
-        callerTimeoutMs,
-        configuredPreparationMs === false ? undefined : configuredPreparationMs,
-      );
+      // The service-wide method ceiling also bounds decoding before any method is known.
       const preparation = createFetchRequestPreparation(context.req.raw, {
-        ...(preparationTimeoutMs === undefined ? {} : { deadlineAt: receivedAt + preparationTimeoutMs }),
+        deadlineAt: preparationDeadlineAt(
+          receivedAt,
+          resolveTimeoutMs(timeoutMsFromRequest(context.req), this.timeoutPolicy),
+          this.options.timeout?.methodMs ?? DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS,
+        ),
         deadlineError: () => new ServicePlaneTimeoutError(`Service-Plane request decoding exceeded its deadline: ${ability.id}`),
       });
       try {
@@ -391,9 +365,9 @@ export class ServicePlaneService<TEnv extends Env = Env> {
         );
         return handled.matched ? handled.response : new Response('Service-Plane method not found', { status: 404 });
       } catch (error) {
-        const info = servicePlaneErrorInfo(error);
-        if (info?.code !== 'timeout') throw error;
-        return Response.json({ error: { code: info.code, message: info.message, retryable: info.retryable } }, { status: info.status });
+        // Only a decoding timeout is answered here; the private codec has already shaped every other failure.
+        if (servicePlaneErrorInfo(error)?.code !== 'timeout') throw error;
+        return servicePlaneErrorResponse(error, 'Service-Plane request failed');
       }
     };
 
@@ -421,31 +395,33 @@ export class ServicePlaneService<TEnv extends Env = Env> {
         },
         onMessage: (event, socket) => {
           const receivedAt = Date.now();
-          const delivery = this.webSocketTasks.run(socket, async () => {
-            let data: string | ArrayBuffer;
-            try {
-              data = await readBoundedWebSocketMessage(event.data, this.rpcMaxRequestBodyBytes, SERVICE_WEB_SOCKET_TOO_LARGE_MESSAGE);
-            } catch (error) {
-              if (!(error instanceof ServicePlaneBodyTooLargeError)) throw error;
-              closeOversizedWebSocket(socket);
-              return;
-            }
-            return {
-              completion: websocketHandler.message(socket, data, {
-                context: (request: StandardLazyRequest) => {
-                  const callContext = rpcMessageContext(context as unknown as Context<TEnv>, request);
-                  return this.createRpcRuntime(ability, callContext, this.timeoutPolicy, request.signal, socket, receivedAt);
-                },
-                prefix: ability.rpc.path as `/${string}`,
-              }),
-            };
+          const base = context as unknown as Context<TEnv>;
+          return this.webSocketTasks.deliver(socket, event.data, {
+            closeOnOversized: true,
+            maxBytes: this.rpcMaxRequestBodyBytes,
+            send: (data) => websocketHandler.message(socket, data, this.webSocketMessageOptions(ability, base, socket, receivedAt)),
+            tooLargeMessage: SERVICE_WEB_SOCKET_TOO_LARGE_MESSAGE,
           });
-          // The queue covers only normalization and synchronous protocol delivery. The RPC itself
-          // remains concurrent with later calls on the same socket, matching oRPC's own upgrader.
-          return delivery.then((result) => result?.completion);
         },
       });
     });
+  }
+
+  // One logical call per frame: the frame's own headers and signal derive a per-call context.
+  private webSocketMessageOptions(
+    ability: NormalizedServiceAbility<TEnv>,
+    base: Context<TEnv>,
+    webSocket: ServiceAbilityWebSocket,
+    receivedAt: number,
+  ) {
+    return {
+      context: (request: StandardLazyRequest) => {
+        const headers = mergedRequestHeaders(base.req.raw.headers, request.headers);
+        const callContext = rpcCallContext(base, headers, request.signal, request.method);
+        return this.createRpcRuntime(ability, callContext, this.timeoutPolicy, request.signal, webSocket, receivedAt);
+      },
+      prefix: ability.rpc.path as `/${string}`,
+    };
   }
 
   private orpcWebSocketAbility(abilityId: string): NormalizedServiceAbility<TEnv> {
@@ -460,10 +436,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
   private orpcWebSocketHandler(ability: NormalizedServiceAbility<TEnv>): WebSocketRpcHandler<Record<PropertyKey, unknown>> {
     let handler = this.webSocketHandlers.get(ability.id);
     if (!handler) {
-      const router = this.rpcRouter(ability);
-      const plugins = this.rpcHandlerPlugins(ability, true);
-      const options = plugins.length > 0 ? { plugins } : {};
-      handler = new WebSocketRpcHandler(router, options);
+      handler = new WebSocketRpcHandler(this.rpcRouter(ability), { plugins: this.rpcHandlerPlugins(ability, true) });
       this.webSocketHandlers.set(ability.id, handler);
     }
     return handler;
@@ -516,7 +489,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
         logicalSignal?.throwIfAborted();
         const callContext =
           headers || (logicalSignal && logicalSignal !== context.req.raw.signal)
-            ? rpcRequestContext(context, headers ?? context.req.raw.headers, logicalSignal)
+            ? rpcCallContext(context, headers ?? context.req.raw.headers, logicalSignal)
             : context;
         const timeoutMs = resolveCallTimeoutMs(headers);
         const deadlineAt = timeoutMs === undefined ? undefined : receivedAt + timeoutMs;
@@ -579,7 +552,7 @@ export class ServicePlaneService<TEnv extends Env = Env> {
               onHandlerFailure(
                 {
                   abilityId: ability.id,
-                  error: cause instanceof Error ? { message: cause.message, name: cause.name } : { message: String(cause), name: 'Error' },
+                  error: logErrorFields(cause),
                   event: 'service_plane.ability.handler_failed',
                   level: 'error',
                   method: methodName,
@@ -637,67 +610,10 @@ function compileAbilityRouter<TEnv extends Env>(ability: NormalizedServiceAbilit
   return router;
 }
 
-function rpcMessageContext<TEnv extends Env>(base: Context<TEnv>, message: StandardLazyRequest): Context<TEnv> {
-  const headers = new Headers(base.req.raw.headers);
-  applyStandardHeaders(headers, message.headers);
-  const request = preserveRuntimeRequestMetadata(
-    base.req.raw,
-    new Request(base.req.url, {
-      headers,
-      method: message.method,
-      ...(message.signal ? { signal: message.signal } : {}),
-    }),
-  );
-  const context = new Context<TEnv>(request, {
-    env: base.env,
-    ...contextExecutionOptions(base),
-    path: base.req.path,
-  });
-  for (const [name, value] of Object.entries(base.var)) context.set(name as never, value as never);
-  const requestId = validRequestId(headers.get(SERVICE_PLANE_REQUEST_ID_HEADER) ?? undefined) ?? requestIdFromContext(base);
-  if (requestId) context.set('requestId' as never, requestId as never);
-  return context;
-}
-
-function rpcRequestContext<TEnv extends Env>(base: Context<TEnv>, headers: Headers, signal?: AbortSignal): Context<TEnv> {
-  const request = preserveRuntimeRequestMetadata(
-    base.req.raw,
-    new Request(base.req.url, {
-      headers,
-      method: base.req.method,
-      ...(signal ? { signal } : {}),
-    }),
-  );
-  const context = new Context<TEnv>(request, {
-    env: base.env,
-    ...contextExecutionOptions(base),
-    path: base.req.path,
-  });
-  for (const [name, value] of Object.entries(base.var)) context.set(name as never, value as never);
-  const requestId = validRequestId(headers.get(SERVICE_PLANE_REQUEST_ID_HEADER) ?? undefined) ?? requestIdFromContext(base);
-  if (requestId) context.set('requestId' as never, requestId as never);
-  return context;
-}
-
-function contextExecutionOptions(context: Context): { executionCtx?: Context['executionCtx'] } {
-  try {
-    return { executionCtx: context.executionCtx };
-  } catch {
-    return {};
-  }
-}
-
-function applyStandardHeaders(target: Headers, source: StandardHeaders): void {
-  for (const [name, value] of Object.entries(source)) {
-    if (value === undefined) continue;
-    target.delete(name);
-    for (const item of Array.isArray(value) ? value : [value]) target.append(name, item);
-  }
-}
-
-function requestIdFromContext(context: Context): string | undefined {
-  const value = context.get('requestId' as never) as unknown;
-  return typeof value === 'string' ? value : undefined;
+// The logical call's headers and signal on a context that still carries the physical request's vars.
+function rpcCallContext<TEnv extends Env>(base: Context<TEnv>, headers: Headers, signal?: AbortSignal, method?: string): Context<TEnv> {
+  const requestId = normalizeForwardedToken(headers.get(SERVICE_PLANE_REQUEST_ID_HEADER)) ?? requestIdFromContext(base);
+  return deriveRequestContext(base, { headers, method, signal }, requestId);
 }
 
 async function serviceVerifier<TEnv extends Env>(
@@ -731,23 +647,6 @@ function forwardedConnInfo(context: Context): ConnInfo | undefined {
   return parseConnInfo(context.req.header(SERVICE_PLANE_CONN_INFO_HEADER) ?? context.req.query(SERVICE_PLANE_CONN_INFO_QUERY_PARAM));
 }
 
-// Mirrors hono/request-id's header validation so a query-supplied id cannot smuggle
-// arbitrary characters into logs.
-function brokeredRequestId(context: Context): string | undefined {
-  return validRequestId(context.req.query(SERVICE_PLANE_REQUEST_ID_QUERY_PARAM));
-}
-
-function validRequestId(value: string | undefined): string | undefined {
-  // Same rule as every other forwarded token-shaped value, from one shared implementation.
-  return normalizeForwardedToken(value);
-}
-
-function minimumDefinedTimeout(first: number | undefined, second: number | undefined): number | undefined {
-  if (first === undefined) return second;
-  if (second === undefined) return first;
-  return Math.min(first, second);
-}
-
 // Native-binding calls skip Hono routing, but handlers still receive an actual Hono Context.
 // This keeps request helpers and response construction available without pretending that the
 // normal middleware chain ran for a Workers RPC invocation.
@@ -757,7 +656,8 @@ function nativeBindingContext<TEnv extends Env>(
   requestId: string | undefined,
   forwardedHeaders?: Headers,
 ): Context<TEnv> {
-  const normalizedRequestId = validRequestId(requestId);
+  const normalizedRequestId = normalizeForwardedToken(requestId);
+
   const headers = new Headers(forwardedHeaders);
   if (normalizedRequestId) headers.set(SERVICE_PLANE_REQUEST_ID_HEADER, normalizedRequestId);
   const request = new Request(new URL(abilityPath, 'https://service-plane-native.internal'), {

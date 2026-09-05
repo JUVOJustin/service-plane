@@ -7,7 +7,7 @@ import {
   defineCapabilities,
   ServicePlaneService,
 } from '../service/index.js';
-import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
+import { publicJwkFromPrivateJwk } from '../shared/jwk-auth.js';
 import type { ControlPlaneAuthorizationInvocation, ControlPlaneInvocationAuthorizer } from './caller.js';
 import { ServicePlaneControlPlane } from './control-plane.js';
 import { cloudflareServiceBinding } from './endpoints.js';

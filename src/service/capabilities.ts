@@ -2,12 +2,13 @@ import { readBoundedResponseJson, validateBodyByteLimit } from '../shared/body-l
 import {
   decodeCapabilityTokenPayload,
   normalizeCapabilitySubject,
-  publicJwkFromPrivateJwk,
+  normalizeCapabilityTokenTtlSeconds,
   verifyCapabilityToken,
 } from '../shared/capability-tokens.js';
-import { CapabilityAuthError } from '../shared/errors.js';
+import { CapabilityAuthError, requireNonEmpty } from '../shared/errors.js';
 import { SERVICE_PLANE_HMAC_CLIENT_HEADER, SERVICE_PLANE_HMAC_TIMESTAMP_HEADER, signServicePlaneHmacRequest } from '../shared/hmac-auth.js';
 import {
+  publicJwkFromPrivateJwk,
   SERVICE_PLANE_JWK_ASSERTION_AUDIENCE,
   SERVICE_PLANE_JWK_CLIENT_HEADER,
   SERVICE_PLANE_JWK_KEY_ID_HEADER,
@@ -31,7 +32,6 @@ import {
   type FetchLike,
   type IssueCapabilityTokenInput,
   type IssuedCapabilityToken,
-  MAX_CAPABILITY_TOKEN_TTL_SECONDS,
   SERVICE_PLANE_CAPABILITY_JWKS_PATH,
   SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
   SERVICE_PLANE_REQUEST_ID_HEADER,
@@ -143,7 +143,7 @@ export function defineCapabilities(catalog: CapabilityCatalog): CapabilityCatalo
   if (duplicate) throw new CapabilityAuthError(`Duplicate Service-Plane capability scope: ${duplicate}`, 500);
   return Object.freeze({
     scopes: Object.freeze(scopes),
-    serviceId: normalizeValue(catalog.serviceId, 'service id'),
+    serviceId: requireNonEmpty(catalog.serviceId, 'capability service id'),
   });
 }
 
@@ -156,18 +156,14 @@ export async function verifyAuthenticationToken(token: string, verifier: Capabil
 
 export function jwksFromUrl(url: string | URL, options: JwksFromUrlOptions = {}): CapabilityJwksResolver {
   requireExplicitJwksCacheKeyForVariantSources(options, 'headers');
-  const key = JSON.stringify({
-    cacheTtlSeconds: options.cacheTtlSeconds ?? DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
-    maxResponseBytes: options.maxResponseBytes ?? DEFAULT_CAPABILITY_JWKS_RESPONSE_MAX_BYTES,
-    url: String(url),
-  });
-  if (!options.cache && !options.cacheKey && !options.fetch && !options.headers && !options.now) {
-    const existing = urlJwksResolvers.get(key);
-    if (existing) return existing;
-  }
+  // Only a resolver with no caller-owned state can be shared across callers.
+  const shareable = !options.cache && !options.cacheKey && !options.fetch && !options.headers && !options.now;
+  const key = jwksResolverKey(url, options);
+  const existing = shareable ? urlJwksResolvers.get(key) : undefined;
+  if (existing) return existing;
 
   const resolver = createRemoteJwksResolver({ ...options, url });
-  if (!options.cache && !options.cacheKey && !options.fetch && !options.headers && !options.now) urlJwksResolvers.set(key, resolver);
+  if (shareable) urlJwksResolvers.set(key, resolver);
   return resolver;
 }
 
@@ -180,11 +176,7 @@ export function jwksFromServiceBinding(binding: FetchLike, options: JwksFromServ
     return createRemoteJwksResolver({ ...options, fetch: binding, url });
   }
 
-  const key = JSON.stringify({
-    cacheTtlSeconds: options.cacheTtlSeconds ?? DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
-    maxResponseBytes: options.maxResponseBytes ?? DEFAULT_CAPABILITY_JWKS_RESPONSE_MAX_BYTES,
-    url: String(url),
-  });
+  const key = jwksResolverKey(url, options);
   let resolvers = serviceBindingJwksResolvers.get(binding);
   if (!resolvers) {
     resolvers = new Map();
@@ -197,14 +189,22 @@ export function jwksFromServiceBinding(binding: FetchLike, options: JwksFromServ
   return resolver;
 }
 
+function jwksResolverKey(url: string | URL, options: JwksFromUrlOptions): string {
+  return JSON.stringify({
+    cacheTtlSeconds: options.cacheTtlSeconds ?? DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
+    maxResponseBytes: options.maxResponseBytes ?? DEFAULT_CAPABILITY_JWKS_RESPONSE_MAX_BYTES,
+    url: String(url),
+  });
+}
+
 export function createCapabilityTokenProvider(options: CreateCapabilityTokenProviderOptions): CapabilityTokenProvider {
   let cached: { cacheKey: string; expiresAt: Date; token: string } | undefined;
   const inFlight = new Map<string, Promise<string>>();
   const refreshSkewSeconds = normalizeRefreshSkewSeconds(options.refreshSkewSeconds ?? 10);
-  const callerServiceId = normalizeValue(options.callerServiceId, 'caller service id');
-  const targetServiceId = normalizeValue(options.targetServiceId, 'target service id');
+  const callerServiceId = requireNonEmpty(options.callerServiceId, 'capability caller service id');
+  const targetServiceId = requireNonEmpty(options.targetServiceId, 'capability target service id');
   const scopes = normalizeScopes(options.scopes);
-  const ttlSeconds = options.ttlSeconds === undefined ? undefined : normalizeTtlSeconds(options.ttlSeconds);
+  const ttlSeconds = options.ttlSeconds === undefined ? undefined : normalizeCapabilityTokenTtlSeconds(options.ttlSeconds, 500);
   const subject = options.subject === undefined ? undefined : normalizeCapabilitySubject(options.subject);
   const requester = options.requestToken as CapabilityTokenRequester;
   const senderConstrained = Boolean(requester.proveTokenPossession);
@@ -271,7 +271,7 @@ async function capabilityProviderCacheKey(options: {
   ttlSeconds: number | undefined;
 }): Promise<string> {
   const senderConstraint = options.requester.cacheBinding
-    ? normalizeValue(await options.requester.cacheBinding(), 'capability token cache binding')
+    ? requireNonEmpty(await options.requester.cacheBinding(), 'capability token cache binding')
     : undefined;
   const bindingSuffix = senderConstraint ? `:cnf:${encodeURIComponent(senderConstraint)}` : options.senderConstrained ? ':cnf' : '';
   if (options.cacheKey) {
@@ -280,7 +280,7 @@ async function capabilityProviderCacheKey(options: {
       : `${options.cacheKey}${bindingSuffix}`;
   }
   return capabilityTokenCacheKey({
-    ...(options.abilityId ? { abilityId: normalizeValue(options.abilityId, 'ability id') } : {}),
+    ...(options.abilityId ? { abilityId: requireNonEmpty(options.abilityId, 'capability ability id') } : {}),
     callerServiceId: options.callerServiceId,
     scopes: options.scopes,
     ...(senderConstraint ? { senderConstraint } : {}),
@@ -326,40 +326,45 @@ function capabilitySubjectCacheIdentity(subject: CapabilitySubject): { id: strin
 export function controlPlaneHmacTokenRequester(
   options: ControlPlaneHmacTokenRequesterOptions,
 ): CreateCapabilityTokenProviderOptions['requestToken'] {
+  const post = controlPlaneTokenPoster(options);
+  return (input) =>
+    post(input, async (request, requestIdHeaderName) =>
+      signServicePlaneHmacRequest(request, {
+        clientId: options.clientId,
+        clientIdHeaderName: options.clientIdHeaderName ?? SERVICE_PLANE_HMAC_CLIENT_HEADER,
+        requestIdHeaderName,
+        secret: await resolveClientSecret(options.clientSecret),
+        timestampHeaderName: options.timestampHeaderName ?? SERVICE_PLANE_HMAC_TIMESTAMP_HEADER,
+        ...(options.now ? { now: options.now() } : {}),
+      }),
+    );
+}
+
+// The HTTP half both token requesters share: correlation headers, the signed POST, and a bounded,
+// validated response. Only the request signer differs between the caller-auth schemes.
+function controlPlaneTokenPoster(
+  options: ControlPlaneTokenRequestOptions,
+): (
+  input: IssueCapabilityTokenInput,
+  sign: (request: Request, requestIdHeaderName: string) => Promise<Request>,
+) => Promise<IssuedCapabilityToken> {
   const fetcher = options.fetch ?? fetch;
   const tokenUrl = new URL(options.tokenPath ?? SERVICE_PLANE_CAPABILITY_TOKEN_PATH, options.controlPlaneUrl);
   const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
-  const clientIdHeaderName = options.clientIdHeaderName ?? SERVICE_PLANE_HMAC_CLIENT_HEADER;
-  const timestampHeaderName = options.timestampHeaderName ?? SERVICE_PLANE_HMAC_TIMESTAMP_HEADER;
   const maxResponseBytes = validateBodyByteLimit(
     options.maxResponseBytes ?? DEFAULT_CAPABILITY_TOKEN_RESPONSE_MAX_BYTES,
     'Service-Plane capability token maxResponseBytes must be a positive safe integer',
   );
 
-  return async (input) => {
+  return async (input, sign) => {
     rejectRequesterSubject(input);
     const headers = new Headers(typeof options.headers === 'function' ? await options.headers() : options.headers);
     headers.set('content-type', 'application/json');
     const requestId = await resolveRequestId(options.requestId);
     if (requestId) headers.set(requestIdHeaderName, requestId);
 
-    const request = await signServicePlaneHmacRequest(
-      new Request(tokenUrl, {
-        body: JSON.stringify(input),
-        headers,
-        method: 'POST',
-      }),
-      {
-        clientId: options.clientId,
-        clientIdHeaderName,
-        requestIdHeaderName,
-        secret: await resolveClientSecret(options.clientSecret),
-        timestampHeaderName,
-        ...(options.now ? { now: options.now() } : {}),
-      },
-    );
-
-    const response = await fetchToken(fetcher, request);
+    const request = await sign(new Request(tokenUrl, { body: JSON.stringify(input), headers, method: 'POST' }), requestIdHeaderName);
+    const response = await callFetcher(fetcher, request);
     if (!response.ok) throw new CapabilityAuthError(`Unable to fetch Service-Plane capability token: ${response.status}`, response.status);
     return parseIssuedCapabilityToken(
       await readBoundedResponseJson(response, maxResponseBytes, {
@@ -411,52 +416,22 @@ async function assertProofKeyMatchesToken(privateJwk: JsonWebKey, token: string)
 }
 
 export function controlPlaneJwkTokenRequester(options: ControlPlaneJwkTokenRequesterOptions): CapabilityTokenRequester {
-  const fetcher = options.fetch ?? fetch;
-  const tokenUrl = new URL(options.tokenPath ?? SERVICE_PLANE_CAPABILITY_TOKEN_PATH, options.controlPlaneUrl);
-  const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
-  const clientIdHeaderName = options.clientIdHeaderName ?? SERVICE_PLANE_JWK_CLIENT_HEADER;
-  const keyIdHeaderName = options.keyIdHeaderName ?? SERVICE_PLANE_JWK_KEY_ID_HEADER;
-  const maxResponseBytes = validateBodyByteLimit(
-    options.maxResponseBytes ?? DEFAULT_CAPABILITY_TOKEN_RESPONSE_MAX_BYTES,
-    'Service-Plane capability token maxResponseBytes must be a positive safe integer',
-  );
-
-  const requestToken: CapabilityTokenRequester = async (input) => {
-    rejectRequesterSubject(input);
-    const headers = new Headers(typeof options.headers === 'function' ? await options.headers() : options.headers);
-    headers.set('content-type', 'application/json');
-    const requestId = await resolveRequestId(options.requestId);
-    if (requestId) headers.set(requestIdHeaderName, requestId);
-
-    const request = await signServicePlaneJwkRequest(
-      new Request(tokenUrl, {
-        body: JSON.stringify(input),
-        headers,
-        method: 'POST',
-      }),
-      {
+  const post = controlPlaneTokenPoster(options);
+  const requestToken: CapabilityTokenRequester = (input) =>
+    post(input, async (request, requestIdHeaderName) =>
+      signServicePlaneJwkRequest(request, {
         audience: options.assertionAudience ?? SERVICE_PLANE_JWK_ASSERTION_AUDIENCE,
         clientId: options.clientId,
-        clientIdHeaderName,
+        clientIdHeaderName: options.clientIdHeaderName ?? SERVICE_PLANE_JWK_CLIENT_HEADER,
         keyId: options.keyId,
-        keyIdHeaderName,
+        keyIdHeaderName: options.keyIdHeaderName ?? SERVICE_PLANE_JWK_KEY_ID_HEADER,
         ...(options.assertionTtlSeconds === undefined ? {} : { assertionTtlSeconds: options.assertionTtlSeconds }),
         ...(options.maxBodyBytes === undefined ? {} : { maxBodyBytes: options.maxBodyBytes }),
         ...(options.now ? { now: options.now() } : {}),
         privateJwk: await resolvePrivateJwk(options.privateJwk),
         requestIdHeaderName,
-      },
-    );
-
-    const response = await fetchToken(fetcher, request);
-    if (!response.ok) throw new CapabilityAuthError(`Unable to fetch Service-Plane capability token: ${response.status}`, response.status);
-    return parseIssuedCapabilityToken(
-      await readBoundedResponseJson(response, maxResponseBytes, {
-        invalidJsonMessage: 'Invalid Service-Plane capability token response',
-        tooLargeMessage: 'Service-Plane capability token response is too large',
       }),
     );
-  };
 
   // The same key authenticates the token request and proves possession of the token it returns, so a
   // client using this requester satisfies sender-constrained calls without further configuration.
@@ -543,30 +518,9 @@ function normalizeScopes(scopes: ReadonlyArray<string>): string[] {
 }
 
 function normalizeScope(scope: string): string {
-  const normalized = normalizeValue(scope, 'scope');
+  const normalized = requireNonEmpty(scope, 'capability scope');
   if (normalized.includes('*')) throw new CapabilityAuthError('Service-Plane capability wildcards are not supported', 500);
   return normalized;
-}
-
-function normalizeValue(value: string, field: string): string {
-  const normalized = value.trim();
-  if (!normalized) throw new CapabilityAuthError(`Service-Plane capability ${field} cannot be empty`, 500);
-  return normalized;
-}
-
-function normalizeTtlSeconds(ttlSeconds: number): number {
-  if (
-    !Number.isFinite(ttlSeconds) ||
-    !Number.isSafeInteger(ttlSeconds) ||
-    ttlSeconds <= 0 ||
-    ttlSeconds > MAX_CAPABILITY_TOKEN_TTL_SECONDS
-  ) {
-    throw new CapabilityAuthError(
-      `Service-Plane capability token TTL must be a positive integer no greater than ${MAX_CAPABILITY_TOKEN_TTL_SECONDS} seconds`,
-      500,
-    );
-  }
-  return ttlSeconds;
 }
 
 function normalizeRefreshSkewSeconds(refreshSkewSeconds: number): number {
@@ -612,7 +566,8 @@ function createRemoteJwksResolver(options: JwksFromUrlOptions & { url: string | 
     inFlight = (async () => {
       const headers = typeof options.headers === 'function' ? await options.headers() : options.headers;
       const request = headers === undefined ? new Request(String(options.url)) : new Request(String(options.url), { headers });
-      const response = await fetchJwks(fetcher, request);
+      const response = await callFetcher(fetcher, request);
+
       if (!response.ok) {
         throw new CapabilityAuthError(`Unable to fetch Service-Plane JWKS: ${response.status}`, 500);
       }
@@ -642,19 +597,12 @@ function capabilityJwksCacheKey(url: string | URL): string {
   return `service-plane:jwks:${encodeURIComponent(String(url))}`;
 }
 
-function fetchJwks(fetcher: RemoteJwksFetch, request: Request): Promise<Response> {
-  return typeof fetcher === 'function' ? fetcher(request) : fetcher.fetch(request);
-}
-
-function fetchToken(fetcher: typeof fetch | FetchLike, request: Request): Promise<Response> {
+function callFetcher(fetcher: RemoteJwksFetch, request: Request): Promise<Response> {
   return typeof fetcher === 'function' ? fetcher(request) : fetcher.fetch(request);
 }
 
 async function resolveClientSecret(secret: ControlPlaneHmacTokenRequesterOptions['clientSecret']): Promise<string> {
-  const resolved = typeof secret === 'function' ? await secret() : secret;
-  const normalized = resolved.trim();
-  if (!normalized) throw new CapabilityAuthError('Service-Plane HMAC client secret cannot be empty', 500);
-  return normalized;
+  return requireNonEmpty(typeof secret === 'function' ? await secret() : secret, 'HMAC client secret');
 }
 
 async function resolvePrivateJwk(privateJwk: ControlPlaneJwkTokenRequesterOptions['privateJwk']): Promise<JsonWebKey> {

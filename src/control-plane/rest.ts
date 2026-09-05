@@ -1,10 +1,13 @@
 import { readBoundedRequestText, validateBodyByteLimit } from '../shared/body-limit.js';
-import { CapabilityAuthError, ServicePlaneTimeoutError, servicePlaneErrorInfo } from '../shared/errors.js';
+import { CapabilityAuthError, ServicePlaneTimeoutError, servicePlaneErrorInfo, servicePlaneErrorResponse } from '../shared/errors.js';
+import { isRecord, isServiceHttpMethod } from '../shared/guards.js';
 import { jsonSchemaRootProperties } from '../shared/json-schema.js';
-import { emitBestEffortServicePlaneLog, type ServicePlaneBrokerLogEvent } from '../shared/logging.js';
+import { emitBestEffortServicePlaneLog, logErrorFields, type ServicePlaneBrokerLogEvent } from '../shared/logging.js';
+import { templateVariableName } from '../shared/paths.js';
 import {
+  cancelUnusedRequestBody,
   createFetchRequestPreparation,
-  DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS,
+  preparationDeadlineAt,
   requestWithBoundedBody,
 } from '../shared/request-preparation.js';
 import type {
@@ -24,7 +27,7 @@ import {
 
 const DEFAULT_REST_MAX_BODY_BYTES = 1_048_576;
 const REST_BODY_TOO_LARGE_MESSAGE = 'Service-Plane REST request body is too large';
-const REST_METHODS = ['delete', 'get', 'patch', 'post', 'put', 'query'] as const satisfies readonly ServiceHttpMethod[];
+const REST_MAX_BODY_BYTES_MESSAGE = 'Service-Plane REST maxBodyBytes must be a positive safe integer';
 
 /** Published REST operation selected from one request-scoped discovery snapshot. */
 export type ControlPlaneRestInvocation = {
@@ -104,7 +107,7 @@ export async function handleControlPlaneRestRequest(request: Request, options: C
         abilityId: matched.ability.id,
         ...brokerCallerLogFields(invocationOptions?.caller),
         durationMs: Date.now() - startedAt,
-        error: error instanceof Error ? { message: error.message, name: error.name } : { message: String(error), name: 'Error' },
+        error: logErrorFields(error),
         event: 'service_plane.rest.failed',
         level: 'warn',
         method: matched.method,
@@ -114,28 +117,21 @@ export async function handleControlPlaneRestRequest(request: Request, options: C
         ...(errorInfo ? { status: errorInfo.status } : {}),
       });
     }
-    return restErrorResponse(error);
+    return servicePlaneErrorResponse(error, 'Service-Plane REST request failed');
   };
   // Authentication may bind a signature to the body. Give the decoder a separate branch before
   // middleware runs, and release both branches on every miss, refusal, timeout, or invocation.
   let physicalRequest: Request;
+  let maxBodyBytes: number;
   try {
-    physicalRequest = requestWithBoundedBody(
-      request,
-      validateBodyByteLimit(
-        options.maxBodyBytes ?? DEFAULT_REST_MAX_BODY_BYTES,
-        'Service-Plane REST maxBodyBytes must be a positive safe integer',
-      ),
-      REST_BODY_TOO_LARGE_MESSAGE,
-    );
+    maxBodyBytes = validateBodyByteLimit(options.maxBodyBytes ?? DEFAULT_REST_MAX_BODY_BYTES, REST_MAX_BODY_BYTES_MESSAGE);
+    physicalRequest = requestWithBoundedBody(request, maxBodyBytes, REST_BODY_TOO_LARGE_MESSAGE);
   } catch (error) {
     return failureResponse(error);
   }
   const decodingSource = options.runInvocationMiddleware ? physicalRequest.clone() : physicalRequest;
   const preparation = createFetchRequestPreparation(decodingSource, {
-    deadlineAt:
-      (options.receivedAt ?? startedAt) +
-      Math.min(options.timeoutMs ?? DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS, DEFAULT_RPC_REQUEST_PREPARATION_TIMEOUT_MS),
+    deadlineAt: preparationDeadlineAt(options.receivedAt ?? startedAt, options.timeoutMs),
     deadlineError: () => new ServicePlaneTimeoutError('Service-Plane REST request decoding exceeded its deadline'),
     ...(options.runInvocationMiddleware ? { linkedRequests: [physicalRequest] } : {}),
   });
@@ -150,7 +146,7 @@ export async function handleControlPlaneRestRequest(request: Request, options: C
       const url = new URL(request.url);
       const method = request.method.toLowerCase();
       const pathMatches = restMatches(snapshot, url.pathname);
-      if (!isRestMethod(method)) return restRouteMiss(pathMatches, options.onNotFound);
+      if (!isServiceHttpMethod(method)) return restRouteMiss(pathMatches, options.onNotFound);
 
       const match = findRestMethod(pathMatches, method, url.pathname);
       if (!match) return restRouteMiss(pathMatches, options.onNotFound);
@@ -168,13 +164,7 @@ export async function handleControlPlaneRestRequest(request: Request, options: C
       if (resolved instanceof Response) return resolved;
       invocationOptions = resolved;
       const input = await raceControlPlaneOperation(
-        restInput(
-          decodingRequest,
-          url,
-          match.params,
-          options.maxBodyBytes ?? DEFAULT_REST_MAX_BODY_BYTES,
-          match.ability.methods[match.method]?.inputSchema,
-        ),
+        restInput(decodingRequest, url, match.params, maxBodyBytes, match.ability.methods[match.method]?.inputSchema),
         options,
         'REST request decoding',
       );
@@ -278,7 +268,7 @@ function restRouteIndex(snapshot: ServiceRegistrySnapshot): RestRouteIndex {
 function compileRestRoute(abilityIndex: number, method: string, path: string): CompiledRestRoute {
   let staticSegments = 0;
   const segments = normalizedSegments(path).map((segment): CompiledRestPathSegment => {
-    const parameter = /^\{([A-Za-z_]\w*)\}$/u.exec(segment)?.[1];
+    const parameter = templateVariableName(segment);
     if (parameter) return { parameter };
     staticSegments += 1;
     return { static: segment };
@@ -351,9 +341,6 @@ async function restInput(
   maxBodyBytes: number,
   inputSchema: OpenApiObject | undefined,
 ): Promise<unknown> {
-  if (!Number.isSafeInteger(maxBodyBytes) || maxBodyBytes <= 0) {
-    throw new CapabilityAuthError('Service-Plane REST maxBodyBytes must be a positive safe integer', 500);
-  }
   // Query names are caller-controlled and must never reach Object.prototype setters.
   const query = Object.create(null) as Record<string, string | string[]>;
   const arrayQueryNames = inputSchema ? stringArrayQueryNames(inputSchema) : new Set<string>();
@@ -398,33 +385,4 @@ function isJsonContentType(value: string | null): boolean {
   if (!value) return false;
   const type = value.split(';', 1)[0]?.trim().toLowerCase();
   return type === 'application/json' || Boolean(type?.endsWith('+json'));
-}
-
-function isRestMethod(value: string): value is ServiceHttpMethod {
-  return (REST_METHODS as readonly string[]).includes(value);
-}
-
-function restErrorResponse(error: unknown): Response {
-  const info = servicePlaneErrorInfo(error);
-  if (!info)
-    return Response.json({ error: { code: 'internal', message: 'Service-Plane REST request failed', retryable: false } }, { status: 500 });
-  return Response.json(
-    {
-      error: {
-        code: info.code,
-        message: info.message,
-        ...(info.reason ? { reason: info.reason } : {}),
-        retryable: info.retryable,
-      },
-    },
-    { status: info.status },
-  );
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function cancelUnusedRequestBody(request: Request): void {
-  if (!request.bodyUsed) void request.body?.cancel().catch(() => undefined);
 }

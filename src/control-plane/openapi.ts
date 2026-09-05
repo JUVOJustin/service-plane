@@ -1,5 +1,5 @@
+import { isRecord } from '../shared/guards.js';
 import { inlineJsonSchemaRoot } from '../shared/json-schema.js';
-import { normalizePath } from '../shared/paths.js';
 import {
   DEFAULT_REGISTRY_CACHE_TTL_SECONDS,
   type OpenApiDocument,
@@ -9,6 +9,7 @@ import {
   type ServiceEndpoint,
   type ServiceRegistrySnapshot,
 } from '../shared/types.js';
+import { normalizedReservedRestPaths, sortedServiceIdentities } from './registry.js';
 
 export const DEFAULT_OPENAPI_CACHE_TTL_SECONDS = DEFAULT_REGISTRY_CACHE_TTL_SECONDS;
 const DEFAULT_OPENAPI_DOCUMENT_VERSION = '1.0.0';
@@ -104,15 +105,13 @@ export function controlPlaneOpenApiCacheKey(
   return JSON.stringify({
     description: options.description ?? null,
     path: options.path ?? SERVICE_PLANE_OPENAPI_PATH,
-    reservedRestPaths: [...new Set(reservedRestPaths.map(normalizePath))].sort(),
+    reservedRestPaths: normalizedReservedRestPaths(reservedRestPaths),
     security: options.security ?? null,
     securitySchemes: options.securitySchemes ?? null,
     servers: options.servers ?? null,
     // Same identity as the registry cache key: the same service ids can resolve to
     // different origins per tenant/environment and must not share one cached document.
-    services: services
-      .map((service) => ({ id: service.id, origin: service.origin }))
-      .sort((left, right) => `${left.id}\u0000${left.origin}`.localeCompare(`${right.id}\u0000${right.origin}`)),
+    services: sortedServiceIdentities(services),
     title: options.title ?? 'Service Plane API',
     version: options.version ?? DEFAULT_OPENAPI_DOCUMENT_VERSION,
   });
@@ -228,8 +227,4 @@ function isQueryParameterSchema(value: unknown): value is OpenApiObject {
 
 function pathParameterSchema(value: unknown): OpenApiObject {
   return isRecord(value) && value.type === 'string' ? value : { type: 'string' };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
