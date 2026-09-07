@@ -1,14 +1,14 @@
-import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
-import { CapabilityAuthError } from '../shared/errors.js';
+import { decodeBase64Url } from 'hono/utils/encode';
+import { bytesToBase64Url } from '../shared/encoding.js';
+import { CapabilityAuthError, requireNonEmpty } from '../shared/errors.js';
 import { type CapabilityCatalog, DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS, type ServiceGrantDefinition } from '../shared/types.js';
 import {
   type CapabilityIssuer,
   type CapabilitySigningAuthority,
   type CapabilitySigningJwk,
-  type CreateCapabilityIssuerFromPrivateJwkOptions,
   createCapabilityIssuerFromPrivateJwk,
   createCapabilitySigningAuthority,
-  validateEs256KeyPair,
+  validateActiveSigningKey,
 } from './capabilities.js';
 
 const DEFAULT_CAPABILITY_ISSUER = 'control-plane';
@@ -131,7 +131,7 @@ export function createCapabilitySigningAuthorityFromSigningKeys(
 export async function createCapabilityIssuerFromSigningKeys(
   options: CreateCapabilityIssuerFromSigningKeysOptions,
 ): Promise<CapabilityIssuer> {
-  const input: CreateCapabilityIssuerFromPrivateJwkOptions = {
+  return createCapabilityIssuerFromPrivateJwk({
     capabilities: options.capabilities,
     grants: options.grants,
     issuer: options.issuer ?? DEFAULT_CAPABILITY_ISSUER,
@@ -139,8 +139,7 @@ export async function createCapabilityIssuerFromSigningKeys(
     ttlSeconds: options.ttlSeconds ?? DEFAULT_CAPABILITY_TOKEN_TTL_SECONDS,
     validateKeyPair: options.validateKeyPair ?? true,
     ...(options.now ? { now: options.now } : {}),
-  };
-  return createCapabilityIssuerFromPrivateJwk(input);
+  });
 }
 
 /**
@@ -152,10 +151,7 @@ export async function createCapabilityIssuerFromSigningKeys(
  */
 export async function validatedPrivateJwksFromSigningKeys(keys: CapabilitySigningKey[]): Promise<CapabilitySigningJwk[]> {
   const privateJwks = privateJwksFromSigningKeys(keys);
-  // Only the active key is round-tripped: retired entries are allowed to be public-only, so there
-  // is no private half left to check against them. Same rule as createCapabilityIssuerFromPrivateJwk.
-  const signingJwk = privateJwks[0] as CapabilitySigningJwk;
-  await validateEs256KeyPair(signingJwk, publicJwkFromPrivateJwk(signingJwk, signingJwk.kid), signingJwk.kid);
+  await validateActiveSigningKey(privateJwks);
   return privateJwks;
 }
 
@@ -165,8 +161,7 @@ function privateJwksFromSigningKeys(keys: CapabilitySigningKey[]): CapabilitySig
 }
 
 function normalizeSigningSecret(signingSecret: string): string {
-  const trimmed = signingSecret.trim();
-  if (!trimmed) throw new CapabilityAuthError('Service-Plane signing secret cannot be empty', 500);
+  const trimmed = requireNonEmpty(signingSecret, 'signing secret');
   if (!/^[A-Za-z0-9_-]{43}$/u.test(trimmed)) throw new CapabilityAuthError('Invalid Service-Plane signing secret', 500);
   return trimmed;
 }
@@ -230,38 +225,11 @@ function hexToBigInt(hex: string): bigint {
 }
 
 function base64UrlToBigInt(value: string): bigint {
-  const bytes = base64UrlToBytes(value);
-  return BigInt(`0x${bytesToHex(bytes)}`);
+  const hex = Array.from(decodeBase64Url(value), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return BigInt(`0x${hex}`);
 }
 
 function bigIntToBase64Url(value: bigint): string {
   const hex = value.toString(16).padStart(64, '0');
-  return bytesToBase64Url(hexToBytes(hex));
-}
-
-function base64UrlToBytes(value: string): Uint8Array {
-  const padded = value
-    .replace(/-/gu, '+')
-    .replace(/_/gu, '/')
-    .padEnd(Math.ceil(value.length / 4) * 4, '=');
-  const binary = atob(padded);
-  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
-}
-
-function bytesToBase64Url(bytes: Uint8Array): string {
-  let binary = '';
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/gu, '-').replace(/\//gu, '_').replace(/=+$/u, '');
-}
-
-function hexToBytes(hex: string): Uint8Array {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let index = 0; index < bytes.length; index += 1) {
-    bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
-  }
-  return bytes;
-}
-
-function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return bytesToBase64Url(Uint8Array.from(hex.match(/../gu) ?? [], (pair) => Number.parseInt(pair, 16)));
 }

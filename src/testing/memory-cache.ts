@@ -5,6 +5,7 @@ type TokenEntry = {
   value: CapabilityTokenCacheEntry;
 };
 
+/** Creates an expiring process-local capability-token cache for tests. */
 export function memoryCapabilityTokenCache(now: () => number = () => Date.now()): CapabilityTokenCache {
   const entries = new Map<string, TokenEntry>();
   return {

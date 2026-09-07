@@ -1,21 +1,25 @@
-import { abilitySession, disposeAbilitySession } from '../service/index.js';
 import type { ConnInfo } from '../shared/conn-info.js';
-import { remainingTimeoutMs } from '../shared/deadline.js';
+import { discardDisposableValue, normalizeTimeoutMs, raceDeadline, remainingTimeoutMs } from '../shared/deadline.js';
 import { CapabilityAuthError, ServicePlaneTimeoutError } from '../shared/errors.js';
-import type { DiscoveredServiceAbility } from '../shared/types.js';
-import { type BrokerCaller, brokerCallerAccess, brokerCallerSubject, brokerRequestToken, transportForAbility } from './broker.js';
+import type { DiscoveredServiceAbility, ServiceRegistry } from '../shared/types.js';
+import { createControlPlaneRpcBroker } from './broker.js';
+import { type BrokerCaller, brokerCallerAccess, type ControlPlaneInvocationAuthorizer } from './caller.js';
 import type { CapabilityIssuer } from './capabilities.js';
 
+/** One already-matched catalog method passed to the shared control-plane dispatcher. */
 export type ControlPlaneMethodInvocation = {
-  /** Discovered ability being invoked. */
+  /** Catalog entry whose endpoint and access metadata authorize the call. */
   ability: DiscoveredServiceAbility;
-  /** Ability method name. */
+  /** Method key already resolved within the discovered ability. */
   method: string;
-  /** Scopes required by the method. */
-  scopes: string[];
+  /** Method scopes to mint into the downstream capability token. */
+  scopes: ReadonlyArray<string>;
 };
 
+/** Authenticated request facts needed to authorize and dispatch one projected method. */
 export type ControlPlaneInvocationOptions = {
+  /** Optional product permission check shared by every projected invocation. */
+  authorizeInvocation?: ControlPlaneInvocationAuthorizer;
   /** Authenticated product or service caller. */
   caller?: BrokerCaller;
   /** Original-client connection information forwarded to the service. */
@@ -34,60 +38,71 @@ export type ControlPlaneInvocationOptions = {
   timeoutMs?: number;
 };
 
-/**
- * Invokes one discovered unary method through the same authorization and transport path used by
- * projected protocol surfaces. The session is always disposed before this function returns.
- */
+/** Request-entry timestamp and caller budget shared by control-plane operation stages. */
+export type ControlPlaneOperationDeadline = Pick<ControlPlaneInvocationOptions, 'receivedAt' | 'timeoutMs'>;
+
+/** Refuses to start a new control-plane stage after the request-entry budget has expired. */
+export function assertControlPlaneOperationCanStart(deadline: ControlPlaneOperationDeadline, stage: string): void {
+  const timeoutMs = normalizeTimeoutMs(deadline.timeoutMs);
+  if (timeoutMs === undefined) return;
+  const receivedAt = deadline.receivedAt ?? Date.now();
+  if (remainingTimeoutMs(timeoutMs, Date.now() - receivedAt) === 0) {
+    throw new ServicePlaneTimeoutError(`Service-Plane control-plane deadline exceeded before ${stage}`);
+  }
+}
+
+/** Applies one request-entry budget to discovery, dependency resolution, and final dispatch. */
+export function raceControlPlaneOperation<T>(operation: Promise<T>, deadline: ControlPlaneOperationDeadline, stage: string): Promise<T> {
+  const timeoutMs = normalizeTimeoutMs(deadline.timeoutMs);
+  if (timeoutMs === undefined) return operation;
+  const receivedAt = deadline.receivedAt ?? Date.now();
+  const remaining = remainingTimeoutMs(timeoutMs, Date.now() - receivedAt) as number;
+  return raceDeadline(operation, {
+    deadlineAt: Date.now() + remaining,
+    deadlineError: () => new ServicePlaneTimeoutError(`Service-Plane control-plane deadline exceeded during ${stage}`),
+    discardLateValue: discardDisposableValue,
+  });
+}
+
+/** Invokes one discovered method through the shared authorization and transport path. */
 export async function invokeControlPlaneMethod(
   invocation: ControlPlaneMethodInvocation,
   input: unknown,
   options: ControlPlaneInvocationOptions,
 ): Promise<unknown> {
-  const { api, dispose } = await openControlPlaneMethodSession(invocation, options);
-  try {
-    const method = api[invocation.method];
-    if (!method) throw new CapabilityAuthError(`Service-Plane projected method not found: ${invocation.method}`, 500);
-    return await method(input);
-  } finally {
-    await dispose();
-  }
+  authorizePublishedAbility(invocation.ability, options.caller);
+  const broker = createControlPlaneRpcBroker({
+    ...(options.authorizeInvocation ? { authorizeInvocation: options.authorizeInvocation } : {}),
+    ...(options.connInfo ? { connInfo: options.connInfo } : {}),
+    controlPlaneServiceId: options.controlPlaneServiceId,
+    ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+    issuer: options.issuer,
+    ...(options.receivedAt === undefined ? {} : { receivedAt: options.receivedAt }),
+    ...(options.requestId ? { requestId: options.requestId } : {}),
+    registry: singleAbilityRegistry(invocation.ability),
+    ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+  });
+  return raceControlPlaneOperation(
+    broker.callAbility({
+      abilityId: invocation.ability.id,
+      ...(options.caller ? { caller: options.caller } : {}),
+      input,
+      method: invocation.method,
+      scopes: [...invocation.scopes],
+      targetServiceId: invocation.ability.serviceId,
+    }),
+    options,
+    `${invocation.ability.serviceId}/${invocation.ability.id}/${invocation.method}`,
+  );
 }
 
-/** Opens one projected method session for protocol surfaces that own a streaming response. */
-export async function openControlPlaneMethodSession(
-  invocation: ControlPlaneMethodInvocation,
-  options: ControlPlaneInvocationOptions,
-): Promise<{ api: Record<string, (methodInput: unknown) => Promise<unknown>>; dispose: () => Promise<void> }> {
-  authorizePublishedAbility(invocation.ability, options.caller);
-  const subject = brokerCallerSubject(options.caller);
-  const timeoutMs = remainingTimeoutMs(options.timeoutMs, Date.now() - (options.receivedAt ?? Date.now()));
-  if (timeoutMs === 0) {
-    throw new ServicePlaneTimeoutError(
-      `Service-Plane exhausted the caller's deadline before reaching the service: ${invocation.ability.serviceId}/${invocation.ability.id}`,
-    );
-  }
-
-  const api = await abilitySession<Record<string, (methodInput: unknown) => Promise<unknown>>>({
-    abilityId: invocation.ability.id,
-    callerServiceId: options.caller?.kind === 'service' ? options.caller.id : options.controlPlaneServiceId,
-    ...(options.connInfo ? { connInfo: options.connInfo } : {}),
-    ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-    ...(subject ? { subject } : {}),
-    ...(options.requestId ? { requestId: options.requestId } : {}),
-    requestToken: brokerRequestToken({
-      ability: invocation.ability,
-      brokerServiceId: options.controlPlaneServiceId,
-      caller: options.caller,
-      issuer: options.issuer,
-    }),
-    scopes: invocation.scopes,
-    targetServiceId: invocation.ability.serviceId,
-    ...(timeoutMs === undefined ? {} : { timeoutMs }),
-    transport: transportForAbility(invocation.ability, {
-      requiresStreaming: invocation.ability.methods[invocation.method]?.stream === true,
-    }),
-  });
-  return { api, dispose: () => disposeAbilitySession(api) };
+function singleAbilityRegistry(ability: DiscoveredServiceAbility): ServiceRegistry {
+  return {
+    abilities: async () => [ability],
+    ability: async (serviceId, abilityId) => (serviceId === ability.serviceId && abilityId === ability.id ? ability : undefined),
+    discover: async () => ({ abilities: [ability], discoveredAt: new Date().toISOString(), services: [] }),
+    endpoint: (serviceId) => (serviceId === ability.serviceId ? ability.service : undefined),
+  };
 }
 
 // Catalog authorization is an early, readable refusal. The signed caller-access claim makes the

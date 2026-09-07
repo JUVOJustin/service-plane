@@ -1,6 +1,15 @@
-import { CapabilityAuthError, servicePlaneErrorInfo } from '../shared/errors.js';
+import { readBoundedRequestText, validateBodyByteLimit } from '../shared/body-limit.js';
+import { CapabilityAuthError, ServicePlaneTimeoutError, servicePlaneErrorInfo, servicePlaneErrorResponse } from '../shared/errors.js';
+import { isRecord, isServiceHttpMethod } from '../shared/guards.js';
 import { jsonSchemaRootProperties } from '../shared/json-schema.js';
-import type { ServicePlaneBrokerLogEvent } from '../shared/logging.js';
+import { emitBestEffortServicePlaneLog, logErrorFields, type ServicePlaneBrokerLogEvent } from '../shared/logging.js';
+import { templateVariableName } from '../shared/paths.js';
+import {
+  cancelUnusedRequestBody,
+  createFetchRequestPreparation,
+  preparationDeadlineAt,
+  requestWithBoundedBody,
+} from '../shared/request-preparation.js';
 import type {
   DiscoveredServiceAbility,
   OpenApiObject,
@@ -8,31 +17,42 @@ import type {
   ServiceRegistry,
   ServiceRegistrySnapshot,
 } from '../shared/types.js';
-import { brokerCallerLogFields } from './broker.js';
-import { type ControlPlaneInvocationOptions, invokeControlPlaneMethod } from './invocation.js';
+import { brokerCallerLogFields } from './caller.js';
+import {
+  assertControlPlaneOperationCanStart,
+  type ControlPlaneInvocationOptions,
+  invokeControlPlaneMethod,
+  raceControlPlaneOperation,
+} from './invocation.js';
 
 const DEFAULT_REST_MAX_BODY_BYTES = 1_048_576;
-const REST_METHODS = ['delete', 'get', 'patch', 'post', 'put', 'query'] as const satisfies readonly ServiceHttpMethod[];
+const REST_BODY_TOO_LARGE_MESSAGE = 'Service-Plane REST request body is too large';
+const REST_MAX_BODY_BYTES_MESSAGE = 'Service-Plane REST maxBodyBytes must be a positive safe integer';
 
+/** Published REST operation selected from one request-scoped discovery snapshot. */
 export type ControlPlaneRestInvocation = {
-  /** Discovered ability id. */
+  /** Ability selected from the discovery snapshot used for route matching. */
   abilityId: string;
-  /** Ability method name. */
+  /** Method selected after matching the request verb and path template. */
   method: string;
-  /** Published REST path template. */
+  /** Published path template that matched the request, before parameter substitution. */
   path: string;
-  /** Scopes minted for this operation. */
-  scopes: string[];
-  /** Service that owns the ability. */
+  /** Method scopes requested when the plane mints the downstream capability. */
+  readonly scopes: ReadonlyArray<string>;
+  /** Catalog service that owns the matched ability. */
   serviceId: string;
-  /** Projection surface discriminator. */
+  /**
+   * Discriminator for shared invocation middleware and audit-event unions. Keep it literal so
+   * consumers can narrow to REST route metadata without inspecting route-specific fields.
+   */
   surface: 'rest';
 };
 
+/** Dependencies and policy hooks for the low-level REST projection dispatcher. */
 export type ControlPlaneRestHandlerOptions = {
   /** Maximum JSON request-body size. Defaults to one MiB. */
   maxBodyBytes?: number;
-  /** Structured event sink. */
+  /** Receives completion and failure events for matched REST invocations. */
   log?: (event: ServicePlaneBrokerLogEvent) => void;
   /** Receives the resolved service, ability, and method before invocation. */
   onInvocation?: (invocation: ControlPlaneRestInvocation) => void;
@@ -41,20 +61,39 @@ export type ControlPlaneRestHandlerOptions = {
   /** Time the HTTP request entered the plane, used for deadline accounting. */
   receivedAt?: number;
   /** Registry used to resolve published REST metadata. */
-  registry: ServiceRegistry;
+  registry: Pick<ServiceRegistry, 'discover'>;
   /** Lazily resolves authenticated invocation facts from the snapshot that matched the route. */
   resolveInvocation: (snapshot: ServiceRegistrySnapshot) => Promise<ControlPlaneInvocationOptions | Response>;
-  /** Runs invocation-only Hono middleware around a matched REST operation. */
-  runInvocationMiddleware?: (next: () => Promise<Response>) => Promise<Response>;
+  /** Runs authentication before discovery. Body-bound authentication reads the provided request; metadata is available after `next()`. */
+  runInvocationMiddleware?: (next: () => Promise<Response>, request: Request) => Promise<Response>;
+  /** Effective request-entry deadline used while the public route is still being resolved. */
+  timeoutMs?: number;
 };
 
 type RestMatch = {
   ability: DiscoveredServiceAbility;
+  httpMethod: ServiceHttpMethod;
   method: string;
   params: Record<string, string>;
-  scopes: string[];
+  scopes: ReadonlyArray<string>;
   staticSegments: number;
 };
+
+type CompiledRestPathSegment = { parameter: string } | { static: string };
+
+type CompiledRestRoute = {
+  abilityIndex: number;
+  method: string;
+  segments: CompiledRestPathSegment[];
+  staticSegments: number;
+};
+
+type RestRouteIndex = Map<number, CompiledRestRoute[]>;
+
+// A registry cache preserves the discovery document's services array while rebuilding endpoint-
+// bound abilities for each request. Cache only route coordinates and tokens against that stable
+// array: matching becomes allocation-light without retaining an old binding or grant set.
+const restRouteIndexes = new WeakMap<ServiceRegistrySnapshot['services'], RestRouteIndex>();
 
 /** Dispatches one HTTP request through published REST projection metadata. */
 export async function handleControlPlaneRestRequest(request: Request, options: ControlPlaneRestHandlerOptions): Promise<Response> {
@@ -64,11 +103,11 @@ export async function handleControlPlaneRestRequest(request: Request, options: C
   const failureResponse = (error: unknown): Response => {
     if (matched) {
       const errorInfo = servicePlaneErrorInfo(error);
-      options.log?.({
+      emitBestEffortServicePlaneLog(options.log, {
         abilityId: matched.ability.id,
         ...brokerCallerLogFields(invocationOptions?.caller),
         durationMs: Date.now() - startedAt,
-        error: error instanceof Error ? { message: error.message, name: error.name } : { message: String(error), name: 'Error' },
+        error: logErrorFields(error),
         event: 'service_plane.rest.failed',
         level: 'warn',
         method: matched.method,
@@ -78,103 +117,167 @@ export async function handleControlPlaneRestRequest(request: Request, options: C
         ...(errorInfo ? { status: errorInfo.status } : {}),
       });
     }
-    return restErrorResponse(error);
+    return servicePlaneErrorResponse(error, 'Service-Plane REST request failed');
   };
+  // Authentication may bind a signature to the body. Give the decoder a separate branch before
+  // middleware runs, and release both branches on every miss, refusal, timeout, or invocation.
+  let physicalRequest: Request;
+  let maxBodyBytes: number;
   try {
-    const snapshot = await options.registry.discover();
-    const url = new URL(request.url);
-    const method = request.method.toLowerCase();
-    if (!isRestMethod(method)) return restRouteMiss(snapshot, url.pathname, options.onNotFound);
-
-    const match = findRestMethod(snapshot, method, url.pathname);
-    if (!match) return restRouteMiss(snapshot, url.pathname, options.onNotFound);
-    matched = match;
-
-    options.onInvocation?.({
-      abilityId: match.ability.id,
-      method: match.method,
-      path: match.ability.methods[match.method]?.rest?.path ?? url.pathname,
-      scopes: match.scopes,
-      serviceId: match.ability.serviceId,
-      surface: 'rest',
-    });
-    const invoke = async () => {
-      try {
-        const resolved = await options.resolveInvocation(snapshot);
-        if (resolved instanceof Response) return resolved;
-        invocationOptions = resolved;
-        const input = await restInput(
-          request,
-          url,
-          match.params,
-          options.maxBodyBytes ?? DEFAULT_REST_MAX_BODY_BYTES,
-          match.ability.methods[match.method]?.inputSchema,
-        );
-        const result = await invokeControlPlaneMethod(match, input, invocationOptions);
-        const status = match.ability.methods[match.method]?.rest?.status ?? 200;
-        options.log?.({
-          abilityId: match.ability.id,
-          ...brokerCallerLogFields(invocationOptions.caller),
-          durationMs: Date.now() - startedAt,
-          event: 'service_plane.rest.completed',
-          level: 'info',
-          method: match.method,
-          ...(invocationOptions.requestId ? { requestId: invocationOptions.requestId } : {}),
-          scopes: match.scopes,
-          serviceId: match.ability.serviceId,
-          status,
-        });
-        if (status === 204 || status === 205) return new Response(null, { status });
-        return Response.json(result ?? null, { status });
-      } catch (error) {
-        return failureResponse(error);
-      }
-    };
-    return options.runInvocationMiddleware ? options.runInvocationMiddleware(invoke) : invoke();
+    maxBodyBytes = validateBodyByteLimit(options.maxBodyBytes ?? DEFAULT_REST_MAX_BODY_BYTES, REST_MAX_BODY_BYTES_MESSAGE);
+    physicalRequest = requestWithBoundedBody(request, maxBodyBytes, REST_BODY_TOO_LARGE_MESSAGE);
   } catch (error) {
     return failureResponse(error);
   }
+  const decodingSource = options.runInvocationMiddleware ? physicalRequest.clone() : physicalRequest;
+  const preparation = createFetchRequestPreparation(decodingSource, {
+    deadlineAt: preparationDeadlineAt(options.receivedAt ?? startedAt, options.timeoutMs),
+    deadlineError: () => new ServicePlaneTimeoutError('Service-Plane REST request decoding exceeded its deadline'),
+    ...(options.runInvocationMiddleware ? { linkedRequests: [physicalRequest] } : {}),
+  });
+  const decodingRequest = preparation.request;
+  const middlewareRequest = preparation.linkedRequests[0] ?? decodingRequest;
+  const dispatch = async (): Promise<Response> => {
+    try {
+      // Middleware may call next after the outer deadline race has already returned a 504. Refuse
+      // that late continuation before it can fan out discovery work in the background.
+      assertControlPlaneOperationCanStart(options, 'REST route discovery');
+      const snapshot = await raceControlPlaneOperation(options.registry.discover(), options, 'REST route discovery');
+      const url = new URL(request.url);
+      const method = request.method.toLowerCase();
+      const pathMatches = restMatches(snapshot, url.pathname);
+      if (!isServiceHttpMethod(method)) return restRouteMiss(pathMatches, options.onNotFound);
+
+      const match = findRestMethod(pathMatches, method, url.pathname);
+      if (!match) return restRouteMiss(pathMatches, options.onNotFound);
+      matched = match;
+
+      options.onInvocation?.({
+        abilityId: match.ability.id,
+        method: match.method,
+        path: match.ability.methods[match.method]?.rest?.path ?? url.pathname,
+        scopes: [...match.scopes],
+        serviceId: match.ability.serviceId,
+        surface: 'rest',
+      });
+      const resolved = await raceControlPlaneOperation(options.resolveInvocation(snapshot), options, 'REST caller and issuer resolution');
+      if (resolved instanceof Response) return resolved;
+      invocationOptions = resolved;
+      const input = await raceControlPlaneOperation(
+        restInput(decodingRequest, url, match.params, maxBodyBytes, match.ability.methods[match.method]?.inputSchema),
+        options,
+        'REST request decoding',
+      );
+      preparation.complete();
+      const result = await invokeControlPlaneMethod(match, input, invocationOptions);
+      const status = match.ability.methods[match.method]?.rest?.status ?? 200;
+      emitBestEffortServicePlaneLog(options.log, {
+        abilityId: match.ability.id,
+        ...brokerCallerLogFields(invocationOptions.caller),
+        durationMs: Date.now() - startedAt,
+        event: 'service_plane.rest.completed',
+        level: 'info',
+        method: match.method,
+        ...(invocationOptions.requestId ? { requestId: invocationOptions.requestId } : {}),
+        scopes: match.scopes,
+        serviceId: match.ability.serviceId,
+        status,
+      });
+      if (status === 204 || status === 205) return new Response(null, { status });
+      return Response.json(result ?? null, { status });
+    } catch (error) {
+      return failureResponse(error);
+    }
+  };
+  try {
+    return await preparation.run(() =>
+      raceControlPlaneOperation(
+        options.runInvocationMiddleware ? options.runInvocationMiddleware(dispatch, middlewareRequest) : dispatch(),
+        options,
+        'REST request invocation',
+      ),
+    );
+  } catch (error) {
+    return failureResponse(error);
+  } finally {
+    cancelUnusedRequestBody(decodingRequest);
+    if (decodingRequest !== middlewareRequest) cancelUnusedRequestBody(middlewareRequest);
+  }
 }
 
-function findRestMethod(snapshot: ServiceRegistrySnapshot, method: ServiceHttpMethod, pathname: string): RestMatch | undefined {
-  const matches = restMatches(snapshot, pathname).filter((match) => match.ability.methods[match.method]?.rest?.method === method);
-  if (matches.length === 0) return undefined;
-  matches.sort((left, right) => right.staticSegments - left.staticSegments);
-  const best = matches[0];
-  if (!best) return undefined;
-  if (matches[1]?.staticSegments === best.staticSegments) {
-    throw new CapabilityAuthError(`Ambiguous Service-Plane REST route: ${method.toUpperCase()} ${pathname}`, 500);
+function findRestMethod(pathMatches: RestMatch[], method: ServiceHttpMethod, pathname: string): RestMatch | undefined {
+  let best: RestMatch | undefined;
+  let ambiguous = false;
+  for (const match of pathMatches) {
+    if (match.httpMethod !== method) continue;
+    if (!best || match.staticSegments > best.staticSegments) {
+      best = match;
+      ambiguous = false;
+      continue;
+    }
+    if (match.staticSegments === best.staticSegments) ambiguous = true;
   }
+  if (ambiguous) throw new CapabilityAuthError(`Ambiguous Service-Plane REST route: ${method.toUpperCase()} ${pathname}`, 500);
   return best;
 }
 
 function restMatches(snapshot: ServiceRegistrySnapshot, pathname: string): RestMatch[] {
+  const requestSegments = decodedPathSegments(pathname);
+  if (!requestSegments) return [];
+
   const matches: RestMatch[] = [];
-  for (const ability of snapshot.abilities) {
-    if (ability.exposure !== 'published') continue;
-    for (const [method, definition] of Object.entries(ability.methods)) {
-      if (!definition.rest || definition.stream) continue;
-      const pathMatch = matchRestPath(definition.rest.path, pathname);
-      if (pathMatch) {
-        matches.push({ ability, method, params: pathMatch.params, scopes: definition.scopes, staticSegments: pathMatch.staticSegments });
-      }
-    }
+  const routes = restRouteIndex(snapshot).get(requestSegments.length) ?? [];
+  for (const route of routes) {
+    const params = matchCompiledRestPath(route.segments, requestSegments);
+    if (!params) continue;
+    const ability = snapshot.abilities[route.abilityIndex];
+    const definition = ability?.methods[route.method];
+    if (!ability || !definition?.rest || definition.stream) continue;
+    matches.push({
+      ability,
+      httpMethod: definition.rest.method,
+      method: route.method,
+      params,
+      scopes: [...definition.scopes],
+      staticSegments: route.staticSegments,
+    });
   }
   return matches;
 }
 
-function restRouteMiss(
-  snapshot: ServiceRegistrySnapshot,
-  pathname: string,
-  onNotFound: ControlPlaneRestHandlerOptions['onNotFound'],
-): Promise<Response> | Response {
-  const allowed = [
-    ...new Set(
-      restMatches(snapshot, pathname)
-        .map((match) => match.ability.methods[match.method]?.rest?.method)
-        .filter((method): method is ServiceHttpMethod => method !== undefined),
-    ),
-  ].sort();
+function restRouteIndex(snapshot: ServiceRegistrySnapshot): RestRouteIndex {
+  const cached = restRouteIndexes.get(snapshot.services);
+  if (cached) return cached;
+
+  const index: RestRouteIndex = new Map();
+  for (let abilityIndex = 0; abilityIndex < snapshot.abilities.length; abilityIndex += 1) {
+    const ability = snapshot.abilities[abilityIndex];
+    if (ability?.exposure !== 'published') continue;
+    for (const [method, definition] of Object.entries(ability.methods)) {
+      if (!definition.rest || definition.stream) continue;
+      const route = compileRestRoute(abilityIndex, method, definition.rest.path);
+      const routes = index.get(route.segments.length);
+      if (routes) routes.push(route);
+      else index.set(route.segments.length, [route]);
+    }
+  }
+  restRouteIndexes.set(snapshot.services, index);
+  return index;
+}
+
+function compileRestRoute(abilityIndex: number, method: string, path: string): CompiledRestRoute {
+  let staticSegments = 0;
+  const segments = normalizedSegments(path).map((segment): CompiledRestPathSegment => {
+    const parameter = templateVariableName(segment);
+    if (parameter) return { parameter };
+    staticSegments += 1;
+    return { static: segment };
+  });
+  return { abilityIndex, method, segments, staticSegments };
+}
+
+function restRouteMiss(pathMatches: RestMatch[], onNotFound: ControlPlaneRestHandlerOptions['onNotFound']): Promise<Response> | Response {
+  const allowed = [...new Set(pathMatches.map((match) => match.httpMethod))].sort();
   if (allowed.length === 0) {
     return onNotFound ? onNotFound() : Response.json({ error: 'Not Found' }, { status: 404 });
   }
@@ -184,30 +287,28 @@ function restRouteMiss(
   );
 }
 
-function matchRestPath(template: string, pathname: string): { params: Record<string, string>; staticSegments: number } | undefined {
-  const templateSegments = normalizedSegments(template);
-  const requestSegments = normalizedSegments(pathname);
-  if (templateSegments.length !== requestSegments.length) return undefined;
+function matchCompiledRestPath(segments: CompiledRestPathSegment[], requestSegments: string[]): Record<string, string> | undefined {
+  // Reject the common case without allocating a parameter object. Large catalogs usually share a
+  // segment count but differ in a static prefix, so this first pass keeps non-matches cheap.
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index];
+    const requestSegment = requestSegments[index];
+    if (!segment || requestSegment === undefined) return undefined;
+    if ('static' in segment && segment.static !== requestSegment) return undefined;
+  }
 
   // Template names are metadata, but a null prototype also keeps reserved object keys inert.
   const params = Object.create(null) as Record<string, string>;
-  let staticSegments = 0;
-  for (let index = 0; index < templateSegments.length; index += 1) {
-    const templateSegment = templateSegments[index];
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index];
     const requestSegment = requestSegments[index];
-    if (templateSegment === undefined || requestSegment === undefined) return undefined;
-    const variable = /^\{([A-Za-z_]\w*)\}$/u.exec(templateSegment)?.[1];
-    const decoded = decodePathSegment(requestSegment);
-    if (decoded === undefined) return undefined;
-    if (variable) {
-      if (decoded.length === 0) return undefined;
-      params[variable] = decoded;
-      continue;
+    if (!segment || requestSegment === undefined) return undefined;
+    if ('parameter' in segment) {
+      if (requestSegment.length === 0) return undefined;
+      params[segment.parameter] = requestSegment;
     }
-    if (templateSegment !== decoded) return undefined;
-    staticSegments += 1;
   }
-  return { params, staticSegments };
+  return params;
 }
 
 function normalizedSegments(path: string): string[] {
@@ -223,6 +324,16 @@ function decodePathSegment(segment: string): string | undefined {
   }
 }
 
+function decodedPathSegments(path: string): string[] | undefined {
+  const decoded: string[] = [];
+  for (const segment of normalizedSegments(path)) {
+    const value = decodePathSegment(segment);
+    if (value === undefined) return undefined;
+    decoded.push(value);
+  }
+  return decoded;
+}
+
 async function restInput(
   request: Request,
   url: URL,
@@ -230,9 +341,6 @@ async function restInput(
   maxBodyBytes: number,
   inputSchema: OpenApiObject | undefined,
 ): Promise<unknown> {
-  if (!Number.isSafeInteger(maxBodyBytes) || maxBodyBytes <= 0) {
-    throw new CapabilityAuthError('Service-Plane REST maxBodyBytes must be a positive integer', 500);
-  }
   // Query names are caller-controlled and must never reach Object.prototype setters.
   const query = Object.create(null) as Record<string, string | string[]>;
   const arrayQueryNames = inputSchema ? stringArrayQueryNames(inputSchema) : new Set<string>();
@@ -245,7 +353,7 @@ async function restInput(
     query[name] = previous === undefined ? value : Array.isArray(previous) ? [...previous, value] : [previous, value];
   }
 
-  const bodyText = await readBoundedBody(request, maxBodyBytes);
+  const bodyText = await readBoundedRequestText(request, maxBodyBytes, REST_BODY_TOO_LARGE_MESSAGE);
   if (!bodyText) return { ...query, ...path };
   if (!isJsonContentType(request.headers.get('content-type'))) {
     throw new CapabilityAuthError('Service-Plane REST request body must use application/json', 415);
@@ -273,64 +381,8 @@ function stringArrayQueryNames(schema: OpenApiObject): Set<string> {
   );
 }
 
-async function readBoundedBody(request: Request, maxBytes: number): Promise<string> {
-  const declared = request.headers.get('content-length');
-  if (declared && Number(declared) > maxBytes) throw new CapabilityAuthError('Service-Plane REST request body is too large', 413);
-  if (!request.body) return '';
-
-  const reader = request.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let bytes = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      bytes += value.byteLength;
-      if (bytes > maxBytes) {
-        await reader.cancel();
-        throw new CapabilityAuthError('Service-Plane REST request body is too large', 413);
-      }
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const joined = new Uint8Array(bytes);
-  let offset = 0;
-  for (const chunk of chunks) {
-    joined.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder().decode(joined);
-}
-
 function isJsonContentType(value: string | null): boolean {
   if (!value) return false;
   const type = value.split(';', 1)[0]?.trim().toLowerCase();
   return type === 'application/json' || Boolean(type?.endsWith('+json'));
-}
-
-function isRestMethod(value: string): value is ServiceHttpMethod {
-  return (REST_METHODS as readonly string[]).includes(value);
-}
-
-function restErrorResponse(error: unknown): Response {
-  const info = servicePlaneErrorInfo(error);
-  if (!info)
-    return Response.json({ error: { code: 'internal', message: 'Service-Plane REST request failed', retryable: false } }, { status: 500 });
-  return Response.json(
-    {
-      error: {
-        code: info.code,
-        message: info.message,
-        ...(info.reason ? { reason: info.reason } : {}),
-        retryable: info.retryable,
-      },
-    },
-    { status: info.status },
-  );
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

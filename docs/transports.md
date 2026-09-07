@@ -1,79 +1,213 @@
 # Choosing A Transport
 
-Goal: decide which transport to use between two services — by environment, call shape, performance, and cost.
+Start with the topology, then optimize measured bottlenecks. The public API stays the same across
+transports.
 
-Service Plane offers four transports. They are interchangeable at the ability level (same tokens, same validation, same handlers), so this is purely a routing decision — and it can differ per caller/service pair.
+## Decision Table
 
-| Transport | Shape | Streams | Where |
-| --- | --- | --- | --- |
-| `cloudflareNativeRpc(binding)` | session (Workers RPC) | yes | Cloudflare, same account |
-| `cloudflareServiceBindingRpc(binding)` / `httpBatchRpc(url)` | one HTTP request per call (with pipelining) | no | everywhere |
-| `websocketRpc(url, { createWebSocket? })` | long-lived session | yes | everywhere both ends can hold a socket |
-| `customRpcTransport(transport)` | whatever you bring | yes | tests, message ports, exotic links |
-
-## Decision Rules
-
-Apply in order; the first match wins.
-
-1. **Same Cloudflare account → native binding RPC. Always.** No public egress, streams work natively, and billing is favorable: requests through service bindings [do not incur additional request fees](https://developers.cloudflare.com/workers/platform/pricing/) — CPU time is billed once across the chain. This holds for streaming too.
-2. **Request/response between services → HTTP-batch. The default.** Stateless, retryable, observable, no connection lifecycle to manage, and promise pipelining resolves chained calls in one round trip. The price: the capability token is verified on every call (~100 µs of ES256). Cap'n Web 0.11 removed Node and Bun's former ~1 ms batch-scheduling floor.
-3. **Chatty pair or streaming → WebSocket, but only if *both* ends can hold the socket.** A session authenticates once, then calls cost ~10 µs; streams require a session transport anyway. Which brings us to the question that decides most real cases:
-
-### Can this end hold a socket?
-
-| End of the connection | Can hold a long-lived WebSocket? |
-| --- | --- |
-| Long-running Node / Bun / Deno process | **Yes — and it is essentially free** (one TCP socket and some memory; no per-message platform cost) |
-| Stateless Cloudflare Worker as the **caller** | **No.** A Worker can open outbound WebSockets, but [cannot persist a connection across invocations](https://developers.cloudflare.com/workers/runtime-apis/websockets/) — each request would pay a fresh upgrade handshake, which is strictly worse than one HTTP-batch POST |
-| Durable Object | **Yes, but it bills duration for the whole connection.** Normally the [WebSocket Hibernation API](https://developers.cloudflare.com/durable-objects/best-practices/websockets/) would make accepted sockets cheap — but **Cap'n Web sessions cannot hibernate yet** ([capnweb#36](https://github.com/cloudflare/capnweb/issues/36), open feature request): the session's in-memory state must survive between messages, so a DO holding a Cap'n Web session — inbound or outbound — [bills wall-clock duration for the entire connection](https://developers.cloudflare.com/durable-objects/platform/pricing/) |
-| Browser / external client | Yes |
-
-If either end answers "no", use HTTP-batch (or restructure so a Durable Object owns the session).
-
-## Scenarios
-
-| Situation | Use | Why |
+| Hop | Recommended transport | Why |
 | --- | --- | --- |
-| CF worker → CF worker, same account — any shape, including streaming | `cloudflareNativeRpc` | Rule 1: free through bindings, streams natively, no public surface |
-| CF worker → CF worker, **different account**, request/response | `httpBatchRpc` over the public URL | No bindings across accounts; neither stateless worker can hold a socket, so per-request WebSocket = handshake + teardown every call. Both accounts bill their own requests either way |
-| CF worker → CF worker, different account, **streaming** | WebSocket, with a **Durable Object as the caller** holding the session | Someone must own the socket; only a DO can — and it bills duration for the whole connection (no hibernation for Cap'n Web sessions, [capnweb#36](https://github.com/cloudflare/capnweb/issues/36)). If the traffic doesn't justify that, reconsider: same-account placement (rule 1), or request/response with batched results |
-| Node service ↔ Node service, both long-running, frequent calls or streaming | `websocketRpc` | Sockets are free on Node; auth amortizes to once per session (~10 µs/call) instead of verifying a token for every batch |
-| Node ↔ Node, occasional calls (webhooks, cron fan-out) | `httpBatchRpc` | Reconnect/heartbeat upkeep isn't worth it below a few calls per second |
-| Many stateless CF workers → one Node service | `httpBatchRpc` | The callers can't hold sockets, so a WebSocket server on the Node side gains nothing |
-| Browser or AI session → control plane broker (interactive, streaming tools) | WebSocket to `/rpc` | Long-lived by nature. On Cloudflare, serving the socket from a plain Worker costs no duration (only CPU per message); a Durable Object adds cross-connection coordination but bills duration for the whole connection — Cap'n Web can't hibernate ([capnweb#36](https://github.com/cloudflare/capnweb/issues/36)) — so keep sessions purposeful and close them when idle. Stock AI clients use the MCP endpoint instead |
-| LLM token streaming | any session transport + the [batching recipe](streaming.md#high-frequency-streams) | Streams need sessions; message count dominates cost |
+| Cloudflare Worker → bound Worker, unary | `service-binding` native RPC | No Service Plane HTTP/JSON codec; platform-owned routing |
+| Cloudflare Worker → bound Worker, stream | Service-binding Fetch | Streaming codec and backpressure |
+| Node, another account, or another runtime | Fetch | Universal, stateless, easy to observe |
+| Browser/headless client → control plane | Broker Fetch, REST, or MCP | Keeps services and capability tokens private |
+| Interactive, long-lived session | WebSocket | Reuses one connection and supports streams |
+| Separate, directly reachable Durable Object | Experimental hibernating WebSocket | Outside the central-plane topology |
 
-## Cloudflare Cost Notes
+Do not expose private services merely to avoid one control-plane hop. On Cloudflare, keep the plane
+public and use service bindings for its downstream calls.
 
-Doc-backed facts that drive the rules above (see [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/) and [Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/) for current numbers):
+## Fetch
 
-- **Service bindings**: no additional request fees; CPU time across the chain is billed once. This is why rule 1 has no exceptions.
-- **Stateless Workers**: no duration billing at all. A WebSocket upgrade counts as one request; incoming WebSocket messages are billed at a favorable 20:1 ratio; outgoing messages are free. So *serving* WebSockets on a plain Worker is cheap — the constraint is never cost, it's that a stateless *caller* can't keep the socket.
-- **Durable Objects**: `accept()`ing a WebSocket bills duration for the entire connection unless the Hibernation API lets the object sleep between messages — **and Cap'n Web sessions cannot hibernate today** ([capnweb#36](https://github.com/cloudflare/capnweb/issues/36) is an open feature request): the RPC session keeps in-memory state between messages. Until that lands, treat any DO-held Service Plane session as duration-billed for its whole lifetime, inbound or outbound. Mitigations: idle timeouts that close sessions, plain-Worker WS serving where no cross-connection state is needed, or HTTP-batch.
-- **Node (self-hosted)**: no platform billing dimension; a WebSocket costs a file descriptor, some memory, and your reconnect/heartbeat logic.
+Fetch is the default ability transport and the baseline for cross-runtime deployments. Most callers
+use the public broker, which chooses the downstream service transport from discovery:
 
-## Performance
-
-From `npm run bench` (in-memory, network excluded — see [Streaming](streaming.md#high-frequency-streams) for the streaming numbers):
-
-- Persistent session: **~10 µs per call** after the one-time authenticate; within ~25% of a raw Cap'n Web session.
-- HTTP-batch: **per-call token verify (~100 µs)** plus batch framing. Cap'n Web 0.11 uses `setImmediate` on Node and Bun, removing the former ~1 ms timer floor; Service Plane mirrors that scheduler for service-binding batches.
-- Native binding: no serialization at all in-process; on Cloudflare it is also the only transport with zero public egress.
-- A reused brokered session (plane in the data path) benchmarks ~2× *faster* than a hand-rolled two-hop Hono chain with bearer middleware — connection reuse pays for the real crypto.
-
-## Rule Of Thumb
-
-```mermaid
-flowchart TD
-  A["Call another service"] --> B{"Same Cloudflare account?"}
-  B -- yes --> NB["cloudflareNativeRpc"]
-  B -- no --> C{"Streaming, or sustained chatty pair?"}
-  C -- no --> HB["httpBatchRpc (default)"]
-  C -- yes --> D{"Can BOTH ends hold a socket?<br/>(long-running process, DO, browser)"}
-  D -- yes --> WS["websocketRpc"]
-  D -- no --> E{"Worth giving the caller a Durable Object?"}
-  E -- yes --> WS
-  E -- no --> HB
+```ts
+const client = createBrokeredAbilityClient({
+  ability: tasksContract,
+  targetServiceId: 'tasks-service',
+  transport: {
+    type: 'fetch',
+    origin: 'https://api.example.com',
+    headers: () => ({ authorization: `Bearer ${readProductToken()}` }),
+  },
+});
 ```
 
-Next: [Streaming](streaming.md), [Cloudflare](cloudflare.md), [Node.js](nodejs.md), and the [reference](reference.md).
+It is request-scoped, works across runtimes, and carries unary results and ordinary streams. It also
+supports Service Plane batching and compression.
+
+## Cloudflare Service Bindings
+
+Declare the fast path on the ability and endpoint:
+
+```ts
+// Service contract
+rpc: { transports: ['fetch', 'service-binding'] }
+
+// Control-plane endpoint
+cloudflareServiceBinding({
+  id: 'tasks-service',
+  binding: c.env.TASKS,
+  abilityRpc: true,
+  grants,
+})
+```
+
+Unary calls use `invokeAbility` without Service Plane's HTTP/JSON codec. Ordinary streams
+automatically use `binding.fetch`. Cloudflare RPC can carry `ReadableStream` values, but Service
+Plane does not yet use that path: the Fetch stream adapter already owns validation, cancellation,
+backpressure, and connection cleanup consistently across runtimes. A native stream path should be
+added only with the same lifecycle guarantees and a measured gain. Native calls bypass Hono
+middleware, so security and invariants must live in the ability policy or handler. Service Plane
+still verifies tokens, scopes, ingress, schemas, and deadlines on this path.
+
+Cloudflare allows at most 32 Worker invocations from one originating request. Every downstream
+service-binding call still counts, including calls unpacked from a public batch. Native RPC values
+are limited to 32 MiB; larger byte streams use ownership-transferring `ReadableStream` values, which
+is a different lifecycle from Service Plane's typed item streams. See Cloudflare's
+[service-binding limits](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/#limits)
+and [RPC stream rules](https://developers.cloudflare.com/workers/runtime-apis/rpc/#readablestream-writablestream-request-and-response).
+
+## WebSocket
+
+Use WebSocket when a session is genuinely long-lived or interactive:
+
+```ts
+const client = createBrokeredAbilityClient({
+  ability: eventsContract,
+  targetServiceId: 'events-service',
+  transport: {
+    type: 'websocket',
+    url: 'wss://api.example.com/rpc/v1/broker/ws',
+    reconnect: { enabled: true, maxAttempt: 5 },
+  },
+});
+```
+
+The server needs a runtime-specific `upgradeWebSocket`. A socket saves repeated connection setup,
+but adds connection ownership, reconnect policy, idle lifecycle, and deploy behavior. Fetch is
+usually simpler for sporadic calls.
+
+A broker socket authenticates its physical HTTP upgrade, not each logical call. Browser clients
+normally use a secure cookie or short-lived URL ticket. Server runtimes may close over a WebSocket
+implementation that adds upgrade headers in `createWebSocket`. `transport.headers` is available on
+broker Fetch only. Request ID, idempotency key, and timeout remain per-call metadata after the
+socket is accepted.
+
+Hibernation is an experimental direct-service WebSocket mode; see [streaming](streaming.md). It is never
+brokered, opened by `plane.abilityClient`, or batched; those clients fail fast.
+
+## Batch Concurrent Fetch Calls
+
+Enable batching on both ends:
+
+```ts
+// Service or public broker
+rpc: {
+  batch: { maxSize: 20 },
+}
+
+// Client transport
+transport: {
+  type: 'fetch',
+  origin: 'https://api.example.com',
+  batch: { maxSize: 20 },
+}
+```
+
+Batching combines only concurrent unary logical calls into one physical Fetch request. Streams and
+WebSocket calls never enter a batch. Every subrequest retains its own method scopes, request ID,
+idempotency key, and timeout.
+
+The largest win is usually a high-latency public or HTTP/1.1 hop. HTTP/2 and HTTP/3 already
+multiplex concurrent requests on one connection, so batching saves less there; measure before
+accepting batch-wide latency coupling.
+
+For a brokered client, batching removes caller-to-plane round trips only. The plane still performs
+authorization, token handling, and one downstream service invocation per logical call. It is not a
+distributed fan-in protocol. `servicePlaneConnInfo` also remains owned by trusted invocation
+middleware, not by individual public calls.
+
+Use a bounded `maxSize`; an unbounded batch turns one request into unbounded service work. On
+Cloudflare, leave room below the 32-invocation request limit for any other Workers called by the
+plane or target services. The example size of 20 is a starting point, not a universal default.
+
+## Compress Fetch Payloads
+
+```ts
+// Server
+rpc: {
+  compression: {
+    request: true,
+    response: { encodings: ['gzip', 'deflate'], threshold: 1_024 },
+  },
+}
+
+// Client
+transport: {
+  type: 'fetch',
+  origin: 'https://api.example.com',
+  compression: {
+    request: { encoding: 'gzip', threshold: 1_024 },
+    response: true,
+  },
+}
+```
+
+Supported Service Plane encodings are `gzip`, `deflate`, and `deflate-raw`; choose only values
+available in the target runtime. Requests may use one encoding; stacked, malformed, and unsupported
+encodings are rejected with 415 before allocating a decoder, on Fetch and WebSocket alike.
+Compression helps large JSON or text payloads and usually hurts
+small requests through extra CPU and latency. Measure with realistic payloads.
+
+Compression applies to request bodies, including batches, and ordinary unary responses. Framed
+batch responses and streamed responses stay uncompressed. They intentionally avoid the buffering
+and Node-specific compression dependencies that would otherwise change portability or latency.
+
+Every RPC server rejects decoded request bodies and individual WebSocket messages larger than one
+MiB by default, including compressed and batched requests. Change `maxRequestBodyBytes`
+deliberately; `false` disables the byte limit, not the compression depth limit.
+
+## Performance Expectations
+
+The useful ordering is stable even when absolute numbers change by machine:
+
+1. A direct in-process method call is cheapest.
+2. Cloudflare native binding RPC avoids Service Plane's HTTP/JSON codec for unary calls.
+3. Fetch adds encoding and request dispatch.
+4. A public broker adds discovery/grant/token work plus a second hop.
+5. Batching amortizes the first Fetch hop; it does not erase downstream work.
+
+`npm run bench` measures the current engine, Service Plane middleware, token signing, discovery,
+REST matching, local JS binding adapters, in-process Fetch, broker calls, batching, and streams.
+The binding measurements do not exercise Cloudflare scheduling or cross-isolate serialization.
+These are regression benchmarks; deployment latency also depends on placement, network, payloads,
+schemas, cold starts, and storage. Ten-call batch measurements count groups; multiply by ten for
+logical calls per second and compare against the matching ten-call unbatched workload.
+
+A Node 22 loopback HTTP comparison on 2026-09-05 found similar unary median latency for oRPC
+beta.33 and Cap'n Web 0.12 (about 0.4 ms). Ten-call batches took 1.891 versus 0.331 ms for 16-byte
+values, and 2.665 versus 1.121 ms for 8 KiB values: Cap'n Web won both. Five alternating rounds used
+200 samples after 100 warmups, identical validation, one HTTP request per sample, and no compression
+or TLS. This excludes Service Plane authorization, distributed network latency, and deployed
+Cloudflare behavior. Reproduce with an independently unpacked Cap'n Web package:
+
+```sh
+node scripts/compare-rpc.mjs /absolute/path/to/capnweb/package
+```
+
+The migration is not a general speed improvement: portable typed Fetch streams are its main
+transport benefit. Even the local Service Plane benchmark runs faster without batching; opt in only
+when measured network/request savings justify its scheduling and framing overhead.
+
+## Practical Defaults
+
+- Keep Fetch enabled on every ordinary ability.
+- Add `service-binding` for unary calls between bound Workers.
+- Add WebSocket only for a stream or session that benefits from it.
+- Enable batching for measured bursts of concurrent unary calls.
+- Enable compression above a measured payload threshold.
+- Preserve the one-MiB decoded request limit unless the API requires more.
+
+See [Cloudflare](cloudflare.md), [Node.js](nodejs.md), and [streaming](streaming.md).

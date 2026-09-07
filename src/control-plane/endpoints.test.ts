@@ -3,7 +3,7 @@ import type { FetchLike, ServiceAbilityNativeRpcBinding } from '../shared/types.
 import { cloudflareServiceBinding } from './endpoints.js';
 
 // A Workers service-binding stub answers any property access with a callable RPC proxy, so the
-// endpoint must not infer native ability RPC support from the presence of `connectAbility`.
+// endpoint must not infer native ability RPC support from the presence of `invokeAbility`.
 function serviceBindingStub(): FetchLike & Partial<ServiceAbilityNativeRpcBinding> {
   return new Proxy(
     { fetch: async () => new Response(null, { status: 404 }) },
@@ -19,12 +19,17 @@ function serviceBindingStub(): FetchLike & Partial<ServiceAbilityNativeRpcBindin
 describe('cloudflareServiceBinding', () => {
   it('does not infer native ability RPC from a service-binding stub', () => {
     const binding = serviceBindingStub();
-    expect(typeof binding.connectAbility).toBe('function');
+    expect(typeof binding.invokeAbility).toBe('function');
     expect(cloudflareServiceBinding({ binding, id: 'hub' }).abilityRpc).toBeUndefined();
   });
 
   it('uses the native ability RPC binding when it is passed explicitly', () => {
-    const abilityRpc = { connectAbility: () => ({}) };
+    const abilityRpc = { invokeAbility: () => ({}) };
     expect(cloudflareServiceBinding({ abilityRpc, binding: serviceBindingStub(), id: 'hub' }).abilityRpc).toBe(abilityRpc);
+  });
+
+  it('uses the service binding itself after an explicit native RPC opt-in', () => {
+    const binding = serviceBindingStub();
+    expect(cloudflareServiceBinding({ abilityRpc: true, binding, id: 'hub' }).abilityRpc).toBe(binding);
   });
 });

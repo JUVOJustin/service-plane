@@ -1,303 +1,231 @@
 # Create A Control Plane
 
-Goal: create the service that issues tokens, discovers services, and builds user-facing projections.
-
-The smallest useful control plane knows which services exist, which callers may use which scopes, and how to sign capability tokens.
+The control plane discovers services, checks grants, issues short-lived capabilities, routes public
+calls, and builds projections. It does not contain product-service handlers.
 
 ## Minimal Plane
 
 ```ts
+import type { AbilityNativeBinding } from 'service-plane/service';
 import {
+  type FetchLike,
   ServicePlaneControlPlane,
   cloudflareServiceBinding,
   hmacServiceClientAuth,
 } from 'service-plane/control-plane';
 
-export default new ServicePlaneControlPlane({
-  signingKeys: (env) => [{ kid: '2026-07', secret: env.STS_SIGNING_SECRET }],
-  invocationMiddleware: async (c, next) => {
-    if (c.req.header('authorization') !== `Bearer ${c.env.PRODUCT_API_TOKEN}`) {
-      return c.json({ error: 'Unauthorized' }, 401);
-    }
-    c.set('servicePlaneCaller', { id: 'product-api', kind: 'user' });
-    await next();
-  },
-  authenticateCaller: (c) =>
-    hmacServiceClientAuth({
-      clients: [{ clientId: 'workflow-runner', secret: c.env.WORKFLOW_RUNNER_SECRET }],
-    })(c),
+type ControlPlaneEnv = {
+  Bindings: {
+    STS_SIGNING_SECRET: string;
+    TASKS: FetchLike & AbilityNativeBinding;
+    WORKFLOW_SERVICE_SECRET: string;
+  };
+};
+
+export default new ServicePlaneControlPlane<ControlPlaneEnv>({
+  signingKeys: (env) => [{ kid: '2026-08', secret: env.STS_SIGNING_SECRET }],
+
+  authenticateCaller: hmacServiceClientAuth<ControlPlaneEnv>({
+    clients: (c) => [{
+      clientId: 'workflow-service',
+      secret: c.env.WORKFLOW_SERVICE_SECRET,
+    }],
+  }),
+
   services: (c) => [
     cloudflareServiceBinding({
-      id: 'asana',
-      binding: c.env.ASANA,
-      grants: [{ caller: 'workflow-runner', scopes: ['asana.tasks.write'] }],
+      id: 'tasks-service',
+      binding: c.env.TASKS,
+      abilityRpc: true,
+      grants: [
+        { caller: 'workflow-service', scopes: ['tasks.read', 'tasks.write'] },
+        { caller: 'control-plane', scopes: ['tasks.read'] },
+      ],
     }),
   ],
+
+  invocationMiddleware: async (c, next) => {
+    const principal = await authenticateProductRequest(c.req.raw);
+    if (!principal) return c.json({ error: 'Unauthorized' }, 401);
+    c.set('servicePlaneCaller', { id: principal.id, kind: 'user' });
+    await next();
+  },
+
+  broker: {},
+  mcp: {},
 });
 ```
 
-This mounts:
+The two authentication hooks serve different boundaries:
 
-```txt
-POST /.well-known/service-plane/capability-token
-GET  /.well-known/service-plane/jwks.json
-GET  /openapi.json
-POST /mcp                                        (when published MCP projections exist)
-*    <published rest.path>                       (metadata-driven REST facade)
-```
+- `authenticateCaller` protects the capability-token endpoint for services requesting tokens.
+- `invocationMiddleware` protects product-facing REST, MCP, and broker routes.
 
-To serve a documentation UI, mount a Hono renderer on `plane.app` against `/openapi.json` — see [OpenAPI and MCP: Docs UI](openapi-mcp.md#docs-ui).
+For per-user method permissions, add `authorizeInvocation(invocation, context)`. It covers RPC,
+REST, MCP, and in-process clients before issuing a capability; only `true` permits the call when
+configured. It complements service grants rather than replacing them. See [method authorization](auth.md#authorize-individual-methods).
 
-## What The Plane Does
+The auth helpers carry the plane's Hono environment generic, so a resolver can read `c.env` while
+the authenticator itself is constructed only once.
 
-```mermaid
-flowchart TD
-  Secret["signingKeys"] --> Authority["Signing authority: issuer, key ids, public JWKS"]
-  Authority --> JWKS["Serve /jwks.json"]
-  Services["Configured services"] --> Discovery["Fetch service discovery"]
-  Discovery --> Catalog["Build ability + scope catalog"]
-  Catalog --> STS["Issue scoped capability tokens"]
-  Authority --> STS
-  Catalog --> OpenAPI["Build /openapi.json"]
-  Catalog --> MCP["Build /mcp tool list"]
-```
+Do not infer either identity from an unverified header. Authenticate first, then set the typed
+context value. Token request bodies are independently bounded to one MiB; set
+`tokenMaxBodyBytes` when a different STS limit is required. Body-signing authenticators may consume
+the request because Service Plane gives them an exact package-owned snapshot only after enforcing
+that limit.
 
-The plane does not implement Asana, ClickUp, or Moco logic. It only knows how to discover those services, validate grants, issue tokens, and project published metadata.
+## Routes And Defaults
 
-A control-plane instance has one logical service catalog. Its `services(context)` callback may use
-the request context to resolve runtime bindings or deployment configuration, but it must return the
-same logical endpoints and discovery metadata for every caller and organization. Organization-specific
-data scoping happens inside each service, using the verified subject or validated ability input; it
-does not change which services or abilities the plane discovers. If an application truly needs a
-different catalog, run it as a separate control-plane instance with its own discovery cache.
+| Route | Default |
+| --- | --- |
+| `POST /.well-known/service-plane/capability-token` | On |
+| `GET /.well-known/service-plane/jwks.json` | On |
+| `GET /openapi.json` | On; disable with `openapi: false` |
+| Published `rest.path` routes | On; `rest: false` removes the facade and catch-all |
+| `/rpc/v1/broker` and `/rpc/v1/broker/ws` | Off; enable with `broker: {}` |
+| `POST /mcp` | Off; enable with `mcp: {}` |
 
-JWKS hangs off the signing authority alone: it needs no discovery, so services can keep refreshing
-their verification keys while a target service is down. Everything on the catalog path fails closed
-when discovery cannot be completed. See [auth.md](auth.md#signing-authority-and-authorization-catalog).
+Only methods on `exposure: 'published'` abilities become REST/OpenAPI or MCP surfaces. Streaming
+methods are not projected to REST.
 
-Every inbound request gets an `X-Request-Id` (adopted from the caller or generated), and the REST,
-broker, and MCP surfaces forward it to services on every brokered call. REST calls, broker connects,
-MCP calls, and configuration errors are logged as structured JSON events; pass `log` to redirect
-them to your own sink or `log: false` to silence them. See the logging section in [the
-reference](reference.md).
+## Configure Service Endpoints
 
-## Service-Plane Ingress
-
-For production services, configure `ServicePlaneService` with `ingress: {}` and send callers through the control-plane broker.
+Use a Cloudflare binding in the same account:
 
 ```ts
 cloudflareServiceBinding({
-  id: 'asana',
-  binding: c.env.ASANA,
-  grants: [{ caller: 'workflow-runner', scopes: ['asana.tasks.write'] }],
+  id: 'tasks-service',
+  binding: c.env.TASKS,
+  abilityRpc: true,
+  grants,
 });
 ```
 
-The broker uses the existing capability issuer to mint a signed brokered token. A caller that sends a valid non-brokered capability token directly to `/rpc/<abilityId>` gets `403` before any ability handler is created.
+`abilityRpc` is explicit because a Workers binding proxy cannot be feature-detected safely. Set it
+to `true` when that same binding exposes `invokeAbility`, or pass a separate native RPC adapter.
+Unary calls then use native RPC; streams use `binding.fetch`.
+
+Use HTTPS for another runtime or account:
+
+```ts
+httpsService({
+  id: 'search-service',
+  baseUrl: 'https://search.internal.example',
+  grants,
+});
+```
+
+The logical endpoint set must not vary by user or tenant. Tenant-level data access belongs behind a
+stable service contract, enforced from the delegated subject or validated input.
 
 ## Grants
 
-Grants decide which caller can request which scopes for a service.
+A grant is an upper bound on scopes a caller may receive for one target service. Issuance fails if
+the target, scope, or grant is unknown. The service checks the scopes again before its handler runs.
 
 ```ts
-cloudflareServiceBinding({
-  id: 'asana',
-  binding: c.env.ASANA,
-  grants: [
-    { caller: 'workflow-runner', scopes: ['asana.tasks.write'] },
-    { caller: 'admin-worker', scopes: ['asana.tasks.write'] },
-  ],
-});
+grants: [
+  { caller: 'workflow-service', scopes: ['tasks.read'] },
+  { caller: 'admin-service', scopes: ['tasks.read', 'tasks.write'] },
+],
 ```
 
-If a caller asks for an unknown service, unknown scope, or ungranted scope, the token endpoint rejects the request.
+Direct service token requests use the authenticated service id as `caller`. Product-facing REST,
+MCP, and broker calls use `controlPlaneServiceId` (default `control-plane`) as the downstream token
+actor; the authenticated product user is preserved separately as the delegated subject. Grant the
+plane for product traffic, not each end-user id.
 
-Grants are checked per target service. If one service's grant goes stale — it names a scope that service renamed or removed on its next deploy, or that service is currently undiscoverable — only tokens for that target are refused. Other services keep issuing, brokering, and serving MCP normally. See [auth.md](auth.md#signing-authority-and-authorization-catalog).
+`access: 'service'` adds a caller-class requirement; it does not replace scopes. Set
+`kind: 'service'` only after authenticating a real service identity. Product users, API keys, and
+anonymous sessions use `kind: 'user'` plus an application-owned `principalKind` when useful.
+
+## Invocation Middleware
+
+Middleware must either return its own `401`/`403`, or set `servicePlaneCaller` before `next()`.
+Calling `next()` without it produces a configuration error instead of anonymous access.
+
+```ts
+invocationMiddleware: async (c, next) => {
+  const caller = await authenticate(c.req.raw);
+  if (!caller) return c.json({ error: 'Unauthorized' }, 401);
+
+  c.set('servicePlaneCaller', { id: caller.id, kind: caller.kind });
+  c.set('servicePlaneConnInfo', trustedConnInfo(c));
+  await next();
+
+  audit(c.get('servicePlaneInvocation'), c.res.status);
+},
+```
+
+`servicePlaneConnInfo` is optional, trusted-middleware-owned, and advisory. It is forwarded only to
+brokered, ingress-protected services. Never use it for authorization.
+
+REST runs this middleware before catalog discovery, including requests that later return 404. That
+keeps unauthenticated wildcard traffic from causing discovery fan-out. After `next()`,
+`servicePlaneInvocation` identifies a matched REST or MCP operation for audit logs and is undefined
+for a REST miss. A broker connection exposes only `surface: 'broker'` because one session can call
+several methods. The request-entry deadline also bounds invocation middleware; if middleware calls
+`next()` after that budget has expired, the plane refuses the continuation before parsing,
+discovery, or dispatch begins.
+
+For a broker WebSocket, this middleware authenticates the physical HTTP upgrade. Browser clients
+can use a secure cookie or a short-lived URL ticket. A server runtime may provide a
+`createWebSocket` closure whose WebSocket implementation sets upgrade headers. Per-call request ID,
+idempotency key, and timeout travel as logical call metadata; `BrokeredAbilityTransport.headers`
+applies only to Fetch.
 
 ## Discovery Cache
 
-Resolving the catalog is a fan-out: the plane fetches `/.well-known/service-plane/service.json` from **every** configured service. It needs the catalog to issue a token — that is how it knows which scopes a service actually has — so without a cache a plane with 50 services makes 50 requests to mint one token.
-
-**This is cached by default.** A plane you configure with nothing extra keeps a process-local snapshot for 30 seconds, which is per isolate on Cloudflare and per process on Node. Nothing to install and no infrastructure required.
-
-Pass `discoveryCache` to replace it with a shared store — KV, Redis — so a whole fleet resolves the catalog once instead of once per replica:
-
-```ts
-const plane = new ServicePlaneControlPlane({
-  discoveryCache: env.SERVICE_DISCOVERY_CACHE,
-  // ...
-});
-```
-
-Or turn it off with `discoveryCache: false` when the plane must see every catalog change immediately and would rather pay the fan-out.
-
-There are two ways the catalog gets used, and you can give each its own store:
-
-```ts
-const plane = new ServicePlaneControlPlane({
-  discoveryCache: {
-    token: redisRegistryCache(),        // issuing tokens, brokering, MCP
-    openapi: env.SERVICE_DISCOVERY_KV,  // building the OpenAPI document
-  },
-  // ...
-});
-```
-
-`token` covers the whole call path. Brokering and MCP are not separate: a brokered call *is* a token issuance plus a registry lookup, and both halves have to come from one snapshot. `openapi` is the projection path — cold, infrequent, and happy on a store whose reads are slow.
-
-`default` covers whichever of the two you do not name, and either can be set to `false` on its own. Splitting is worth it when the two genuinely differ in what they need, but note the cost: **separate stores warm separately**, so the same catalog is fetched and held once per store. One shared cache is the cheaper default for a reason.
-
-On Cloudflare, see [layering a shared store behind the in-memory one](cloudflare.md#sharing-the-discovery-cache-across-isolates) before reaching for KV or a Durable Object.
-
-The registry derives distinct cache keys from the configured service ids and origins, so one cache
-instance is safe to share across routes, replicas, and different control-plane instances whose
-endpoint sets differ. A single control plane must not vary those endpoints or their discovery
-catalog by caller or organization. This is separate from `openapi.cache`, which caches the generated
-document rather than the catalog behind it.
-
-A discovery that could not reach every service is never cached — an unreachable service is simply absent from the snapshot, and storing that would keep the plane refusing it for the rest of the TTL after it recovers.
-
-Measured with `npm run bench` at one millisecond per service — roughly a Cloudflare service binding, and low for anything over the public internet:
-
-| Catalog | no cache | warm cache |
-| --- | --- | --- |
-| 20 services | 1.7 ms | 0.006 ms |
-| 200 services | 22.7 ms | 0.065 ms |
-
-ETag revalidation helps less than it looks: a 304 skips parsing and validating the document, but it is still one round trip per service. At 20 services over a 10 ms link it saves under a millisecond.
-
-Staleness here is mostly a convergence question. A token minted from a stale catalog is still checked by the service against its current definition, so a scope the service no longer declares is refused at the service regardless of what the plane cached. Grants are plane-side configuration and are re-read on every request, so revoking one takes effect immediately.
-
-`access` is checked twice for the same reason. The broker reads it from the catalog, which the plane caches, so on its own it would be the one field whose staleness *loosens* enforcement: an ability tightened from `access: 'plane'` to `access: 'service'` would stay brokerable for the rest of the TTL. The caller's access class therefore also rides the token as [`spa`](reference.md#capability-token-claims), and the service re-checks it against its own definition. A stale catalog can still broker such a call, but the service refuses it — tightening lands when the service deploys, and the cache only decides where the 403 comes from. The service's half of that guarantee needs the service on a package version that carries the check; until every service is, the [rollout-order note](reference.md#capability-token-claims) applies.
-
-## OpenAPI Cache
-
-The control plane can cache the bundled OpenAPI document.
-
-```ts
-const plane = new ServicePlaneControlPlane({
-  openapi: {
-    cache: env.OPENAPI_CACHE,
-    cacheTtlSeconds: 300,
-    security: [{ ProductApiKey: [] }],
-    securitySchemes: {
-      ProductApiKey: { type: 'apiKey', in: 'header', name: 'X-API-Key' },
-    },
-  },
-  // ...
-});
-```
-
-The document is derived from published ability metadata. Individual services do not serve OpenAPI
-files. Because `invocationMiddleware` owns public authentication, OpenAPI security is explicit too:
-`security` and `securitySchemes` must describe what that middleware actually accepts. Omitting them
-makes no authentication claim in the generated document.
-
-## Signing Material
-
-The plane memoizes one thing, and it needs no configuration: the signing material derived from your secret. Deriving a private JWK is a P-256 scalar multiplication and proving the key pair is a sign/verify round-trip — together about 9.5 ms — and neither depends on your service catalog or grants, so the result is reused until the key set changes.
-
-The capability issuer itself is rebuilt on every request. Assembling one around already-derived material costs 0.03 ms at 20 services and 0.35 ms at 200, which is not worth a cache with a bound, an eviction policy and an expiry to get right. Two consequences worth knowing:
-
-- **A changed grant takes effect immediately.** Grants are plane-side configuration and are re-read on every request, so withdrawing one refuses the next request — there is no issuer cache holding the old answer. A changed *catalog* is different: it converges within the [discovery cache](#discovery-cache) TTL, because that is where the service's own view of itself is held.
-- **Cost scales with catalog size**, not with how many distinct configurations you resolve. A plane that hands different callers different grants pays nothing extra.
-
-The memo is per instance, in memory. On Cloudflare that means per isolate: a plane constructed at module scope (as above) keeps it for the isolate's lifetime and across the many requests it serves, but nothing is shared between isolates and each warms up independently. Constructing the plane *inside* the fetch handler would instead re-derive the signing material on every request — that is the one arrangement worth avoiding.
-
-`npm run bench` tracks the ratio these numbers rest on.
-
-## Invocation Caller And Optional RPC Broker
-
-REST, MCP, and the optional RPC broker are **fail closed**: their Hono context must contain a
-`servicePlaneCaller` before an invocation proceeds. The simplest setup is one top-level
-`invocationMiddleware`. It is an ordinary Hono middleware handler, runs only after a real invocation
-route has matched, and is shared by all three surfaces. Unknown REST paths remain `404` without
-running it.
-
-The RPC broker is not mounted by default. `rpc: {}` enables its Cap'n Web endpoint at `/rpc`;
-omitting `rpc` leaves that route absent. The MCP dispatcher is automatic, but `/mcp` behaves as
-absent (`404`) when the current request's discovery snapshot has no published MCP tool, resource, or
-prompt. When MCP projections exist, calls are not anonymous: like REST and an enabled broker, they
-still require `servicePlaneCaller` in the Hono context.
-
-`invocationMiddleware` is intentionally separate from `authenticateCaller`: that option protects
-the capability-token endpoint and admits service-class callers, while invocation middleware handles
-product users, API keys, or services invoking REST, MCP, or the broker.
+Discovery fans out to every configured service. A process-local 30-second cache is enabled by
+default. Keep it unless you need immediate convergence or fleet-wide cache sharing.
 
 ```ts
 new ServicePlaneControlPlane({
-  invocationMiddleware: async (c, next) => {
-    const serviceId = await authenticateBrokerRequest(c);
-    if (!serviceId) {
-      return c.json({ error: 'Unauthorized' }, 401, {
-        'WWW-Authenticate': 'Bearer realm="service-plane"',
-      });
-    }
-    c.set('servicePlaneCaller', { id: serviceId, kind: 'service' });
-    c.set('servicePlaneConnInfo', getConnInfo(c));
-    await next();
-    audit(c.get('servicePlaneInvocation'), c.res.status);
-  },
-  rpc: {},
+  discoveryCache: env.REGISTRY_CACHE,
   // ...
 });
 ```
 
-The middleware may also set `servicePlaneConnInfo` using the `getConnInfo` implementation from the
-runtime's Hono adapter. It reaches handlers only on brokered calls into ingress-protected services
-and is advisory — see [Forwarded Connection Info](auth.md#forwarded-connection-info).
-
-The context writes are the contract, not an optional observation hook. If middleware calls `next()`
-without setting `servicePlaneCaller`, the matched invocation fails with `500`. Middleware may
-instead short-circuit with its own `401` or `403` response, including the appropriate
-`WWW-Authenticate` challenge. After `await next()`, it can inspect `servicePlaneInvocation` and
-`c.res` for auditing. REST metadata includes service, ability, method, scopes, and path; MCP metadata
-is enriched once the protocol operation resolves; a broker session exposes only `surface: 'broker'`
-because one session may invoke many abilities later.
-
-Existing global Hono middleware is equally valid when it already owns the routing policy. It can
-populate the same variables on the `app` passed to the plane; in that case `invocationMiddleware`
-may be omitted:
+For different storage needs, split the hot call path from OpenAPI:
 
 ```ts
-type PlaneEnv = { Variables: ServicePlaneControlPlaneVariables };
-const app = new Hono<PlaneEnv>();
-
-app.use('*', async (c, next) => {
-  const caller = await resolveCallerIfPresent(c);
-  if (caller) c.set('servicePlaneCaller', caller);
-  c.set('servicePlaneConnInfo', getConnInfo(c));
-  await next();
-  audit(c.get('servicePlaneInvocation'));
-});
-
-new ServicePlaneControlPlane<PlaneEnv>({ app, services, signingKeys });
+discoveryCache: {
+  token: redisCache,
+  openapi: kvCache,
+},
 ```
 
-`servicePlaneCaller` is a `BrokerCaller` —
-`{ id, kind: 'service' | 'user', orgId?, principalKind? }`. Service callers
-(`kind: 'service'`) can reach `access: 'service'` abilities and are brokered under their own service
-id; other callers are brokered under the control-plane identity for `access: 'plane'` abilities. For
-an API key, automation, anonymous session, or other plane-class principal, keep `kind: 'user'` and
-set an application-owned `principalKind`; the service receives it as signed
-`identity.subject.kind`. `principalKind` never changes access. The caller's `kind` is what the plane
-attests in the token's [`spa` claim](reference.md#capability-token-claims),
-so setting `kind: 'service'` for a caller the middleware did not actually authenticate as a service
-hands it service-only abilities across the fleet. To intentionally allow anonymous access, set a
-fixed caller in middleware — it is always an explicit choice, never a default.
+`token` also covers broker and MCP calls. Separate stores warm separately. Stale discovery can
+delay newly deployed metadata, but the target service's own checks prevent it from loosening
+authorization.
 
-Use scopes, grants, and ability `access` for method authorization. A broker WebSocket can invoke many
-methods after its original HTTP middleware has completed, so Hono middleware cannot reliably act as
-a per-ability policy hook for every protocol.
+Each remote discovery document is limited to one MiB by default. Set
+`discoveryMaxResponseBytes` only when a known service document requires more.
 
-The broker connects by ability:
+## Trusted In-Process Calls
+
+Control-plane code can create a typed, in-process ability client without entering the public
+broker route:
 
 ```ts
-broker.ability('asana', 'asana.tasks').connect(['asana.tasks.write']);
+const tasks = plane.abilityClient({
+  ability: tasksContract,
+  targetServiceId: 'tasks-service',
+}, env);
+
+await tasks.get(
+  { id: 'task_123' },
+  { requestId: 'request_123', idempotencyKey: 'attempt_123', timeoutMs: 2_000 },
+);
 ```
 
-When service-plane ingress protection is enabled, callers must use the broker or another approved service-plane component that can mint brokered capability tokens.
+The contract infers the method signatures and required method scopes. Optional `scopes` only adds
+ability-level scopes. This is a trusted server-side helper, not a public authentication bypass.
+Omitting `caller` uses the plane's own grant. An explicit service caller needs its own matching grant;
+the configured `authorizeInvocation` policy also runs for in-process calls.
+Construction performs no I/O. Every call resolves the current endpoint, grants, and issuer, then
+repeats token, service authorization, and schema checks; the facade does not pin security state.
+Hibernating methods fail before a downstream call because they require a direct service WebSocket.
 
-Streaming ability methods proxy through the broker as native Cap'n Web `ReadableStream`s: connect to the broker over WebSocket (`upgradeWebSocket`), and the plane reaches the service over its own session transport — the endpoint's native ability RPC binding when available (pass it as `cloudflareServiceBinding({ abilityRpc })`), otherwise WebSocket. See [Streaming](streaming.md).
-
-Next: [auth](auth.md), [OpenAPI and MCP](openapi-mcp.md), and [Cloudflare](cloudflare.md).
+Next: [authentication](auth.md), [OpenAPI and MCP](openapi-mcp.md), or
+[transport selection](transports.md).

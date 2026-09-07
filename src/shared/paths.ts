@@ -1,11 +1,3 @@
-export function joinPaths(prefix: string, path: string): string {
-  const normalizedPrefix = normalizePath(prefix);
-  const normalizedPath = normalizePath(path);
-  if (normalizedPrefix === '/') return normalizedPath;
-  if (normalizedPath === '/') return normalizedPrefix;
-  return `${normalizedPrefix}${normalizedPath}`;
-}
-
 export function normalizePath(path: string): string {
   const trimmed = path.trim();
   if (!trimmed || trimmed === '/') return '/';
@@ -13,14 +5,59 @@ export function normalizePath(path: string): string {
   return withLeadingSlash.length > 1 ? withLeadingSlash.replace(/\/+$/u, '') : withLeadingSlash;
 }
 
+/** A literal URI component or its single variable with fixed surrounding text. */
+export type SimpleTemplateComponent =
+  | string
+  | {
+      /** Globally unique identifier used as a method input property. */
+      name: string;
+      /** Literal component text before the variable. */
+      prefix: string;
+      /** Literal component text after the variable. */
+      suffix: string;
+    };
+
+/** Accepts one globally unique `{identifier}` per component delimited by `/`, `?`, or `#`. */
+export function hasOnlySimpleTemplateExpressions(value: string): boolean {
+  return simpleTemplateComponents(value) !== undefined;
+}
+
+/** Keeps delimiters literal and prevents overlapping captures in URI template matching. */
+export function simpleTemplateComponents(value: string): SimpleTemplateComponent[] | undefined {
+  const components: SimpleTemplateComponent[] = [];
+  const names = new Set<string>();
+  for (const component of value.split(/([/?#])/u)) {
+    const opening = component.indexOf('{');
+    if (opening === -1) {
+      if (component.includes('}')) return undefined;
+      components.push(component);
+      continue;
+    }
+
+    const closing = component.indexOf('}', opening + 1);
+    const name = templateVariableName(component.slice(opening, closing + 1));
+    const prefix = component.slice(0, opening);
+    const suffix = component.slice(closing + 1);
+    if (!name || names.has(name) || prefix.includes('}') || suffix.includes('{') || suffix.includes('}')) return undefined;
+    names.add(name);
+    components.push({ name, prefix, suffix });
+  }
+  return components;
+}
+
+/** The variable a whole `{name}` template segment declares, or undefined for any other text. */
+export function templateVariableName(segment: string): string | undefined {
+  return /^\{([A-Za-z_]\w*)\}$/u.exec(segment)?.[1];
+}
+
 /** Returns unique whole-segment `{name}` variables, or `undefined` for an invalid template. */
 export function pathTemplateVariables(path: string): string[] | undefined {
   const names = new Set<string>();
   for (const segment of path.split('/')) {
     if (!segment.includes('{') && !segment.includes('}')) continue;
-    const match = /^\{([A-Za-z_]\w*)\}$/u.exec(segment);
-    if (!match?.[1] || names.has(match[1])) return undefined;
-    names.add(match[1]);
+    const name = templateVariableName(segment);
+    if (!name || names.has(name)) return undefined;
+    names.add(name);
   }
   return [...names];
 }
@@ -46,39 +83,12 @@ export function isOriginRelativePath(path: string): boolean {
   return path.startsWith('/') && !path.startsWith('//') && !path.includes('\\') && !path.includes('?') && !path.includes('#');
 }
 
-export function pathAndQuery(request: Request): string {
-  const url = new URL(request.url);
-  return `${url.pathname}${url.search}`;
+/** Trims and removes trailing slashes from a safe origin-relative route. */
+export function normalizeOriginRelativePath(path: string): string | undefined {
+  const trimmed = path.trim();
+  return isOriginRelativePath(trimmed) ? normalizePath(trimmed) : undefined;
 }
 
-export function pathMatches(routePath: string, requestPath: string): boolean {
-  const pattern = pathPattern(normalizePath(routePath));
-  if (!pattern) return false;
-  return new RegExp(`^${pattern}$`, 'u').test(normalizePath(requestPath));
-}
-
-function escapeRegExp(value: string): string {
+export function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
-}
-
-function pathPattern(path: string): string | undefined {
-  const patterns = path.split('/').map(pathPartPattern);
-  return patterns.includes(undefined) ? undefined : patterns.join('/');
-}
-
-function pathPartPattern(part: string): string | undefined {
-  if (part === '*') return '.*';
-
-  const param = /^:([^{}]+)(?:\{(.+)\})?$/u.exec(part);
-  if (!param) return escapeRegExp(part);
-
-  const constraint = param[2];
-  if (!constraint) return '[^/]+';
-
-  try {
-    new RegExp(`^(?:${constraint})$`, 'u');
-  } catch {
-    return undefined;
-  }
-  return `(?:${constraint})`;
 }

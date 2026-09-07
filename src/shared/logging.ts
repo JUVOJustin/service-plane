@@ -24,8 +24,8 @@ export type ServicePlaneLogSink<TEvent extends ServicePlaneLoggableEvent = Servi
 
 export type ServicePlaneBrokerLogEvent = {
   event:
-    | 'service_plane.broker.connect.completed'
-    | 'service_plane.broker.connect.failed'
+    | 'service_plane.broker.call.completed'
+    | 'service_plane.broker.call.failed'
     | 'service_plane.mcp.prompt.completed'
     | 'service_plane.mcp.prompt.failed'
     | 'service_plane.mcp.resource.completed'
@@ -51,7 +51,7 @@ export type ServicePlaneBrokerLogEvent = {
   prompt?: string;
   requestId?: string;
   resource?: string;
-  scopes?: string[];
+  scopes?: ReadonlyArray<string>;
   serviceId?: string;
   status?: number;
   tool?: string;
@@ -76,4 +76,38 @@ export function defaultServicePlaneLogSink(event: ServicePlaneLoggableEvent): vo
     return;
   }
   console.log(message);
+}
+
+/**
+ * Emits an operational event without allowing an application-owned sink to change request
+ * behavior. Logging is best effort at every Service Plane boundary: synchronous sink failures and
+ * rejected async sinks are both contained.
+ *
+ * @internal
+ */
+export function emitBestEffortServicePlaneLog<TEvent extends ServicePlaneLoggableEvent>(
+  sink: ServicePlaneLogSink<TEvent> | undefined,
+  event: TEvent,
+  context?: Context,
+): void {
+  if (!sink) return;
+  try {
+    const result = (sink as (event: TEvent, context?: Context) => unknown)(event, context);
+    if (isPromiseLike(result)) void Promise.resolve(result).catch(() => undefined);
+  } catch {
+    // An observability integration must never turn a successful request into an application error.
+  }
+}
+
+/** The serializable view of a thrown value for structured log events. */
+export function logErrorFields(error: unknown): { message: string; name: string } {
+  return error instanceof Error ? { message: error.message, name: error.name } : { message: String(error), name: 'Error' };
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (
+    (typeof value === 'object' || typeof value === 'function') &&
+    value !== null &&
+    typeof (value as PromiseLike<unknown>).then === 'function'
+  );
 }

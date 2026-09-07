@@ -1,5 +1,5 @@
 import type { CapabilitySigningJwk } from '../control-plane/capabilities.js';
-import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
+import { publicJwkFromPrivateJwk } from '../shared/jwk-auth.js';
 
 export type TestKeys = {
   privateJwk: CapabilitySigningJwk;

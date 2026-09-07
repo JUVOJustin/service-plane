@@ -1,6 +1,7 @@
 import type { Context } from 'hono';
 import { createMiddleware } from 'hono/factory';
-import { defaultServicePlaneLogSink, type ServicePlaneLogLevel } from '../shared/logging.js';
+import { requestIdFromContext } from '../shared/hono-context.js';
+import { defaultServicePlaneLogSink, emitBestEffortServicePlaneLog, logErrorFields, type ServicePlaneLogLevel } from '../shared/logging.js';
 import {
   SERVICE_DISCOVERY_PATH,
   SERVICE_PLANE_REQUEST_ID_HEADER,
@@ -25,7 +26,7 @@ export type ServicePlaneRequestLogEvent = {
   ability?: {
     exposure: string;
     id: string;
-    scopes?: string[];
+    scopes?: ReadonlyArray<string>;
   };
   serviceId: string;
   status: number;
@@ -82,39 +83,37 @@ export function servicePlaneLogger(service: ServiceDefinition, options: ServiceP
     const url = new URL(context.req.url);
     const ability = discovery.abilities.find((candidate) => candidate.rpc.path === url.pathname);
     const requestId = resolveRequestId(context, options);
+    const emit = (outcome: Pick<ServicePlaneRequestLogEvent, 'error' | 'event' | 'level' | 'status'>) => {
+      const event: ServicePlaneRequestLogEvent = {
+        durationMs: Date.now() - startedAt,
+        ...(outcome.error ? { error: outcome.error } : {}),
+        event: outcome.event,
+        level: outcome.level,
+        method: context.req.method,
+        path: url.pathname,
+        serviceId: service.id,
+        status: outcome.status,
+      };
+      if (requestId) event.requestId = requestId;
+      if (ability) event.ability = compactAbility(ability);
+      recordServicePlaneLogEvent(context, event);
+      emitBestEffortServicePlaneLog(write, event, context);
+    };
 
     try {
       await next();
-      const durationMs = Date.now() - startedAt;
-      const event: ServicePlaneRequestLogEvent = {
-        durationMs,
+      emit({
         event: url.pathname === SERVICE_DISCOVERY_PATH ? 'service_plane.discovery.served' : 'service_plane.request.completed',
         level: 'info',
-        method: context.req.method,
-        path: url.pathname,
-        serviceId: service.id,
         status: context.res.status,
-      };
-      if (requestId) event.requestId = requestId;
-      if (ability) event.ability = compactAbility(ability);
-      stashLogEvent(context, event);
-      write(event, context);
+      });
     } catch (error) {
-      const durationMs = Date.now() - startedAt;
-      const event: ServicePlaneRequestLogEvent = {
-        durationMs,
-        error: error instanceof Error ? { message: error.message, name: error.name } : { message: String(error), name: 'Error' },
+      emit({
+        error: logErrorFields(error),
         event: 'service_plane.request.failed',
         level: 'error',
-        method: context.req.method,
-        path: url.pathname,
-        serviceId: service.id,
         status: context.res.status >= 400 ? context.res.status : 500,
-      };
-      if (requestId) event.requestId = requestId;
-      if (ability) event.ability = compactAbility(ability);
-      stashLogEvent(context, event);
-      write(event, context);
+      });
       throw error;
     }
   });
@@ -144,21 +143,12 @@ function resolveRequestId(context: Context, options: ServicePlaneLoggerOptions):
  * surface mid-RPC, not at request completion) so app middleware reads one list either way.
  */
 export function recordServicePlaneLogEvent(context: Context, event: ServicePlaneLogEvent): void {
-  stashLogEvent(context, event);
-}
-
-function stashLogEvent(context: Context, event: ServicePlaneLogEvent): void {
   const events = context.get('servicePlaneLogEvents' as never) as ServicePlaneLogEvent[] | undefined;
   if (Array.isArray(events)) {
     events.push(event);
     return;
   }
   context.set('servicePlaneLogEvents' as never, [event] as never);
-}
-
-function requestIdFromContext(context: Context): string | undefined {
-  const value = context.get('requestId' as never) as unknown;
-  return typeof value === 'string' ? value : undefined;
 }
 
 function compactAbility(ability: ServiceAbilityDiscovery): NonNullable<ServicePlaneRequestLogEvent['ability']> {

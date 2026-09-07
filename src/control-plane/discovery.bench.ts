@@ -28,7 +28,7 @@ const document = (id: string): ServiceDiscoveryDocument => ({
     methods: {
       go: { inputSchema: { type: 'object' }, outputSchema: { type: 'object' }, scopes: [`${id}.s${index}`] },
     },
-    rpc: { path: `/rpc/${id}.a${index}`, transports: ['http-batch' as const] },
+    rpc: { path: `/rpc/v1/${id}.a${index}`, transports: ['fetch' as const] },
     scopes: [`${id}.s${index}`],
   })),
   capabilities: { scopes: Array.from({ length: 5 }, (_, index) => ({ id: `${id}.s${index}` })), serviceId: id },

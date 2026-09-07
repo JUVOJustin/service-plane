@@ -14,6 +14,7 @@ export {
   type AbilityValidationIssue,
   CapabilityAuthError,
   handlerFailureCause,
+  ServicePlaneClientError,
   ServicePlaneError,
   type ServicePlaneErrorCode,
   type ServicePlaneErrorInfo,
@@ -40,6 +41,7 @@ export {
   type ServicePlaneLoggableEvent,
   type ServicePlaneLogSink,
 } from '../shared/logging.js';
+export { SERVICE_PLANE_BROKER_RPC_PATH, SERVICE_PLANE_RPC_PROTOCOL, SERVICE_PLANE_RPC_PROTOCOL_HEADER } from '../shared/rpc-protocol.js';
 export type {
   AbilityAccess,
   AbilityExposure,
@@ -51,6 +53,7 @@ export type {
   CapabilityJwks,
   CapabilityScopeDefinition,
   CapabilitySubject,
+  ControlPlaneRpcTokenBinding,
   DiscoveredServiceAbility,
   FetchLike,
   IssueCapabilityTokenInput,
@@ -64,6 +67,9 @@ export type {
   OpenApiDocument,
   OpenApiDocumentCache,
   OpenApiObject,
+  PinnedCapabilityTokenInput,
+  ReadonlyOpenApiObject,
+  ReadonlyServiceCallerAuthDiscovery,
   RegistryCache,
   ServiceAbilityDiscovery,
   ServiceAbilityMcpProjection,
@@ -71,6 +77,7 @@ export type {
   ServiceAbilityMcpPromptProjection,
   ServiceAbilityMcpResourceProjection,
   ServiceAbilityMethodDiscovery,
+  ServiceAbilityNativeRpcBinding,
   ServiceAbilityRestProjection,
   ServiceCallerAuthDiscovery,
   ServiceDiscoveryDocument,
@@ -94,19 +101,16 @@ export {
   SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
   SERVICE_PLANE_MCP_PATH,
   SERVICE_PLANE_OPENAPI_PATH,
+  SERVICE_PLANE_PROOF_HEADER,
   SERVICE_PLANE_REQUEST_ID_HEADER,
   SERVICE_PLANE_REQUEST_ID_QUERY_PARAM,
 } from '../shared/types.js';
+export type { ControlPlaneAuthorizationInvocation, ControlPlaneInvocationAuthorizer } from './caller.js';
 export {
   type BrokerCaller,
   brokerCallerAccess,
   brokerCallerSubject,
-  type ControlPlaneRpcBroker,
-  type ControlPlaneRpcBrokerAbilityInput,
-  type CreateControlPlaneRpcBrokerOptions,
-  createControlPlaneRpcBroker,
-  type RootCapabilityOptions,
-} from './broker.js';
+} from './caller.js';
 export {
   generateHmacClientSecret,
   type HmacServiceClient,
@@ -145,7 +149,9 @@ export {
   mountCapabilityTokenEndpoint,
 } from './capabilities.js';
 export {
-  type ControlPlaneAbilitySessionOptions,
+  type ControlPlaneAbilityClient,
+  type ControlPlaneAbilityClientCallOptions,
+  type ControlPlaneAbilityClientOptions,
   type ControlPlaneRestOptions,
   type DiscoveryCacheRoute,
   ServicePlaneControlPlane,
@@ -160,8 +166,10 @@ export {
   httpsService,
   serviceDiscoveryRequest,
 } from './endpoints.js';
+export type { ControlPlaneInvocationOptions } from './invocation.js';
 export {
   type ControlPlaneMcpHandlerOptions,
+  type ControlPlaneMcpInvocation,
   type ControlPlaneMcpServerInfo,
   DEFAULT_MCP_PATH,
   generateMcpDiscovery,
@@ -178,6 +186,7 @@ export {
 export {
   type CreateServiceRegistryOptions,
   createServiceRegistry,
+  DEFAULT_SERVICE_DISCOVERY_RESPONSE_MAX_BYTES,
   memoryRegistryCache,
   serviceRegistryCacheKey,
 } from './registry.js';
@@ -186,12 +195,6 @@ export {
   type ControlPlaneRestInvocation,
   handleControlPlaneRestRequest,
 } from './rest.js';
-export {
-  type IssueCapabilityTokenForCallerInput,
-  issueCapabilityTokenForCaller,
-  issuedCapabilityTokenRpcResponse,
-  type RpcIssuedCapabilityToken,
-} from './rpc.js';
 export {
   type CapabilitySigningKey,
   type CreateCapabilityIssuerFromSigningKeysOptions,

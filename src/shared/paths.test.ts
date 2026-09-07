@@ -1,24 +1,38 @@
 import { describe, expect, it } from 'vitest';
-import { isOriginRelativePath, pathMatches } from './paths.js';
+import { hasOnlySimpleTemplateExpressions, isOriginRelativePath } from './paths.js';
 
 describe('path matching', () => {
-  it('honors constrained Hono route parameters', () => {
-    expect(pathMatches('/users/:id{[0-9]+}', '/users/123')).toBe(true);
-    expect(pathMatches('/users/:id{[0-9]+}', '/users/admin')).toBe(false);
+  it.each([
+    'example://items/{left}{right}',
+    'example://items/{left}-between-{right}',
+    'example://{host}.{suffix}/items',
+    'example://items?q={query}&page={page}',
+    'example://items#part-{start}-{end}',
+    'example://{id}/items/{id}',
+    'example://items/{id}?q={id}',
+    'example://items/{nested{id}}',
+    'example://items/{id',
+    'example://items/id}',
+    'example://items/}{id}',
+  ])('rejects unsafe or malformed URI template components: %s', (template) => {
+    expect(hasOnlySimpleTemplateExpressions(template)).toBe(false);
   });
 
-  it('honors Hono wildcard route segments', () => {
-    expect(pathMatches('/*', '/users/123')).toBe(true);
-    expect(pathMatches('/users/*', '/users/123/settings')).toBe(true);
-    expect(pathMatches('/users/*', '/teams/123')).toBe(false);
+  it.each([
+    'example://items/static',
+    'example://{host}.internal/items/pre-{id}.json?q={query}&fixed=yes#part-{fragment}-end',
+    'example://items/{id}/{other}',
+    'example://items/{__proto__}',
+  ])('accepts one globally unique variable per URI component: %s', (template) => {
+    expect(hasOnlySimpleTemplateExpressions(template)).toBe(true);
   });
 
   it('distinguishes service-local routes from host-replacing URL references', () => {
-    expect(isOriginRelativePath('/rpc/example.sync')).toBe(true);
+    expect(isOriginRelativePath('/rpc/v1/example.sync')).toBe(true);
     expect(isOriginRelativePath('//other.example/rpc')).toBe(false);
     expect(isOriginRelativePath('/\\other.example/rpc')).toBe(false);
-    expect(isOriginRelativePath('/rpc/example.sync?token=x')).toBe(false);
-    expect(isOriginRelativePath('/rpc/example.sync#fragment')).toBe(false);
+    expect(isOriginRelativePath('/rpc/v1/example.sync?token=x')).toBe(false);
+    expect(isOriginRelativePath('/rpc/v1/example.sync#fragment')).toBe(false);
   });
 
   it('rejects paths whose control characters the URL parser strips into a host reference', () => {
@@ -27,7 +41,7 @@ describe('path matching', () => {
       expect(new URL(path, 'https://hub.internal').origin).toBe('https://attacker.example');
       expect(isOriginRelativePath(path)).toBe(false);
     }
-    expect(isOriginRelativePath('/rpc/example sync')).toBe(false);
+    expect(isOriginRelativePath('/rpc/v1/example sync')).toBe(false);
     expect(isOriginRelativePath(' //attacker.example/rpc')).toBe(false);
   });
 });

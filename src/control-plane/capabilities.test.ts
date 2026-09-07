@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { defineCapabilities } from '../service/capabilities.js';
 import { verifyCapabilityToken } from '../shared/capability-tokens.js';
 import { testKeys } from '../test-support/index.js';
@@ -16,6 +16,35 @@ import {
 } from './capabilities.js';
 
 describe('capability issuer', () => {
+  it('shares one imported signing key across request-scoped issuer rebuilds', async () => {
+    const keys = await testKeys('shared-import-key');
+    const privateJwks = [keys.privateJwk];
+    const options = {
+      capabilities: [fizzyCapabilities],
+      grants: defineServiceGrants({
+        grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
+      }),
+      issuer: 'control-plane',
+      now: () => new Date('2026-05-09T12:00:00.000Z'),
+      privateJwks,
+    };
+    const importKey = vi.spyOn(crypto.subtle, 'importKey');
+    try {
+      for (let index = 0; index < 2; index += 1) {
+        const issuer = createCapabilityIssuer(options);
+        await issuer.issueCapabilityToken({
+          callerAccess: 'service',
+          callerServiceId: 'moco',
+          scopes: ['fizzy.users.lookup'],
+          targetServiceId: 'fizzy',
+        });
+      }
+      expect(importKey.mock.calls.filter((call) => Array.isArray(call[4]) && call[4].includes('sign'))).toHaveLength(1);
+    } finally {
+      importKey.mockRestore();
+    }
+  });
+
   it('issues tokens for granted service scopes', async () => {
     const keys = await testKeys();
     const issuer = createCapabilityIssuer({
@@ -384,6 +413,151 @@ describe('capability issuer', () => {
 
     expect(emptyScopeResponse.status).toBe(400);
     expect(wildcardScopeResponse.status).toBe(400);
+  });
+
+  it('keeps token parsing independent from body-consuming caller authentication', async () => {
+    const keys = await testKeys();
+    const issuer = createCapabilityIssuer({
+      capabilities: [fizzyCapabilities],
+      grants: defineServiceGrants({
+        grants: [{ caller: 'moco', scopes: ['fizzy.users.lookup'], target: 'fizzy' }],
+      }),
+      issuer: 'control-plane',
+      privateJwks: [keys.privateJwk],
+    });
+    const body = JSON.stringify({ scopes: ['fizzy.users.lookup'], targetServiceId: 'fizzy' });
+    let authenticatedBody = '';
+    let issuerResolutions = 0;
+    const app = new Hono();
+    mountCapabilityTokenEndpoint(
+      app,
+      () => {
+        issuerResolutions += 1;
+        return issuer;
+      },
+      {
+        authenticateCaller: async (context) => {
+          authenticatedBody = await context.req.raw.text();
+          return 'moco';
+        },
+        maxBodyBytes: new TextEncoder().encode(body).byteLength,
+      },
+    );
+
+    const response = await app.request('/.well-known/service-plane/capability-token', {
+      body,
+      headers: { 'content-type': 'application/json' },
+      method: 'POST',
+    });
+
+    expect(response.status).toBe(200);
+    expect(authenticatedBody).toBe(body);
+    expect(issuerResolutions).toBe(1);
+  });
+
+  it('stops an oversized streaming token body before a custom authenticator can consume it', async () => {
+    let authenticatorCalls = 0;
+    let cancelled = false;
+    let pulls = 0;
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelled = true;
+      },
+      pull(controller) {
+        pulls += 1;
+        controller.enqueue(new Uint8Array(64));
+        if (pulls === 512) controller.close();
+      },
+    });
+    const app = new Hono();
+    mountCapabilityTokenEndpoint(
+      app,
+      {
+        issueBrokeredCapabilityToken: async () => {
+          throw new Error('not reached');
+        },
+        issueCapabilityToken: async () => {
+          throw new Error('not reached');
+        },
+        jwks: async () => ({ keys: [] }),
+      },
+      {
+        authenticateCaller: async (context) => {
+          authenticatorCalls += 1;
+          await context.req.raw.text();
+          return 'moco';
+        },
+        maxBodyBytes: 8,
+      },
+    );
+
+    const response = await app.request(
+      new Request('https://plane.internal/.well-known/service-plane/capability-token', {
+        body,
+        method: 'POST',
+        duplex: 'half',
+      } as RequestInit),
+    );
+
+    expect(response.status).toBe(413);
+    expect(authenticatorCalls).toBe(0);
+    await vi.waitFor(() => expect(cancelled).toBe(true));
+    expect(pulls).toBeLessThanOrEqual(2);
+  });
+
+  it('bounds and validates token input before resolving the issuer', async () => {
+    let issuerResolutions = 0;
+    const issuer: CapabilityIssuer = {
+      issueBrokeredCapabilityToken: async () => {
+        throw new Error('not reached');
+      },
+      issueCapabilityToken: async () => {
+        throw new Error('not reached');
+      },
+      jwks: async () => ({ keys: [] }),
+    };
+    const app = new Hono();
+    mountCapabilityTokenEndpoint(
+      app,
+      () => {
+        issuerResolutions += 1;
+        return issuer;
+      },
+      { authenticateCaller: () => 'moco', maxBodyBytes: 8 },
+    );
+
+    const invalid = await app.request('/.well-known/service-plane/capability-token', {
+      body: '{',
+      method: 'POST',
+    });
+    const oversized = await app.request('/.well-known/service-plane/capability-token', {
+      body: '123456789',
+      headers: { 'content-length': '9' },
+      method: 'POST',
+    });
+
+    expect(invalid.status).toBe(400);
+    expect(oversized.status).toBe(413);
+    expect(issuerResolutions).toBe(0);
+  });
+
+  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])('rejects invalid token maxBodyBytes %s while mounting', (maxBodyBytes) => {
+    const app = new Hono();
+    expect(() =>
+      mountCapabilityTokenEndpoint(
+        app,
+        {
+          issueBrokeredCapabilityToken: async () => {
+            throw new Error('not reached');
+          },
+          issueCapabilityToken: async () => {
+            throw new Error('not reached');
+          },
+          jwks: async () => ({ keys: [] }),
+        },
+        { authenticateCaller: () => 'moco', maxBodyBytes },
+      ),
+    ).toThrow('Service-Plane capability token maxBodyBytes must be a positive safe integer');
   });
 
   it('rejects caller-asserted subjects at the token endpoint', async () => {

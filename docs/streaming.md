@@ -1,63 +1,77 @@
 # Streaming
 
-Goal: return many results over time from one ability method — large file transfers, long exports, incremental tool output — without inventing a wire protocol.
+Streaming methods return typed async iterators. Service Plane validates every yielded item and
+preserves cancellation across supported transports.
 
-Service Plane uses Cap'n Web's native stream support: a streaming method resolves to a standard `ReadableStream`, transferred over the RPC session with built-in flow control. Service Plane adds only its usual layer on top — per-item schema validation, scopes, discovery, and projections.
-
-## Declare A Streaming Method
-
-Set `stream: true`. The `output` schema then validates **each streamed item**, not the whole return:
+## Define A Stream
 
 ```ts
-readFile: abilityMethod({
-  input: z.object({ path: z.string() }),
-  output: z.object({ chunk: z.string() }), // one streamed item
-  scopes: ['hub.files.read'],
-  stream: true,
-}),
-```
+const ability = createAbilityBuilder<{ Bindings: Env }>();
 
-The handler returns an async generator (or any iterable / `ReadableStream`); the wrapper turns it into a validated `ReadableStream` lazily, so consumer backpressure reaches the generator untouched:
+export const filesContract = defineAbility({
+  id: 'files',
+  scopes: ['files.read'],
+  methods: {
+    read: ability.stream({
+      input: z.object({ path: z.string() }),
+      output: z.object({ chunk: z.string() }),
+      scopes: ['files.read'],
+      mcp: { name: 'files_read', description: 'Read a file' },
+    }),
+  },
+  rpc: { transports: ['fetch', 'service-binding', 'websocket'] },
+});
 
-```ts
-class HubFilesHandler extends RpcTarget {
-  async *readFile(input: { path: string }) {
-    for await (const chunk of this.storage.read(input.path)) {
+export const files = implementAbility(filesContract, {
+  read: async function* ({ context, input }) {
+    for await (const chunk of context.env.STORAGE.read(input.path)) {
+      context.signal?.throwIfAborted();
       yield { chunk };
     }
-  }
+  },
+});
+```
+
+The output schema describes one item, not an array or stream wrapper. Streaming methods may be MCP
+tools, but cannot be REST operations, MCP resources, or MCP prompts.
+
+## Consume A Stream
+
+```ts
+const files = createBrokeredAbilityClient({
+  ability: filesContract,
+  targetServiceId: 'files-service',
+  transport: { origin: 'https://api.example.com' },
+});
+
+const stream = await files.read({ path: '/events.ndjson' }, { signal });
+for await (const item of stream) {
+  console.log(item.chunk);
 }
 ```
 
-### Why `stream: true` is explicit
+Breaking out of the loop calls iterator cleanup. An `AbortSignal` also cancels the local call and is
+combined with the forwarded deadline at the service. Upstream work should observe
+`context.signal`, especially around long waits. A caller-side abort is reported as
+`ServicePlaneClientError` with `code: 'cancelled'`, status `499`, and `retryable: false`.
 
-The flag is declarative metadata, like `rest` and `mcp` — it cannot be inferred from the handler returning a `ReadableStream` at runtime, because it changes meaning before any call happens:
+## Choose A Transport
 
-- It flips what the `output` schema describes (one item instead of the whole return), which drives per-item validation and the JSON Schemas in discovery.
-- Projections are static: MCP tools advertise the aggregated `{ items }` schema and `_meta.servicePlane.stream`, and the broker/MCP pick a session transport *before* invoking the method.
-- Setup checks fail fast: streaming abilities must enable a session transport, and streaming methods cannot project REST, MCP resources, or prompts.
-- The TypeScript contracts (`AbilityImplementation`, `AbilityRpc`) derive handler and caller signatures from it.
+| Hop | Normal choice |
+| --- | --- |
+| Browser/headless client → plane | Fetch streaming; WebSocket for an interactive session |
+| Plane → same-account Worker | Service-binding Fetch |
+| Plane → HTTPS service | Fetch streaming |
+| Direct long-lived session | WebSocket |
+| Separate direct Durable Object deployment | Experimental hibernating WebSocket |
 
-Without the flag, a method that accidentally returned a stream would silently change transport semantics instead of failing output validation.
+Cloudflare native RPC is unary-only in Service Plane. A `service-binding` client automatically uses
+native `invokeAbility` for unary methods and `binding.fetch` for ordinary streams.
+Batching is also unary Fetch-only; streaming calls are never placed into a batch.
 
-## Transports
+## Enable WebSocket
 
-Cap'n Web streams ride the ongoing RPC session, so streaming methods need a **session transport**:
-
-| Transport | Streams | Notes |
-| --- | --- | --- |
-| `cloudflareNativeRpc(binding)` | yes | Workers RPC streams natively; preferred same-account on Cloudflare |
-| `websocketRpc(url, { createWebSocket? })` | yes | long-lived Cap'n Web session; inject a client factory when the runtime has no global `WebSocket` |
-| `customRpcTransport(transport)` | yes | any bidirectional transport |
-| `cloudflareServiceBindingRpc(binding)` / `httpBatchRpc(url)` | no | one round trip; streaming calls fail with 405 |
-
-An ability that declares streaming methods must enable `websocket` or `cloudflare-binding-rpc` in `rpc.transports` (checked at setup). Unary methods on the same ability keep working over HTTP-batch — batch stays the right default for request/response calls. For the full environment/cost decision guide, see [Choosing A Transport](transports.md).
-
-## Serve WebSocket Sessions
-
-The service shell serves HTTP-batch and WebSocket on the same `/rpc/<abilityId>` route through [`@hono/capnweb`](https://github.com/honojs/middleware/tree/main/packages/capnweb); you only wire the runtime's `upgradeWebSocket` helper, exactly as that adapter documents.
-
-Cloudflare Workers:
+Add the runtime's Hono upgrade helper and declare the transport on the ability:
 
 ```ts
 import { upgradeWebSocket } from 'hono/cloudflare-workers';
@@ -68,155 +82,163 @@ const service = new ServicePlaneService({
 });
 ```
 
-Node.js:
+For the public plane, use `broker: { upgradeWebSocket }`; clients connect to
+`wss://<plane>/rpc/v1/broker/ws`. Caller authentication still runs in `invocationMiddleware`, and
+logical calls carry their own request ID, idempotency key, and deadline.
+
+The middleware authenticates the physical HTTP upgrade once. In a browser, use a secure cookie or
+a short-lived ticket in the URL. In a server runtime, a custom `createWebSocket` closure may use a
+WebSocket implementation that sets upgrade headers. The `headers` option on a broker transport is
+Fetch-only and does not authenticate a WebSocket.
+
+`rpc.maxRequestBodyBytes` and `broker.maxRequestBodyBytes` limit each decoded message to one MiB by
+default. Automatically managed sockets close with WebSocket code `1009` when a message is too
+large. A Durable Object forwarding the event manually receives a rejected promise with status
+`413`, so its own socket policy stays explicit.
+
+Client reconnect is explicit:
 
 ```ts
-import { serve } from '@hono/node-server';
-import { createNodeWebSocket } from '@hono/node-ws';
+transport: {
+  type: 'websocket',
+  url: 'wss://api.example.com/rpc/v1/broker/ws',
+  reconnect: { enabled: true, maxAttempt: 5 },
+},
+```
 
-const app = new Hono();
-const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
+Retries remain an application decision. Reconnecting a socket does not make a non-idempotent
+method safe to repeat.
+
+Dispose a long-lived client when its owner shuts down:
+
+```ts
+disposeAbilityClient(client);
+```
+
+This cancels its active iterators, closes every physical socket, and prevents configured reconnect
+from opening another one. Disposal is idempotent. Breaking out of a stream remains the prompt way
+to release that individual iterator; client disposal owns the physical WebSocket lifetime.
+
+## Experimental Direct Durable Object Hibernation
+
+A hibernating method is a direct service WebSocket feature. It cannot use Fetch, native unary RPC,
+batching, the control-plane broker, or `plane.abilityClient`. Brokered and in-process clients
+fail before opening a downstream call; only the Durable Object that owns the direct service socket
+can restore the subscription.
+
+This is outside the normal single-public-plane architecture. Default broker-protected ingress rejects
+ordinary direct capabilities. A direct deployment must explicitly choose `ingress: false`, secure
+its upgrade endpoint, and own subscription expiry and revocation after wake-up. Hibernation methods
+cannot be projected as REST/MCP. Use `ability.stream` for portable, brokered subscriptions.
+
+Declare the contract:
+
+```ts
+const eventsContract = defineAbility({
+  id: 'events',
+  scopes: ['events.read'],
+  methods: {
+    subscribe: ability.hibernationStream({
+      input: z.object({ channel: z.string() }),
+      output: EventSchema,
+      scopes: ['events.read'],
+    }),
+  },
+  rpc: { transports: ['websocket'] },
+});
+```
+
+Attach the subscription ID to the accepted socket:
+
+```ts
+const events = implementAbility(eventsContract, {
+  subscribe: ({ context }) =>
+    new AbilityHibernationStream((id) => {
+      context.webSocket?.serializeAttachment?.({ id });
+    }),
+});
 
 const service = new ServicePlaneService({
+  abilities: [events],
+  ingress: false, // Deliberate direct-service topology; not the public-plane production default.
+  rpc: { manualWebSocket: true },
   // ...
-  app,
-  rpc: { upgradeWebSocket },
 });
-
-const server = serve({ fetch: service.fetch, port: 8787 });
-injectWebSocket(server);
 ```
 
-Deno and Bun follow the same pattern with `upgradeWebSocket` from `hono/deno` or `hono/bun`. The
-control-plane configures authentication once at the top level and the socket upgrade on its RPC
-broker: `{ invocationMiddleware, rpc: { upgradeWebSocket } }`.
+Cloudflare limits a serialized WebSocket attachment to 16,384 bytes. Persist larger state in
+Durable Object storage and attach only its lookup key. Fixed heartbeats can use
+`state.setWebSocketAutoResponse(...)` so they do not wake the object; request and response are each
+limited to 2,048 characters. See Cloudflare's
+[hibernation guidance](https://developers.cloudflare.com/durable-objects/best-practices/websockets/#websocketserializeattachment).
 
-On Cloudflare, same-account callers can skip WebSocket entirely: expose `connectAbility` from a `WorkerEntrypoint` and use native binding RPC, which streams natively (see [Cloudflare](cloudflare.md)).
-
-## Call A Streaming Method
-
-Nothing changes on the caller except the transport choice — the method resolves to a `ReadableStream` of validated items:
+The Durable Object accepts the socket and forwards platform events:
 
 ```ts
-const api = await abilitySession<AbilityRpc<typeof hubFiles>>({
-  abilityId: 'hub.files',
-  callerServiceId: 'workflow-runner',
-  targetServiceId: 'hub',
-  scopes: ['hub.files.read'],
-  requestToken,
-  transport: websocketRpc('wss://hub.example.com/rpc/hub.files'), // or cloudflareNativeRpc(binding)
-});
-
-const stream = await api.readFile({ path: '/big.bin' });
-for await (const item of stream) {
-  // { chunk: string }, already output-validated by the service
-}
-```
-
-Persistent WebSocket/custom sessions and cached `cloudflareNativeRpc` targets own transport
-resources. Dispose every ability session when its work is complete; TypeScript's explicit resource
-management handles the normal case:
-
-```ts
-{
-  using api = await abilitySession<AbilityRpc<typeof hubFiles>>({
-    // ...the same session options
-  });
-
-  const stream = await api.readFile({ path: '/big.bin' });
-  for await (const item of stream) {
-    // ...
+export class EventSocket extends DurableObject<Env> {
+  async fetch(request: Request) {
+    if (request.headers.get('upgrade') !== 'websocket') {
+      return service.fetch(request, this.env);
+    }
+    const pair = new WebSocketPair();
+    this.ctx.acceptWebSocket(pair[1]);
+    return new Response(null, { status: 101, webSocket: pair[0] });
   }
-} // closes the persistent session or disposes the native target
-```
 
-When `using` is not available, use `disposeAbilitySession` in `finally`:
+  webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    return service.webSocketMessage('events', ws, message, this.env);
+  }
 
-```ts
-const api = await abilitySession<AbilityRpc<typeof hubFiles>>({
-  // ...the same session options
-});
-
-try {
-  const stream = await api.readFile({ path: '/big.bin' });
-  // consume the stream
-} finally {
-  await disposeAbilitySession(api);
+  webSocketClose(ws: WebSocket) {
+    return service.webSocketClose('events', ws);
+  }
 }
 ```
 
-Disposal is safe for every transport and idempotent. It closes persistent sockets/custom sessions,
-disposes a cached native binding target, and has no transport resource to release for per-call
-HTTP-batch/fetch. In every case the session object is permanently closed and must not be reused.
+Forward each event as soon as the runtime delivers it and return the promise. Service Plane
+normalizes frames and enters them into the private peer in arrival order per socket, including when
+binary conversion is asynchronous. `webSocketClose` waits for queued frames to reach that peer;
+independent RPC executions remain concurrent after delivery.
 
-Cancel by exiting the loop early (or `reader.cancel()`). For a handler-owned `ReadableStream`, its standard `cancel()` hook runs even while a pull is pending, so use that form when cancellation must interrupt an upstream fetch, subscription, or other long wait. Async iterators receive `return()`, but JavaScript queues it behind an already-running `next()`; an async generator parked in a non-settling `await` must therefore make that wait cooperative or return a cancellable `ReadableStream` instead. A handler failure or an item that fails output validation surfaces as a stream error on `read()`.
-
-## Stream Through The Broker
-
-Streams proxy transparently across broker sessions — no extra routes. Connect to `/rpc` over WebSocket; the plane authorizes the caller, mints the (brokered) token, and reaches the service over its own session transport:
-
-1. the endpoint's native ability RPC binding, when available (`ServiceEndpoint.abilityRpc` — pass it explicitly as `cloudflareServiceBinding({ abilityRpc })`),
-2. otherwise WebSocket.
+When the object wakes, validate and encode each event before sending it:
 
 ```ts
-const ability = await broker.ability('hub', 'hub.files');
-{
-  using api = await ability.connect(['hub.files.read']);
-  const stream = await api.readFile({ path: '/big.bin' });
-  // consume the stream before the session leaves scope
-}
+const { id } = ws.deserializeAttachment() as { id: string };
+ws.send(await encodeAbilityHibernationEvent(EventSchema, id, event));
 ```
 
-Ingress-protected services work unchanged: the broker's token carries the signed broker claim, and the stream flows service → plane → caller with flow control on each hop.
+Terminal events use the fourth argument; the third argument remains their payload:
 
-`ServicePlaneControlPlane` enables broker streaming only for an upgraded WebSocket caller. If you
-embed `createControlPlaneRpcBroker` in a custom shell, `rootCapability` defaults to rejecting
-streaming methods; pass `{ allowStreaming: true }` only when that shell has established a session
-transport to the caller.
+```ts
+ws.send(await encodeAbilityHibernationEvent(EventSchema, id, error, { event: 'error' }));
+ws.send(await encodeAbilityHibernationEvent(EventSchema, id, undefined, { event: 'close' }));
+```
+
+A hibernating subscription can outlive an in-memory deadline; persist its expiry and check it after
+wake-up.
 
 ## High-Frequency Streams
 
-Per-item cost is CPU, not waiting: validation runs on one item as it passes through (microseconds), and Cap'n Web serializes one message per item per hop. Cost therefore scales with **message rate × hops** — and serialization dominates, not validation (`npm run bench` streams 100,000 token-sized items per iteration against native baselines; disabling validation changes almost nothing, while batching items changes everything).
-
-For LLM-style token streams, batch deltas instead of sending one message per token. This is deliberately a recipe, not an API: the batching policy is application-owned, and the batch belongs in the method contract — declare it as the item and flush on whichever limit is hit first, size or time. The size cap flushes chunky items early instead of piling them up in memory; the time cap bounds latency when the producer trickles:
-
-```ts
-streamCompletion: abilityMethod({
-  input: z.object({ prompt: z.string() }),
-  output: z.array(z.object({ delta: z.string() })), // the batch is the item
-  scopes: ['llm.call'],
-  stream: true,
-}),
-```
+For token streams or change feeds, batching items can reduce serialization, validation, and
+transport overhead. Batching changes the yielded item type, so declare it in the contract:
 
 ```ts
-async *streamCompletion(input: { prompt: string }) {
-  let batch: Array<{ delta: string }> = [];
-  let batchBytes = 0;
-  let flushBy = 0;
-  for await (const delta of this.llm.tokens(input.prompt)) {
-    if (batch.length === 0) flushBy = Date.now() + 50; // latency bound for slow producers
-    batch.push(delta);
-    batchBytes += JSON.stringify(delta).length;
-    if (batchBytes >= 2048 || Date.now() >= flushBy) {
-      yield batch;
-      batch = [];
-      batchBytes = 0;
-    }
+const EventBatch = z.array(EventSchema).max(100);
+
+watch: ability.stream({ input: WatchInput, output: EventBatch, scopes: ['events.read'] })
+
+watch: async function* ({ input }) {
+  for await (const batch of readEventBatches(input, { maxItems: 100, maxWaitMs: 25 })) {
+    yield batch;
   }
-  if (batch.length > 0) yield batch;
 }
 ```
 
-In the benchmark (100,000 deltas per stream) this cuts a stream from ~1.0 s to ~87 ms — ~2,400 wire messages instead of ~100k — and lands *below* the per-item native-binding cost, because validating one array per batch is also cheaper than validating items one by one.
+The client then iterates `Event[]`. If the output schema remains `EventSchema`, yield one event at a
+time; every yielded value is validated against that schema.
 
-Two more levers for hot paths:
+MCP streaming tools aggregate items into a final structured response and enforce configured item
+and byte limits. Use the typed client for an unbounded stream.
 
-- **Choose the data path explicitly.** Production ingress-protected services stream through the broker. Direct `websocketRpc`/`cloudflareNativeRpc` sessions are for local development or deployments that intentionally opt out of ingress; they keep the plane out of the data path but make the service directly reachable.
-- **Prefer persistent sessions over HTTP-batch for chatty callers.** A batch call verifies the capability token per request; a session verifies once at `authenticate` and then costs microseconds per call.
-
-## MCP Streaming Tools
-
-Published streaming methods with `mcp` metadata become tools whose `tools/call` answers over SSE per MCP streamable HTTP: progress notifications while items arrive, then one final result aggregating `structuredContent: { items }`. See [OpenAPI and MCP](openapi-mcp.md#tools).
-
-Next: [reference](reference.md#streaming-methods), [Cloudflare](cloudflare.md), and [Node.js](nodejs.md).
+See [transports](transports.md) for topology guidance and [Cloudflare](cloudflare.md) for deployment
+details.

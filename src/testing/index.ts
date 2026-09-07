@@ -1,2 +1,2 @@
 export { memoryCapabilityTokenCache } from './memory-cache.js';
-export { memoryRpcTransportPair } from './memory-transport.js';
+export { MemoryWebSocket, memoryWebSocketPair } from './memory-web-socket.js';

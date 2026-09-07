@@ -1,7 +1,11 @@
+import { toAbilityStream } from '../service/ability.js';
+import { readBoundedRequestText, ServicePlaneBodyTooLargeError, validateBodyByteLimit } from '../shared/body-limit.js';
 import type { ConnInfo } from '../shared/conn-info.js';
-import { CapabilityAuthError } from '../shared/errors.js';
+import { CapabilityAuthError, servicePlaneErrorInfo } from '../shared/errors.js';
+import { isAsyncIterable, isRecord } from '../shared/guards.js';
 import { inlineJsonSchemaRoot as inlineSchemaRoot } from '../shared/json-schema.js';
-import type { ServicePlaneBrokerLogEvent } from '../shared/logging.js';
+import { emitBestEffortServicePlaneLog, logErrorFields, type ServicePlaneBrokerLogEvent } from '../shared/logging.js';
+import { hasOnlySimpleTemplateExpressions, simpleTemplateComponents } from '../shared/paths.js';
 import {
   type DiscoveredServiceAbility,
   type McpDiscoveryDocument,
@@ -12,21 +16,37 @@ import {
   type McpToolDiscovery,
   type OpenApiObject,
   SERVICE_PLANE_MCP_PATH,
+  type ServiceAbilityMcpProjection,
   type ServiceAbilityMcpPromptArgument,
+  type ServiceAbilityMcpPromptProjection,
   type ServiceAbilityMcpResourceProjection,
   type ServiceRegistry,
   type ServiceRegistrySnapshot,
 } from '../shared/types.js';
-import { type BrokerCaller, brokerCallerLogFields } from './broker.js';
+import { type BrokerCaller, brokerCallerLogFields, type ControlPlaneInvocationAuthorizer } from './caller.js';
 import type { CapabilityIssuer } from './capabilities.js';
-import { invokeControlPlaneMethod, openControlPlaneMethodSession } from './invocation.js';
+import { invokeControlPlaneMethod, raceControlPlaneOperation } from './invocation.js';
 
 export type ControlPlaneMcpServerInfo = {
   name: string;
   version: string;
 };
 
+/** Published MCP projection selected from one request-scoped discovery snapshot. */
+export type ControlPlaneMcpInvocation = {
+  /** Ability selected from the discovery snapshot used for MCP matching. */
+  readonly abilityId: string;
+  /** Method selected after resolving the tool, resource, or prompt identifier. */
+  readonly method: string;
+  /** Method scopes requested when the plane mints the downstream capability. */
+  readonly scopes: ReadonlyArray<string>;
+  /** Catalog service that owns the matched ability. */
+  readonly serviceId: string;
+};
+
 export type ControlPlaneMcpHandlerOptions = {
+  /** Product permission check applied to tool, resource, and prompt method invocations. */
+  authorizeInvocation?: ControlPlaneInvocationAuthorizer;
   /**
    * Browser requests must come from the MCP endpoint's own origin by default. Deployments
    * intentionally serving browser clients from another origin can allow exact origins here.
@@ -44,15 +64,18 @@ export type ControlPlaneMcpHandlerOptions = {
   idempotencyKey?: string;
   issuer: CapabilityIssuer;
   log?: (event: ServicePlaneBrokerLogEvent) => void;
+  /** Maximum accepted JSON-RPC request-body size. Defaults to one MiB. */
+  maxBodyBytes?: number;
   /** Receives the projected target once a tool, resource, or prompt resolves to an ability method. */
-  onInvocation?: (invocation: { abilityId: string; method: string; scopes: string[]; serviceId: string }) => void;
+  onInvocation?: (invocation: ControlPlaneMcpInvocation) => void;
   /**
    * When the request reached the plane, for deadline accounting: the budget forwarded to a service
    * is what is left of `timeoutMs` after everything since this instant — JSON-RPC parsing, the
    * catalog fan-out, token minting. Defaults to handler entry.
    */
   receivedAt?: number;
-  registry: ServiceRegistry;
+  /** Discovery surface used by MCP projections. A full ServiceRegistry remains assignable. */
+  registry: Pick<ServiceRegistry, 'discover'>;
   requestId?: string;
   serverInfo?: Partial<ControlPlaneMcpServerInfo>;
   /**
@@ -68,8 +91,25 @@ export type ControlPlaneMcpHandlerOptions = {
   timeoutMs?: number;
 };
 
+/** Cheap request-boundary options needed before registry and issuer resolution. */
+type ControlPlaneMcpPreflightOptions = Pick<ControlPlaneMcpHandlerOptions, 'allowedOrigins' | 'maxBodyBytes'>;
+
+/** A validated MCP request whose body can be dispatched without reading the Request again. */
+export type PreparedControlPlaneMcpRequest = {
+  /** Whether the caller can receive an SSE response for a streaming tool. */
+  acceptsEventStream: boolean;
+  /** Validated JSON-RPC correlation id. */
+  id: JsonRpcId;
+  /** Validated JSON-RPC method name. */
+  method: string;
+  /** Method parameters from the parsed JSON-RPC request. */
+  params: unknown;
+};
+
 const DEFAULT_MCP_STREAM_MAX_ITEMS = 10_000;
 const DEFAULT_MCP_STREAM_MAX_BYTES = 1_048_576;
+const DEFAULT_MCP_MAX_BODY_BYTES = 1_048_576;
+const MCP_BODY_TOO_LARGE_MESSAGE = 'Service-Plane MCP request body is too large';
 
 export const DEFAULT_MCP_PATH = SERVICE_PLANE_MCP_PATH;
 
@@ -92,78 +132,120 @@ type JsonRpcId = string | number | null;
 type McpMethodMatch = {
   ability: DiscoveredServiceAbility;
   method: string;
-  scopes: string[];
+  scopes: ReadonlyArray<string>;
 };
+
+type IndexedMcpMethod<TProjection> = McpMethodMatch & {
+  definition: DiscoveredServiceAbility['methods'][string];
+  projection: TProjection;
+};
+
+type McpProjectionIndex = {
+  prompts: Map<string, IndexedMcpMethod<ServiceAbilityMcpPromptProjection>>;
+  resources: Map<string, IndexedMcpMethod<ServiceAbilityMcpResourceProjection>>;
+  tools: Map<string, IndexedMcpMethod<ServiceAbilityMcpProjection>>;
+};
+
+// Listing and invocation share this full-catalog pass so a direct call cannot silently select the
+// first of two services that publish the same MCP identifier.
+function indexMcpProjections(snapshot: ServiceRegistrySnapshot): McpProjectionIndex {
+  const prompts = new Map<string, IndexedMcpMethod<ServiceAbilityMcpPromptProjection>>();
+  const resources = new Map<string, IndexedMcpMethod<ServiceAbilityMcpResourceProjection>>();
+  const tools = new Map<string, IndexedMcpMethod<ServiceAbilityMcpProjection>>();
+
+  for (const ability of snapshot.abilities) {
+    if (ability.exposure !== 'published') continue;
+    for (const [method, definition] of Object.entries(ability.methods)) {
+      const match = { ability, definition, method, scopes: [...definition.scopes] };
+      if (definition.mcp) {
+        indexMcpProjection(tools, definition.mcp.name, 'tool name', { ...match, projection: definition.mcp });
+      }
+      if (definition.mcpResource) {
+        if (!hasOnlySimpleTemplateExpressions(definition.mcpResource.uri)) {
+          throw new Error(`Service-Plane MCP resource URI has an invalid template expression: ${ability.id}/${method}`);
+        }
+        indexMcpProjection(resources, definition.mcpResource.uri, 'resource uri', {
+          ...match,
+          projection: definition.mcpResource,
+        });
+      }
+      if (definition.mcpPrompt) {
+        indexMcpProjection(prompts, definition.mcpPrompt.name, 'prompt name', {
+          ...match,
+          projection: definition.mcpPrompt,
+        });
+      }
+    }
+  }
+
+  return { prompts, resources, tools };
+}
+
+function indexMcpProjection<T>(
+  index: Map<string, T>,
+  identifier: string,
+  kind: 'prompt name' | 'resource uri' | 'tool name',
+  value: T,
+): void {
+  if (index.has(identifier)) {
+    throw new Error(`Duplicate MCP ${kind} across published methods: ${identifier}`);
+  }
+  index.set(identifier, value);
+}
 
 export function generateMcpDiscovery(snapshot: ServiceRegistrySnapshot): McpDiscoveryDocument {
   const prompts: McpPromptDiscovery[] = [];
   const resources: McpResourceDiscovery[] = [];
   const resourceTemplates: McpResourceTemplateDiscovery[] = [];
   const tools: McpToolDiscovery[] = [];
-  // Dispatch resolves by first name/uri match, so duplicates across services would make
-  // routing order-dependent and silently shadow one projection behind another.
-  const seenToolNames = new Set<string>();
-  const seenPromptNames = new Set<string>();
-  const seenResourceUris = new Set<string>();
+  const index = indexMcpProjections(snapshot);
 
-  for (const ability of snapshot.abilities) {
-    if (ability.exposure !== 'published') continue;
-    for (const [methodName, method] of Object.entries(ability.methods)) {
-      const meta: McpServicePlaneMeta = {
-        servicePlane: {
-          abilityId: ability.id,
-          method: methodName,
-          scopes: method.scopes,
-          serviceId: ability.serviceId,
-          ...(method.stream ? { stream: true as const } : {}),
-        },
-      };
-      if (method.mcp) {
-        if (seenToolNames.has(method.mcp.name)) {
-          throw new Error(`Duplicate MCP tool name across published methods: ${method.mcp.name}`);
-        }
-        seenToolNames.add(method.mcp.name);
-        const outputSchema = mcpToolOutputSchema(method);
-        tools.push({
-          _meta: meta,
-          ...(method.mcp.description ? { description: method.mcp.description } : {}),
-          // Root inlined so clients that read `type`/`properties` without a resolver see the
-          // object shape even when the vendor rooted the schema at a `$ref`.
-          inputSchema: inlineSchemaRoot(method.inputSchema),
-          name: method.mcp.name,
-          ...(outputSchema ? { outputSchema } : {}),
-        });
-      }
-      if (method.mcpResource) {
-        const { uri, ...metadata } = method.mcpResource;
-        if (seenResourceUris.has(uri)) {
-          throw new Error(`Duplicate MCP resource uri across published methods: ${uri}`);
-        }
-        seenResourceUris.add(uri);
-        if (isResourceTemplateUri(uri)) {
-          resourceTemplates.push({ _meta: meta, ...metadata, uriTemplate: uri });
-        } else {
-          resources.push({ _meta: meta, ...metadata, uri });
-        }
-      }
-      if (method.mcpPrompt) {
-        if (seenPromptNames.has(method.mcpPrompt.name)) {
-          throw new Error(`Duplicate MCP prompt name across published methods: ${method.mcpPrompt.name}`);
-        }
-        seenPromptNames.add(method.mcpPrompt.name);
-        const args = method.mcpPrompt.arguments ?? derivePromptArguments(method.inputSchema);
-        prompts.push({
-          _meta: meta,
-          ...(args ? { arguments: args } : {}),
-          ...(method.mcpPrompt.description ? { description: method.mcpPrompt.description } : {}),
-          name: method.mcpPrompt.name,
-          ...(method.mcpPrompt.title ? { title: method.mcpPrompt.title } : {}),
-        });
-      }
+  for (const match of index.tools.values()) {
+    const outputSchema = mcpToolOutputSchema(match.definition);
+    tools.push({
+      _meta: mcpServicePlaneMeta(match),
+      ...(match.projection.description ? { description: match.projection.description } : {}),
+      // Root inlined so clients that read `type`/`properties` without a resolver see the
+      // object shape even when the vendor rooted the schema at a `$ref`.
+      inputSchema: inlineSchemaRoot(match.definition.inputSchema),
+      name: match.projection.name,
+      ...(outputSchema ? { outputSchema } : {}),
+    });
+  }
+
+  for (const match of index.resources.values()) {
+    const { uri, ...metadata } = match.projection;
+    if (isResourceTemplateUri(uri)) {
+      resourceTemplates.push({ _meta: mcpServicePlaneMeta(match), ...metadata, uriTemplate: uri });
+    } else {
+      resources.push({ _meta: mcpServicePlaneMeta(match), ...metadata, uri });
     }
   }
 
+  for (const match of index.prompts.values()) {
+    const args = match.projection.arguments ?? derivePromptArguments(match.definition.inputSchema);
+    prompts.push({
+      _meta: mcpServicePlaneMeta(match),
+      ...(args ? { arguments: [...args] } : {}),
+      ...(match.projection.description ? { description: match.projection.description } : {}),
+      name: match.projection.name,
+      ...(match.projection.title ? { title: match.projection.title } : {}),
+    });
+  }
+
   return { prompts, resourceTemplates, resources, tools };
+}
+
+function mcpServicePlaneMeta(match: IndexedMcpMethod<unknown>): McpServicePlaneMeta {
+  return {
+    servicePlane: {
+      abilityId: match.ability.id,
+      method: match.method,
+      scopes: [...match.scopes],
+      serviceId: match.ability.serviceId,
+      ...(match.definition.stream ? { stream: true as const } : {}),
+    },
+  };
 }
 
 /**
@@ -171,16 +253,48 @@ export function generateMcpDiscovery(snapshot: ServiceRegistrySnapshot): McpDisc
  * JSON except streaming tool calls over SSE, and no session id is issued.
  */
 export async function handleControlPlaneMcpRequest(request: Request, options: ControlPlaneMcpHandlerOptions): Promise<Response> {
-  const transportError = validateControlPlaneMcpTransportRequest(request, options.allowedOrigins);
-  if (transportError) return transportError;
-  if (request.method !== 'POST') {
-    return new Response(null, { headers: { allow: 'POST' }, status: 405 });
+  const receivedAt = options.receivedAt ?? Date.now();
+  let prepared: PreparedControlPlaneMcpRequest | Response;
+  try {
+    prepared = await raceControlPlaneOperation(
+      prepareControlPlaneMcpRequest(request, options),
+      { receivedAt, ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) },
+      'MCP request parsing',
+    );
+  } catch (error) {
+    return protocolError(null, error, JSON_RPC_INTERNAL_ERROR);
   }
+  if (prepared instanceof Response) return prepared;
+  return handlePreparedControlPlaneMcpRequest(prepared, mcpOptionsWithReceivedAt(options, receivedAt));
+}
 
+// Keep lazy registry/issuer getters lazy: object spread would resolve every runtime dependency even
+// for ping and invalid requests. An inherited view only overrides the request-entry timestamp.
+function mcpOptionsWithReceivedAt(options: ControlPlaneMcpHandlerOptions, receivedAt: number): ControlPlaneMcpHandlerOptions {
+  if (options.receivedAt === receivedAt) return options;
+  const view = Object.create(options) as ControlPlaneMcpHandlerOptions;
+  Object.defineProperty(view, 'receivedAt', { enumerable: true, value: receivedAt });
+  return view;
+}
+
+/**
+ * Consumes and validates the cheap HTTP and JSON-RPC boundary before runtime dependencies are
+ * resolved. A Response means the request is complete and no registry or issuer is needed.
+ */
+export async function prepareControlPlaneMcpRequest(
+  request: Request,
+  options: ControlPlaneMcpPreflightOptions = {},
+): Promise<PreparedControlPlaneMcpRequest | Response> {
+  const boundaryError = preflightControlPlaneMcpRequest(request, options);
+  if (boundaryError) return boundaryError;
+  const maxBodyBytes = validateControlPlaneMcpMaxBodyBytes(options.maxBodyBytes);
   let message: unknown;
   try {
-    message = await request.json();
-  } catch {
+    message = JSON.parse(await readBoundedRequestText(request, maxBodyBytes, MCP_BODY_TOO_LARGE_MESSAGE));
+  } catch (error) {
+    if (error instanceof ServicePlaneBodyTooLargeError) {
+      return jsonRpcError(null, JSON_RPC_INVALID_REQUEST, error.message, 413, { status: 413 });
+    }
     return jsonRpcError(null, JSON_RPC_PARSE_ERROR, 'Invalid JSON in MCP request body', 400);
   }
   if (Array.isArray(message)) {
@@ -210,33 +324,83 @@ export async function handleControlPlaneMcpRequest(request: Request, options: Co
   if (!Object.hasOwn(message, 'id')) return new Response(null, { status: 202 });
   const id = jsonRpcIdOf(message);
   if (id === undefined) return jsonRpcError(null, JSON_RPC_INVALID_REQUEST, 'Invalid JSON-RPC id', 400);
-  const method = message.method;
 
+  return {
+    acceptsEventStream: acceptsEventStream(request),
+    id,
+    method: message.method,
+    params: message.params,
+  };
+}
+
+/**
+ * Rejects transport, method, and declared-size failures without consuming the request body. The
+ * mounted control plane uses this before authentication, then parses a cloned request afterward so
+ * body-bound authentication can still read the original request.
+ */
+export function preflightControlPlaneMcpRequest(request: Request, options: ControlPlaneMcpPreflightOptions = {}): Response | undefined {
+  const transportError = validateMcpTransportRequest(request, options.allowedOrigins);
+  if (transportError) return transportError;
+  if (request.method !== 'POST') return new Response(null, { headers: { allow: 'POST' }, status: 405 });
+
+  const maxBodyBytes = validateControlPlaneMcpMaxBodyBytes(options.maxBodyBytes);
+  const declaredBytes = Number(request.headers.get('content-length'));
+  if (Number.isFinite(declaredBytes) && declaredBytes > maxBodyBytes) {
+    return jsonRpcError(null, JSON_RPC_INVALID_REQUEST, MCP_BODY_TOO_LARGE_MESSAGE, 413, { status: 413 });
+  }
+  return undefined;
+}
+
+/** Dispatches a parsed request; registry and issuer values may resolve lazily per method. */
+export async function handlePreparedControlPlaneMcpRequest(
+  request: PreparedControlPlaneMcpRequest,
+  options: ControlPlaneMcpHandlerOptions,
+): Promise<Response> {
+  try {
+    return await raceControlPlaneOperation(dispatchPreparedControlPlaneMcpRequest(request, options), options, 'MCP request invocation');
+  } catch (error) {
+    return protocolError(request.id, error, JSON_RPC_INTERNAL_ERROR);
+  }
+}
+
+/** Formats a route-entry failure, preserving a JSON-RPC id once parsing reached it. */
+export function controlPlaneMcpErrorResponse(error: unknown, id: string | number | null = null): Response {
+  if (error instanceof ServicePlaneBodyTooLargeError) {
+    return jsonRpcError(id, JSON_RPC_INVALID_REQUEST, error.message, 413, { status: 413 });
+  }
+  return protocolError(id, error, JSON_RPC_INTERNAL_ERROR);
+}
+
+async function dispatchPreparedControlPlaneMcpRequest(
+  request: PreparedControlPlaneMcpRequest,
+  options: ControlPlaneMcpHandlerOptions,
+): Promise<Response> {
+  const { id, method, params } = request;
   switch (method) {
     case 'initialize':
-      return jsonRpcResult(id, initializeResult(message.params, options));
+      return jsonRpcResult(id, initializeResult(params, options));
     case 'ping':
       return jsonRpcResult(id, {});
     case 'tools/list':
       return jsonRpcResult(id, { tools: (await discover(options)).tools });
     case 'tools/call':
-      return callTool(id, message.params, options, acceptsEventStream(request));
+      return callTool(id, params, options, request.acceptsEventStream);
     case 'resources/list':
       return jsonRpcResult(id, { resources: (await discover(options)).resources });
     case 'resources/templates/list':
       return jsonRpcResult(id, { resourceTemplates: (await discover(options)).resourceTemplates });
     case 'resources/read':
-      return readResource(id, message.params, options);
+      return readResource(id, params, options);
     case 'prompts/list':
       return jsonRpcResult(id, { prompts: (await discover(options)).prompts });
     case 'prompts/get':
-      return getPrompt(id, message.params, options);
+      return getPrompt(id, params, options);
     default:
       return jsonRpcError(id, JSON_RPC_METHOD_NOT_FOUND, `Unsupported MCP method: ${method}`);
   }
 }
 
-export function validateControlPlaneMcpTransportRequest(request: Request, configuredOrigins: string[] | undefined): Response | undefined {
+function validateMcpTransportRequest(request: Request, configuredOrigins: string[] | undefined): Response | undefined {
   const protocolVersion = request.headers.get('mcp-protocol-version')?.trim();
   if (protocolVersion && !SUPPORTED_MCP_PROTOCOL_VERSIONS.includes(protocolVersion)) {
     return new Response('Unsupported MCP-Protocol-Version', { status: 400 });
@@ -276,7 +440,11 @@ function parseOrigin(value: string): string | undefined {
 }
 
 async function discover(options: ControlPlaneMcpHandlerOptions): Promise<McpDiscoveryDocument> {
-  return generateMcpDiscovery(await options.registry.discover());
+  return generateMcpDiscovery(await discoverSnapshot(options));
+}
+
+function discoverSnapshot(options: ControlPlaneMcpHandlerOptions): Promise<ServiceRegistrySnapshot> {
+  return raceControlPlaneOperation(options.registry.discover(), options, 'MCP route discovery');
 }
 
 function initializeResult(params: unknown, options: ControlPlaneMcpHandlerOptions) {
@@ -307,10 +475,10 @@ async function callTool(
   const input = isRecord(params) && params.arguments !== undefined ? params.arguments : {};
 
   try {
-    const snapshot = await options.registry.discover();
-    const match = findMcpMethod(snapshot, (method) => method.mcp?.name === name);
+    const snapshot = await discoverSnapshot(options);
+    const match = indexMcpProjections(snapshot).tools.get(name);
     if (!match) throw new CapabilityAuthError(`Service-Plane MCP tool not found: ${name}`, 404);
-    if (match.ability.methods[match.method]?.stream) {
+    if (match.definition.stream) {
       // A streaming tool can only be answered as SSE. Negotiate before opening the backing
       // session so a JSON-only client gets the Streamable HTTP 406 instead of a body it cannot
       // parse — and so the plane does not pay for a session whose result it cannot deliver.
@@ -330,10 +498,7 @@ async function callTool(
       if (error instanceof CapabilityAuthError) throw error;
       // Tool execution failures are reported in-band per the MCP spec, not as protocol errors.
       logMcpFailed(options, 'service_plane.mcp.tool.failed', { tool: name }, error, startedAt);
-      return jsonRpcResult(id, {
-        content: [{ text: error instanceof Error ? error.message : String(error), type: 'text' }],
-        isError: true,
-      });
+      return toolFailureResult(id, error);
     }
 
     logMcpCompleted(options, 'service_plane.mcp.tool.completed', { tool: name }, match, startedAt);
@@ -347,10 +512,8 @@ async function callTool(
   }
 }
 
-// Streaming tools answer over MCP Streamable HTTP (SSE). The plane opens the backing ability
-// over a session transport and forwards items as progress notifications while they arrive
-// (when the client sent a progressToken); the final tools/call result aggregates the items,
-// because MCP defines exactly one response per request.
+// Streaming tools answer over MCP Streamable HTTP (SSE). The final tools/call result aggregates the
+// bounded stream because MCP defines exactly one response per request.
 async function streamToolCall(
   id: JsonRpcId,
   name: string,
@@ -360,42 +523,21 @@ async function streamToolCall(
   params: unknown,
 ): Promise<Response> {
   const startedAt = Date.now();
-  const limits = resolveMcpStreamLimits(options.streamLimits);
+  const limits = validateControlPlaneMcpStreamLimits(options.streamLimits);
   notifyInvocation(match, options);
-  const { api, dispose } = await openControlPlaneMethodSession(match, options);
-  let stream: ReadableStream<unknown>;
+  let iterator: AsyncIterator<unknown>;
   try {
-    const method = api[match.method];
-    if (!method) throw new CapabilityAuthError(`Service-Plane MCP method not found: ${match.method}`, 500);
-    const result = await method(input);
-    if (!(result instanceof ReadableStream)) {
-      throw new Error(`Service-Plane streaming tool did not return a stream: ${name}`);
-    }
-    stream = result;
+    iterator = streamIterator(await invokeControlPlaneMethod(match, input, options), name);
   } catch (error) {
-    // The session must be closed on every early-exit path; only the happy path hands ownership
-    // to streamToolEvents (which disposes after the stream drains).
-    await dispose();
     if (error instanceof CapabilityAuthError) throw error;
-    // Tool execution failures are reported in-band per the MCP spec, not as protocol errors.
     logMcpFailed(options, 'service_plane.mcp.tool.failed', { tool: name }, error, startedAt);
-    return jsonRpcResult(id, {
-      content: [{ text: error instanceof Error ? error.message : String(error), type: 'text' }],
-      isError: true,
-    });
+    return toolFailureResult(id, error);
   }
-  const reader = stream.getReader();
   const state = { deliveryAborted: false };
-  return sseResponse(
-    streamToolEvents(id, name, match, options, limits, reader, dispose, state, progressTokenOf(params), startedAt),
-    (reason) => {
-      // This stateless endpoint has no resumable response path after SSE delivery is abandoned.
-      // Abort the request-owned upstream reader promptly so serverless work and its session do
-      // not leak; the flag distinguishes delivery abandonment from natural completion.
-      state.deliveryAborted = true;
-      void reader.cancel(reason).catch(() => undefined);
-    },
-  );
+  return sseResponse(streamToolEvents(id, name, match, options, limits, iterator, state, progressTokenOf(params), startedAt), (reason) => {
+    state.deliveryAborted = true;
+    void Promise.resolve(iterator.return?.(reason)).catch(() => undefined);
+  });
 }
 
 async function* streamToolEvents(
@@ -404,8 +546,7 @@ async function* streamToolEvents(
   match: McpMethodMatch,
   options: ControlPlaneMcpHandlerOptions,
   limits: { maxBytes: number; maxItems: number },
-  reader: ReadableStreamDefaultReader<unknown>,
-  dispose: () => Promise<void>,
+  iterator: AsyncIterator<unknown>,
   state: { deliveryAborted: boolean },
   progressToken: string | number | undefined,
   startedAt: number,
@@ -418,9 +559,7 @@ async function* streamToolEvents(
   let sendProgress = progressToken !== undefined;
   try {
     while (true) {
-      const { done, value } = await reader.read();
-      // Abandoning SSE delivery resolves the pending read as done via reader.cancel; treat it as
-      // an aborted delivery, not a successful completion, and skip pointless aggregation.
+      const { done, value } = await iterator.next();
       if (state.deliveryAborted) {
         logMcpFailed(
           options,
@@ -433,13 +572,10 @@ async function* streamToolEvents(
       }
       if (done) break;
       items.push(value);
-      // Measure UTF-8 bytes (not UTF-16 code units) so multibyte items count against the cap
-      // at their true wire cost.
+      // Count UTF-8 bytes rather than JavaScript string units so the cap reflects wire size.
       aggregatedBytes += encoder.encode(JSON.stringify(value) ?? 'null').length;
       if (items.length > maxItems || aggregatedBytes > maxBytes) {
-        // MCP defines exactly one response per request, so the full stream must be held in
-        // memory here; unbounded or caller-inflated streams are cut off in-band instead.
-        const message = `Service-Plane MCP tool stream exceeded aggregation limits (${maxItems} items / ${maxBytes} bytes); use a session transport for large streams`;
+        const message = `Service-Plane MCP tool stream exceeded aggregation limits (${maxItems} items / ${maxBytes} bytes); use a typed ability client for large streams`;
         logMcpFailed(options, 'service_plane.mcp.tool.failed', { tool: name }, new CapabilityAuthError(message, 413), startedAt);
         yield sseEvent({ id, jsonrpc: '2.0', result: { content: [{ text: message, type: 'text' }], isError: true } });
         return;
@@ -451,8 +587,7 @@ async function* streamToolEvents(
           progressBytes += eventBytes;
           yield event;
         } else {
-          // Progress is optional in MCP. Stop emitting it once its independent wire budget is
-          // exhausted, while still returning the complete, bounded tool result.
+          // Progress is optional. Stop emitting it while still returning the bounded result.
           sendProgress = false;
         }
       }
@@ -472,12 +607,22 @@ async function* streamToolEvents(
     yield sseEvent({
       id,
       jsonrpc: '2.0',
-      result: { content: [{ text: error instanceof Error ? error.message : String(error), type: 'text' }], isError: true },
+      result: { content: [{ text: publicMcpErrorMessage(error), type: 'text' }], isError: true },
     });
   } finally {
-    void reader.cancel().catch(() => undefined);
-    await dispose();
+    if (!state.deliveryAborted) await iterator.return?.(undefined);
   }
+}
+
+// In-band per the MCP spec: a tool that ran and failed is a result, not a protocol error.
+function toolFailureResult(id: JsonRpcId, error: unknown): Response {
+  return jsonRpcResult(id, { content: [{ text: publicMcpErrorMessage(error), type: 'text' }], isError: true });
+}
+
+function streamIterator(value: unknown, name: string): AsyncIterator<unknown> {
+  const readable = isRecord(value) && typeof value.getReader === 'function';
+  if (!isAsyncIterable(value) && !readable) throw new Error(`Service-Plane streaming tool did not return a stream: ${name}`);
+  return toAbilityStream(value as AsyncIterable<unknown> | ReadableStream<unknown>);
 }
 
 function progressTokenOf(params: unknown): string | number | undefined {
@@ -487,11 +632,20 @@ function progressTokenOf(params: unknown): string | number | undefined {
   return typeof token === 'number' && Number.isSafeInteger(token) ? token : undefined;
 }
 
-function resolveMcpStreamLimits(limits: ControlPlaneMcpHandlerOptions['streamLimits']): { maxBytes: number; maxItems: number } {
+/** Validates and fills MCP aggregation limits before a stream is consumed. */
+export function validateControlPlaneMcpStreamLimits(limits: ControlPlaneMcpHandlerOptions['streamLimits']): {
+  maxBytes: number;
+  maxItems: number;
+} {
   return {
     maxBytes: positiveMcpStreamLimit(limits?.maxBytes, DEFAULT_MCP_STREAM_MAX_BYTES, 'maxBytes'),
     maxItems: positiveMcpStreamLimit(limits?.maxItems, DEFAULT_MCP_STREAM_MAX_ITEMS, 'maxItems'),
   };
+}
+
+/** Validates and fills the MCP request-body limit before a request is consumed. */
+export function validateControlPlaneMcpMaxBodyBytes(value: number | undefined): number {
+  return validateBodyByteLimit(value ?? DEFAULT_MCP_MAX_BODY_BYTES, 'Service-Plane MCP maxBodyBytes must be a positive safe integer');
 }
 
 function positiveMcpStreamLimit(value: number | undefined, fallback: number, name: string): number {
@@ -589,8 +743,8 @@ async function readResource(id: JsonRpcId, params: unknown, options: ControlPlan
   if (!uri) return jsonRpcError(id, JSON_RPC_INVALID_PARAMS, 'MCP resources/read requires a resource uri');
 
   try {
-    const snapshot = await options.registry.discover();
-    const match = findResource(snapshot, uri);
+    const snapshot = await discoverSnapshot(options);
+    const match = findResource(indexMcpProjections(snapshot).resources, uri);
     if (!match) throw new CapabilityAuthError(`Service-Plane MCP resource not found: ${uri}`, 404);
 
     const result = await invokeMethod(match, match.input, options);
@@ -609,21 +763,20 @@ async function getPrompt(id: JsonRpcId, params: unknown, options: ControlPlaneMc
   const input = isRecord(params) && params.arguments !== undefined ? params.arguments : {};
 
   try {
-    const snapshot = await options.registry.discover();
-    const match = findMcpMethod(snapshot, (method) => method.mcpPrompt?.name === name);
+    const snapshot = await discoverSnapshot(options);
+    const match = indexMcpProjections(snapshot).prompts.get(name);
     if (!match) throw new CapabilityAuthError(`Service-Plane MCP prompt not found: ${name}`, 404);
 
     const result = await invokeMethod(match, input, options);
-    const definition = match.ability.methods[match.method]?.mcpPrompt;
     logMcpCompleted(options, 'service_plane.mcp.prompt.completed', { prompt: name }, match, startedAt);
-    return jsonRpcResult(id, promptResult(result, definition?.description));
+    return jsonRpcResult(id, promptResult(result, match.projection.description));
   } catch (error) {
     logMcpFailed(options, 'service_plane.mcp.prompt.failed', { prompt: name }, error, startedAt);
     return protocolError(id, error, JSON_RPC_INVALID_PARAMS);
   }
 }
 
-// Unary invocation: the session is closed as soon as the single result resolves.
+// Unary MCP projections share the same authorization and dispatch helper as REST.
 async function invokeMethod(match: McpMethodMatch, input: unknown, options: ControlPlaneMcpHandlerOptions): Promise<unknown> {
   notifyInvocation(match, options);
   return invokeControlPlaneMethod(match, input, options);
@@ -633,22 +786,9 @@ function notifyInvocation(match: McpMethodMatch, options: ControlPlaneMcpHandler
   options.onInvocation?.({
     abilityId: match.ability.id,
     method: match.method,
-    scopes: match.scopes,
+    scopes: [...match.scopes],
     serviceId: match.ability.serviceId,
   });
-}
-
-function findMcpMethod(
-  snapshot: ServiceRegistrySnapshot,
-  matches: (method: DiscoveredServiceAbility['methods'][string]) => boolean,
-): McpMethodMatch | undefined {
-  for (const ability of snapshot.abilities) {
-    if (ability.exposure !== 'published') continue;
-    for (const [method, definition] of Object.entries(ability.methods)) {
-      if (matches(definition)) return { ability, method, scopes: definition.scopes };
-    }
-  }
-  return undefined;
 }
 
 type McpResourceMatch = McpMethodMatch & {
@@ -656,36 +796,54 @@ type McpResourceMatch = McpMethodMatch & {
   resource: ServiceAbilityMcpResourceProjection;
 };
 
-function findResource(snapshot: ServiceRegistrySnapshot, uri: string): McpResourceMatch | undefined {
-  for (const ability of snapshot.abilities) {
-    if (ability.exposure !== 'published') continue;
-    for (const [method, definition] of Object.entries(ability.methods)) {
-      const resource = definition.mcpResource;
-      if (!resource) continue;
-      if (!isResourceTemplateUri(resource.uri)) {
-        if (resource.uri === uri) return { ability, input: {}, method, resource, scopes: definition.scopes };
-        continue;
-      }
-      const input = matchResourceTemplate(resource.uri, uri);
-      if (input) return { ability, input, method, resource, scopes: definition.scopes };
-    }
+function findResource(
+  resources: ReadonlyMap<string, IndexedMcpMethod<ServiceAbilityMcpResourceProjection>>,
+  uri: string,
+): McpResourceMatch | undefined {
+  const exact = resources.get(uri);
+  if (exact && !isResourceTemplateUri(exact.projection.uri)) {
+    return { ...exact, input: {}, resource: exact.projection };
   }
-  return undefined;
+
+  let templateMatch: McpResourceMatch | undefined;
+  for (const match of resources.values()) {
+    const resource = match.projection;
+    if (!isResourceTemplateUri(resource.uri)) continue;
+    const input = matchResourceTemplate(resource.uri, uri);
+    if (!input) continue;
+    if (templateMatch) {
+      throw new Error(`Multiple MCP resource templates match the requested URI: ${uri}`);
+    }
+    templateMatch = { ...match, input, resource };
+  }
+  return templateMatch;
 }
 
 function isResourceTemplateUri(uri: string): boolean {
   return uri.includes('{');
 }
 
-// Template variables become string method inputs; a variable matches one path segment and is URI-decoded.
+// Fixed component boundaries and literal affixes leave no competing capture lengths to search.
 function matchResourceTemplate(template: string, uri: string): Record<string, string> | undefined {
-  const pattern = template
-    .split(/(\{[A-Za-z_]\w*\})/gu)
-    .map((part) => (/^\{[A-Za-z_]\w*\}$/u.test(part) ? `(?<${part.slice(1, -1)}>[^/?#]+)` : escapeRegExp(part)))
-    .join('');
-  const matched = new RegExp(`^${pattern}$`, 'u').exec(uri);
-  if (!matched) return undefined;
-  return Object.fromEntries(Object.entries(matched.groups ?? {}).map(([name, value]) => [name, decodeUriComponentSafe(value)]));
+  const templateComponents = simpleTemplateComponents(template);
+  const uriComponents = uri.split(/([/?#])/u);
+  if (!templateComponents || templateComponents.length !== uriComponents.length) return undefined;
+
+  const captures: [string, string][] = [];
+  for (const [index, component] of templateComponents.entries()) {
+    const value = uriComponents[index];
+    if (value === undefined) return undefined;
+    if (typeof component === 'string') {
+      if (component !== value) return undefined;
+      continue;
+    }
+
+    const { name, prefix, suffix } = component;
+    const end = value.length - suffix.length;
+    if (end <= prefix.length || !value.startsWith(prefix) || !value.endsWith(suffix)) return undefined;
+    captures.push([name, value.slice(prefix.length, end)]);
+  }
+  return Object.fromEntries(captures.map(([name, value]) => [name, decodeUriComponentSafe(value)]));
 }
 
 function decodeUriComponentSafe(value: string): string {
@@ -694,10 +852,6 @@ function decodeUriComponentSafe(value: string): string {
   } catch {
     return value;
   }
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
 }
 
 // String outputs are served as-is, `{ blob }` outputs pass through as binary, everything else is JSON text.
@@ -745,7 +899,7 @@ function logMcpCompleted(
   match: McpMethodMatch,
   startedAt: number,
 ): void {
-  options.log?.({
+  emitBestEffortServicePlaneLog(options.log, {
     abilityId: match.ability.id,
     ...brokerCallerLogFields(options.caller),
     durationMs: Date.now() - startedAt,
@@ -765,10 +919,10 @@ function logMcpFailed(
   error: unknown,
   startedAt: number,
 ): void {
-  options.log?.({
+  emitBestEffortServicePlaneLog(options.log, {
     ...brokerCallerLogFields(options.caller),
     durationMs: Date.now() - startedAt,
-    error: error instanceof Error ? { message: error.message, name: error.name } : { message: String(error), name: 'Error' },
+    error: logErrorFields(error),
     event,
     level: 'warn',
     ...(options.requestId ? { requestId: options.requestId } : {}),
@@ -791,15 +945,17 @@ function jsonRpcResult(id: JsonRpcId, result: unknown): Response {
 function protocolError(id: JsonRpcId, error: unknown, notFoundCode: number): Response {
   if (error instanceof CapabilityAuthError) {
     const code = error.status === 404 ? notFoundCode : JSON_RPC_INTERNAL_ERROR;
-    return jsonRpcError(id, code, error.message, 200, { status: error.status });
+    return jsonRpcError(id, code, publicMcpErrorMessage(error), 200, { status: error.status });
   }
-  return jsonRpcError(id, JSON_RPC_INTERNAL_ERROR, error instanceof Error ? error.message : String(error));
+  return jsonRpcError(id, JSON_RPC_INTERNAL_ERROR, publicMcpErrorMessage(error));
+}
+
+function publicMcpErrorMessage(error: unknown): string {
+  const info = servicePlaneErrorInfo(error);
+  if (!info || info.code === 'internal' || (info.code === 'capability_auth' && info.status >= 500)) return 'Internal error';
+  return info.message || 'Service Plane call failed';
 }
 
 function jsonRpcError(id: JsonRpcId, code: number, message: string, status = 200, data?: Record<string, unknown>): Response {
   return Response.json({ error: { code, ...(data ? { data } : {}), message }, id, jsonrpc: '2.0' }, { status });
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

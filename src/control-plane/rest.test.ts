@@ -1,17 +1,20 @@
-import { RpcTarget } from 'capnweb';
 import { Hono } from 'hono';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as z from 'zod';
-import { abilityMethod, defineAbility, defineCapabilities, ServicePlaneService } from '../service/index.js';
-import { publicJwkFromPrivateJwk } from '../shared/capability-tokens.js';
+import { createAbilityBuilder, defineAbility, defineCapabilities, ServicePlaneService } from '../service/index.js';
 import type { ConnInfo } from '../shared/conn-info.js';
-import { SERVICE_DISCOVERY_PATH } from '../shared/types.js';
+import { publicJwkFromPrivateJwk } from '../shared/jwk-auth.js';
+import type { ServicePlaneLogSink } from '../shared/logging.js';
+import { SERVICE_PLANE_RPC_PROTOCOL } from '../shared/rpc-protocol.js';
+import { type DiscoveredServiceAbility, SERVICE_DISCOVERY_PATH } from '../shared/types.js';
+import type { CapabilityIssuer } from './capabilities.js';
 import {
   ServicePlaneControlPlane,
   type ServicePlaneControlPlaneInvocation,
   type ServicePlaneControlPlaneVariables,
 } from './control-plane.js';
 import { cloudflareServiceBinding } from './endpoints.js';
+import { handleControlPlaneRestRequest } from './rest.js';
 import { generateCapabilitySigningSecret, privateJwkFromCapabilitySigningSecret } from './signing-keys.js';
 
 const PLANE_ORIGIN = 'https://plane.internal';
@@ -22,6 +25,92 @@ type TestEnv = {
 };
 
 describe('control-plane REST facade', () => {
+  it('keeps REST invocation observers from changing dispatch or catalog scopes', async () => {
+    const invokeAbility = vi.fn(async () => ({ ok: true }));
+    const ability: DiscoveredServiceAbility = {
+      access: 'plane',
+      exposure: 'published',
+      id: 'tasks',
+      methods: {
+        get: {
+          inputSchema: { type: 'object' },
+          outputSchema: { type: 'object' },
+          rest: { method: 'get', path: '/tasks' },
+          scopes: ['tasks.read'],
+        },
+      },
+      rpc: { path: '/rpc/v1/tasks', protocol: SERVICE_PLANE_RPC_PROTOCOL, transports: ['service-binding'] },
+      scopes: ['tasks.read', 'tasks.admin'],
+      service: {
+        abilityRpc: { invokeAbility },
+        fetch: async () => new Response(null, { status: 500 }),
+        id: 'tasks-service',
+        origin: 'https://tasks.internal',
+      },
+      serviceId: 'tasks-service',
+      serviceTitle: 'Tasks',
+      serviceVersion: '1.0.0',
+    };
+    const issueCapabilityToken = vi.fn(async () => ({ expiresAt: new Date(Date.now() + 60_000), token: 'unused' }));
+    const issuer: CapabilityIssuer = {
+      issueBrokeredCapabilityToken: issueCapabilityToken,
+      issueCapabilityToken,
+      jwks: async () => ({ keys: [] }),
+    };
+
+    const response = await handleControlPlaneRestRequest(new Request(`${PLANE_ORIGIN}/tasks`), {
+      onInvocation: (invocation) => {
+        (invocation.scopes as string[]).push('tasks.admin');
+      },
+      registry: { discover: async () => ({ abilities: [ability], discoveredAt: new Date(0).toISOString(), services: [] }) },
+      resolveInvocation: async () => ({ controlPlaneServiceId: 'control-plane', issuer }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(issueCapabilityToken).toHaveBeenCalledWith(expect.objectContaining({ scopes: ['tasks.read'] }));
+    expect(ability.methods.get?.scopes).toEqual(['tasks.read']);
+    expect(invokeAbility).toHaveBeenCalledOnce();
+  });
+
+  it('rejects an invalid body limit when the plane is constructed', () => {
+    expect(
+      () =>
+        new ServicePlaneControlPlane({
+          broker: false,
+          openapi: false,
+          rest: { maxBodyBytes: 0 },
+          services: () => [],
+          signingKeys: () => [],
+        }),
+    ).toThrow('Service-Plane REST maxBodyBytes must be a positive safe integer');
+  });
+
+  it('can leave the REST catch-all unmounted without resolving the service catalog', async () => {
+    const app = new Hono();
+    app.get('/health', (context) => context.text('ok'));
+    let serviceResolutions = 0;
+    const plane = new ServicePlaneControlPlane({
+      app,
+      broker: false,
+      log: false,
+      openapi: false,
+      rest: false,
+      services: () => {
+        serviceResolutions += 1;
+        return [];
+      },
+      signingKeys: () => [],
+    });
+
+    const health = await plane.fetch(new Request(`${PLANE_ORIGIN}/health`));
+    const missing = await plane.fetch(new Request(`${PLANE_ORIGIN}/missing`));
+
+    expect(health.status).toBe(200);
+    expect(await health.text()).toBe('ok');
+    expect(missing.status).toBe(404);
+    expect(serviceResolutions).toBe(0);
+  });
+
   it('uses middleware identity and connection info, preserves query arrays, and applies path > body > query', async () => {
     const observed: Array<{ input: unknown; subject: unknown; connInfo: ConnInfo | undefined }> = [];
     const { endpoint, signingKey } = await restService(observed);
@@ -35,9 +124,8 @@ describe('control-plane REST facade', () => {
     });
     const plane = new ServicePlaneControlPlane<TestEnv>({
       app,
-      rpc: false,
+      broker: false,
       issuer: PLANE_ORIGIN,
-      mcp: false,
       openapi: false,
       services: () => [endpoint],
       signingKeys: () => [signingKey],
@@ -84,7 +172,7 @@ describe('control-plane REST facade', () => {
     const { endpoint, signingKey } = await restService(observed);
     let invocationMiddlewareCalls = 0;
     const plane = new ServicePlaneControlPlane({
-      rpc: false,
+      broker: false,
       invocationMiddleware: async (context, next) => {
         invocationMiddlewareCalls += 1;
         context.set('servicePlaneCaller', { id: 'user-7', kind: 'user' });
@@ -92,7 +180,6 @@ describe('control-plane REST facade', () => {
       },
       issuer: PLANE_ORIGIN,
       log: false,
-      mcp: false,
       openapi: false,
       services: () => [endpoint],
       signingKeys: () => [signingKey],
@@ -136,9 +223,8 @@ describe('control-plane REST facade', () => {
       },
       issuer: PLANE_ORIGIN,
       log: false,
-      mcp: false,
       openapi: false,
-      rpc: false,
+      broker: false,
       services: () => [countedEndpoint],
       signingKeys: () => [signingKey],
     });
@@ -155,12 +241,12 @@ describe('control-plane REST facade', () => {
     expect(discoveryFetches).toBe(1);
   });
 
-  it('runs invocation middleware only for an exact match and exposes metadata plus the final response', async () => {
+  it('authenticates before route discovery and exposes matched metadata after the response', async () => {
     const { endpoint, signingKey } = await restService([]);
     const before: ServicePlaneControlPlaneInvocation[] = [];
     const after: Array<{ invocation: ServicePlaneControlPlaneInvocation | undefined; status: number }> = [];
     const plane = new ServicePlaneControlPlane({
-      rpc: false,
+      broker: false,
       invocationMiddleware: async (context, next) => {
         const invocation = context.get('servicePlaneInvocation');
         if (invocation) before.push(invocation);
@@ -169,7 +255,6 @@ describe('control-plane REST facade', () => {
         after.push({ invocation: context.get('servicePlaneInvocation'), status: context.res.status });
       },
       issuer: PLANE_ORIGIN,
-      mcp: false,
       openapi: false,
       services: () => [endpoint],
       signingKeys: () => [signingKey],
@@ -194,25 +279,29 @@ describe('control-plane REST facade', () => {
     expect(failed.status).toBe(422);
     expect(unmatched.status).toBe(404);
     expect(emptySegment.status).toBe(404);
-    expect(before).toEqual([
+    expect(before).toEqual([]);
+    expect(after).toEqual([
       {
-        abilityId: 'connections.snapshots',
-        method: 'createSnapshot',
-        path: '/connections/{connectionId}/snapshots',
-        scopes: [SCOPE],
-        serviceId: 'connections',
-        surface: 'rest',
+        invocation: {
+          abilityId: 'connections.snapshots',
+          method: 'createSnapshot',
+          path: '/connections/{connectionId}/snapshots',
+          scopes: [SCOPE],
+          serviceId: 'connections',
+          surface: 'rest',
+        },
+        status: 422,
       },
+      { invocation: undefined, status: 404 },
+      { invocation: undefined, status: 404 },
     ]);
-    expect(after).toEqual([{ invocation: before[0], status: 422 }]);
   });
 
   it('fails closed without middleware caller identity and returns Allow for a known path', async () => {
     const { endpoint, signingKey } = await restService([]);
     const plane = new ServicePlaneControlPlane({
-      rpc: false,
+      broker: false,
       issuer: PLANE_ORIGIN,
-      mcp: false,
       openapi: false,
       services: () => [endpoint],
       signingKeys: () => [signingKey],
@@ -227,14 +316,13 @@ describe('control-plane REST facade', () => {
     expect(missingCaller.status).toBe(500);
 
     const authenticated = new ServicePlaneControlPlane({
-      rpc: false,
+      broker: false,
       issuer: PLANE_ORIGIN,
       invocationMiddleware: async (context, next) => {
         context.set('servicePlaneCaller', { id: 'user-7', kind: 'user' });
         await next();
       },
       log: false,
-      mcp: false,
       openapi: false,
       services: () => [endpoint],
       signingKeys: () => [signingKey],
@@ -252,13 +340,12 @@ describe('control-plane REST facade', () => {
       routedRestService({ kid, path: '/slack/messages/{id}', secret, serviceId: 'slack' }),
     ]);
     const plane = new ServicePlaneControlPlane({
-      rpc: false,
+      broker: false,
       issuer: PLANE_ORIGIN,
       invocationMiddleware: async (context, next) => {
         context.set('servicePlaneCaller', { id: 'product-user', kind: 'user' });
         await next();
       },
-      mcp: false,
       openapi: false,
       services: () => endpoints,
       signingKeys: () => [{ kid, secret }],
@@ -290,7 +377,7 @@ describe('control-plane REST facade', () => {
     ]);
     let middlewareCalls = 0;
     const plane = new ServicePlaneControlPlane({
-      rpc: false,
+      broker: false,
       issuer: PLANE_ORIGIN,
       log: false,
       invocationMiddleware: async (context, next) => {
@@ -298,7 +385,6 @@ describe('control-plane REST facade', () => {
         context.set('servicePlaneCaller', { id: 'product-user', kind: 'user' });
         await next();
       },
-      mcp: false,
       openapi: false,
       services: () => endpoints,
       signingKeys: () => [{ kid, secret }],
@@ -320,23 +406,26 @@ describe('control-plane REST facade', () => {
 
     const hidden = await plane.fetch(new Request(`${PLANE_ORIGIN}/private/secret`));
     expect(hidden.status).toBe(404);
-    expect(middlewareCalls).toBe(1);
+    expect(middlewareCalls).toBe(3);
   });
 
   it('bounds and validates JSON bodies before opening an ability session', async () => {
     const { endpoint, signingKey } = await restService([]);
+    let signingKeyResolutions = 0;
     const plane = new ServicePlaneControlPlane({
-      rpc: false,
+      broker: false,
       invocationMiddleware: async (context, next) => {
         context.set('servicePlaneCaller', { id: 'user-7', kind: 'user' });
         await next();
       },
       issuer: PLANE_ORIGIN,
-      mcp: false,
       openapi: false,
       rest: { maxBodyBytes: 8 },
       services: () => [endpoint],
-      signingKeys: () => [signingKey],
+      signingKeys: () => {
+        signingKeyResolutions += 1;
+        return [signingKey];
+      },
     });
     const request = (body: string, contentType: string) =>
       plane.fetch(
@@ -350,18 +439,90 @@ describe('control-plane REST facade', () => {
     expect((await request('{broken', 'application/json')).status).toBe(400);
     expect((await request('{}', 'text/plain')).status).toBe(415);
     expect((await request('{"name":1}', 'application/json')).status).toBe(413);
+    expect(signingKeyResolutions).toBe(0);
+  });
+
+  it('keeps the REST body available after body-bound invocation authentication', async () => {
+    const observed: Array<{ input: unknown; subject: unknown; connInfo: ConnInfo | undefined }> = [];
+    const { endpoint, signingKey } = await restService(observed);
+    const body = JSON.stringify({ name: 'Signed request' });
+    let authenticatedBody: string | undefined;
+    const plane = new ServicePlaneControlPlane({
+      broker: false,
+      invocationMiddleware: async (context, next) => {
+        authenticatedBody = await context.req.raw.text();
+        context.set('servicePlaneCaller', { id: 'signed-user', kind: 'user' });
+        await next();
+      },
+      issuer: PLANE_ORIGIN,
+      log: false,
+      openapi: false,
+      services: () => [endpoint],
+      signingKeys: () => [signingKey],
+    });
+
+    const response = await plane.fetch(
+      new Request(`${PLANE_ORIGIN}/connections/conn-1/snapshots?dryRun=true`, {
+        body,
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
+      }),
+    );
+
+    expect(authenticatedBody).toBe(body);
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toEqual({ connectionId: 'conn-1', name: 'Signed request' });
+    expect(observed).toHaveLength(1);
+  });
+
+  it('cancels both REST body branches when invocation middleware refuses the request', async () => {
+    const { endpoint, signingKey } = await restService([]);
+    let cancelled = false;
+    let serviceResolutions = 0;
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelled = true;
+      },
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"name":"Unread"}'));
+      },
+    });
+    const plane = new ServicePlaneControlPlane({
+      broker: false,
+      invocationMiddleware: (context) => Promise.resolve(context.json({ error: 'Unauthorized' }, 401)),
+      issuer: PLANE_ORIGIN,
+      log: false,
+      openapi: false,
+      services: () => {
+        serviceResolutions += 1;
+        return [endpoint];
+      },
+      signingKeys: () => [signingKey],
+    });
+
+    const response = await plane.fetch(
+      new Request(`${PLANE_ORIGIN}/connections/conn-1/snapshots?dryRun=true`, {
+        body,
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
+        duplex: 'half',
+      } as RequestInit),
+    );
+
+    expect(response.status).toBe(401);
+    expect(serviceResolutions).toBe(0);
+    await vi.waitFor(() => expect(cancelled).toBe(true));
   });
 
   it('returns bodyless 205 responses exactly as declared', async () => {
     const { endpoint, signingKey } = await restService([], 205);
     const plane = new ServicePlaneControlPlane({
-      rpc: false,
+      broker: false,
       invocationMiddleware: async (context, next) => {
         context.set('servicePlaneCaller', { id: 'user-7', kind: 'user' });
         await next();
       },
       issuer: PLANE_ORIGIN,
-      mcp: false,
       openapi: false,
       services: () => [endpoint],
       signingKeys: () => [signingKey],
@@ -377,7 +538,62 @@ describe('control-plane REST facade', () => {
     expect(response.status).toBe(205);
     expect(await response.text()).toBe('');
   });
+
+  it('contains throwing REST log sinks for both completed and failed invocations', async () => {
+    await expectRestLogSinkContained(() => {
+      throw new Error('synchronous log failure');
+    });
+  });
+
+  it('observes rejected async REST log sinks without rejecting either response', async () => {
+    await expectRestLogSinkContained(() => Promise.reject(new Error('asynchronous log failure')));
+  });
 });
+
+async function expectRestLogSinkContained(fail: () => unknown): Promise<void> {
+  const observed: Array<{ input: unknown; subject: unknown; connInfo: ConnInfo | undefined }> = [];
+  const { endpoint, signingKey } = await restService(observed);
+  const loggedEvents: string[] = [];
+  const log: ServicePlaneLogSink = (event) => {
+    if (event.event !== 'service_plane.rest.completed' && event.event !== 'service_plane.rest.failed') return;
+    loggedEvents.push(event.event);
+    return fail();
+  };
+  const plane = new ServicePlaneControlPlane({
+    broker: false,
+    invocationMiddleware: async (context, next) => {
+      context.set('servicePlaneCaller', { id: 'user-7', kind: 'user' });
+      await next();
+    },
+    issuer: PLANE_ORIGIN,
+    log,
+    openapi: false,
+    services: () => [endpoint],
+    signingKeys: () => [signingKey],
+  });
+
+  const completed = await plane.fetch(
+    new Request(`${PLANE_ORIGIN}/connections/conn-1/snapshots?dryRun=true`, {
+      body: JSON.stringify({ name: 'Persisted before logging' }),
+      headers: { 'content-type': 'application/json' },
+      method: 'POST',
+    }),
+  );
+  const failed = await plane.fetch(
+    new Request(`${PLANE_ORIGIN}/connections/conn-2/snapshots?dryRun=true`, {
+      body: '{}',
+      headers: { 'content-type': 'application/json' },
+      method: 'POST',
+    }),
+  );
+
+  expect(completed.status).toBe(202);
+  await expect(completed.json()).resolves.toEqual({ connectionId: 'conn-1', name: 'Persisted before logging' });
+  expect(failed.status).toBe(422);
+  expect(observed).toHaveLength(1);
+  expect(loggedEvents).toEqual(['service_plane.rest.completed', 'service_plane.rest.failed']);
+  await Promise.resolve();
+}
 
 async function routedRestService(options: {
   exposure?: 'private' | 'published';
@@ -390,12 +606,14 @@ async function routedRestService(options: {
   const scope = `${options.serviceId}.items.read`;
   const privateJwk = privateJwkFromCapabilitySigningSecret(options.secret, options.kid);
   const capabilities = defineCapabilities({ scopes: [{ id: scope }], serviceId: options.serviceId });
+  const method = createAbilityBuilder();
   const ability = defineAbility({
     access: 'plane',
     exposure: options.exposure ?? 'published',
     id: `${options.serviceId}.items`,
     methods: {
-      get: abilityMethod({
+      get: method.method({
+        handler: ({ input }) => ({ id: input.id ?? input.slug ?? '', serviceId: options.serviceId }),
         input: z.object({ id: z.string().optional(), slug: z.string().optional() }),
         output: z.object({ id: z.string(), serviceId: z.string() }),
         rest: { method: 'get', path: options.path, ...(options.status === undefined ? {} : { status: options.status }) },
@@ -403,14 +621,6 @@ async function routedRestService(options: {
       }),
     },
     scopes: [scope],
-    handler: () => {
-      class ItemsHandler extends RpcTarget {
-        async get(input: { id?: string; slug?: string }) {
-          return { id: input.id ?? input.slug ?? '', serviceId: options.serviceId };
-        }
-      }
-      return new ItemsHandler() as ItemsHandler & Record<string, unknown>;
-    },
   });
   const service = new ServicePlaneService({
     abilities: [ability],
@@ -434,12 +644,17 @@ async function restService(observed: Array<{ input: unknown; subject: unknown; c
   const kid = 'rest-key';
   const privateJwk = privateJwkFromCapabilitySigningSecret(secret, kid);
   const capabilities = defineCapabilities({ scopes: [{ id: SCOPE }], serviceId: 'connections' });
+  const method = createAbilityBuilder();
   const ability = defineAbility({
     access: 'plane',
     exposure: 'published',
     id: 'connections.snapshots',
     methods: {
-      createSnapshot: abilityMethod({
+      createSnapshot: method.method({
+        handler: ({ context, input }) => {
+          observed.push({ connInfo: context.connInfo, input, subject: context.identity.subject });
+          return { connectionId: input.connectionId, name: input.name };
+        },
         input: z.object({ connectionId: z.string(), dryRun: z.string(), name: z.string(), tags: z.array(z.string()).optional() }),
         output: z.object({ connectionId: z.string(), name: z.string() }),
         rest: { method: 'post', path: '/connections/{connectionId}/snapshots', status },
@@ -447,15 +662,6 @@ async function restService(observed: Array<{ input: unknown; subject: unknown; c
       }),
     },
     scopes: [SCOPE],
-    handler: ({ connInfo, identity }) => {
-      class SnapshotsHandler extends RpcTarget {
-        async createSnapshot(input: { connectionId: string; dryRun: string; name: string; tags?: string[] }) {
-          observed.push({ connInfo, input, subject: identity.subject });
-          return { connectionId: input.connectionId, name: input.name };
-        }
-      }
-      return new SnapshotsHandler() as SnapshotsHandler & Record<string, unknown>;
-    },
   });
   const service = new ServicePlaneService({
     abilities: [ability],

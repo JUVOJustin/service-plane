@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import * as z from 'zod';
-import { type AbilitySchema, abilityMethod, defineAbility, defineAbilityService, defineCapabilities, RpcTarget } from '../service/index.js';
+import { type AbilitySchema, createAbilityBuilder, defineAbility, defineAbilityService, defineCapabilities } from '../service/index.js';
 import type { DiscoveredServiceAbility, OpenApiObject, ServiceEndpoint, ServiceRegistrySnapshot } from '../shared/types.js';
 import { generateMcpDiscovery } from './mcp.js';
 import { generateControlPlaneOpenApi } from './openapi.js';
@@ -44,23 +44,24 @@ function plainSchema(): AbilitySchema {
 const capabilities = defineCapabilities({ scopes: [{ id: 'example.search' }], serviceId: 'example' });
 
 function serviceWith(input: AbilitySchema, output: AbilitySchema, restPath = '/examples/search') {
+  const method = createAbilityBuilder();
   return defineAbilityService({
     abilities: [
       defineAbility({
         exposure: 'published',
         id: 'example.search',
         methods: {
-          search: abilityMethod({
-            input,
+          search: method.method({
             mcp: { name: 'example_search' },
             mcpPrompt: { name: 'example_search_prompt' },
-            output,
             rest: { method: 'post', path: restPath, summary: 'Search' },
             scopes: ['example.search'],
+            input: input,
+            output: output,
+            handler: () => ({}),
           }),
         },
         scopes: ['example.search'],
-        handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
       }),
     ],
     capabilities,
@@ -77,17 +78,23 @@ const endpoint: ServiceEndpoint = {
 };
 
 function streamingServiceWith(output: AbilitySchema) {
+  const method = createAbilityBuilder();
   return defineAbilityService({
     abilities: [
       defineAbility({
         exposure: 'published',
         id: 'example.stream',
         methods: {
-          watch: abilityMethod({ input: plainSchema(), mcp: { name: 'example_watch' }, output, scopes: ['example.search'], stream: true }),
+          watch: method.stream({
+            mcp: { name: 'example_watch' },
+            scopes: ['example.search'],
+            input: plainSchema(),
+            output: output,
+            handler: async function* () {},
+          }),
         },
         rpc: { transports: ['websocket'] },
         scopes: ['example.search'],
-        handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
       }),
     ],
     capabilities,
@@ -248,8 +255,8 @@ describe('MCP projection of ref-rooted schemas', () => {
 
   it('embeds an $id-anchored streaming item schema without hoisting, refs intact', () => {
     // The hoist-and-rewrite wrapper must not capture an $id-carrying item: the nested resource
-    // would re-anchor the rewritten wrapper-relative refs and they would dangle (Codex review
-    // finding on this PR). An anchored item embeds as-is; its $id keeps its refs resolving.
+    // would re-anchor the rewritten wrapper-relative refs and they would dangle. An anchored item
+    // embeds as-is; its $id keeps its refs resolving.
     const discovery = generateMcpDiscovery(snapshotFromAbility(streamingServiceWith(refRootedSchema()).abilities[0]));
     const tool = discovery.tools.find((entry) => entry.name === 'example_watch');
     const outputSchema = tool?.outputSchema as OpenApiObject;
@@ -264,12 +271,21 @@ describe('MCP projection of ref-rooted schemas', () => {
   it('still hoists and rewrites $id-less streaming item schemas from older services', () => {
     // Discovery documents produced before schemas carried $id reach the registry unchanged;
     // their root-relative refs must keep being re-anchored to the wrapper.
-    const legacy = snapshotFromAbility(streamingServiceWith(refRootedSchema()).abilities[0]);
-    const method = legacy.abilities[0]?.methods.watch;
+    const current = snapshotFromAbility(streamingServiceWith(refRootedSchema()).abilities[0]);
+    const currentAbility = current.abilities[0];
+    const method = currentAbility?.methods.watch;
     if (!method) throw new Error('missing method');
     const { $id, ...withoutId } = method.outputSchema;
     void $id;
-    method.outputSchema = withoutId;
+    const legacy: ServiceRegistrySnapshot = {
+      ...current,
+      abilities: [
+        {
+          ...currentAbility,
+          methods: { ...currentAbility.methods, watch: { ...method, outputSchema: withoutId } },
+        },
+      ],
+    };
 
     const discovery = generateMcpDiscovery(legacy);
     const outputSchema = discovery.tools.find((entry) => entry.name === 'example_watch')?.outputSchema as OpenApiObject;

@@ -1,493 +1,187 @@
-import { RpcSession } from 'capnweb';
-import { describe, expect, it } from 'vitest';
-import { type CapabilityIssuer, createCapabilityIssuer, defineServiceGrants } from '../control-plane/capabilities.js';
-import { testKeys } from '../test-support/index.js';
-import { memoryCapabilityTokenCache, memoryRpcTransportPair } from '../testing/index.js';
+import { describe, expect, it, vi } from 'vitest';
+import type { CapabilityTokenCache, CapabilityTokenCacheEntry } from '../shared/types.js';
 import {
-  bindCapabilityIdentity,
-  type ControlPlaneRpcTokenBinding,
-  type CreateCapabilityTokenProviderOptions,
-  capabilityIdentity,
-  capabilityRpcSession,
-  capabilityTokenCacheKey,
-  cloudflareNativeRpc,
-  cloudflareServiceBindingRpc,
+  type CapabilityTokenRequester,
   controlPlaneHmacTokenRequester,
   controlPlaneRpcTokenRequester,
   createCapabilityTokenProvider,
-  defineCapabilities,
-  disposeAbilitySession,
-  RpcTarget,
-  requireScopes,
-  verifyAuthenticationToken,
-  websocketRpc,
+  jwksFromUrl,
 } from './capabilities.js';
 
-const ISSUED_AT = new Date('2026-05-09T12:00:00.000Z');
-const VERIFIED_AT = new Date('2026-05-09T12:00:01.000Z');
+const NOW = new Date('2030-01-01T00:00:00.000Z');
 
-describe('Cap’n Web service capabilities', () => {
-  it('authenticates a Cap’n Web session and binds identity to scoped targets', async () => {
-    const keys = await testKeys();
-    const capabilities = defineCapabilities({
-      scopes: [{ id: 'example.users.lookup' }, { id: 'example.sync.run' }],
-      serviceId: 'example',
-    });
-    const issuer = createCapabilityIssuer({
-      capabilities: [capabilities],
-      grants: defineServiceGrants({
-        grants: [{ caller: 'moco', scopes: ['example.users.lookup', 'example.sync.run'], target: 'example' }],
-      }),
-      issuer: 'control-plane',
-      now: () => ISSUED_AT,
-      privateJwks: [keys.privateJwk],
-    });
+describe('custom capability token requesters', () => {
+  it.each([
+    { expiresAt: new Date(NOW.getTime() + 60_000), token: '   ' },
+    { expiresAt: 'not-a-date', token: 'opaque-token' },
+  ])('rejects malformed requester results', async (issued) => {
+    const provider = createProvider(async () => issued);
 
-    class ScopedExample extends RpcTarget {
-      async lookupUser(email: string) {
-        const caller = requireScopes(this, 'example.users.lookup');
-        return { caller: caller.serviceId, email };
-      }
-
-      async whoami() {
-        return capabilityIdentity(this)?.serviceId;
-      }
-    }
-
-    class PublicRoot extends RpcTarget {
-      async authenticate(token: string) {
-        const identity = await verifyAuthenticationToken(token, {
-          expectedAudience: 'example',
-          issuer: 'control-plane',
-          jwks: { keys: [keys.publicJwk] },
-          now: VERIFIED_AT,
-        });
-        return bindCapabilityIdentity(new ScopedExample(), identity);
-      }
-    }
-
-    const { left, right } = memoryRpcTransportPair();
-    new RpcSession(right, new PublicRoot());
-    const issued = await issuer.issueCapabilityToken({
-      callerAccess: 'service',
-      callerServiceId: 'moco',
-      scopes: ['example.users.lookup'],
-      targetServiceId: 'example',
-    });
-
-    interface ExampleApi {
-      lookupUser(email: string): Promise<{ caller: string; email: string }>;
-      whoami(): Promise<string | undefined>;
-    }
-
-    const stub = await capabilityRpcSession<ExampleApi>({
-      callerServiceId: 'moco',
-      requestToken: async () => issued,
-      scopes: ['example.users.lookup'],
-      targetServiceId: 'example',
-      transport: { kind: 'custom', transport: left },
-    });
-
-    await expect(stub.lookupUser('a@example.com')).resolves.toEqual({ caller: 'moco', email: 'a@example.com' });
-    await expect(stub.whoami()).resolves.toBe('moco');
+    await expect(provider.token()).rejects.toThrow('Invalid Service-Plane capability token response');
   });
 
-  it('rejects methods when the bound identity lacks a required scope', async () => {
-    const target = bindCapabilityIdentity(new RpcTarget(), {
-      audience: 'example',
-      callerAccess: 'service',
-      expiresAt: new Date('2026-05-09T12:05:00.000Z'),
-      issuer: 'control-plane',
-      scopes: ['example.read'],
-      serviceId: 'moco',
-      tokenId: 'token-1',
-    });
+  it('rejects a token whose declared expiration is not in the future', async () => {
+    const provider = createProvider(async () => ({ expiresAt: NOW, token: 'opaque-token' }));
 
-    expect(() => requireScopes(target, 'example.write')).toThrow('Missing Service-Plane capability scope: example.write');
+    await expect(provider.token()).rejects.toThrow('Service-Plane capability token response is already expired');
   });
 
-  it('caches capability tokens and shares cache entries across providers', async () => {
-    let now = new Date('2026-05-09T12:00:00.000Z');
-    const cache = memoryCapabilityTokenCache(() => now.getTime());
-    let issuedCount = 0;
-    const requestToken = async () => {
-      issuedCount += 1;
-      return { expiresAt: new Date('2026-05-09T12:05:00.000Z'), token: `token-${issuedCount}` };
-    };
-
-    const first = createCapabilityTokenProvider({
+  it('bounds the cached lifetime by the expiration signed into a JWT', async () => {
+    const jwtExpiresAt = new Date(NOW.getTime() + 30_000);
+    const set = vi.fn<CapabilityTokenCache['set']>(async () => undefined);
+    const cache: CapabilityTokenCache = { get: async () => undefined, set };
+    const provider = createProvider(
+      async () => ({ expiresAt: new Date(NOW.getTime() + 5 * 60_000), token: capabilityToken(jwtExpiresAt) }),
       cache,
-      callerServiceId: 'moco',
-      now: () => now,
-      requestToken,
-      scopes: ['example.users.lookup'],
-      targetServiceId: 'example',
-    });
-    const second = createCapabilityTokenProvider({
-      cache,
-      callerServiceId: 'moco',
-      now: () => now,
-      requestToken,
-      scopes: ['example.users.lookup'],
-      targetServiceId: 'example',
-    });
-
-    await expect(first.token()).resolves.toBe('token-1');
-    await expect(second.token()).resolves.toBe('token-1');
-    expect(issuedCount).toBe(1);
-
-    now = new Date('2026-05-09T12:04:55.000Z');
-    await expect(second.token()).resolves.toBe('token-2');
-    expect(issuedCount).toBe(2);
-  });
-
-  it('deduplicates concurrent token requests and retries after a failed request', async () => {
-    let attempts = 0;
-    const provider = createCapabilityTokenProvider({
-      callerServiceId: 'moco',
-      requestToken: async () => {
-        attempts += 1;
-        await Promise.resolve();
-        if (attempts === 1) throw new Error('temporary issuer failure');
-        return { expiresAt: new Date('2026-05-09T12:05:00.000Z'), token: 'token-2' };
-      },
-      scopes: ['example.users.lookup'],
-      targetServiceId: 'example',
-    });
-
-    await expect(Promise.all([provider.token(), provider.token()])).rejects.toThrow('temporary issuer failure');
-    expect(attempts).toBe(1);
-    await expect(Promise.all([provider.token(), provider.token()])).resolves.toEqual(['token-2', 'token-2']);
-    expect(attempts).toBe(2);
-  });
-
-  it('rejects invalid token refresh skew at setup', () => {
-    expect(() =>
-      createCapabilityTokenProvider({
-        callerServiceId: 'moco',
-        refreshSkewSeconds: Number.NaN,
-        requestToken: async () => ({ expiresAt: new Date('2026-05-09T12:05:00.000Z'), token: 'token' }),
-        scopes: ['example.users.lookup'],
-        targetServiceId: 'example',
-      }),
-    ).toThrow('refresh skew must be a non-negative integer');
-  });
-
-  it('builds stable token cache keys regardless of scope order', () => {
-    expect(capabilityTokenCacheKey({ callerServiceId: 'moco', scopes: ['b', 'a'], targetServiceId: 'example' })).toBe(
-      capabilityTokenCacheKey({ callerServiceId: 'moco', scopes: ['a', 'b'], targetServiceId: 'example' }),
-    );
-  });
-
-  it('never shares cached tokens across delegated subjects', async () => {
-    expect(
-      capabilityTokenCacheKey({ callerServiceId: 'moco', scopes: ['a'], subject: { id: 'user-7' }, targetServiceId: 'example' }),
-    ).not.toBe(capabilityTokenCacheKey({ callerServiceId: 'moco', scopes: ['a'], targetServiceId: 'example' }));
-    expect(
-      capabilityTokenCacheKey({ callerServiceId: 'moco', scopes: ['a'], subject: { id: 'user-7' }, targetServiceId: 'example' }),
-    ).not.toBe(capabilityTokenCacheKey({ callerServiceId: 'moco', scopes: ['a'], subject: { id: 'user-8' }, targetServiceId: 'example' }));
-    expect(
-      capabilityTokenCacheKey({
-        callerServiceId: 'moco',
-        scopes: ['a'],
-        subject: { id: 'principal-7', kind: 'api-key', orgId: 'org-42' },
-        targetServiceId: 'example',
-      }),
-    ).not.toBe(
-      capabilityTokenCacheKey({
-        callerServiceId: 'moco',
-        scopes: ['a'],
-        subject: { id: 'principal-7', kind: 'automation', orgId: 'org-42' },
-        targetServiceId: 'example',
-      }),
     );
 
-    const cache = memoryCapabilityTokenCache(() => new Date('2026-05-09T12:00:00.000Z').getTime());
-    let issuedCount = 0;
-    const providerFor = (subjectId: string) =>
-      createCapabilityTokenProvider({
-        cache,
-        callerServiceId: 'control-plane',
-        now: () => new Date('2026-05-09T12:00:00.000Z'),
-        requestToken: async (input) => {
-          issuedCount += 1;
-          expect(input.subject).toEqual({ id: subjectId, orgId: 'org-42' });
-          return { expiresAt: new Date('2026-05-09T12:05:00.000Z'), token: `token-${subjectId}` };
-        },
-        scopes: ['example.users.lookup'],
-        subject: { id: subjectId, orgId: 'org-42' },
-        targetServiceId: 'example',
-      });
+    await provider.token();
 
-    await expect(providerFor('user-7').token()).resolves.toBe('token-user-7');
-    await expect(providerFor('user-8').token()).resolves.toBe('token-user-8');
-    expect(issuedCount).toBe(2);
+    expect(set).toHaveBeenCalledOnce();
+    expect(set.mock.calls[0]?.[1].expiresAt).toEqual(jwtExpiresAt);
+    expect(set.mock.calls[0]?.[2]).toBe(30);
   });
 
-  it('partitions caller-supplied cache keys by delegated subject', async () => {
-    const cache = memoryCapabilityTokenCache(() => new Date('2026-05-09T12:00:00.000Z').getTime());
-    let issuedCount = 0;
-    const providerFor = (subjectId: string) =>
-      createCapabilityTokenProvider({
-        cache,
-        cacheKey: 'shared-key',
-        callerServiceId: 'control-plane',
-        now: () => new Date('2026-05-09T12:00:00.000Z'),
-        requestToken: async () => {
-          issuedCount += 1;
-          return { expiresAt: new Date('2026-05-09T12:05:00.000Z'), token: `token-${subjectId}-${issuedCount}` };
-        },
-        scopes: ['example.users.lookup'],
-        subject: { id: subjectId },
-        targetServiceId: 'example',
-      });
+  it('rejects a JWT that is already expired even when the requester advertises a later expiration', async () => {
+    const provider = createProvider(async () => ({
+      expiresAt: new Date(NOW.getTime() + 60_000),
+      token: capabilityToken(new Date(NOW.getTime() - 1_000)),
+    }));
 
-    await expect(providerFor('user-7').token()).resolves.toBe('token-user-7-1');
-    await expect(providerFor('user-8').token()).resolves.toBe('token-user-8-2');
-    await expect(providerFor('user-7').token()).resolves.toBe('token-user-7-1');
-    expect(issuedCount).toBe(2);
+    await expect(provider.token()).rejects.toThrow('Service-Plane capability token response is already expired');
   });
 
-  it('partitions caller-supplied cache keys by delegated principal kind', async () => {
-    const cache = memoryCapabilityTokenCache(() => new Date('2026-05-09T12:00:00.000Z').getTime());
-    let issuedCount = 0;
-    const providerFor = (kind: string) =>
-      createCapabilityTokenProvider({
-        cache,
-        cacheKey: 'shared-principal',
-        callerServiceId: 'control-plane',
-        now: () => new Date('2026-05-09T12:00:00.000Z'),
-        requestToken: async () => {
-          issuedCount += 1;
-          return { expiresAt: new Date('2026-05-09T12:05:00.000Z'), token: `token-${kind}` };
-        },
-        scopes: ['example.users.lookup'],
-        subject: { id: 'principal-7', kind, orgId: 'org-42' },
-        targetServiceId: 'example',
-      });
-
-    await expect(providerFor('api-key').token()).resolves.toBe('token-api-key');
-    await expect(providerFor('automation').token()).resolves.toBe('token-automation');
-    expect(issuedCount).toBe(2);
-  });
-
-  it('rejects delegated subjects on shipped token requesters before anything is sent', async () => {
-    const input = {
-      callerServiceId: 'moco',
-      scopes: ['example.users.lookup'],
-      subject: { id: 'user-7' },
-      targetServiceId: 'example',
+  it('partitions shared and in-memory tokens by sender-constraining key', async () => {
+    const entries = new Map<string, CapabilityTokenCacheEntry>();
+    const cache: CapabilityTokenCache = {
+      get: async (key) => entries.get(key),
+      set: async (key, value) => {
+        entries.set(key, value);
+      },
     };
-    const rpcRequester = controlPlaneRpcTokenRequester({
-      binding: {
-        async issueCapabilityToken() {
-          throw new Error('raw binding must not be reached');
-        },
-      },
-    });
-    const hmacRequester = controlPlaneHmacTokenRequester({
-      clientId: 'moco',
-      clientSecret: 'secret',
-      controlPlaneUrl: 'https://plane.example.com',
-      fetch: async () => {
-        throw new Error('token endpoint must not be reached');
-      },
-    });
+    let requests = 0;
+    const requesterFor = (binding: () => string): CapabilityTokenRequester => {
+      const requester: CapabilityTokenRequester = async () => {
+        requests += 1;
+        return { expiresAt: new Date(NOW.getTime() + 60_000), token: `token-${binding()}` };
+      };
+      requester.cacheBinding = binding;
+      requester.proveTokenPossession = async () => 'proof';
+      return requester;
+    };
+    let firstBinding = 'thumbprint-a';
+    const firstRequester = requesterFor(() => firstBinding);
+    const providerFor = (requestToken: CapabilityTokenRequester) =>
+      createCapabilityTokenProvider({
+        cache,
+        cacheKey: 'shared-caller',
+        callerServiceId: 'caller',
+        now: () => NOW,
+        requestToken,
+        scopes: ['catalog:read'],
+        targetServiceId: 'catalog',
+      });
+    const first = providerFor(firstRequester);
+    const second = providerFor(requesterFor(() => 'thumbprint-b'));
 
-    await expect(rpcRequester(input)).rejects.toThrow('Service-Plane token requesters cannot assert a delegated subject');
-    await expect(hmacRequester(input)).rejects.toThrow('Service-Plane token requesters cannot assert a delegated subject');
+    await expect(first.token()).resolves.toBe('token-thumbprint-a');
+    await expect(second.token()).resolves.toBe('token-thumbprint-b');
+    await expect(providerFor(firstRequester).token()).resolves.toBe('token-thumbprint-a');
+    expect(requests).toBe(2);
+
+    firstBinding = 'thumbprint-c';
+    await expect(first.token()).resolves.toBe('token-thumbprint-c');
+    expect(requests).toBe(3);
+    expect(entries).toHaveLength(3);
   });
 
-  it('requests capability tokens from a private RPC binding', async () => {
-    const requester = controlPlaneRpcTokenRequester({
+  it('never forwards caller identity through a native token binding', async () => {
+    const issueCapabilityToken = vi.fn(async () => ({
+      expiresAt: new Date(NOW.getTime() + 60_000),
+      token: capabilityToken(new Date(NOW.getTime() + 60_000), 'caller-controlled-value'),
+    }));
+    const requestToken = controlPlaneRpcTokenRequester({ binding: { issueCapabilityToken } });
+
+    await expect(
+      requestToken({
+        callerServiceId: 'caller-controlled-value',
+        scopes: ['catalog:read'],
+        targetServiceId: 'catalog',
+        ttlSeconds: 30,
+      }),
+    ).resolves.toMatchObject({ token: expect.any(String) });
+    expect(issueCapabilityToken).toHaveBeenCalledWith({
+      scopes: ['catalog:read'],
+      targetServiceId: 'catalog',
+      ttlSeconds: 30,
+    });
+  });
+
+  it('rejects a native token binding pinned to a different service', async () => {
+    const requestToken = controlPlaneRpcTokenRequester({
       binding: {
-        async issueCapabilityTokenForCaller(callerServiceId, input) {
-          expect(callerServiceId).toBe('worker-a');
-          expect(input).toEqual({ scopes: ['example.sync.run'], targetServiceId: 'example' });
-          return { expiresAt: '2026-05-12T10:17:00.000Z', token: 'rpc-token-1' };
-        },
+        issueCapabilityToken: async () => ({
+          expiresAt: new Date(NOW.getTime() + 60_000),
+          token: capabilityToken(new Date(NOW.getTime() + 60_000), 'other-service'),
+        }),
       },
-      callerServiceId: 'worker-a',
     });
 
     await expect(
-      requester({
-        callerServiceId: 'ignored',
-        scopes: ['example.sync.run'],
-        targetServiceId: 'example',
-      }),
-    ).resolves.toEqual({
-      expiresAt: new Date('2026-05-12T10:17:00.000Z'),
-      token: 'rpc-token-1',
+      requestToken({ callerServiceId: 'workflow-service', scopes: ['catalog:read'], targetServiceId: 'catalog' }),
+    ).rejects.toThrow('RPC token binding returned a token not bound to its pinned service caller');
+  });
+
+  it('bounds remote token and JWKS responses', async () => {
+    const oversizedFetch = async () => new Response('{"keys":[]}', { headers: { 'content-length': '11' } });
+    const requestToken = controlPlaneHmacTokenRequester({
+      clientId: 'workflow',
+      clientSecret: 'secret',
+      controlPlaneUrl: 'https://plane.example',
+      fetch: oversizedFetch,
+      maxResponseBytes: 10,
     });
-  });
+    await expect(requestToken({ callerServiceId: 'workflow', scopes: ['catalog:read'], targetServiceId: 'catalog' })).rejects.toThrow(
+      'Service-Plane capability token response is too large',
+    );
 
-  it('asks the token provider for each stateless RPC call', async () => {
-    let tokenCount = 0;
-    const api = await capabilityRpcSession<{ ping(): Promise<string> }>({
-      abilityId: 'example.sync',
-      authenticate: (_root, token) =>
-        ({
-          ping: async () => token,
-        }) as never,
-      callerServiceId: 'worker-a',
-      scopes: ['example.sync.run'],
-      targetServiceId: 'example',
-      tokenProvider: {
-        async token() {
-          tokenCount += 1;
-          return `token-${tokenCount}`;
-        },
-      },
-      transport: cloudflareServiceBindingRpc({
-        fetch: async () => {
-          throw new Error('authenticate stub should not use the transport root');
-        },
-      }),
-    });
-
-    await expect(api.ping()).resolves.toBe('token-1');
-    await expect(api.ping()).resolves.toBe('token-2');
-    await expect((api as unknown as { missing(): Promise<unknown> }).missing()).rejects.toThrow('ability method is not available: missing');
-  });
-
-  it('creates a WebSocket after adding the request id and restores an absent runtime global', async () => {
-    const globalObject = globalThis as typeof globalThis & { WebSocket?: typeof WebSocket };
-    const descriptor = Object.getOwnPropertyDescriptor(globalObject, 'WebSocket');
-    const socket = new FakeWebSocket();
-    let createdUrl: string | undefined;
-    let createdSockets = 0;
-    let tokenAttempts = 0;
-    Reflect.deleteProperty(globalObject, 'WebSocket');
-
-    try {
-      const api = await capabilityRpcSession<{ ping(): Promise<string> }>({
-        abilityId: 'example.sync',
-        authenticate: () => ({ ping: async () => 'pong' }),
-        callerServiceId: 'worker-a',
-        requestId: 'request-42',
-        scopes: ['example.sync.run'],
-        targetServiceId: 'example',
-        tokenProvider: {
-          async token() {
-            tokenAttempts += 1;
-            await Promise.resolve();
-            if (tokenAttempts === 1) throw new Error('temporary token failure');
-            return 'capability-token';
-          },
-        },
-        transport: websocketRpc('ws://example.internal/rpc/example.sync?existing=1', {
-          createWebSocket(url) {
-            createdSockets += 1;
-            createdUrl = url;
-            return socket as unknown as WebSocket;
-          },
-        }),
-      });
-
-      await expect(api.ping()).rejects.toThrow('temporary token failure');
-      await expect(Promise.all([api.ping(), api.ping()])).resolves.toEqual(['pong', 'pong']);
-      await expect(api.ping()).resolves.toBe('pong');
-      expect(tokenAttempts).toBe(2);
-      expect(createdSockets).toBe(1);
-      expect(createdUrl).toBe('ws://example.internal/rpc/example.sync?existing=1&request_id=request-42');
-      expect(socket.binaryType).toBe('arraybuffer');
-      expect(Object.hasOwn(globalObject, 'WebSocket')).toBe(false);
-      await disposeAbilitySession(api);
-    } finally {
-      if (descriptor) Object.defineProperty(globalObject, 'WebSocket', descriptor);
-      else Reflect.deleteProperty(globalObject, 'WebSocket');
-    }
-  });
-
-  it('opens a native binding once for concurrent and later calls', async () => {
-    let connections = 0;
-    let calls = 0;
-    let disposals = 0;
-    let tokenRequests = 0;
-    const target = {
-      [Symbol.dispose]() {
-        disposals += 1;
-      },
-      async ping() {
-        calls += 1;
-        return 'pong';
-      },
-    };
-    const api = await capabilityRpcSession<{ ping(): Promise<string> }>({
-      abilityId: 'example.sync',
-      callerServiceId: 'worker-a',
-      scopes: ['example.sync.run'],
-      targetServiceId: 'example',
-      tokenProvider: {
-        async token() {
-          tokenRequests += 1;
-          await Promise.resolve();
-          return 'capability-token';
-        },
-      },
-      transport: cloudflareNativeRpc({
-        async connectAbility() {
-          connections += 1;
-          await Promise.resolve();
-          return target;
-        },
-      }),
-    });
-
-    await expect(Promise.all([api.ping(), api.ping()])).resolves.toEqual(['pong', 'pong']);
-    await expect(api.ping()).resolves.toBe('pong');
-    expect({ calls, connections, tokenRequests }).toEqual({ calls: 3, connections: 1, tokenRequests: 1 });
-    await disposeAbilitySession(api);
-    expect(disposals).toBe(1);
-  });
-
-  it('invokes methods directly on a native binding RPC stub', async () => {
-    class NativeAbility extends RpcTarget {
-      async ping() {
-        return 'pong';
-      }
-    }
-    class NativeBinding extends RpcTarget {
-      connectAbility() {
-        return new NativeAbility();
-      }
-    }
-    const { left, right } = memoryRpcTransportPair();
-    new RpcSession(right, new NativeBinding());
-    const binding = new RpcSession<{ connectAbility(input: { abilityId: string; token: string }): Promise<object> }>(left).getRemoteMain();
-    const api = await capabilityRpcSession<{ ping(): Promise<string> }>({
-      abilityId: 'example.sync',
-      callerServiceId: 'worker-a',
-      scopes: ['example.sync.run'],
-      targetServiceId: 'example',
-      tokenProvider: { token: async () => 'capability-token' },
-      transport: cloudflareNativeRpc(binding),
-    });
-
-    await expect(api.ping()).resolves.toBe('pong');
-    await disposeAbilitySession(api);
-  });
-
-  it('refuses a raw CapabilityIssuer at the requester seams at compile time', () => {
-    // Pins the property-function declarations on both seams: with method syntax TypeScript
-    // compares parameters bivariantly, so a raw issuer — whose input additionally requires
-    // callerAccess — would compile here and then throw a 500 on the first token request.
-    const issuer = { issueCapabilityToken: async () => ({ expiresAt: new Date(), token: 't' }) } as unknown as CapabilityIssuer;
-    // @ts-expect-error a raw issuer must not satisfy the RPC token binding seam
-    const binding: ControlPlaneRpcTokenBinding = issuer;
-    // @ts-expect-error a raw issuer method must not satisfy requestToken
-    const requestToken: CreateCapabilityTokenProviderOptions['requestToken'] = issuer.issueCapabilityToken;
-    expect(binding).toBe(issuer);
-    expect(requestToken).toBe(issuer.issueCapabilityToken);
+    const resolveJwks = jwksFromUrl('https://plane.example/.well-known/jwks.json', {
+      fetch: oversizedFetch,
+      maxResponseBytes: 10,
+    }) as () => Promise<unknown>;
+    await expect(resolveJwks()).rejects.toThrow('Service-Plane JWKS response is too large');
   });
 });
 
-class FakeWebSocket extends EventTarget {
-  binaryType: BinaryType = 'blob';
-  readonly readyState = 0;
+function createProvider(requestToken: () => Promise<{ expiresAt: Date | string; token: string }>, cache?: CapabilityTokenCache) {
+  return createCapabilityTokenProvider({
+    ...(cache ? { cache } : {}),
+    callerServiceId: 'caller',
+    now: () => NOW,
+    requestToken,
+    scopes: ['catalog:read'],
+    targetServiceId: 'catalog',
+  });
+}
 
-  close(): void {}
+function capabilityToken(expiresAt: Date, subject = 'caller'): string {
+  return [
+    encodeJwtPart({ alg: 'EdDSA', kid: 'test-key' }),
+    encodeJwtPart({
+      aud: 'catalog',
+      exp: Math.floor(expiresAt.getTime() / 1000),
+      iat: Math.floor(NOW.getTime() / 1000),
+      iss: 'https://control.example',
+      jti: 'test-token',
+      nbf: Math.floor(NOW.getTime() / 1000),
+      scp: ['catalog:read'],
+      spa: 'service',
+      sub: subject,
+    }),
+    'signature',
+  ].join('.');
+}
 
-  send(): void {}
+function encodeJwtPart(value: unknown): string {
+  return btoa(JSON.stringify(value)).replace(/\+/gu, '-').replace(/\//gu, '_').replace(/=+$/u, '');
 }

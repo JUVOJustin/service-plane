@@ -1,224 +1,202 @@
 # Create A Service
 
-Goal: create one service that exposes schema-backed abilities through Service Plane.
+This guide creates a schema-validated service with one ability.
 
-The smallest useful service defines capabilities, abilities, handler classes, and `ServicePlaneService`.
+## 1. Define Capabilities
 
-## 1. Define Scopes
-
-Scopes belong to one service. They are the names the control plane grants and the service enforces.
+Scopes are part of the service's public security contract. Declare them once, then reference them
+from abilities and methods.
 
 ```ts
+// capabilities.ts
 import { defineCapabilities } from 'service-plane/service';
 
 export const capabilities = defineCapabilities({
-  serviceId: 'asana',
-  scopes: [{ id: 'asana.tasks.write', title: 'Create Asana tasks' }],
+  serviceId: 'tasks-service',
+  scopes: [
+    { id: 'tasks.read', title: 'Read tasks' },
+    { id: 'tasks.write', title: 'Write tasks' },
+  ],
 });
 ```
 
-If an ability or method references an unknown scope, the service fails during setup.
+Service Plane rejects unknown, missing, or duplicated scopes during setup. This is intentional:
+configuration errors should fail a deployment, not a request.
 
-## 2. Define Schemas
-
-Schemas are the source of truth for input and output. Pick any validation library that implements [Standard Schema](https://standardschema.dev) and its [Standard JSON Schema](https://standardschema.dev/json-schema) companion — see [Choosing A Validation Library](#choosing-a-validation-library) below. The snippets here use Zod to stay concrete; every one of them works the same written in ArkType, Valibot, or VineJS.
+## 2. Define A Portable Contract
 
 ```ts
+// tasks.contract.ts
 import * as z from 'zod';
+import { createAbilityBuilder, defineAbility } from 'service-plane/service';
 
-export const CreateTaskInput = z.object({
-  connectionId: z.string(),
-  name: z.string().min(1),
-  projectId: z.string(),
-});
+export type TasksEnv = {
+  Bindings: {
+    TASKS: TaskRepository;
+  };
+};
 
-export const CreateTaskOutput = z.object({
-  id: z.string(),
-  url: z.string().url(),
+const ability = createAbilityBuilder<TasksEnv>();
+
+export const tasksContract = defineAbility({
+  id: 'tasks',
+  title: 'Tasks',
+  description: 'Read and create tasks',
+  exposure: 'published',
+  access: 'plane',
+  scopes: ['tasks.read', 'tasks.write'],
+  methods: {
+    get: ability.method({
+      input: z.object({ id: z.string() }),
+      output: z.object({ id: z.string(), title: z.string() }),
+      scopes: ['tasks.read'],
+      idempotent: true,
+      rest: { method: 'get', path: '/tasks/{id}' },
+      mcp: { name: 'tasks_get', description: 'Get a task by id' },
+    }),
+    create: ability.method({
+      input: z.object({ title: z.string().min(1) }),
+      output: z.object({ id: z.string(), title: z.string() }),
+      scopes: ['tasks.write'],
+      rest: { method: 'post', path: '/tasks', status: 201 },
+    }),
+  },
+  rpc: { transports: ['fetch', 'service-binding'] },
 });
 ```
 
-The same schemas are used for RPC validation, discovery, OpenAPI, and MCP metadata.
+Keep `TasksEnv` limited to portable TypeScript interfaces used by handlers. It is compile-time
+context, not client runtime state; avoid Cloudflare `Fetcher`, database-driver, or RPC-engine types
+in a contract that browser packages import.
 
-Besides `mcp` (an MCP tool), a published method can declare `mcpResource` (a static or `{variable}`-templated MCP resource) and `mcpPrompt` (an MCP prompt). See [OpenAPI and MCP](openapi-mcp.md#mcp) for how the control plane projects and serves them.
+Use plain `createAbilityBuilder()` when no handler reads `context.env`; that contract can mount in
+any more specific Hono environment. Pass `createAbilityBuilder<TasksEnv>()` only when inline or
+separately attached handlers need those bindings. A service environment may add bindings, but must
+still contain every binding its mounted handlers require.
+
+`private` is the default exposure; use `published` only for a deliberate product surface. `plane`
+is the normal access mode. Use `service` only for authenticated service-to-service abilities.
 
 ### Choosing A Validation Library
 
-`service-plane` has no validation library of its own and no validation peer dependency. An `input` or `output` schema is anything that implements two companion specs:
+An ability schema must provide both `~standard.validate` and `~standard.jsonSchema`; Standard Schema
+support alone is not enough. The current
+[compatibility table](https://standardschema.dev/json-schema#what-schema-libraries-support-this-spec)
+lists Zod 4.2+, ArkType 2.1.28 or later, and VineJS 4.3.0+ as direct implementations. Valibot 1.2
+needs `toStandardJsonSchema` from `@valibot/to-json-schema` 1.5+. The library does not depend on any
+of them; these examples are tested with Zod 4.5.4.
 
-- [Standard Schema](https://standardschema.dev) — the `~standard.validate()` contract used to validate one RPC call's input, one return value, or one streamed item.
-- [Standard JSON Schema](https://standardschema.dev/json-schema) — the `~standard.jsonSchema` contract used to render the discovery document, OpenAPI, and MCP tool metadata.
+The generated JSON Schema is not decorative: discovery, OpenAPI, REST input mapping, and MCP all
+read it. Test custom schemas for both runtime validation and JSON Schema generation.
 
-Both halves are required, because every ability method appears in the discovery document. Service Plane always asks for the `draft-2020-12` target, so every service publishes the same JSON Schema dialect no matter which library produced it.
+## 3. Add Handlers
 
-Known implementations, alphabetically — none is preferred by this package, and the list is not exhaustive:
-
-| Library | Supported from | Note |
-| --- | --- | --- |
-| [ArkType](https://arktype.io) | 2.1.28 | Works directly. |
-| [Valibot](https://valibot.dev) | 1.2 | Wrap with `toStandardJsonSchema()` from `@valibot/to-json-schema` 1.5+. |
-| [VineJS](https://vinejs.dev) | 4.3 | Works directly. |
-| [Zod](https://zod.dev) | 4.2 | Works directly. |
-
-There is nothing to configure. You do not register a library, pass an adapter, or set an option — you import the library you want and pass its schemas as `input` and `output`. Service Plane reads the contract off each schema it is handed.
-
-That means the choice is per schema, not per service. Two services in one plane can use different libraries, one ability can mix them across methods, and a single method can take its `input` from one library and its `output` from another. Each schema is projected on its own, so mixing is invisible to callers.
+Keep service-only code out of the shared contract:
 
 ```ts
-// Valibot schemas carry validation, but JSON Schema comes from the wrapper.
-import { toStandardJsonSchema } from '@valibot/to-json-schema';
-import * as v from 'valibot';
+// tasks.implementation.ts
+import { AbilityHandlerError, implementAbility } from 'service-plane/service';
+import { tasksContract } from './tasks.contract';
 
-export const CreateTaskInput = toStandardJsonSchema(
-  v.object({
-    connectionId: v.string(),
-    name: v.pipe(v.string(), v.minLength(1)),
-    projectId: v.string(),
-  }),
-);
-```
-
-Both halves of the contract are checked when the service is defined, not on the first call: a schema missing `~standard.validate` or `~standard.jsonSchema`, or one JSON Schema cannot represent — a Zod `.transform()` on the output side, for example — fails while the service boots, with the offending ability and method named. Because there is no validation peer dependency, an outdated library installs cleanly and only fails here, so the error names the version floor.
-
-## 3. Define An Ability
-
-An ability is the service API surface. A method is one callable operation.
-
-```ts
-import { abilityMethod, defineAbility } from 'service-plane/service';
-import { CreateTaskInput, CreateTaskOutput } from './schemas';
-import { AsanaTasksHandler } from './tasks.handler';
-
-export const asanaTasks = defineAbility({
-  id: 'asana.tasks',
-  title: 'Asana Tasks',
-  exposure: 'published',
-  access: 'plane',
-  scopes: ['asana.tasks.write'],
-  methods: {
-    createTask: abilityMethod({
-      input: CreateTaskInput,
-      output: CreateTaskOutput,
-      scopes: ['asana.tasks.write'],
-      rest: { method: 'post', path: '/asana/tasks', summary: 'Create an Asana task' },
-      mcp: { name: 'asana_create_task', description: 'Create a task in Asana' },
-    }),
+export const tasks = implementAbility(tasksContract, {
+  get: async ({ context, input }) => {
+    const task = await context.env.TASKS.get(input.id);
+    if (!task) {
+      throw new AbilityHandlerError('Task not found', {
+        reason: 'task_not_found',
+        status: 404,
+      });
+    }
+    return task;
   },
-  handler: ({ context, identity }) => new AsanaTasksHandler(context.env, identity),
+  create: ({ context, input }) => context.env.TASKS.create(input),
 });
 ```
 
-`handler` returns the implementation object. The object can implement many methods, but only methods declared in `ability.methods` are callable through Service Plane.
+Handlers receive validated `input` and an authorized `context`. Their return value is validated
+before it leaves the service. An arbitrary thrown error becomes an opaque internal error; use
+`AbilityHandlerError` only for messages deliberately safe for callers.
 
-Every `{name}` segment in `rest.path` must name a top-level field in the method's input schema. The
-service rejects an inconsistent definition during setup, and an empty request segment never binds a
-path variable.
-
-`access: 'plane'` is the default Service Plane path: the control plane or gateway decides whether an upstream product user, API key, or anonymous request may invoke the ability. Use `access: 'service'` only for abilities that should be brokered for authenticated service callers.
-
-The service enforces this itself. Every capability token names the access class the control plane authenticated for the caller ([`identity.callerAccess`](auth.md#context-and-identity)), and an `access: 'service'` ability rejects a `plane` caller with 403 before the handler is created. The check reads the ability definition in front of you, not the plane's discovered catalog, so tightening an ability takes effect the moment the service deploys.
-
-## 4. Implement The Handler
-
-The handler receives already-validated input. Service Plane validates input before the method call and validates output after the method returns.
+For a small, service-local contract, an inline handler is equivalent:
 
 ```ts
-import { RpcTarget } from 'capnweb';
-import type { CapabilityIdentity } from 'service-plane/service';
-
-type Env = {
-  ASANA_CONNECTIONS: DurableObjectNamespace;
-};
-
-export class AsanaTasksHandler extends RpcTarget {
-  constructor(
-    private readonly env: Env,
-    private readonly identity: CapabilityIdentity,
-  ) {
-    super();
-  }
-
-  async createTask(input: { connectionId: string; name: string; projectId: string }) {
-    const connectionName = `${this.identity.serviceId}:${input.connectionId}`;
-    const id = this.env.ASANA_CONNECTIONS.idFromName(connectionName);
-    const connection = this.env.ASANA_CONNECTIONS.get(id);
-
-    return connection.createTask(input);
-  }
-}
-```
-
-### Streaming Methods
-
-Some operations produce many results over time — large file transfers, long exports. Declare them with `stream: true`; the `output` schema then validates each streamed item and the handler method returns an async generator (or any iterable / `ReadableStream`):
-
-```ts
-readFile: abilityMethod({
-  input: z.object({ path: z.string() }),
-  output: z.object({ chunk: z.string() }),
-  scopes: ['hub.files.read'],
-  stream: true,
+create: ability.method({
+  input: CreateTask,
+  output: Task,
+  scopes: ['tasks.write'],
+  handler: ({ context, input }) => context.env.TASKS.create(input),
 }),
 ```
 
-```ts
-async *readFile(input: { path: string }) {
-  for await (const chunk of this.storage.read(input.path)) {
-    yield { chunk };
-  }
-}
-```
+The options object is the only method declaration form, keeping schemas, policy, projections, and
+an optional inline implementation together.
 
-Callers receive a native Cap'n Web `ReadableStream` of validated items from the ordinary `abilitySession` call. Streams need an ongoing session, so the ability must enable a session transport (`websocket` or `cloudflare-binding-rpc`); HTTP-batch calls to streaming methods fail with 405. See [Streaming](streaming.md).
-
-`context` is runtime access, such as Hono context, environment bindings, storage, and execution context.
-
-`identity` is the verified Service Plane caller and granted scopes. When the control plane brokers a call for an authenticated plane principal, `identity.subject` carries its id, optional org, and optional principal kind as an RFC 8693 delegated subject (see [auth](auth.md#subject-delegation)). Any other product-level connection context is application-owned; pass it in validated method input if the service needs it. Do not put provider OAuth tokens in identity. Store credentials in a service-owned store such as a Durable Object.
-
-`connInfo` is the original client's connection (`{ remote: { address?, addressType?, port?, transport? } }`, Hono's `ConnInfo`), forwarded by the control plane when it is configured to do so. It is present only for brokered calls into an ingress-protected service, and it is **advisory**: unlike `identity` it is not signature-verified. Use it for audit records and logs, never to decide access. See [Forwarded Connection Info](auth.md#forwarded-connection-info).
-
-```ts
-handler: ({ connInfo, identity }) => new AsanaTasksHandler(identity, connInfo?.remote.address),
-```
-
-## 5. Mount The Service
+## 4. Mount The Hono Shell
 
 ```ts
 import {
   ServicePlaneService,
-  jwksFromServiceBinding,
+  jwksFromUrl,
 } from 'service-plane/service';
-import { asanaTasks } from './abilities';
 import { capabilities } from './capabilities';
+import { tasks } from './tasks.implementation';
+import type { TasksEnv } from './tasks.contract';
 
-type Env = {
-  ASANA_CONNECTIONS: DurableObjectNamespace;
-  CONTROL_PLANE: Fetcher;
-};
-
-export default new ServicePlaneService<{ Bindings: Env }>({
-  id: 'asana',
-  title: 'Asana Service',
-  version: '0.2.0',
+export default new ServicePlaneService<TasksEnv>({
+  id: 'tasks-service',
+  title: 'Tasks Service',
+  version: '1.0.0',
+  capabilities,
+  abilities: [tasks],
   auth: {
     issuer: 'control-plane',
-    jwks: (c) => jwksFromServiceBinding(c.env.CONTROL_PLANE),
+    jwks: jwksFromUrl(
+      'https://plane.example.com/.well-known/service-plane/jwks.json',
+    ),
   },
-  ingress: {},
-  capabilities,
-  abilities: [asanaTasks],
 });
 ```
 
-This mounts discovery and an ingress-protected RPC endpoint:
+The service exposes discovery at `/.well-known/service-plane/service.json` and one private RPC path
+per ability, `/rpc/v1/<ability-id>` by default. Protected ingress is on by default and requires the signed broker claim; an
+ordinary valid capability token cannot bypass the control plane.
 
-```txt
-GET /.well-known/service-plane/service.json
-ALL /rpc/asana.tasks
+## Handler Context
+
+`AbilityMethodContext` contains:
+
+| Field | Use |
+| --- | --- |
+| `abilityId`, `methodName` | Metrics and correctly scoped deduplication keys |
+| `env` | Runtime bindings without importing Hono |
+| `request` | Request-local headers and URL, including the propagated request ID |
+| `identity` | Verified caller, delegated subject, and granted scopes |
+| `idempotencyKey` | Caller-owned key for recognizing the same logical attempt across retries |
+| `signal`, `remainingTimeoutMs()` | Cancellation and remaining deadline budget |
+| `connInfo` | Advisory original-client connection data from a trusted broker |
+| `context` | Advanced Hono escape hatch |
+
+Never authorize from `connInfo` or a caller-provided header. Authorization decisions come from the
+verified identity and the service's method definition.
+
+## Add Existing Hono Middleware
+
+Pass an existing app or middleware array:
+
+```ts
+const app = new Hono<MyEnv>();
+app.use('*', cors());
+
+const service = new ServicePlaneService({
+  app,
+  middleware: [rateLimiter],
+  // ...
+});
 ```
 
-When `ingress` is configured, ability RPC requests must use a brokered capability token issued by the control plane. Normal capability tokens still verify cryptographically, but they are rejected before input validation or handler creation.
+Hono middleware wraps Fetch and WebSocket upgrade requests. Cloudflare native RPC does not traverse
+Hono, so put method security and invariants in Service Plane policy or the handler, not solely in
+HTTP middleware.
 
-The service shell also mounts `hono/request-id` and a structured JSON request logger by default. Request ids propagated by the control-plane broker are adopted and echoed on responses, so service logs correlate with plane logs. Pass `logger: { log: (event) => ... }` to forward events to your own logger, or `logger: false` to disable request logging; request-id assignment is always on because brokered-call correlation depends on it.
-
-Next: [create a control plane](plane-creation.md) and [configure auth](auth.md).
+Next: [create the control plane](plane-creation.md), [configure auth](auth.md), or add
+[streaming](streaming.md).

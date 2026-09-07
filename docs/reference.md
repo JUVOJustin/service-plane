@@ -1,636 +1,549 @@
-# Reference
+# API Reference
 
-Goal: quickly look up the main Service Plane API pieces and wire shapes.
+Use this page for option shapes and defaults. Start with [Create a service](service-creation.md) for
+a guided path.
 
-For a guided walkthrough, start with [Create A Service](service-creation.md) and [Create A Control Plane](plane-creation.md).
+## Package Entries
 
-## Ability Definition
+| Entry | Intended use |
+| --- | --- |
+| `service-plane/service` | Contracts, service runtime, typed clients, token requesters |
+| `service-plane/control-plane` | Plane, endpoints, grants, token authority, projections |
+| `service-plane/testing` | In-memory token cache and WebSocket pair for tests |
+| `service-plane` | Combined convenience entry |
+
+The private RPC engine is not exported.
+
+## Ability Contract
 
 ```ts
-defineAbility({
-  id: 'asana.tasks',
-  title: 'Asana Tasks',
-  description: 'Task operations for Asana',
-  exposure: 'private' | 'published',
-  access: 'plane' | 'service',
-  scopes: ['asana.tasks.write'],
+const ability = createAbilityBuilder<{ Bindings: Env }>();
+
+const contract = defineAbility({
+  id: 'tasks',
+  title: 'Tasks',
+  description: 'Task operations',
+  exposure: 'published',
+  access: 'plane',
+  scopes: ['tasks.read'],
   methods: {
-    createTask: abilityMethod({
-      input,
-      output,
-      scopes: ['asana.tasks.write'],
-      rest: { method: 'post', path: '/asana/tasks' },
-      mcp: { name: 'asana_create_task', description: 'Create a task in Asana' },
+    get: ability.method({
+      input: GetTaskInput,
+      output: Task,
+      scopes: ['tasks.read'],
+      idempotent: true,
+      timeoutMs: 2_000,
+      rest: { method: 'get', path: '/tasks/{id}' },
+      mcp: { name: 'tasks_get' },
     }),
   },
   rpc: {
-    path: '/rpc/asana.tasks',
-    transports: ['http-batch', 'websocket'],
+    path: '/rpc/v1/tasks',
+    transports: ['fetch', 'service-binding'],
   },
-  handler: ({ context, identity }) => new AsanaTasksHandler(context.env, identity),
 });
 ```
 
-Defaults:
+Ability defaults:
 
-- `exposure: 'private'`
-- `access: 'plane'`
-- `rpc.path: /rpc/<abilityId>`
-- `rpc.transports: ['http-batch']`
+| Field | Default |
+| --- | --- |
+| `exposure` | `private` |
+| `access` | `plane` |
+| `rpc.path` | `/rpc/v1/<abilityId>` |
+| `rpc.transports` | `['fetch']` |
 
-`access: 'plane'` means the control plane or gateway owns any upstream product auth decision before calling the service. `access: 'service'` restricts the ability to authenticated service callers, and is enforced at both ends: the broker refuses it for a non-service caller from the discovered catalog, and the service refuses it from its own definition using the token's [`spa` claim](#capability-token-claims). Tightening an ability therefore takes effect when the service deploys, not when the plane's [discovery cache](plane-creation.md#discovery-cache) catches up.
+`scopes` is the maximum scope surface. By default, every ability and method needs at least one
+scope, and every referenced scope must exist in the service capability catalog.
 
-## Ability Method
+Method forms:
 
 ```ts
-abilityMethod({
-  input: z.object({ name: z.string() }),
-  output: z.object({ id: z.string() }),
-  scopes: ['asana.tasks.write'],
+ability.method({ input, output, scopes, handler? })
+ability.stream({ input, output: ItemSchema, scopes, handler? })
+ability.hibernationStream({ input, output: ItemSchema, scopes, handler? })
+```
+
+Each method uses exactly one options object. Omit `handler` for a portable contract and attach its
+service implementation with `implementAbility`.
+
+Optional metadata is `idempotent`, `timeoutMs`, `rest`, `mcp`, `mcpResource`, and `mcpPrompt`.
+`stream` and `hibernationStream` output schemas describe one yielded item. Natural JavaScript names
+such as `call`, `apply`, `name`, `constructor`, and `toString` are valid method names. `then` and
+`toJSON` are reserved because Promise and JSON machinery invoke them implicitly; `__proto__` is
+reserved because its ordinary object-literal spelling changes the object's prototype instead of
+declaring an own method.
+
+An ordinary stream handler may return an async iterator, pure `AsyncIterable`, synchronous iterable
+object, or `ReadableStream`. `AbilityStreamSource<T>` names that union; `toAbilityStream(source)`
+normalizes it when application code needs the client-style iterator explicitly.
+
+An ability method's `timeoutMs` must be a valid millisecond value. Invalid values are rejected;
+`0` disables that method's service-side execution ceiling. This definition-time ceiling is separate
+from the per-call deadline described below.
+
+Keep handlers out of a shared contract with:
+
+```ts
+const implementation = implementAbility(contract, {
+  get: ({ context, input }) => context.env.TASKS.get(input.id),
 });
 ```
 
-Each method accepts one input object and returns one output value. The wrapper validates both.
-
-`input` and `output` accept any [Standard Schema](https://standardschema.dev) value that also implements [Standard JSON Schema](https://standardschema.dev/json-schema) — ArkType 2.1.28+, Valibot 1.2+ via `@valibot/to-json-schema`, VineJS 4.3+, Zod 4.2+, or anything else meeting both contracts. The choice is per schema: one method may take its `input` from one library and its `output` from another. See [Choosing A Validation Library](service-creation.md#choosing-a-validation-library).
-
-Validation failures raise `AbilityValidationError` carrying the issues the schema library reported. See [Errors](#errors).
-
-Optional `rest` metadata projects the method into the generated OpenAPI 3.2 document and mounts the
-live control-plane route; `rest.method` accepts `get`, `post`, `put`, `patch`, `delete`, and `query`
-(HTTP QUERY per RFC 10008 — request parameters in the body, safe and idempotent). `rest.status`
-declares the successful 2xx response and defaults to `200`. See [OpenAPI and
-MCP](openapi-mcp.md#openapi).
-
-Optional `idempotent: true` declares that calling the method again with the same input cannot double its effect, so a caller may safely retry an ambiguous failure. See [Idempotency](#idempotency).
-
-## Streaming Methods
-
-Some methods produce many results over time — large file transfers, long exports. Declare them with `stream: true`; the `output` schema then validates **each streamed item**, and the handler returns an async iterable (usually an async generator), a sync iterable, or a `ReadableStream`:
+## Method Context
 
 ```ts
-abilityMethod({
-  input: z.object({ path: z.string() }),
-  output: z.object({ chunk: z.string() }), // validates each streamed item
-  scopes: ['hub.files.read'],
-  stream: true,
-});
-```
-
-There is no custom wire protocol: the wrapper returns the items as a **native Cap'n Web `ReadableStream`** with built-in flow control, so callers receive them exactly like any other RPC value:
-
-```ts
-const api = await abilitySession<AbilityRpc<typeof hubFiles>>({ ... });
-const stream = await api.readFile({ path: '/big.bin' }); // ReadableStream<{ chunk: string }>
-for await (const item of stream) {
-  // ...
-}
-```
-
-Cap'n Web streams ride the ongoing session, so streaming methods require a **session transport**: WebSocket (`websocketRpc`), the Cloudflare native binding (`cloudflareNativeRpc`), or a custom bidirectional transport. The one-round-trip HTTP-batch transport cannot carry them — calling a streaming method over HTTP-batch fails with a 405, and an ability that declares streaming methods must enable `websocket` or `cloudflare-binding-rpc` in `rpc.transports` (checked at setup). Unary methods on the same ability keep working over HTTP-batch.
-
-Through the broker, streams proxy transparently: connect to `/rpc` over WebSocket, and the plane reaches the service over its own session transport — preferring the endpoint's native ability RPC binding (`ServiceEndpoint.abilityRpc`, set explicitly via `cloudflareServiceBinding({ abilityRpc })` — a Workers stub answers any property with a callable proxy, so it cannot be detected), then WebSocket. When the caller's own leg cannot carry a stream (HTTP-batch), the ability's streaming methods are rejected with a 405 and the plane leg stays on HTTP-batch — no socket is opened for a stream that could never be returned. Streaming methods cannot project MCP prompts, resources, or REST operations (single-response surfaces); MCP tools are supported.
-
-For high-frequency streams (LLM token deltas), batch deltas in the handler and declare the batch as the item (`output: z.array(...)`) — see the coalescing recipe in [Streaming](streaming.md#high-frequency-streams).
-
-Full guide, including per-runtime WebSocket wiring and performance guidance: [Streaming](streaming.md).
-
-## Discovery Document
-
-```ts
-type ServiceDiscoveryDocument = {
-  id: string;
-  title: string;
-  version: string;
-  capabilities?: CapabilityCatalog;
-  abilities: ServiceAbilityDiscovery[];
+type AbilityMethodContext = {
+  abilityId: string;
+  methodName: string;
+  env: Bindings;
+  request: Request;
+  context: HonoContext;
+  identity: CapabilityIdentity;
+  connInfo?: ConnInfo;
+  idempotencyKey?: string;
+  remainingTimeoutMs?: () => number;
+  signal?: AbortSignal;
+  webSocket?: ServiceAbilityWebSocket;
 };
 ```
 
-Ability discovery includes exposure, access, scopes, RPC path, transports, method names, method scopes, JSON Schemas, optional REST metadata, and optional MCP metadata. Streaming methods carry `stream: true`, with their `outputSchema` describing one streamed item.
+`input` is validated before the handler; the returned value or every yielded item is validated
+afterward. `connInfo` is advisory. `context.context` is the Hono escape hatch; use `env` and
+`request` for portable code.
 
-The control-plane registry accepts a discovery document only when its `id`, and its optional `capabilities.serviceId`, match the configured endpoint `id`. The endpoint configuration is the identity authority; a service cannot publish metadata for another configured service.
-
-## Service
+## ServicePlaneService
 
 ```ts
 new ServicePlaneService({
   id,
   title,
   version,
-  auth,
-  ingress,
+  abilities: [implementation],
   capabilities,
-  abilities,
+  auth: { issuer?, expectedAudience?, now?, jwks } |
+        { issuer?, expectedAudience?, now?, controlPlaneBinding },
+  ingress: {},
+  rpc: { upgradeWebSocket?, manualWebSocket?, batch?, compression?, maxRequestBodyBytes? },
+  timeout: { methodMs?, defaultMs?, maxMs? },
+  app?, middleware?, logger?, requestId?, discoveryPath?, httpCache?,
 });
 ```
 
-Mounted routes:
+Routes:
 
-```txt
+```text
 GET /.well-known/service-plane/service.json
-ALL /rpc/<abilityId>
+ALL /rpc/v1/<abilityId>/*
+ALL /rpc/v1/<abilityId>       # WebSocket upgrade when declared and configured
 ```
 
-`ingress` is optional. When configured, ability RPC routes require a capability token with a signed broker claim from the configured control-plane service id. Non-brokered tokens are rejected before handler execution.
+Omitting `ingress` is equivalent to `ingress: {}`: a signed broker claim is required. Only
+`ingress: false` permits ordinary direct capabilities. `rpc.maxRequestBodyBytes` defaults to 1 MiB for decoded
+Fetch bodies and individual WebSocket messages. `rpc.upgradeWebSocket` lets Hono own upgrades;
+`manualWebSocket` enables the Durable Object event-forwarding methods.
 
-`httpCache` is optional. When set (`true` or `{ maxAgeSeconds, staleWhileRevalidateSeconds, tags }`), the discovery route emits `Cache-Control` and `Cache-Tag` headers so an edge cache (e.g. Cloudflare Workers Cache) can serve it without executing the Worker. See [Cloudflare](cloudflare.md#caching-metadata-at-the-edge).
+Service authentication must supply either `jwks` or `controlPlaneBinding`; supplying both is
+allowed and the explicit `jwks` resolver wins. A missing trust source is therefore a type error.
 
-## Control Plane
+Every unary method has a 10-second service ceiling by default. Override one method with
+`timeoutMs`; `0` disables that method's ceiling. `timeout.methodMs` changes the service default, and
+`false` disables the service-wide default. Streams have no method ceiling.
+
+## ServicePlaneControlPlane
 
 ```ts
 new ServicePlaneControlPlane({
   signingKeys,
-  authenticateCaller,
-  invocationMiddleware,
   services,
-  openapi,
-  rpc,
-  mcp,
+  authenticateCaller?,
+  invocationMiddleware?,
+  authorizeInvocation?,
+  broker?,
+  mcp?,
+  openapi?,
+  rest?,
+  discoveryCache?,
+  discoveryMaxResponseBytes?,
+  timeout?,
+  issuer?, controlPlaneServiceId?, ttlSeconds?, tokenMaxBodyBytes?,
+  app?, log?, requestId?, httpCache?,
 });
 ```
 
-Mounted routes:
+Routes and defaults:
 
-```txt
-POST /.well-known/service-plane/capability-token
-GET  /.well-known/service-plane/jwks.json
-GET  /openapi.json
-POST /mcp                                        (when published MCP projections exist)
-ALL  /rpc                                        (only when `rpc` is configured)
-*    <published rest.path>                       (REST facade)
+```text
+POST /.well-known/service-plane/capability-token     always
+GET  /.well-known/service-plane/jwks.json            always
+GET  /openapi.json                                   default; `openapi: false` disables
+*    <published rest.path>                           default; `rest: false` disables catch-all
+ALL  /rpc/v1/broker/*                                `broker: {}` enables
+ALL  /rpc/v1/broker/ws                               when broker WebSocket upgrade is configured
+POST /mcp                                            `mcp: {}` enables
 ```
 
-The plane serves the OpenAPI document and mounts every published non-streaming REST projection as a
-live route. Mount a documentation UI yourself on `plane.app` (e.g. `@hono/swagger-ui` or
-`@scalar/hono-api-reference`) pointed at `/openapi.json`.
+`broker.path`, `mcp.path`, and `openapi.path` override defaults. `tokenMaxBodyBytes`,
+`rest.maxBodyBytes`, and `mcp.maxBodyBytes` each default to one MiB. `rest: false` removes the live
+REST facade and its wildcard dispatcher without removing REST metadata from OpenAPI.
+The token endpoint enforces its limit on the physical stream before passing a bounded byte-for-byte
+request snapshot to `authenticateCaller`.
+Broker paths are normalized, and their complete subtree is reserved; a published REST method cannot
+occupy a route that broker dispatch owns.
+`broker.maxRequestBodyBytes` also covers each broker WebSocket message. `mcp.streamLimits` defaults
+to 10,000 items and one MiB of aggregated serialized data.
+Each fetched service discovery document is capped at one MiB; change
+`discoveryMaxResponseBytes` only for a known larger catalog.
 
-REST input is assembled as query, then JSON body, then path parameters. The generated operation
-removes path fields from its body schema, represents them as required path parameters, and exposes
-top-level string/string-array fields as optional query fallbacks. The service validates the combined
-value. Every `{name}` in the route must match a top-level input field; inconsistent definitions or
-discovery documents are rejected, and empty request segments do not match variables.
-`openapi.security` and `openapi.securitySchemes` describe the public authentication performed
-by `invocationMiddleware`; neither is invented by default because middleware may use any scheme or
-an explicit anonymous caller.
-
-The top-level `rpc` option controls the control plane's public Cap'n Web broker route. `rpc: {}`
-mounts it at `/rpc`; `rpc: { path: '/custom' }` overrides that path, and omitting `rpc` (or setting
-`rpc: false`) leaves it unmounted. This is separate from an ability's `rpc` metadata, which describes
-how the control plane reaches that ability on its owning service.
-
-The JWKS route is served from the signing authority (`signingKeys`, `issuer`) and never
-resolves `services` or fetches discovery documents, so key publication survives a service-discovery
-outage. The capability-token, REST, broker, and MCP routes additionally need the authorization catalog
-(discovered capabilities and grants) and fail closed when it cannot be built. See
-[auth.md](auth.md#signing-authority-and-authorization-catalog).
-
-`httpCache` is optional and mirrors the service option: when set, the OpenAPI and JWKS routes emit `Cache-Control` and `Cache-Tag` headers. The capability-token endpoint always responds with `Cache-Control: no-store` and `Pragma: no-cache`. Broker and MCP RPC responses are never cache-eligible.
-
-`discoveryCache` caches the discovered service catalog for every route that needs it — token issuance, REST, broker, MCP, and OpenAPI. It defaults to a process-local cache; pass a `RegistryCache` to share one across a fleet, `false` to resolve fresh every time, or an object keyed by `token` (issuance, REST, broker and MCP), `openapi`, and `default` to give either path its own store. `openapi.cache` is separate and caches the generated document rather than the catalog behind it; set its TTL with `openapi.cacheTtlSeconds`.
-
-`services(context)` resolves runtime bindings and deployment configuration for one logical service
-catalog. Its endpoint set and discovery metadata must not vary by caller or organization. Services
-own organization-specific data scoping behind their stable ability definitions; applications that
-need genuinely different catalogs should use separate control-plane instances and discovery caches.
-
-The shared top-level `invocationMiddleware` is a Hono `MiddlewareHandler` that runs only for a
-matched published REST route, an available MCP endpoint, or the enabled broker. Before it calls
-`next()`, it must set `servicePlaneCaller` to a `BrokerCaller`; it may also set
-`servicePlaneConnInfo`. It can short-circuit with an application-owned response, preserving a `401`
-and its `WWW-Authenticate` challenge. Calling `next()` without a caller is a configuration error and
-returns `500`.
-
-Global middleware on a supplied Hono `app` may set the same variables instead.
-`servicePlaneInvocation` is available for policy and auditing: REST sets resolved service, ability,
-method, scopes, and path before invocation middleware runs; MCP enriches the surface during protocol
-dispatch; broker HTTP sessions expose the broker surface because later RPC calls can select multiple
-abilities.
-
-The plane can open a typed, disposable ability session for trusted code running in the same process:
+`invocationMiddleware` runs before REST catch-all discovery, and for valid-boundary MCP and enabled
+broker traffic. REST misses therefore authenticate without causing unauthenticated discovery
+fan-out; `servicePlaneInvocation` remains absent when no published route matched. Later application
+routes bypass the catch-all. MCP method, protocol, origin, and declared-size failures are rejected
+first; middleware registered on the supplied Hono app is the hook for audit or rate limiting that
+must observe every request. The invocation middleware must set:
 
 ```ts
-type ControlPlaneAbilitySessionOptions = {
-  abilityId: string;
-  caller?: { id: string; kind: 'service' | 'user'; orgId?: string; principalKind?: string };
-  connInfo?: ConnInfo;
-  idempotencyKey?: string;
-  requestId?: string;
-  scopes: string[];
-  targetServiceId: string;
-  timeoutMs?: number;
-};
-
-const api = await plane.abilitySession<AsanaTasksApi>(options, bindings);
-```
-
-`caller: { kind: 'user', ... }` creates an RFC 8693 delegated subject and stamps
-`callerAccess: 'plane'`; `kind: 'service'` preserves the service id and stamps
-`callerAccess: 'service'`; omitting `caller`
-creates a plane-class call under `controlPlaneServiceId` without a subject. This is a trusted API,
-not an authentication boundary: application code must authenticate a user or service before passing
-that identity. The method reuses the plane catalog, grants, signing material, discovery cache,
-broker authorization, and transport selection. It automatically mints a brokered token for a target
-that advertises required ingress. `timeoutMs` includes catalog resolution and token issuance.
-
-The returned `AbilitySession<Scoped>` supports streaming and must be disposed with `using` or
-`disposeAbilitySession()`. Caller-facing capability-token endpoints still reject `subject`.
-
-`mcp.streamLimits` accepts `maxItems` and `maxBytes` for streaming tools (defaults: 10,000 items and 1 MiB). `maxBytes` independently caps serialized item aggregation and cumulative optional progress-notification bytes. Exhausting the item aggregation budget fails the tool call in-band; exhausting only the progress budget stops further notifications while the bounded final result continues.
-
-The MCP endpoint accepts protocol revisions `2025-11-25`, `2025-06-18`, and `2025-03-26`; missing
-`MCP-Protocol-Version` means `2025-03-26`, while unsupported values return `400`. Incoming browser
-`Origin` headers must match the endpoint origin. `mcp.allowedOrigins` adds exact trusted origins for
-intentional cross-origin clients; other origins return `403` before invocation middleware.
-
-## Caller
-
-```ts
-const api = await abilitySession<AbilityRpc<typeof asanaTasks>>({
-  abilityId: 'asana.tasks',
-  callerServiceId: 'workflow-runner',
-  targetServiceId: 'asana',
-  scopes: ['asana.tasks.write'],
-  requestToken,
-  transport,
+c.set('servicePlaneCaller', {
+  id: string,
+  kind: 'service' | 'user',
+  orgId?: string,
+  principalKind?: string,
 });
 ```
 
-Persistent WebSocket/custom sessions and native binding targets are disposable. Prefer `using` so
-the transport closes at the end of the block:
+`hmacServiceClientAuth<TEnv>(...)` and `jwkServiceClientAuth<TEnv>(...)` carry the plane's Hono
+environment into their client/service resolver callbacks, so construct the authenticator once and
+read runtime bindings from its typed `Context<TEnv>`.
+
+It may also set `servicePlaneConnInfo`. After `next()`, inspect `servicePlaneInvocation` for audit
+metadata. Calling `next()` without a caller is a configuration error; middleware may instead return
+its own authenticated `401` or authorized `403`. Invocation middleware is inside the request-entry
+deadline: a late `next()` is refused before parsing, discovery, or dispatch can start background
+work after the caller has already received a timeout.
+
+`authorizeInvocation(invocation, context)` is the optional per-method permission check, after
+authentication and method resolution but before token issuance. Its `ControlPlaneAuthorizationInvocation`
+contains readonly `caller?`, `serviceId`, `abilityId`, `method`, and exact token `scopes` (including
+extras). When configured it must return `true`; every other result or exception denies with 403.
+The same hook covers REST, MCP, broker batch items, WebSocket calls, and `plane.abilityClient`.
+An absent caller denotes a trusted plane-owned call. Service grants remain enforced afterward.
+
+Body-reading `invocationMiddleware` receives exact raw bytes, bounded before its stream is cloned
+for decoding. Each surface's body limit therefore covers authentication too; compressed broker
+requests are bounded both physically and after decompression. Header-only refusal does not wait for
+the body. Middleware registered earlier on a supplied Hono app remains application-owned and must
+enforce its own body limits if it consumes requests before Service Plane runs.
+
+For a broker WebSocket, this middleware authenticates the physical HTTP upgrade. Browser clients
+use a secure cookie or short-lived URL ticket; server runtimes may supply upgrade headers inside a
+custom `createWebSocket` closure. Logical call metadata remains per call.
+
+`abilityClient({ ability, targetServiceId, caller?, scopes? }, bindings)` creates a trusted,
+contract-inferred in-process client. Required method scopes come from `ability`; `scopes` is
+additive. Each method accepts optional `requestId`, `idempotencyKey`, and `timeoutMs`. Endpoint,
+grants, issuer, and an automatic request ID resolve for every call instead of being pinned to the
+facade lifetime. Construction is synchronous and performs no I/O. Hibernating methods fail before
+resolving a downstream endpoint because they require a direct service WebSocket.
+
+### Low-level projection helpers
+
+Most applications use `ServicePlaneControlPlane`. Custom shells may call
+`handleControlPlaneRestRequest` or `handleControlPlaneMcpRequest` with a request-scoped registry and
+`ControlPlaneInvocationOptions`; the REST middleware hook must authenticate before invoking its
+`next` callback and read the second `request` argument when authenticating raw bytes.
+`generateControlPlaneOpenApi` and `generateMcpDiscovery` project an already
+discovered snapshot without mounting routes. MCP's optional `onInvocation` receives a
+`ControlPlaneMcpInvocation`; its readonly scopes are a defensive observation copy and cannot change
+the scopes used for downstream token issuance.
+
+## Service Endpoints
 
 ```ts
-{
-  using api = await abilitySession<AbilityRpc<typeof asanaTasks>>({ ... });
-  await api.createTask(input);
-}
+cloudflareServiceBinding({
+  id,
+  binding,
+  abilityRpc?: true | ServiceAbilityNativeRpcBinding,
+  grants?,
+  discovery?,
+  origin?,
+})
+
+httpsService({ id, baseUrl, fetch?, grants?, discovery? })
 ```
 
-Otherwise, call `await disposeAbilitySession(api)` from `finally`. Disposal is idempotent. For a
-stateless transport there is no connection to release, but disposal still permanently closes the
-session object so accidental reuse fails consistently.
+`abilityRpc: true` explicitly enables native unary calls on the same binding. A separate
+`ServiceAbilityNativeRpcBinding` can be supplied for custom adapters. The endpoint's `fetch` path
+handles discovery and streams. Endpoint identity must match the discovery document's service ID.
 
-Transports:
+For native STS, expose one `ControlPlaneRpcTokenBinding` per caller. Build it with
+`plane.capabilityTokenBinding(callerServiceId, bindings)` and consume it with
+`controlPlaneRpcTokenRequester({ binding })`. The RPC input is `PinnedCapabilityTokenInput` and
+cannot select its caller identity.
 
-- `cloudflareServiceBindingRpc(binding)`
-- `cloudflareNativeRpc(binding)`
-- `httpBatchRpc(url)`
-- `websocketRpc(url, { createWebSocket? })` — the optional factory receives the final URL after
-  `request_id` propagation, allowing Node runtimes without a global `WebSocket` to inject a
-  standards-compatible client without requiring the application to install a persistent global;
-  the compatibility path uses a temporary synchronous `WebSocket.CONNECTING` shim that is restored
-  immediately.
-- `customRpcTransport(transport)`
+## Clients
 
-`cloudflareNativeRpc(...)` can call ingress-protected services only with brokered capability tokens. Normal direct caller tokens are rejected.
-
-Control-plane endpoints may additionally provide `ServiceEndpoint.createWebSocket`. Configure it
-with `httpsService({ createWebSocket })` (or `cloudflareServiceBinding({ createWebSocket })`) so
-broker and MCP calls can reach WebSocket-only abilities on runtimes without a global client.
-
-`ServiceEndpoint.abilityRpc` is likewise explicit: pass `cloudflareServiceBinding({ abilityRpc: env.ASANA })`
-for a binding whose target forwards `connectAbility(...)`. It is never inferred from the binding,
-because a Workers service-binding stub returns a callable RPC proxy for every property name.
-
-Which transport fits which pair of services — by environment, performance, and cost — is covered in [Choosing A Transport](transports.md).
-
-Token requesters:
-
-- `controlPlaneRpcTokenRequester(...)`
-- `controlPlaneJwkTokenRequester(...)`
-- `controlPlaneHmacTokenRequester(...)`
-
-## Capability Token Claims
-
-Capability tokens are ES256 JWS tokens with a closed claim set. Unknown claims are dropped at verification.
-
-Tokens come in two shapes, and `sub` always answers the same question: who is this token about. A plain service-to-service token is about the calling service. A delegated token uses RFC 8693's `act` actor-claim semantics: it is about the plane-class principal, while the calling service moves into `act.sub`. The presence of `act` is what switches the interpretation, and the verifier resolves it for you: `identity.serviceId` is always the calling service, and `identity.subject` is set only when a principal is delegated.
-
-Plain service token:
-
-```json
-{ "iss": "control-plane", "sub": "workflow-runner", "aud": "asana", "scp": ["asana.tasks.write"], "spa": "service" }
-```
-
-→ `identity.serviceId = 'workflow-runner'`, no `identity.subject`.
-
-Delegated (plane-principal) token:
-
-```json
-{ "iss": "control-plane", "sub": "key-123", "act": { "sub": "control-plane" }, "spk": "api-key", "spo": "org-42", "aud": "asana", "scp": ["asana.tasks.write"], "spa": "plane" }
-```
-
-→ `identity.serviceId = 'control-plane'` (from `act.sub`), `identity.subject = { id: 'key-123', kind: 'api-key', orgId: 'org-42' }`.
-
-| Claim | Plain service token | Delegated token (`act` present) |
-| --- | --- | --- |
-| `sub` | calling service → `identity.serviceId` | delegated principal → `identity.subject.id` |
-| `act` | absent | acting service, `{ sub }` → `identity.serviceId` |
-| `spk` | rejected at verification | optional principal kind → `identity.subject.kind` |
-| `spo` | rejected at verification | subject's org → `identity.subject.orgId` |
-| `iss` | control-plane issuer → `identity.issuer` | same |
-| `aud` | target service id → `identity.audience` | same |
-| `scp` | granted scopes → `identity.scopes` | same |
-| `spa` | caller access class → `identity.callerAccess`; `'service'` in the example above, `'plane'` when the plane calls without a service caller (e.g. an anonymous broker) | always `'plane'` — a delegated subject is a fronted caller, and the issuer refuses the other pairing |
-| `spb` | broker service id on brokered (ingress) tokens → `identity.brokerServiceId` | same |
-| `cnf` | `{ jkt }` on tokens bound to a caller key (always, for JWK callers) → `identity.confirmation`, only after a matching proof verified | same |
-| `jti` | token id → `identity.tokenId` | same |
-| `exp` | expiry → `identity.expiresAt`; `iat`/`nbf` are also enforced | same |
-
-The `act` delegation relationship comes from RFC 8693 and `cnf` from RFC 7800 (with the `jkt` confirmation method registered by RFC 9449). `scp`, `spa`, `spk`, `spo`, and `spb` are Service Plane-specific claims, and `/.well-known/service-plane/capability-token` is the package's JSON capability endpoint, not an RFC 8693 token-exchange endpoint. `spk` is an optional application-owned string; its absence preserves the legacy user-subject shape, and it never influences `spa` or service access.
-
-`spa` is the access class the control plane authenticated for the caller. It is `service` for a caller the plane proved to be another service — the capability-token endpoint, `issueCapabilityTokenForCaller`, and invocation middleware setting `kind: 'service'` — and `plane` for every caller the plane fronts itself: users, API keys, anonymous traffic. Services compare it against the ability's own `access` and reject a mismatch with 403 before the handler is created. A token carrying no `spa` reads as `plane`, so a control plane that predates the claim can only reach `access: 'plane'` abilities.
-
-That default dictates the rollout order: **upgrade the control plane before any service declares `access: 'service'`.** A service on this version behind an older plane refuses every caller of its service-only abilities — legitimate service callers included — until the plane mints the claim. The reverse mix is the transitional gap, not a hole in the new guarantee: a *service* still on an older package version never checks `spa`, so for that service tightening `access` keeps depending on the plane's catalog refresh until the service upgrades.
-
-Delegated subjects are minted only by control-plane code — `ServicePlaneControlPlane.abilitySession()`, invocation middleware setting a `BrokerCaller` with `kind: 'user'` and optional `orgId` / `principalKind`, or a low-level direct `issueCapabilityToken({ subject, ... })` call. The capability-token endpoint and `issueCapabilityTokenForCaller` reject caller-supplied subjects with 403, and the shipped token requesters fail fast locally instead of transmitting one. Direct issue mints a non-brokered token; `abilitySession()` and the broker select `issueBrokeredCapabilityToken` automatically for ingress-required targets. See [auth](auth.md#subject-delegation).
-
-## Logging And Request Correlation
-
-Every request that enters a `ServicePlaneControlPlane` gets an `X-Request-Id` (incoming header value or a generated UUID, via `hono/request-id`). The REST, broker, and MCP endpoints forward that id on every outbound call to a service: as the `X-Request-Id` header for HTTP-batch and service-binding transports, as the `request_id` query parameter for WebSocket transports (`SERVICE_PLANE_REQUEST_ID_QUERY_PARAM`), and as the `requestId` field on `connectAbility(...)` for Cloudflare native RPC. `ServicePlaneService` adopts the propagated id into its own `requestId` context variable and echoes it on responses, so one id correlates plane and service logs end to end.
-
-Connection info about the original client rides the same three channels when middleware sets `servicePlaneConnInfo`: the `X-Service-Plane-Conn-Info` header, the `conn_info` query parameter (`SERVICE_PLANE_CONN_INFO_QUERY_PARAM`), and the `connInfo` field on `connectAbility(...)`. Services expose it to handlers as `connInfo` only for brokered calls with ingress enabled — see [Forwarded Connection Info](auth.md#forwarded-connection-info).
-
-## Deadlines
-
-Two bounds, layered. A **service-side ceiling** that always exists, and an **end-to-end budget** a caller may set on top of it. Whichever expires first wins.
-
-### The ceiling you get for free
-
-Every unary ability method is bounded at `DEFAULT_ABILITY_TIMEOUT_MS` — 10 seconds — without anyone configuring anything.
-
-That default is deliberate. gRPC and [Connect](https://connectrpc.com/docs/node/timeouts/) leave deadlines entirely to the caller, and the standing advice in [gRPC's own guidance](https://grpc.io/blog/deadlines/) is to *"always set a deadline"* — a rule that only needs stating because the unset case is unbounded. Systems that own a default do not need the reminder: [Envoy routes time out at 15s](https://www.envoyproxy.io/docs/envoy/latest/faq/configuration/timeouts), and [Armeria's server request timeout is 10s](https://armeria.dev/docs/server/timeouts/). 10s matches the closest analogue — a server bounding its own request handling.
-
-Tune it where it belongs:
+Public broker client:
 
 ```ts
-new ServicePlaneService({
-  timeout: { methodMs: 2_500 },     // service-wide ceiling; `false` removes it
-});
-
-bigExport: abilityMethod({ timeoutMs: 120_000, ... });  // the one slow method
-bigMigration: abilityMethod({ timeoutMs: 0, ... });     // opt this one out entirely
-```
-
-Method values are validated at definition time — a negative, fractional, or absurdly large value refuses the service instead of silently dropping or clamping the ceiling — and a method's own ceiling is deliberately **not** clamped to the 10-minute wire limit: that limit bounds what a *caller* may ask for, not how long a service allows its own export to run.
-
-Raise the exception, not the ceiling. **Streaming methods are never bounded this way** — for the reason Envoy documents about its own route timeout, a bound that suits a request is wrong for a stream. Session lifetime is untouched either way.
-
-The effective ceiling is advertised per method in the discovery document, so a gateway can size its own wait against it.
-
-### The budget a caller sets
-
-A caller states how long it is willing to wait; every hop spends from that budget rather than granting a new one.
-
-```ts
-const api = await abilitySession<AbilityRpc<typeof syncAbility>>({
-  // ...
-  timeoutMs: 5_000,
-});
-```
-
-The value travels on the same three channels as the request id: the `X-Service-Plane-Timeout` header, the `timeout` query parameter (`SERVICE_PLANE_TIMEOUT_QUERY_PARAM`), and the `timeoutMs` field on `connectAbility(...)`. It is **relative milliseconds remaining**, not an absolute timestamp — two clocks that disagree would shift an absolute deadline by the whole skew, and this package already assumes clocks can differ. Each hop measures its own elapsed time on its own clock and forwards what is left, which is the trade `grpc-timeout` makes for the same reason.
-
-What each participant does with it:
-
-- **The caller** bounds its own wait per method call and rejects with `ServicePlaneTimeoutError` when the budget elapses. Cap'n Web has no cancel message, so this frees the caller, not the callee.
-- **The control plane** reads an inbound `X-Service-Plane-Timeout` on REST, broker, and MCP requests and forwards *what is left* after its own work — resolving the catalog, minting a token. If nothing is left, the invocation fails before a service session is opened.
-- **The service** turns it into the `signal` its ability handlers receive, and the validating wrapper fails the method if the handler outlives it. A handler that ignores `signal` therefore loses the work, not correctness.
-
-```ts
-handler: ({ signal }) => new MyApi(signal), // pass it to outbound fetch, long loops, DB calls
-```
-
-### Chains
-
-A budget only survives a chain if each service passes on what is left of its own. Handlers get `remainingTimeoutMs()` for exactly that:
-
-```ts
-handler: ({ remainingTimeoutMs, signal }) => ({
-  async run(input) {
-    const downstream = await abilitySession({ ...opts, timeoutMs: remainingTimeoutMs?.() });
-    return downstream.doWork(input);
+createBrokeredAbilityClient({
+  ability: contract,
+  targetServiceId,
+  scopes?,
+  requestId?, idempotencyKey?, timeoutMs?,
+  transport: {
+    type?: 'fetch',
+    origin?, fetch?, headers?, path?, batch?, compression?,
   },
 });
 ```
 
-Skip it and the next hop starts a **fresh** budget: `A(5s) → B` where B calls C with its own 5s means the end-to-end bound A asked for is gone. Nothing enforces this for you — a service that calls onward has to opt in.
+Use `{ type: 'websocket', url, createWebSocket?, reconnect?, path? }` for the broker socket. The
+physical default is `/rpc/v1/broker/ws`; the logical prefix is `/rpc/v1/broker`. `headers` exists only on
+the Fetch variant. Authenticate WebSocket on its HTTP upgrade with a browser cookie, short-lived
+URL ticket, or a runtime-specific `createWebSocket` closure that can set headers.
 
-At exhaustion the pattern stays safe: `remainingTimeoutMs()` returns `0` once the budget is gone, and a session opened with `timeoutMs: 0` fails every call immediately with a `timeout` error instead of running unbounded — the same fail-fast the broker applies before opening a service leg.
-
-### What This Does And Does Not Bound
-
-Three of the four mechanisms are plain timers over a duration, so they do not read a clock and cannot drift:
-
-- the caller's own wait (`setTimeout`),
-- the `signal` handed to handlers (`AbortSignal.timeout`),
-- the wrapper's refusal to resolve a method past the deadline.
-
-Only the plane's decrement does clock arithmetic — `Date.now()` at request entry versus at the moment it opens the service leg. Both readings are on the same machine, so there is no cross-host skew to worry about.
-
-It does **not**:
-
-- **cancel the peer.** Cap'n Web has no cancel message. A caller-side timeout frees the caller; the service keeps running until its own budget expires. The forwarded budget is what actually stops work.
-- **close a session.** The deadline fails a *method*. A WebSocket session stays open, so on Cloudflare a Durable Object holding one keeps billing duration — see [Transports](transports.md). Use an idle timeout to bound that, not a deadline.
-- **bound a stream's lifetime.** It bounds the call that returns the stream, not consumption of its items.
-
-### On Cloudflare
-
-Workers freeze `Date.now()` during synchronous execution and advance it on I/O (a Spectre mitigation). That suits this design rather than breaking it: the plane's decrement measures *waiting* — the discovery fan-out, the token mint — and waiting is I/O, which is exactly when the clock moves. What stays invisible is pure CPU time, which the Workers CPU limit already bounds and which is small next to a network hop. The effect is that a plane's decrement can slightly under-count, never over-count, so a service is handed a budget that is generous rather than short.
-
-Two caveats worth stating:
-
-- The runtime matrix in [#11](https://github.com/JUVOJustin/service-plane/issues/11) does not run yet, so the above reflects documented workerd behavior, not a test result on workerd.
-- If Cap'n Web ever gains WebSocket Hibernation ([capnweb#36](https://github.com/cloudflare/capnweb/issues/36)), a hibernating Durable Object would lose the in-memory `AbortSignal.timeout` behind a session-scoped deadline, and it would silently never fire on wake. Today Cap'n Web sessions cannot hibernate, so this is not reachable — but a deadline set before hibernation is not something to assume survives it.
-
-Values are clamped to `MAX_SERVICE_PLANE_TIMEOUT_MS` (10 minutes) and anything that is not a positive integer count of milliseconds is ignored. A caller that sends nothing forwards nothing — the service-side ceiling above is what still bounds the call.
-
-Both shells take a policy for what they will accept:
+Direct service client with an existing token provider:
 
 ```ts
-new ServicePlaneControlPlane({ timeout: { defaultMs: 10_000, maxMs: 60_000 } });
-new ServicePlaneService({ timeout: { defaultMs: 5_000, maxMs: 30_000 } });
-```
-
-`defaultMs` supplies a budget when the caller sent none — on per-call transports (HTTP-batch) only. A session transport (WebSocket, native binding) resolves its budget once at session open, so a manufactured default would become a death timer for long-lived sessions whose callers never asked for one; an explicit caller budget on a session transport still applies. `maxMs` clamps any budget — explicit or defaulted — that asks for more than you are willing to hold a connection for. Invalid policy values (`0`, negatives, fractions) are refused at construction rather than silently loosening at runtime. The plane has no built-in default on purpose — it forwards a budget rather than doing the work, so the bound that must always exist lives at the service. Set `defaultMs` when you want the plane to be the policy point, the role Envoy's route timeout plays.
-
-A caller's own local wait is set slightly **above** the budget it forwards (`SERVICE_PLANE_TIMEOUT_GRACE_MS`, 250ms). [Armeria does the same thing](https://armeria.dev/docs/advanced/understanding-timeouts/) — its client response timeout of 15s sits above its 10s server request timeout — so that the service's own enforcement fires first and the caller gets the error the service actually raised instead of a bare local abort that says nothing about what happened downstream.
-
-### When a deadline fires
-
-| | This package | gRPC | Envoy | Armeria |
-| --- | --- | --- | --- | --- |
-| Caller sees | `code: 'timeout'`, `status: 504` **inside the RPC payload** — the HTTP response is 200 | `DEADLINE_EXCEEDED` (maps to 504) | 504 Gateway Timeout | `ResponseTimeoutException` |
-| Service sees | The method rejects; `signal` is aborted | Context cancelled (`CANCELLED`) | Upstream stream reset | `RequestTimeoutException`, work cancelled |
-| Peer is told | **No** | Yes | Yes | Yes (RST_STREAM / close) |
-
-The last row is the honest gap: Cap'n Web has no cancel message, so a caller giving up cannot tell the service. That is why the budget is forwarded rather than relied on locally — the service's own copy is what stops the work. Everyone else in that table can signal the peer; we compensate by making the service-side bound the one that always exists.
-
-`retryable` is `true` for a timeout, matching Envoy's treatment of 504 as a `gateway-error` worth retrying — but only retry when the method is also `idempotent`. See [Idempotency](#idempotency).
-
-**`status` is a classification, not an HTTP status code.** A method's failure is a value inside the Cap'n Web batch, so the HTTP response is `200` and the error travels in its body. Read the classification with `servicePlaneErrorInfo`; do not expect to see 504 on the wire. The number matters when a gateway maps the failure onto its own response. On the MCP surface even an exhausted forwarding budget stays inside the protocol: the refusal is a JSON-RPC-framed tool failure the client can correlate, never a bare HTTP error body.
-
-Unlike forwarded connection info, a deadline is honoured from **any** caller without requiring ingress. It is not an authorization input: a caller shortening its own budget can only cut itself off, and a long one is clamped.
-
-One limit worth knowing: the budget rides the transport, and a session transport is established once. Over HTTP-batch and native bindings a session is one call, so the budget is per call. Over WebSocket it is fixed when the socket opens and therefore bounds every call on that session.
-
-## Idempotency
-
-Deadlines create ambiguous failures — a call that timed out may or may not have run — so a caller needs two things to retry correctly: whether the method is safe to call again, and a way for the service to recognize the retry.
-
-**The method says whether it is safe.** Mark it in the ability definition, the same way `stream` is marked:
-
-```ts
-lookupTask: abilityMethod({
-  idempotent: true,
-  input: TaskQuery,
-  output: Task,
-  scopes: ['asana.tasks.read'],
+createAbilityClient({
+  ability: contract,
+  targetServiceId,
+  tokenProvider,
+  proveTokenPossession?,
+  scopes?,
+  requestId?, idempotencyKey?, connInfo?, timeoutMs?,
+  transport,
 });
 ```
 
-It is projected into the discovery document so callers and gateways can read it. An unmarked method is **absent** from the projection rather than `false`: it makes no claim, which is the safe reading. Note that this package never retries on its own — retry policy is the caller's, and mesh-level retry belongs to your platform.
-
-Combined with `retryable` from the error taxonomy, the decision is: retry only when the failure was transient **and** the method is idempotent.
-
-**The caller says which attempt this is.** Pass a key and it travels the same three channels as the request id — `X-Service-Plane-Idempotency-Key`, the `idempotency_key` query parameter, and the `idempotencyKey` field on `connectAbility(...)` — reaching the handler as `idempotencyKey`:
+Or let the client build and cache a provider around a token requester:
 
 ```ts
-const api = await abilitySession({ /* ... */ idempotencyKey: 'attempt-7f3a' });
-
-// service side
-handler: ({ idempotencyKey }) => new TaskApi(idempotencyKey);
+createAbilityClient({
+  ability: contract,
+  callerServiceId,
+  targetServiceId,
+  requestToken,
+  cache?, refreshSkewSeconds?, subject?, ttlSeconds?,
+  proveTokenPossession?,
+  transport,
+});
 ```
 
-The package forwards the key and nothing else. Deduplicating means storing a result and expiring it, which needs a store and a retention policy — the same reason discovery snapshots and token caches are yours to supply.
+Direct transports:
 
-Two things to get right when you build that store:
+- `{ type: 'fetch', origin?, fetch?, batch?, compression? }`
+- `{ type: 'service-binding', binding, origin?, compression? }` — native unary, binding Fetch for streams
+- `{ type: 'websocket', url, createWebSocket?, reconnect? }`
 
-- **Scope the key by method name.** The key identifies the caller's *attempt*, not one method call, because it rides the transport rather than the RPC payload. Two different methods on one session would otherwise collide. Store under `${idempotencyKey}:${methodName}`.
-- Keys are validated on both send and receive: word characters, `-`, and `=` only, up to 255 characters. Anything else is dropped rather than forwarded, so a key can never smuggle a separator into a log line or a store key.
+Methods accept `(input, options?)`. Per-call `requestId`, `idempotencyKey`, `timeoutMs`, and `signal`
+override client defaults. A direct client also permits `connInfo`; a brokered client does not,
+because public connection information is trusted-middleware-owned.
 
-Both shells log structured JSON events to the console by default. Every event carries `event`, `level`, and (when known) `requestId`.
+Required method scopes are automatic. `scopes` adds ability-level scopes when needed. Client
+construction is synchronous and performs no network work until the first call.
 
-Service events (`ServicePlaneLogEvent`):
+Call `disposeAbilityClient(client)` when a WebSocket client's owner shuts down. It cancels active
+streams, closes its sockets, prevents reconnect, and rejects later calls as `cancelled`. Repeated
+disposal is safe. Fetch and `service-binding` clients own no persistent connection, so disposal is
+an idempotent no-op and does not disable them.
+
+## Wire Features
+
+```ts
+type ServicePlaneClientWireOptions = {
+  batch?: boolean | { maxSize?: number };
+  compression?: boolean | {
+    request?: boolean | { encoding?: 'gzip' | 'deflate' | 'deflate-raw'; threshold?: number };
+    response?: boolean | { encodings?: Array<'gzip' | 'deflate' | 'deflate-raw'> };
+  };
+};
+```
+
+Server compression reverses the request/response direction and adds a response threshold. Requests,
+including batches, and ordinary unary responses can be compressed; batch and stream responses cannot.
+Batching
+combines only concurrent unary Fetch calls; streams and WebSockets never enter a batch.
+Experimental hibernating streams reject the broker, in-process `abilityClient`, batching, REST/MCP
+metadata, and every transport except a separately secured direct service WebSocket with
+`ingress: false`. See [transports](transports.md).
+
+## Discovery
+
+`ServiceDiscoveryDocument` contains service identity, optional capability catalog and caller JWKS,
+and ability discovery. Every method includes scopes plus input/output JSON Schema, and may include
+REST/MCP metadata, `idempotent`, `timeoutMs`, or `stream: true`.
+
+Ability RPC discovery advertises `rpc.protocol: 'service-plane-rpc/1'`. Fetch and WebSocket calls
+carry the owned revision marker; native envelopes carry `protocol`. Missing or unsupported revisions
+fail with `incompatible_protocol` (426), without automatic retry. The service entry point exports
+`SERVICE_PLANE_RPC_PROTOCOL`, `SERVICE_PLANE_RPC_PROTOCOL_HEADER`, and
+`SERVICE_PLANE_BROKER_RPC_PATH`. See the [rollout guide](migration-rpc-boundary.md) before mixing versions.
+
+`serviceDiscoveryDocument()` returns a defensive wire snapshot. Its caller keys and schema
+fragments can be transformed for serialization or tooling without mutating the frozen live service
+definition; call the helper again for a clean snapshot.
+
+The plane validates endpoint identity, duplicate paths/names/operation IDs, scope references, and
+projection shapes before using a snapshot.
+
+## Capability Token Claims
+
+Tokens are ES256 JWS values.
+
+| Claim | Meaning |
+| --- | --- |
+| `iss` | Control-plane issuer |
+| `aud` | Target service ID |
+| `sub` | Calling service, or delegated principal when `act` is present |
+| `act.sub` | Acting control-plane service for a delegated principal |
+| `scp` | Granted scopes |
+| `spa` | Authenticated caller access: `plane` or `service` |
+| `spb` | Broker service ID for ingress-qualified calls |
+| `spo`, `spk` | Delegated organization and principal kind |
+| `cnf.jkt` | Sender-constrained caller-key thumbprint |
+| `iat`, `nbf`, `exp`, `jti` | Issued-at, not-before, expiry, and token ID |
+
+Handlers should read normalized `context.identity`, not decode claims themselves. A missing legacy
+`spa` is interpreted as `plane`, the less-privileged class. Unknown or malformed claims fail closed
+or are discarded according to their role.
+
+## Deadlines
+
+The caller sends relative milliseconds remaining. One request-entry budget covers control-plane
+middleware, route and service discovery, issuer/token work, downstream transport, service JWKS and
+authorization, and the handler. The service races the forwarded remainder against its unary method
+ceiling. Values are capped at 10 minutes. Client local waits include a 250 ms grace so the service's
+classified timeout can arrive first.
+
+Fetch RPC decoding is bounded before a logical call exists. A service uses the nearer caller budget
+or its service-wide method default (10 seconds unless changed; `false` opts out when no caller budget
+exists). The public broker uses the nearer physical-request budget or a 10-second preparation
+ceiling, including physical batches whose per-call headers are still inside the unread body. The
+preparation timer stops at the first procedure entry; logical unary and stream rules then take over.
+Timed-out bodies are actively cancelled, including compressed requests. STS, REST, and MCP also
+apply a 10-second physical request-preparation ceiling; shorter caller budgets win. These timers
+stop when body preparation is complete and do not impose a new ten-second limit on stream execution.
+
+For client defaults and per-call `timeoutMs`, invalid values are rejected, `0` fails immediately,
+and values above the ten-minute wire maximum are clamped. Ability method metadata is definition
+policy instead: `0` disables that method ceiling and values above the JavaScript timer-safe maximum
+are rejected. `timeout.methodMs` uses `false` as its explicit opt-out.
+
+`timeout: { defaultMs, maxMs }` supplies or clamps forwarded budgets at each shell.
+`context.remainingTimeoutMs()` lets a handler forward what remains to its own downstream client.
+Failing to forward it starts a fresh downstream budget.
+
+Method ceilings bound unary calls only. A forwarded caller deadline bounds ordinary stream setup and
+each pull, but not a physical WebSocket or hibernating subscription lifetime. A timed-out handler
+must observe `context.signal` to stop external work promptly.
+
+Typed clients start the budget before token, proof, or caller-header resolution and forward only
+what remains. The control plane continues the same budget across discovery and issuance; its
+in-process client also keeps the local timer active for every ordinary stream pull.
+
+Native `invokeAbility` and manual `webSocketMessage` calls require the bindings argument whenever
+the service's typed environment requires bindings. Environment-neutral services may omit it.
+
+## Idempotency
+
+`idempotent: true` declares that repeating the same logical operation is safe. Service Plane never
+retries automatically.
+
+`idempotencyKey` identifies one caller attempt and reaches `context.idempotencyKey`. Service Plane
+forwards and validates it but does not deduplicate. Store dedupe results under at least
+`abilityId + methodName + key`; the same key can legitimately be used for different methods.
+
+Retry only when both are true:
+
+- the method is idempotent; and
+- the error's `retryable` field says the failure is transient.
+
+## Caches
+
+Separate interfaces exist for registry snapshots, generated OpenAPI documents, service-side JWKS,
+and caller tokens. Default registry and token caches are process-local where provided. Shared cache
+implementations belong to the application because storage, consistency, and tenancy requirements
+vary by deployment.
+
+Registry and generated-OpenAPI cache failures are treated as misses; an external cache operation
+that does not settle is abandoned after one second. The caller that creates a shared discovery fill
+owns its lease: the fill stops accepting new waiters at that caller's deadline, or after ten seconds
+without one. Shorter later callers may time out while waiting, but cannot release the shared fill
+and create a discovery stampede. Remote discovery responses default to a one-MiB bound, JWKS to 256
+KiB, and HTTP token responses to 64 KiB; each corresponding option exposes `maxResponseBytes`. The
+shipped JWK requester automatically partitions token caches by proof-key thumbprint. A custom
+proof-capable requester that can rotate keys must expose `cacheBinding()` with a stable public
+fingerprint.
+
+## Testing Helpers
+
+`memoryCapabilityTokenCache()` provides a process-local token cache with injectable time.
+`memoryWebSocketPair()` returns two connected, initially open `MemoryWebSocket` peers. The client
+peer is accepted directly by `createWebSocket`; attach the server peer to the service or broker
+WebSocket event methods under test. Closing either peer closes both, making lifecycle and reconnect
+assertions deterministic without binding a port.
+
+## Logging And Request IDs
+
+Both shells adopt or generate `X-Request-Id` and forward it across Fetch, WebSocket logical calls,
+and native RPC. Structured events cover requests, broker calls, REST, MCP, caller-auth refusals, and
+opaque handler failures.
+
+`ServicePlaneService.logger.log` and `ServicePlaneControlPlane.log` receive typed events and an
+optional Hono context. Set the corresponding option to `false` to silence package logging. Log sinks
+are best-effort: a logger failure never changes the API result.
+
+Service events:
 
 - `service_plane.discovery.served`
 - `service_plane.request.completed`
 - `service_plane.request.failed`
-- `service_plane.ability.handler_failed` — a handler throw the wrapper replaced with an opaque error; carries the original name and message
+- `service_plane.ability.handler_failed`
 
 Control-plane events:
 
-- `service_plane.broker.connect.completed` / `service_plane.broker.connect.failed` (`ServicePlaneBrokerLogEvent`)
-- `service_plane.mcp.tool.completed` / `service_plane.mcp.tool.failed` (`ServicePlaneBrokerLogEvent`)
-- `service_plane.mcp.resource.completed` / `service_plane.mcp.resource.failed` (`ServicePlaneBrokerLogEvent`)
-- `service_plane.mcp.prompt.completed` / `service_plane.mcp.prompt.failed` (`ServicePlaneBrokerLogEvent`)
-- `service_plane.rest.completed` / `service_plane.rest.failed` (`ServicePlaneBrokerLogEvent`)
-- `service_plane.caller_auth.not_configured` (`ServicePlaneControlPlaneLogEvent`)
-- `service_plane.caller_auth.hmac_unauthorized` / `service_plane.caller_auth.jwk_unauthorized` (caller-auth middleware, own `log` option). The `reason` field names the check that failed.
+- `service_plane.broker.call.completed` / `service_plane.broker.call.failed`
+- `service_plane.rest.completed` / `service_plane.rest.failed`
+- `service_plane.mcp.tool.completed` / `service_plane.mcp.tool.failed`
+- `service_plane.mcp.prompt.completed` / `service_plane.mcp.prompt.failed`
+- `service_plane.mcp.resource.completed` / `service_plane.mcp.resource.failed`
+- `service_plane.caller_auth.not_configured`
 
-Where the events go is up to the app. Each surface takes a `log` callback that is invoked once per event; when it is omitted, the package writes the event as one JSON line to the console. The package never talks to a logging framework itself — you forward events to whatever logger the app uses:
-
-```ts
-new ServicePlaneService({
-  // ...
-  logger: { log: (event, context) => appLogger.info(event) }, // or false to disable request logging
-  requestId: { generator: myIdGenerator }, // customize hono/request-id; the middleware itself is always on
-});
-
-new ServicePlaneControlPlane({
-  // ...
-  log: (event, context) => appLogger.info(event), // or false to silence REST/broker/MCP/config events
-});
-```
-
-The `log` callback receives the Hono `Context` as a second argument when the event was emitted inside a request, so a request-scoped logger stored on the context by your own Hono middleware (e.g. `c.set('logger', child)`) is reachable from it. On the service, middleware mounted via the `middleware` option can also read the emitted events after `await next()` with `servicePlaneLogEvents(context)` — useful when you prefer to do all log shipping in one place in your own middleware.
-
-## Caches
-
-Use separate caches for:
-
-- service discovery snapshots
-- generated OpenAPI document
-- control-plane JWKS fetched by services
-- caller capability tokens
-
-Token cache keys include caller id, target service id, ability id, normalized scopes, optional TTL, and the complete delegated subject when present — including principal kind — so tokens cannot collide across principals or principal categories.
+Broker events are per ability invocation, not per Fetch or WebSocket connection. They carry the
+target service, ability, method, requested scopes, authenticated caller fields, request id, status,
+and duration when known. HMAC and JWK caller-auth middleware have their own log callbacks and emit
+`service_plane.caller_auth.hmac_unauthorized` and
+`service_plane.caller_auth.jwk_unauthorized` respectively.
 
 ## Errors
 
-- Missing or invalid token: `CapabilityAuthError` with 401-style status.
-- Missing scope: `CapabilityAuthError` with 403-style status.
-- Invalid caller input: `AbilityValidationError` with 422-style status.
-- Invalid service output or streamed item: `AbilityValidationError` with 500-style status — the handler broke its own declared contract.
-- Deadline elapsed: `ServicePlaneTimeoutError` with 504-style status, thrown by whichever hop notices first. See [Deadlines](#deadlines).
-
-`AbilityValidationError.issues` carries the schema library's issues as `{ message, path? }` entries, so a gateway can build a field-level response without parsing the joined message:
-
-```ts
-import { AbilityValidationError } from 'service-plane/service';
-
-try {
-  await asana.createTask(input);
-} catch (error) {
-  if (error instanceof AbilityValidationError) {
-    return Response.json({ errors: error.issues }, { status: error.status });
-  }
-  throw error;
-}
-```
-
-### Reading An Error A Caller Received
-
-`instanceof` works in-process, but **not** on an error that arrived over RPC. Cap'n Web rebuilds a received error as a plain `Error`: its class table holds only built-in error types, and the sent class name is used to choose from that table rather than restored onto the result. Own enumerable properties do survive, which is why the taxonomy lives in `code`, `status`, and `retryable`. Read them with `servicePlaneErrorInfo`, which works for both a local instance and a received one:
-
-```ts
-import { servicePlaneErrorInfo } from 'service-plane/service';
-
-const info = servicePlaneErrorInfo(error);
-if (info?.retryable) return retryLater();
-if (info?.code === 'capability_auth') return refreshTokenAndRetry();
-```
+Ability clients throw `ServicePlaneClientError`. Branch on `servicePlaneErrorInfo(error)` when code
+also handles local failures.
 
 | `code` | Meaning |
 | --- | --- |
-| `capability_auth` | Token, scope, ingress, or proof-of-possession check refused the call |
-| `ability_validation` | Input or output did not satisfy the method's schema |
-| `timeout` | The caller's deadline elapsed |
-| `handler` | The handler failed deliberately and chose what the caller sees |
-| `internal` | Anything else, including a handler failure the service did not shape |
+| `capability_auth` | Token, ingress, access, scope, or proof refused the call |
+| `incompatible_protocol` | Missing or unsupported RPC wire revision; status 426 and never retryable |
+| `ability_validation` | Input, output, or stream item failed its schema |
+| `cancelled` | The caller aborted; status 499 and never retryable |
+| `timeout` | An effective deadline or server-owned execution/preparation ceiling elapsed |
+| `handler` | Handler deliberately exposed a safe application failure |
+| `internal` | Transport or unshaped implementation failure |
 
-`retryable` means the failure is transient — the same call may succeed later. It does **not** mean retrying is safe: for a non-idempotent method a retry can still double an effect. It defaults from the status (408, 429, 502, 503, 504) and can be set explicitly. A 500 is deliberately not retryable by default: a handler that broke once usually breaks again, and saying otherwise invites a retry storm against a service already failing.
+The info also contains HTTP-style `status`, `retryable`, optional validation `issues`, and optional
+handler `reason`. Wire fields are validated before use.
 
-Every field is re-validated when read, so a hostile or buggy peer cannot make a refusal look retryable.
-
-### What An Ability Handler May Throw
-
-Errors this package raises are already shaped for callers and pass through untouched. Everything else a handler throws is **replaced** with an opaque 500 before it leaves the service:
-
-```
-Service-Plane ability handler failed: <methodName>
-```
-
-That is deliberate. A database driver error or a `TypeError` was written for an operator, not a caller, and routinely carries connection strings, internal hostnames, SQL, or row data. The same replacement applies to a streaming method that fails mid-stream.
-
-The replacement also holds across chains: an error that already carries the taxonomy — thrown by a downstream service and rebuilt as a plain `Error` on the way through — passes intermediate hops untouched instead of being re-replaced, so the original `code`/`status`/`retryable`/`reason` reach the first caller.
-
-Every replacement is logged service-side as a `service_plane.ability.handler_failed` event carrying the original error's name and message (the RPC response is a 200 batch, so `request.failed` never fires for it). The original object also stays reachable in-process via `handlerFailureCause(error)`.
-
-To choose what the caller sees, throw `AbilityHandlerError`:
+Arbitrary handler errors are replaced with an opaque internal failure and logged service-side. To
+expose an intentional message:
 
 ```ts
-import { AbilityHandlerError } from 'service-plane/service';
-
-throw new AbilityHandlerError('Monthly export quota is used up', {
-  reason: 'quota_exhausted', // your own discriminator, carried alongside code: 'handler'
+throw new AbilityHandlerError('Task not found', {
+  status: 404,
+  reason: 'task_not_found',
   retryable: false,
-  status: 429,
 });
 ```
 
-The original failure is not lost — it is held beside the replacement, reachable in-process with `handlerFailureCause(error)` so a service can log it. It is deliberately not attached as `cause`: Cap'n Web serializes `cause` unconditionally, which would defeat the replacement.
-
-A schema that deviates from the Standard Schema contract fails closed: a validator that throws, or returns neither a value nor issues, raises `AbilityValidationError` rather than letting the value through. A schema missing `~standard.validate` or `~standard.jsonSchema` is rejected when the service is defined, not on the first call.
-
-Next: [auth](auth.md), [OpenAPI and MCP](openapi-mcp.md), and [Cloudflare](cloudflare.md).
+`retryable` means the same call may succeed later; it does not mean repeating a non-idempotent
+operation is safe.

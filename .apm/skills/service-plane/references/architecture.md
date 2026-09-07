@@ -1,154 +1,147 @@
 # Architecture
 
-Goal: understand what Service Plane adds, where Cap'n Web fits, and which layer owns auth and validation.
+This page explains the boundaries of Service Plane and why they exist.
 
-The smallest useful setup has three pieces:
+## The Model
 
-- A service defines abilities.
-- A control plane issues short-lived tokens and aggregates discovery metadata.
-- A caller opens an ability session and invokes methods.
+An **ability** is a service-owned API contract. Each method has input and output schemas, required
+scopes, and optional REST or MCP metadata. One definition drives:
 
-## Why Service Plane Exists
+- runtime input and output validation;
+- a typed TypeScript client;
+- service discovery;
+- REST and OpenAPI projections; and
+- MCP tools, resources, and prompts.
 
-Normal service APIs often split into REST routes, internal RPC, OpenAPI files, custom auth checks, and separate tool metadata. Service Plane keeps those concerns tied to one source of truth: the ability.
+Schemas implement Standard Schema plus Standard JSON Schema. Services may use different validation
+libraries without changing the plane.
 
-An ability is a schema-backed RPC surface owned by a service. Each method declares:
+Three roles stay deliberately separate:
 
-- one input schema
-- one output schema
-- required scopes
-- optional REST metadata
-- optional MCP metadata
+| Role | Owns |
+| --- | --- |
+| Service | Ability contracts and handlers; token, ingress, access, scope, and schema enforcement |
+| Control plane | Service discovery, grants, token issuance, routing, REST/OpenAPI, and MCP |
+| Caller | Authentication to the plane, method input, and per-call metadata |
 
-The schemas power runtime validation, service discovery, OpenAPI generation, and MCP tool metadata.
-
-Schemas are [Standard Schema](https://standardschema.dev) values, so the validation library is the service author's choice rather than this package's. The package depends on the two contracts, not on a vendor: `~standard.validate()` for runtime validation and [`~standard.jsonSchema`](https://standardschema.dev/json-schema) for the projections. Two services in the same plane can use different libraries and still produce a discovery document in the same JSON Schema dialect.
-
-## Request Flow
+## Call Flow
 
 ```mermaid
 sequenceDiagram
-  participant Caller as Caller
-  participant Plane as Control Plane
-  participant Service as Service
-  participant Handler as Ability Handler
-
-  Caller->>Plane: Request token<br/>caller, service, scopes
-  Plane->>Plane: Check grants
-  Plane-->>Caller: Short-lived ServicePlane token
-  Caller->>Service: Open /rpc/asana.tasks
-  Caller->>Service: authenticate(token)
-  Service->>Service: Verify issuer, audience, expiry, signature
-  Service-->>Caller: Validating ability RPC object
-  Caller->>Service: createTask(input)
-  Service->>Service: Validate input and scopes
-  Service->>Handler: createTask(validInput)
-  Handler-->>Service: output
+  participant Caller
+  participant Plane as Control plane
+  participant Service
+  participant Handler
+  Caller->>Plane: Typed RPC, REST, or MCP call
+  Plane->>Plane: Authenticate caller, discover method, check grant
+  Plane->>Plane: Mint short-lived brokered token
+  Plane->>Service: Native RPC, Fetch, or WebSocket
+  Service->>Service: Verify token, ingress, access, scopes
+  Service->>Service: Validate input
+  Service->>Handler: handler({ context, input })
+  Handler-->>Service: result or async iterator
   Service->>Service: Validate output
-  Service-->>Caller: result
+  Service-->>Plane: typed result or stream
+  Plane-->>Caller: result or stream
 ```
 
-## What Cap'n Web Does
+The service remains the final authority. A stale discovery cache can delay a new capability, but it
+cannot make a removed scope or tightened access rule valid: the deployed service checks its own
+definition again before validation or handler creation.
 
-Cap'n Web is the RPC engine. It lets callers invoke methods on remote objects through HTTP-batch, WebSocket, or Cloudflare RPC-style bindings.
+## Contracts And Implementations
 
-Service Plane uses Cap'n Web for the method call transport, then adds the service model around it:
+Keep browser-safe contracts separate from service-only code:
 
-```mermaid
-flowchart TD
-  Hono["Hono shell"] --> Middleware["HTTP middleware<br/>CORS, request ids, logging, rate limits"]
-  Middleware --> Endpoint["/rpc/<abilityId>"]
-  Endpoint --> CapnWeb["Cap'n Web RPC"]
-  CapnWeb --> Auth["authenticate(token)"]
-  Auth --> Wrapper["Service Plane ability wrapper"]
-  Wrapper --> Scopes["Method scope check"]
-  Scopes --> SchemaIn["Input schema validation"]
-  SchemaIn --> Handler["Handler method"]
-  Handler --> SchemaOut["Output schema validation"]
+```ts
+const contract = defineAbility({
+  id: 'tasks',
+  scopes: ['tasks.read'],
+  methods: {
+    get: ability.method({ input: GetTask, output: Task, scopes: ['tasks.read'] }),
+  },
+});
+
+const implementation = implementAbility(contract, {
+  get: ({ context, input }) => context.env.TASKS.get(input.id),
+});
 ```
 
-Hono middleware sees the HTTP or WebSocket request. Cap'n Web sees the logical method call. That is why method auth and validation live in the Service Plane RPC wrapper, not in Hono middleware.
+Clients import `contract`; `ServicePlaneService` receives `implementation`. The handler is stored
+outside the portable contract, so a client bundle does not pull in service bindings or secrets.
+For a local-only ability, an inline `handler` in `ability.method({ ... })` is the shorter equivalent.
 
-Production services should enable service-plane ingress protection so only brokered traffic reaches ability handlers. In that mode, `/rpc/<abilityId>` rejects valid but non-brokered capability tokens before input validation or handler creation. The broker mints a signed broker claim with the same capability issuer and JWKS trust chain the service already uses.
+## Four Independent Policy Knobs
 
-An `access: 'service'` ability is refused at the same point, and for the same reason: the caller's access class is a signed claim only the control plane can mint, so the service can decide from its own definition rather than from the catalog the plane discovered. Every authorization input a service acts on — scopes, ingress, access — is read from what the service currently declares, which is what keeps a plane's cached catalog unable to loosen anything.
+- `exposure` controls projection. `private` is the default; `published` permits declared REST/MCP
+  surfaces.
+- `access` controls caller class. `plane` is the default; `service` requires an authenticated
+  service caller. It is not end-user authentication.
+- `scopes` control what a signed capability may do. Ability scopes are the maximum; method scopes
+  are the minimum for one operation.
+- `ingress` controls network trust. The default, `ingress: {}`, requires a brokered token and prevents a caller
+  from bypassing the control plane with an ordinary valid token.
 
-Methods that return many results over time (`stream: true`) use Cap'n Web's native stream support: the validating wrapper returns a `ReadableStream` of per-item-validated results with built-in flow control. Streams ride the ongoing RPC session, so they work over WebSocket, native Workers RPC bindings, and custom bidirectional transports — but not over the one-round-trip HTTP-batch transport, where streaming calls fail with a clear 405. The broker proxies these streams transparently, and MCP tools backed by streaming methods answer over SSE. The security model is unchanged — only the return shape differs. See [Streaming](streaming.md).
+`ingress: false` explicitly permits direct capability holders; use it only for a separately secured
+direct-service deployment. Hosting a service on another runtime does not require this opt-out.
+
+Product authentication belongs in control-plane `invocationMiddleware`. Provider credentials and
+tenant data belong in service-owned storage or validated method input, never in the capability
+token.
+
+## Hono Outside, Service Plane Inside
+
+Hono owns HTTP composition: middleware, request IDs, logging, custom routes, WebSocket upgrades,
+and deployment adapters. Service Plane owns method policy and execution. Handlers normally use
+`context.env`, `context.request`, `context.identity`, and `context.signal`; `context.context` is an
+escape hatch for Hono-specific features.
+
+Cloudflare native RPC is a separate fast path for unary Worker-to-Worker calls. It bypasses the Hono
+middleware stack, but not Service Plane authorization, validation, deadlines, or logging. Streams
+fall back to the binding's Fetch implementation.
+
+## Why The RPC Engine Is Private
+
+Service Plane currently compiles contracts to a pinned oRPC release for Fetch and WebSocket. It
+does not export oRPC procedures, plugins, clients, or errors. Consumers use Service Plane builders,
+clients, wire options, and error types.
+
+That boundary provides two practical benefits:
+
+1. Application code does not change when the private engine is upgraded or replaced.
+2. Security and distributed-service semantics have one owner instead of leaking into framework
+   middleware.
+
+The trade-off is intentional: arbitrary engine plugins are not consumer extension points. A useful
+feature must first become a stable Service Plane option. This avoids a nominal abstraction that
+still locks applications to one engine.
+
+Service Plane is also not Protocol Buffers gRPC. It is TypeScript-first and uses web-standard
+transports. For non-TypeScript consumers, publish REST/OpenAPI or MCP. A future Connect/gRPC
+projection can be additive without changing the ability contract.
+
+## Scaling And State
+
+Control-plane replicas share configuration—service endpoints, grants, issuer, and signing keys—but
+need no shared runtime session state. A process-local discovery cache is enabled for 30 seconds by
+default. Use a shared `RegistryCache` only when avoiding one cold fan-out per isolate or process is
+worth the extra infrastructure.
+
+WebSocket connections are stateful and owned by the accepting runtime. Experimental Durable Object
+hibernation is outside the central-plane topology: the public broker and an in-process control-plane
+`abilityClient` both reject hibernating methods before opening a downstream call. Use an
+application-owned, explicitly secured Durable Object endpoint only when that separate topology is
+required. Ordinary `ability.stream` works through the public plane.
+
+Wire revisions are advertised independently of service versions and checked before broker dispatch.
+Use the [staged rollout](migration-rpc-boundary.md#roll-out-without-mixing-protocols) for incompatible
+revisions; swapping one endpoint in a live fleet does not convert existing sessions or frames.
 
 ## Observability
 
-One request id follows a call across the whole plane. The control plane assigns or adopts `X-Request-Id` on every inbound request, and its REST, broker, and MCP surfaces forward that id on every outbound service call (header for HTTP transports, `request_id` query parameter for WebSocket upgrades, `requestId` field for native bindings). The service shell adopts the propagated id into its Hono `requestId` variable, echoes it on responses, and includes it in its log events, so plane and service logs correlate without extra plumbing.
+`X-Request-Id` follows REST, broker, MCP, native RPC, Fetch, and WebSocket calls. Both shells emit
+typed, token-safe structured events. Supply a log callback to integrate your logger; logging is
+best-effort and never changes call success.
 
-Both shells emit typed, token-safe JSON log events (requests, REST calls, broker connects, MCP tool calls, caller-auth rejections) to the console by default. The package never owns the application logger: every surface accepts a `log` callback that forwards events to whatever logger the app uses, and events are also exposed on the Hono context for app middleware. See the logging section in [the reference](reference.md).
-
-## Horizontal Scaling
-
-A control plane is designed to run as several independent replicas behind a load balancer — an
-autoscaled Cloudflare deployment, or a set of on-premises instances. Replicas share **configuration
-only**: the signing keys, the issuer, the service list, and the grants. They share no runtime state.
-
-What that buys, and what it costs:
-
-- **Any replica can verify any replica's tokens.** JWKS is derived from `signingKeys` alone, so two
-  replicas on the same configuration publish byte-identical documents. A token issued by one replica
-  verifies against JWKS served by another.
-- **Authorization is identical on every replica.** Grants and scope checks come from configuration,
-  not from a local cache. A replica holding a stale registry or OpenAPI snapshot cannot authorize
-  anything the fleet would refuse — projections are descriptive, and the service remains the only
-  authority on what it currently exposes.
-- **Replicas may disagree about the active signing key.** That is the normal state during a rolling
-  key rotation and needs no coordination, because both configurations publish both keys. See
-  [Rotate The Signing Key](auth.md#rotate-the-signing-key).
-- **Replay protection needs no shared store.** What bounds a replayed token request is per-request
-  signing plus a short timestamp window, and both are stateless — so there is deliberately nothing
-  for replicas to agree on. JWK callers narrow it further: issuance sender-constrains their token to
-  the key that authenticated, so the bytes alone are not enough to use it. HMAC callers get an
-  ordinary bearer token, and their residual risk is the duplicate-token window described in
-  [Replay Protection](auth.md#replay-protection).
-- **Sessions are bound to the replica that serves them.** HTTP-batch carries no cross-request state,
-  which is what makes the fleet safe to load-balance. A long-lived WebSocket session, by contrast,
-  lives on one replica: if that replica goes away the session fails and the caller must reconnect.
-  There is no session failover, and none is planned — reconnect logic belongs to the caller.
-
-Misconfiguration is refused rather than absorbed silently. A replica with a divergent issuer produces
-tokens every service rejects, and a replica signing with a key the fleet does not publish is refused
-with `Unknown Service-Plane capability key id`.
-
-That last guarantee is real only for services whose JWKS is stale relative to the divergent replica —
-a cached snapshot, or a refresh the balancer happened to route elsewhere. A divergent replica serves
-JWKS through the same balancer as its peers, so a service that refreshes *from it* learns its key and
-accepts its tokens. Key material is fleet-wide configuration, and nothing in the plane detects that
-one replica is holding a different set; keep the key list identical across replicas outside the
-deliberate overlap of a rotation.
-
-## Discovery And Projections
-
-Services publish metadata at `/.well-known/service-plane/service.json`. The control plane fetches that metadata, validates grants, and builds projections.
-
-```mermaid
-flowchart LR
-  Asana["Asana service<br/>abilities + schemas"] --> Registry["Control plane registry"]
-  ClickUp["ClickUp service<br/>abilities + schemas"] --> Registry
-  Moco["Moco service<br/>abilities + schemas"] --> Registry
-  Registry --> OpenAPI["/openapi.json"]
-  Registry --> MCP["/mcp<br/>MCP tools"]
-  Registry --> Grants["STS grants<br/>scope checks"]
-```
-
-Only `exposure: 'published'` methods with REST metadata enter OpenAPI and the control plane's live REST facade. Only published methods with MCP metadata enter MCP. Private abilities remain available for broker routing and grant validation, but they are not user-facing projections.
-
-## Core Terms
-
-- Ability: schema-backed API surface owned by a service.
-- Method: one callable operation on an ability.
-- Handler: implementation object returned by the ability factory.
-- Context: runtime access such as Hono context, env, bindings, and execution context.
-- Identity: verified Service Plane caller and scope claims, plus the delegated principal subject on plane-brokered calls.
-- Subject: the plane principal (with optional org and principal kind) a delegated call is made on behalf of. The `sub` principal
-  and `act.sub` acting-service relationship follows RFC 8693 actor semantics; `spo` is a
-  Service Plane-specific organization claim and `spk` carries the optional principal kind.
-- Access: whether an ability is plane-callable or restricted to service callers.
-- Private: ability excluded from OpenAPI and MCP.
-- Published: ability eligible for OpenAPI, MCP, or user-facing transports.
-
-Next: [create a service](service-creation.md), [create a control plane](plane-creation.md), and [choosing a transport](transports.md).
+Continue with [creating a service](service-creation.md), [creating a control plane](plane-creation.md),
+or [choosing a transport](transports.md).

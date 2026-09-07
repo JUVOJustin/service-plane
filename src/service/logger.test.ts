@@ -1,118 +1,156 @@
-import type { MiddlewareHandler } from 'hono';
-import { describe, expect, it, vi } from 'vitest';
-import * as z from 'zod';
-import { SERVICE_DISCOVERY_PATH } from '../shared/types.js';
+import { Hono } from 'hono';
+import { describe, expect, it } from 'vitest';
+import { z } from 'zod';
+import { createCapabilityIssuer, defineServiceGrants } from '../control-plane/capabilities.js';
+import { ServicePlaneClientError } from '../shared/errors.js';
 import { testKeys } from '../test-support/index.js';
-import { defineCapabilities, RpcTarget } from './capabilities.js';
-import { abilityMethod, defineAbility } from './discovery.js';
-import type { ServicePlaneLogEvent } from './logger.js';
-import { servicePlaneLogEvents } from './logger.js';
+import { createAbilityBuilder } from './ability.js';
+import { defineCapabilities } from './capabilities.js';
+import { createAbilityClient } from './client.js';
+import { defineAbility, defineAbilityService } from './discovery.js';
+import { type ServicePlaneLogEvent, type ServicePlaneLoggerOptions, servicePlaneLogger } from './logger.js';
 import { ServicePlaneService } from './service.js';
 
-describe('service plane logging', () => {
-  it('adopts an incoming request id, logs it, and echoes it on the response', async () => {
-    const events: ServicePlaneLogEvent[] = [];
-    const service = await testService({ log: (event) => events.push(event) });
+const ISSUED_AT = new Date('2099-05-09T12:00:00.000Z');
+const VERIFIED_AT = new Date('2099-05-09T12:00:01.000Z');
 
-    const response = await service.fetch(
-      new Request(`https://example.internal${SERVICE_DISCOVERY_PATH}`, { headers: { 'X-Request-Id': 'req-42' } }),
-    );
-    expect(response.status).toBe(200);
-    expect(response.headers.get('X-Request-Id')).toBe('req-42');
-    expect(events).toContainEqual(expect.objectContaining({ event: 'service_plane.discovery.served', requestId: 'req-42' }));
-  });
-
-  it('falls back to the request id query parameter used by WebSocket transports', async () => {
-    const events: ServicePlaneLogEvent[] = [];
-    const service = await testService({ log: (event) => events.push(event) });
-
-    const response = await service.fetch(new Request(`https://example.internal${SERVICE_DISCOVERY_PATH}?request_id=req-ws-7`));
-    expect(response.status).toBe(200);
-    expect(response.headers.get('X-Request-Id')).toBe('req-ws-7');
-    expect(events).toContainEqual(expect.objectContaining({ requestId: 'req-ws-7' }));
-  });
-
-  it('generates a request id when none is provided', async () => {
-    const events: ServicePlaneLogEvent[] = [];
-    const service = await testService({ log: (event) => events.push(event) });
-
-    const response = await service.fetch(new Request(`https://example.internal${SERVICE_DISCOVERY_PATH}`));
-    expect(response.headers.get('X-Request-Id')).toBeTruthy();
-    expect(events[0]?.requestId).toBe(response.headers.get('X-Request-Id'));
-  });
-
-  it('exposes emitted events to app middleware on the Hono context', async () => {
-    let observed: ServicePlaneLogEvent[] = [];
-    const service = await testService(undefined, [
-      async (context, next) => {
-        await next();
-        observed = servicePlaneLogEvents(context);
+describe('service logger reliability', () => {
+  it('does not let a failing log sink change a successful response', async () => {
+    const builder = createAbilityBuilder();
+    const ability = defineAbility({
+      id: 'catalog.health',
+      methods: {
+        read: builder.method({ input: z.object({}), output: z.object({ ok: z.boolean() }), handler: () => ({ ok: true }) }),
       },
-    ]);
+    });
+    const service = defineAbilityService(
+      { abilities: [ability], id: 'catalog', title: 'Catalog', version: '1.0.0' },
+      { requireAbilityScopes: false },
+    );
+    const app = new Hono();
+    app.use(
+      '*',
+      servicePlaneLogger(service, {
+        log: () => {
+          throw new Error('sink failed');
+        },
+      }),
+    );
+    app.get('/ok', (context) => context.text('ok'));
 
-    await service.fetch(new Request(`https://example.internal${SERVICE_DISCOVERY_PATH}`, { headers: { 'X-Request-Id': 'req-mw' } }));
-    expect(observed).toContainEqual(expect.objectContaining({ event: 'service_plane.discovery.served', requestId: 'req-mw' }));
+    const response = await app.request('/ok');
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('ok');
   });
 
-  it('can disable the built-in logger while request ids stay on', async () => {
-    const keys = await testKeys();
-    const service = new ServicePlaneService({
-      abilities: [testAbility()],
-      auth: { issuer: 'control-plane', jwks: { keys: [keys.publicJwk] } },
-      capabilities: testCapabilities(),
-      id: 'example',
-      logger: false,
-      title: 'Example',
-      version: '0.1.0',
+  it('keeps an opaque handler failure when its log sink throws synchronously', async () => {
+    const events: ServicePlaneLogEvent[] = [];
+    const { client } = await serveFailingAbility((event) => {
+      events.push(event);
+      throw new Error('synchronous sink failure');
     });
 
-    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {});
-    try {
-      const response = await service.fetch(new Request(`https://example.internal${SERVICE_DISCOVERY_PATH}`));
-      expect(response.status).toBe(200);
-      expect(response.headers.get('X-Request-Id')).toBeTruthy();
-      expect(consoleLog).not.toHaveBeenCalled();
-    } finally {
-      consoleLog.mockRestore();
-    }
+    const { result, unhandled } = await captureUnhandledRejections(() => client.fail({}));
+
+    expectOpaqueHandlerFailure(result);
+    expect(events.some((event) => event.event === 'service_plane.ability.handler_failed')).toBe(true);
+    expect(unhandled).toEqual([]);
+  });
+
+  it('handles a rejected handler-failure log promise without an unhandled rejection', async () => {
+    const events: ServicePlaneLogEvent[] = [];
+    const { client } = await serveFailingAbility(async (event) => {
+      events.push(event);
+      throw new Error('asynchronous sink failure');
+    });
+
+    const { result, unhandled } = await captureUnhandledRejections(() => client.fail({}));
+
+    expectOpaqueHandlerFailure(result);
+    expect(events.some((event) => event.event === 'service_plane.ability.handler_failed')).toBe(true);
+    expect(unhandled).toEqual([]);
   });
 });
 
-class ExampleApi extends RpcTarget {
-  async runSync() {
-    return { ok: true as const };
-  }
-}
-
-function testCapabilities() {
-  return defineCapabilities({ scopes: [{ id: 'example.sync.run' }], serviceId: 'example' });
-}
-
-function testAbility() {
-  return defineAbility({
-    id: 'example.sync',
+async function serveFailingAbility(log: NonNullable<ServicePlaneLoggerOptions['log']>) {
+  const keys = await testKeys();
+  const capabilities = defineCapabilities({ scopes: [{ id: 'catalog.read' }], serviceId: 'catalog' });
+  const issuer = createCapabilityIssuer({
+    capabilities: [capabilities],
+    grants: defineServiceGrants({ grants: [{ caller: 'headless-front', scopes: ['catalog.read'], target: 'catalog' }] }),
+    issuer: 'control-plane',
+    now: () => ISSUED_AT,
+    privateJwks: [keys.privateJwk],
+  });
+  const issued = await issuer.issueCapabilityToken({
+    callerAccess: 'service',
+    callerServiceId: 'headless-front',
+    scopes: ['catalog.read'],
+    targetServiceId: 'catalog',
+  });
+  const builder = createAbilityBuilder();
+  const ability = defineAbility({
+    id: 'catalog.failure',
     methods: {
-      runSync: abilityMethod({
+      fail: builder.method({
         input: z.object({}),
-        output: z.object({ ok: z.literal(true) }),
-        scopes: ['example.sync.run'],
+        output: z.object({ ok: z.boolean() }),
+        scopes: ['catalog.read'],
+        handler: () => {
+          throw new Error('postgres://secret@internal/catalog');
+        },
       }),
     },
-    scopes: ['example.sync.run'],
-    handler: () => new ExampleApi() as ExampleApi & Record<string, unknown>,
+    rpc: { transports: ['fetch'] },
+    scopes: ['catalog.read'],
   });
+  const service = new ServicePlaneService({
+    ingress: false,
+    abilities: [ability],
+    auth: { issuer: 'control-plane', jwks: { keys: [keys.publicJwk] }, now: () => VERIFIED_AT },
+    capabilities,
+    id: 'catalog',
+    logger: { log },
+    title: 'Catalog',
+    version: '1.0.0',
+  });
+  const client = createAbilityClient({
+    ability,
+    callerServiceId: 'headless-front',
+    requestToken: async () => issued,
+    scopes: ['catalog.read'],
+    targetServiceId: 'catalog',
+    transport: {
+      fetch: async (url, init) => service.fetch(new Request(url, init)),
+      origin: 'https://catalog.internal',
+      type: 'fetch',
+    },
+  });
+  return { client };
 }
 
-async function testService(logger?: { log: (event: ServicePlaneLogEvent) => void }, middleware?: MiddlewareHandler[]) {
-  const keys = await testKeys();
-  return new ServicePlaneService({
-    abilities: [testAbility()],
-    auth: { issuer: 'control-plane', jwks: { keys: [keys.publicJwk] } },
-    capabilities: testCapabilities(),
-    id: 'example',
-    ...(logger ? { logger } : {}),
-    ...(middleware ? { middleware } : {}),
-    title: 'Example',
-    version: '0.1.0',
+function expectOpaqueHandlerFailure(result: unknown): void {
+  expect(result).toBeInstanceOf(ServicePlaneClientError);
+  expect(result).toMatchObject({
+    code: 'internal',
+    message: 'Service-Plane ability handler failed: fail',
+    retryable: false,
+    status: 500,
   });
+  expect(JSON.stringify(result)).not.toContain('secret@internal');
+}
+
+async function captureUnhandledRejections(run: () => Promise<unknown>): Promise<{ result: unknown; unhandled: unknown[] }> {
+  const unhandled: unknown[] = [];
+  const listener = (reason: unknown) => unhandled.push(reason);
+  process.on('unhandledRejection', listener);
+  try {
+    const result = await run().catch((error: unknown) => error);
+    // Let Node/workerd perform their unhandled-rejection checkpoint before inspecting the capture.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return { result, unhandled };
+  } finally {
+    process.off('unhandledRejection', listener);
+  }
 }

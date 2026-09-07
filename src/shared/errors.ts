@@ -1,21 +1,22 @@
 /**
- * What kind of failure this is, independent of the HTTP-style status. Cap'n Web reconstructs a
- * received error as a plain `Error` — its class table holds only built-ins and the sent `name` is
- * used to pick that class, not restored onto the result — so the class a service threw is gone by
- * the time a caller catches it. Own enumerable properties do survive, which is why the taxonomy
- * lives in `code`, `status`, and `retryable` rather than in the constructor name. Read them with
- * {@link servicePlaneErrorInfo} instead of `instanceof`.
+ * What kind of failure this is, independent of the HTTP-style status. Wire transports carry this
+ * taxonomy in typed error data; local calls carry it as enumerable error properties. Read both with
+ * {@link servicePlaneErrorInfo} instead of relying on an error class surviving a remote hop.
  */
 export type ServicePlaneErrorCode =
   /** Input or output did not satisfy the method's schema. */
   | 'ability_validation'
+  /** The caller locally cancelled an in-flight call. */
+  | 'cancelled'
   /** Token, scope, ingress, or proof-of-possession check refused the call. */
   | 'capability_auth'
   /** The ability handler failed deliberately and chose what the caller sees. */
   | 'handler'
+  /** The peer uses an unsupported Service Plane RPC wire revision. */
+  | 'incompatible_protocol'
   /** Anything else, including a handler failure the service did not shape for callers. */
   | 'internal'
-  /** The caller's deadline elapsed. */
+  /** An effective caller deadline or server-owned execution/preparation ceiling elapsed. */
   | 'timeout';
 
 export type ServicePlaneErrorOptions = {
@@ -44,9 +45,9 @@ export class ServicePlaneError extends Error {
   /** @see ServicePlaneErrorOptions.retryable */
   readonly retryable: boolean;
   /**
-   * HTTP-style classification of the failure, not the HTTP status of the response that carried it:
-   * an RPC-level failure travels inside a 200 batch. The number is for gateways mapping the failure
-   * onto their own responses, and for the shells where they answer HTTP directly.
+   * HTTP-style classification of the failure, not necessarily the status of the response that
+   * carried it. The number lets gateways and alternate transports map one error taxonomy onto their
+   * own response model.
    */
   readonly status: number;
 
@@ -67,9 +68,10 @@ export class CapabilityAuthError extends ServicePlaneError {
 }
 
 /**
- * The call ran out of the budget its caller gave it. Thrown on whichever hop notices first: the
- * caller when its own wait elapses, the broker when no budget is left to forward, and the service
- * when a handler outlives the deadline it was handed.
+ * The call exceeded an effective deadline or server-owned ceiling. Thrown on whichever hop notices
+ * first: the caller when its own wait elapses, a Fetch boundary while request preparation stalls,
+ * the broker when no budget is left to forward, or the service when unary work exceeds method
+ * policy. The error alone therefore does not imply that the caller supplied a deadline.
  */
 export class ServicePlaneTimeoutError extends ServicePlaneError {
   constructor(message: string, status = 504) {
@@ -122,6 +124,24 @@ export class AbilityValidationError extends ServicePlaneError {
 }
 
 /**
+ * Stable error received by an ability client. Wire adapters translate their private error objects
+ * into this class so callers never need to import or inspect the underlying RPC engine.
+ */
+export class ServicePlaneClientError extends ServicePlaneError {
+  /** Structured validation failures safe for the caller. */
+  readonly issues?: ReadonlyArray<AbilityValidationIssue>;
+  /** Application-owned discriminator attached by an ability handler. */
+  readonly reason?: string;
+
+  constructor(info: ServicePlaneErrorInfo) {
+    super(info.message, info.status, { code: info.code, retryable: info.retryable });
+    this.name = 'ServicePlaneClientError';
+    if (info.issues) this.issues = info.issues;
+    if (info.reason !== undefined) this.reason = info.reason;
+  }
+}
+
+/**
  * Structurally the Standard Schema issue shape, restated so consumers reading `issues` do not
  * need the spec package and so a malformed vendor issue cannot widen the type.
  */
@@ -137,6 +157,8 @@ export type AbilityValidationIssue = {
 export type ServicePlaneErrorInfo = {
   /** @see ServicePlaneErrorCode */
   code: ServicePlaneErrorCode;
+  /** Structured schema issues, present for validation failures when safe to return to the caller. */
+  issues?: ReadonlyArray<AbilityValidationIssue>;
   /**
    * The error message, empty when the peer sent none.
    */
@@ -159,28 +181,42 @@ export type ServicePlaneErrorInfo = {
 // would drift silently and make servicePlaneErrorInfo blind to the new code.
 const SERVICE_PLANE_ERROR_CODE_ROWS: Record<ServicePlaneErrorCode, true> = {
   ability_validation: true,
+  cancelled: true,
   capability_auth: true,
   handler: true,
+  incompatible_protocol: true,
   internal: true,
   timeout: true,
 };
 const SERVICE_PLANE_ERROR_CODES: ReadonlySet<string> = new Set(Object.keys(SERVICE_PLANE_ERROR_CODE_ROWS));
 
 /**
- * Reads the Service Plane taxonomy off a caught value, whether it is still a real
- * {@link ServicePlaneError} or the plain `Error` a peer's was rebuilt as. Returns undefined for
- * anything that does not carry the taxonomy, so an unrelated failure is never mistaken for one.
+ * Reads the Service Plane taxonomy off a caught value, whether it is a local
+ * {@link ServicePlaneError}, typed wire error data, or a peer's reconstructed error. Returns
+ * undefined for anything that does not carry the taxonomy.
  *
  * Every field is re-checked rather than trusted: these values arrive from a peer, and a hostile or
  * buggy one must not be able to make a caller treat a refusal as retryable.
  */
 export function servicePlaneErrorInfo(error: unknown): ServicePlaneErrorInfo | undefined {
   if (typeof error !== 'object' || error === null) return undefined;
-  const { code, message, reason, retryable, status } = error as Record<string, unknown>;
+  // The private wire runtime carries classification under `data.servicePlane`; in-process callers
+  // carry it directly on the Error. Reading both keeps one branching helper for every link.
+  const data = (error as { data?: unknown }).data;
+  const nested =
+    data && typeof data === 'object' && (data as { servicePlane?: unknown }).servicePlane
+      ? (data as { servicePlane: unknown }).servicePlane
+      : error;
+  if (typeof nested !== 'object' || nested === null) return undefined;
+  const { code, issues: rawIssues, message, reason, retryable, status } = nested as Record<string, unknown>;
   if (typeof code !== 'string' || !SERVICE_PLANE_ERROR_CODES.has(code)) return undefined;
-  if (typeof status !== 'number' || !Number.isInteger(status) || typeof retryable !== 'boolean') return undefined;
+  if (typeof status !== 'number' || !Number.isInteger(status) || status < 400 || status > 599 || typeof retryable !== 'boolean') {
+    return undefined;
+  }
+  const issues = servicePlaneValidationIssues(rawIssues);
   return {
     code: code as ServicePlaneErrorCode,
+    ...(issues ? { issues } : {}),
     message: typeof message === 'string' ? message : '',
     ...(typeof reason === 'string' ? { reason } : {}),
     retryable,
@@ -188,8 +224,120 @@ export function servicePlaneErrorInfo(error: unknown): ServicePlaneErrorInfo | u
   };
 }
 
-// Held beside the error rather than on it. Cap'n Web serializes `cause` unconditionally — it checks
-// `"cause" in e`, so even a non-enumerable one crosses — and the whole point of replacing a handler
+/** Converts a private transport error into the stable error exposed by ability clients. */
+export function servicePlaneClientError(error: unknown, signal?: AbortSignal): ServicePlaneClientError {
+  if (signal?.aborted) {
+    return new ServicePlaneClientError({
+      code: 'cancelled',
+      message: cancellationMessage(signal.reason),
+      retryable: false,
+      status: 499,
+    });
+  }
+  if (error instanceof ServicePlaneClientError) return error;
+  const info = servicePlaneErrorInfo(error);
+  if (info) return new ServicePlaneClientError(info);
+  const status = transportErrorStatus(error);
+  const timeout = status === 408 || status === 504;
+  return new ServicePlaneClientError({
+    code: timeout ? 'timeout' : 'internal',
+    message: timeout ? 'Service Plane call timed out' : error instanceof Error ? error.message : 'Service Plane call failed',
+    retryable: timeout,
+    status,
+  });
+}
+
+function cancellationMessage(reason: unknown): string {
+  if (reason instanceof Error && reason.message) return reason.message;
+  if (typeof reason === 'string' && reason) return reason;
+  return 'Service Plane call was cancelled';
+}
+
+/**
+ * The private transport's error codes and the HTTP-style status each maps to. Kept at this boundary
+ * so both directions of the mapping have one source and the RPC package stays out of the public API.
+ */
+export const PRIVATE_TRANSPORT_ERROR_STATUSES = {
+  BAD_GATEWAY: 502,
+  BAD_REQUEST: 400,
+  CLIENT_CLOSED_REQUEST: 499,
+  CONFLICT: 409,
+  FORBIDDEN: 403,
+  GATEWAY_TIMEOUT: 504,
+  GONE: 410,
+  INTERNAL_SERVER_ERROR: 500,
+  METHOD_NOT_SUPPORTED: 405,
+  NOT_ACCEPTABLE: 406,
+  NOT_FOUND: 404,
+  NOT_IMPLEMENTED: 501,
+  PAYMENT_REQUIRED: 402,
+  PAYLOAD_TOO_LARGE: 413,
+  PRECONDITION_FAILED: 412,
+  PRECONDITION_REQUIRED: 428,
+  SERVICE_UNAVAILABLE: 503,
+  TIMEOUT: 408,
+  TOO_MANY_REQUESTS: 429,
+  UNAUTHORIZED: 401,
+  UNPROCESSABLE_CONTENT: 422,
+  UNSUPPORTED_MEDIA_TYPE: 415,
+} as const;
+
+function transportErrorStatus(error: unknown): number {
+  if (!error || typeof error !== 'object') return 500;
+  const status = (error as { status?: unknown }).status;
+  if (isErrorStatus(status)) return status;
+  // oRPC puts the HTTP response on `data` when a non-protocol response (for example the service's
+  // unmatched-route 404) cannot be decoded. Keep that private shape at this boundary while
+  // preserving the status a rolling deployment needs to distinguish from an actual service 500.
+  const data = (error as { data?: unknown }).data;
+  const responseStatus = data && typeof data === 'object' ? (data as { status?: unknown }).status : undefined;
+  if (isErrorStatus(responseStatus)) return responseStatus;
+  const code = (error as { code?: unknown }).code;
+  if (typeof code !== 'string' || !Object.hasOwn(PRIVATE_TRANSPORT_ERROR_STATUSES, code)) return 500;
+  return PRIVATE_TRANSPORT_ERROR_STATUSES[code as keyof typeof PRIVATE_TRANSPORT_ERROR_STATUSES];
+}
+
+function isErrorStatus(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 400 && value <= 599;
+}
+
+/** JSON error body for the HTTP surfaces that answer outside the private RPC codec. */
+export function servicePlaneErrorResponse(error: unknown, fallbackMessage: string): Response {
+  const info = servicePlaneErrorInfo(error);
+  if (!info) return Response.json({ error: { code: 'internal', message: fallbackMessage, retryable: false } }, { status: 500 });
+  return Response.json(
+    { error: { code: info.code, message: info.message, ...(info.reason ? { reason: info.reason } : {}), retryable: info.retryable } },
+    { status: info.status },
+  );
+}
+
+/**
+ * Refuses an empty or whitespace-only configuration value. Every definition-time check shares this
+ * one message shape so a misconfiguration reads the same wherever it surfaces.
+ */
+export function requireNonEmpty(value: string, what: string, status = 500): string {
+  const normalized = value.trim();
+  if (!normalized) throw new CapabilityAuthError(`Service-Plane ${what} cannot be empty`, status);
+  return normalized;
+}
+
+function servicePlaneValidationIssues(value: unknown): AbilityValidationIssue[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const issues: AbilityValidationIssue[] = [];
+  for (const valueIssue of value) {
+    if (!valueIssue || typeof valueIssue !== 'object') return undefined;
+    const { message, path } = valueIssue as { message?: unknown; path?: unknown };
+    if (typeof message !== 'string') return undefined;
+    if (path !== undefined && (!Array.isArray(path) || !path.every((segment) => ['number', 'string', 'symbol'].includes(typeof segment)))) {
+      return undefined;
+    }
+    issues.push({ message, ...(path === undefined ? {} : { path: path as PropertyKey[] }) });
+  }
+  return issues;
+}
+
+// Held beside the error rather than on it. RPC serializers may expose `cause` even when it is
+// non-enumerable, and the whole point of replacing a handler
 // failure is that its original must not reach the caller. A WeakMap keeps it available in-process
 // for logging and debugging and nowhere else.
 const handlerFailureCauses = new WeakMap<object, unknown>();

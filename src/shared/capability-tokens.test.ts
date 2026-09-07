@@ -1,8 +1,8 @@
-import { sign } from 'hono/jwt';
-import { describe, expect, it } from 'vitest';
-import { extractServicePlaneToken, publicJwkFromPrivateJwk, signCapabilityToken, verifyCapabilityToken } from './capability-tokens.js';
+import { decode, sign } from 'hono/jwt';
+import { describe, expect, it, vi } from 'vitest';
+import { extractServicePlaneToken, signCapabilityToken, verifyCapabilityToken } from './capability-tokens.js';
 import { CapabilityAuthError } from './errors.js';
-import { SERVICE_PLANE_JWK_ALGORITHM, servicePlaneJwkSigningKey } from './jwk-auth.js';
+import { publicJwkFromPrivateJwk, SERVICE_PLANE_JWK_ALGORITHM, servicePlaneJwkSigningKey } from './jwk-auth.js';
 
 const NOW = new Date('2026-05-09T12:00:00.000Z');
 
@@ -45,6 +45,68 @@ describe('STS capability tokens', () => {
       scopes: ['fizzy.users.lookup'],
       serviceId: 'moco',
     });
+  });
+
+  it('imports one private key for repeated token signatures while keeping kid in each header', async () => {
+    const keys = await testKeys();
+    const importKey = vi.spyOn(crypto.subtle, 'importKey');
+    try {
+      const first = await signCapabilityToken({
+        claims: { aud: 'fizzy', iss: 'control-plane', scp: ['fizzy.users.lookup'], sub: 'moco' },
+        keyId: 'key-a',
+        now: NOW,
+        privateJwk: keys.privateJwk,
+      });
+      const second = await signCapabilityToken({
+        claims: { aud: 'fizzy', iss: 'control-plane', scp: ['fizzy.users.lookup'], sub: 'moco' },
+        keyId: 'key-b',
+        now: NOW,
+        privateJwk: keys.privateJwk,
+      });
+
+      expect(decode(first.token).header.kid).toBe('key-a');
+      expect(decode(second.token).header.kid).toBe('key-b');
+      expect(importKey.mock.calls.filter((call) => Array.isArray(call[4]) && call[4].includes('sign'))).toHaveLength(1);
+    } finally {
+      importKey.mockRestore();
+    }
+  });
+
+  it('reimports a private JWK object whose key material changes in place', async () => {
+    const firstKeys = await testKeys();
+    const secondKeys = await testKeys();
+    const mutableKey = { ...firstKeys.privateJwk };
+    const first = await signCapabilityToken({
+      claims: { aud: 'fizzy', iss: 'control-plane', scp: ['fizzy.users.lookup'], sub: 'moco' },
+      keyId: 'rotating-key',
+      now: NOW,
+      privateJwk: mutableKey,
+    });
+    Object.assign(mutableKey, secondKeys.privateJwk);
+    const second = await signCapabilityToken({
+      claims: { aud: 'fizzy', iss: 'control-plane', scp: ['fizzy.users.lookup'], sub: 'moco' },
+      keyId: 'rotating-key',
+      now: NOW,
+      privateJwk: mutableKey,
+    });
+
+    const verification = {
+      expectedAudience: 'fizzy',
+      issuer: 'control-plane',
+      now: new Date('2026-05-09T12:01:00.000Z'),
+    };
+    await expect(
+      verifyCapabilityToken(first.token, {
+        ...verification,
+        jwks: { keys: [publicJwkFromPrivateJwk(firstKeys.privateJwk, 'rotating-key')] },
+      }),
+    ).resolves.toBeDefined();
+    await expect(
+      verifyCapabilityToken(second.token, {
+        ...verification,
+        jwks: { keys: [publicJwkFromPrivateJwk(secondKeys.privateJwk, 'rotating-key')] },
+      }),
+    ).resolves.toBeDefined();
   });
 
   it('surfaces RFC 8693 delegated subjects with the acting service from the act claim', async () => {

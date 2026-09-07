@@ -1,43 +1,14 @@
-import {
-  newHttpBatchRpcSession,
-  newWebSocketRpcSession,
-  type RpcCompatible,
-  RpcSession,
-  type RpcSessionOptions,
-  type RpcStub,
-  RpcTarget,
-  type RpcTransport,
-} from 'capnweb';
+import { readBoundedResponseJson, validateBodyByteLimit } from '../shared/body-limit.js';
 import {
   decodeCapabilityTokenPayload,
   normalizeCapabilitySubject,
-  publicJwkFromPrivateJwk,
+  normalizeCapabilityTokenTtlSeconds,
   verifyCapabilityToken,
 } from '../shared/capability-tokens.js';
-import {
-  type ConnInfo,
-  normalizeConnInfo,
-  SERVICE_PLANE_CONN_INFO_HEADER,
-  SERVICE_PLANE_CONN_INFO_QUERY_PARAM,
-  serializeConnInfo,
-} from '../shared/conn-info.js';
-import {
-  discardDisposableValue,
-  normalizeTimeoutMs,
-  raceDeadline,
-  SERVICE_PLANE_TIMEOUT_GRACE_MS,
-  SERVICE_PLANE_TIMEOUT_HEADER,
-  SERVICE_PLANE_TIMEOUT_QUERY_PARAM,
-  serializeTimeoutMs,
-} from '../shared/deadline.js';
-import { CapabilityAuthError, ServicePlaneTimeoutError } from '../shared/errors.js';
+import { CapabilityAuthError, requireNonEmpty } from '../shared/errors.js';
 import { SERVICE_PLANE_HMAC_CLIENT_HEADER, SERVICE_PLANE_HMAC_TIMESTAMP_HEADER, signServicePlaneHmacRequest } from '../shared/hmac-auth.js';
 import {
-  normalizeIdempotencyKey,
-  SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER,
-  SERVICE_PLANE_IDEMPOTENCY_KEY_QUERY_PARAM,
-} from '../shared/idempotency.js';
-import {
+  publicJwkFromPrivateJwk,
   SERVICE_PLANE_JWK_ASSERTION_AUDIENCE,
   SERVICE_PLANE_JWK_CLIENT_HEADER,
   SERVICE_PLANE_JWK_KEY_ID_HEADER,
@@ -56,27 +27,24 @@ import {
   type CapabilityTokenCache,
   type CapabilityTokenProvider,
   type CapabilityVerifierOptions,
+  type ControlPlaneRpcTokenBinding,
   DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
   type FetchLike,
   type IssueCapabilityTokenInput,
   type IssuedCapabilityToken,
-  MAX_CAPABILITY_TOKEN_TTL_SECONDS,
   SERVICE_PLANE_CAPABILITY_JWKS_PATH,
   SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
   SERVICE_PLANE_REQUEST_ID_HEADER,
-  SERVICE_PLANE_REQUEST_ID_QUERY_PARAM,
 } from '../shared/types.js';
 
-const identityByTarget = new WeakMap<object, CapabilityIdentity>();
 const serviceBindingJwksResolvers = new WeakMap<object, Map<string, CapabilityJwksResolver>>();
 const urlJwksResolvers = new Map<string, CapabilityJwksResolver>();
 
-// Read the well-known symbols once so cleanup works uniformly for local targets and Cap'n Web
-// Disposable stubs, including runtimes that expose only the synchronous hook.
-const { dispose: DISPOSE_SYMBOL, asyncDispose: ASYNC_DISPOSE_SYMBOL } = Symbol as unknown as {
-  asyncDispose: symbol;
-  dispose: symbol;
-};
+/** Default maximum response size for a capability-token endpoint: 64 KiB. */
+export const DEFAULT_CAPABILITY_TOKEN_RESPONSE_MAX_BYTES = 65_536;
+
+/** Default maximum response size for a JWKS endpoint: 256 KiB. */
+export const DEFAULT_CAPABILITY_JWKS_RESPONSE_MAX_BYTES = 262_144;
 
 export type RemoteJwksFetch = typeof fetch | FetchLike;
 
@@ -86,6 +54,8 @@ export type JwksFromUrlOptions = {
   cacheTtlSeconds?: number;
   fetch?: RemoteJwksFetch;
   headers?: HeadersInit | (() => HeadersInit | Promise<HeadersInit>);
+  /** Maximum accepted JWKS response size. Defaults to 256 KiB. */
+  maxResponseBytes?: number;
   now?: () => Date;
 };
 
@@ -108,7 +78,7 @@ export type CreateCapabilityTokenProviderOptions = {
    * wrap the issuer in a closure that supplies `callerAccess` instead.
    */
   requestToken: (input: IssueCapabilityTokenInput) => Promise<IssuedCapabilityToken | { expiresAt: Date | string; token: string }>;
-  scopes: string[];
+  scopes: ReadonlyArray<string>;
   subject?: CapabilitySubject;
   targetServiceId: string;
   ttlSeconds?: number;
@@ -118,6 +88,8 @@ type ControlPlaneTokenRequestOptions = {
   controlPlaneUrl: string | URL;
   fetch?: typeof fetch | FetchLike;
   headers?: HeadersInit | (() => HeadersInit | Promise<HeadersInit>);
+  /** Maximum accepted token response size. Defaults to 64 KiB. */
+  maxResponseBytes?: number;
   requestId?: string | (() => string | Promise<string | undefined> | undefined);
   requestIdHeaderName?: string;
   tokenPath?: string;
@@ -143,57 +115,10 @@ export type ControlPlaneJwkTokenRequesterOptions = ControlPlaneTokenRequestOptio
   privateJwk: JsonWebKey | (() => Promise<JsonWebKey> | JsonWebKey);
 };
 
-export type ControlPlaneRpcTokenBinding = {
-  /**
-   * Property-function for the same reason as `requestToken`: a raw `CapabilityIssuer` must not
-   * satisfy this seam — its input requires `callerAccess`, which no service-side caller supplies.
-   * Expose a control-plane entrypoint (e.g. `issueCapabilityTokenForCaller`) instead.
-   */
-  issueCapabilityToken: (input: IssueCapabilityTokenInput) => Promise<IssuedCapabilityToken | { expiresAt: Date | string; token: string }>;
-};
-
-export type ControlPlaneRpcCallerTokenBinding = {
-  issueCapabilityTokenForCaller(
-    callerServiceId: string,
-    input: Omit<IssueCapabilityTokenInput, 'callerServiceId'> & { callerServiceId?: string },
-  ): Promise<IssuedCapabilityToken | { expiresAt: Date | string; token: string }>;
-};
-
 export type ControlPlaneRpcTokenRequesterOptions = {
-  binding: ControlPlaneRpcCallerTokenBinding | ControlPlaneRpcTokenBinding;
-  callerServiceId?: string;
+  /** A per-caller control-plane binding whose implementation pins the service identity. */
+  binding: ControlPlaneRpcTokenBinding;
 };
-
-export type CloudflareAbilityRpcBinding = {
-  connectAbility(input: {
-    abilityId: string;
-    connInfo?: ConnInfo;
-    /**
-     * The caller's key for this attempt, surfaced to handlers as `idempotencyKey`.
-     */
-    idempotencyKey?: string;
-    proof?: string;
-    requestId?: string;
-    /**
-     * Milliseconds of the caller's budget. Native binding sessions are opened once and cached, so
-     * this bounds the whole session, not each call on it.
-     */
-    timeoutMs?: number;
-    token: string;
-  }): Promise<object> | object;
-};
-
-export type WebSocketRpcOptions = {
-  /**
-   * Inject a standards-compatible client on runtimes without a global WebSocket. A factory lets
-   * Service Plane add its request id to the URL before the connection is created.
-   */
-  createWebSocket?: (url: string) => WebSocket;
-};
-
-export interface AuthenticatedRoot<Scoped> {
-  authenticate(token: string, proof?: string): Scoped;
-}
 
 /**
  * Signs a proof of possession for a sender-constrained token. Supplied by the caller because only the
@@ -207,100 +132,19 @@ export type CapabilityProofSigner = (input: { abilityId: string; targetServiceId
  * configured once, in one place.
  */
 export type CapabilityTokenRequester = CreateCapabilityTokenProviderOptions['requestToken'] & {
+  /** Stable public discriminator used to partition shared tokens by sender-constraining key. */
+  cacheBinding?: () => Promise<string> | string;
   proveTokenPossession?: CapabilityProofSigner;
 };
-
-export type CapabilityRpcTransport =
-  | { binding: CloudflareAbilityRpcBinding; kind: 'cloudflare-binding-rpc' }
-  | { kind: 'custom'; transport: RpcTransport }
-  | { kind: 'fetch'; fetcher: FetchLike; origin: string; path?: string }
-  | { kind: 'http-batch'; path?: string; url: Request | string | URL }
-  | ({ kind: 'websocket'; url: string } & WebSocketRpcOptions);
-
-export type CapabilityRpcSessionOptions<Scoped> = (
-  | (CreateCapabilityTokenProviderOptions & { tokenProvider?: undefined })
-  | ({ tokenProvider: CapabilityTokenProvider } & Pick<
-      CreateCapabilityTokenProviderOptions,
-      'callerServiceId' | 'scopes' | 'targetServiceId'
-    >)
-) & {
-  abilityId?: string;
-  authenticate?: (root: AuthenticatedRoot<Scoped>, token: string, proof?: string) => Scoped;
-  // Advisory connection info about the original client, forwarded to the service alongside the
-  // request id. Only a brokered call into an ingress-protected service surfaces it to handlers.
-  connInfo?: ConnInfo;
-  /**
-   * Identifies one logical attempt so a service can recognize a retry of it. Forwarded to the
-   * service; this package neither generates nor deduplicates it. Not forwarded over the `custom`
-   * transport, which has no header channel.
-   */
-  idempotencyKey?: string;
-  // Required when the plane sender-constrains this caller's tokens (`cnf`), because such a token is
-  // rejected by the service without a matching proof.
-  proveTokenPossession?: CapabilityProofSigner;
-  // Method names whose streamed results cannot travel back over the caller's own transport
-  // (e.g. a brokered ability handed to a caller whose leg to the broker is HTTP-batch). Calls
-  // to them are rejected with a clear 405 instead of returning a stream that fails to serialize.
-  rejectStreamMethods?: string[];
-  requestId?: string;
-  requestIdHeaderName?: string;
-  rpcSessionOptions?: RpcSessionOptions;
-  /**
-   * Milliseconds this caller is willing to wait. Enforced locally per method call and forwarded to
-   * the service, which turns it into the `signal` its handlers receive. Over HTTP-batch the
-   * forwarded budget is per call; over the session transports — WebSocket, and the native binding,
-   * whose `connectAbility` runs once and is cached — it is fixed when the session opens and
-   * therefore bounds the whole session. An explicit `0` means the budget is already exhausted:
-   * every call fails immediately with a timeout instead of running unbounded, which is what makes
-   * the chain pattern (`timeoutMs: remainingTimeoutMs?.()`) safe at exhaustion. The `custom`
-   * transport has no header channel, so nothing is forwarded there — only the local bound applies.
-   */
-  timeoutMs?: number;
-  transport: CapabilityRpcTransport;
-};
-
-export type AbilitySessionOptions<Scoped> = CapabilityRpcSessionOptions<Scoped> & {
-  abilityId: string;
-};
-
-/**
- * A persistent Cap'n Web session follows the platform Disposable contract. Intersecting the
- * caller's ability shape keeps method inference intact while making `using` and explicit cleanup
- * discoverable to consumers.
- */
-export type AbilitySession<Scoped> = Scoped & Disposable;
 
 export function defineCapabilities(catalog: CapabilityCatalog): CapabilityCatalog {
-  const scopes = catalog.scopes.map(normalizeScopeDefinition);
+  const scopes = catalog.scopes.map((scope) => Object.freeze(normalizeScopeDefinition(scope)));
   const duplicate = firstDuplicate(scopes.map((scope) => scope.id));
   if (duplicate) throw new CapabilityAuthError(`Duplicate Service-Plane capability scope: ${duplicate}`, 500);
-  return {
-    scopes,
-    serviceId: normalizeValue(catalog.serviceId, 'service id'),
-  };
-}
-
-export function bindCapabilityIdentity<T extends object>(target: T, identity: CapabilityIdentity): T {
-  identityByTarget.set(target, identity);
-  return target;
-}
-
-export function capabilityIdentity(target: object): CapabilityIdentity | undefined {
-  return identityByTarget.get(target);
-}
-
-export function requireScopes(target: object, ...scopes: string[]): CapabilityIdentity {
-  const identity = identityByTarget.get(target);
-  if (!identity) {
-    throw new CapabilityAuthError('Service-Plane capability identity is not bound to this RPC target', 401);
-  }
-  const required = normalizeScopes(scopes);
-  for (const scope of required) {
-    if (!identity.scopes.includes(scope)) {
-      throw new CapabilityAuthError(`Missing Service-Plane capability scope: ${scope}`, 403);
-    }
-  }
-  return identity;
+  return Object.freeze({
+    scopes: Object.freeze(scopes),
+    serviceId: requireNonEmpty(catalog.serviceId, 'capability service id'),
+  });
 }
 
 export async function verifyAuthenticationToken(token: string, verifier: CapabilityVerifierOptions): Promise<CapabilityIdentity> {
@@ -312,17 +156,14 @@ export async function verifyAuthenticationToken(token: string, verifier: Capabil
 
 export function jwksFromUrl(url: string | URL, options: JwksFromUrlOptions = {}): CapabilityJwksResolver {
   requireExplicitJwksCacheKeyForVariantSources(options, 'headers');
-  const key = JSON.stringify({
-    cacheTtlSeconds: options.cacheTtlSeconds ?? DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
-    url: String(url),
-  });
-  if (!options.cache && !options.cacheKey && !options.fetch && !options.headers && !options.now) {
-    const existing = urlJwksResolvers.get(key);
-    if (existing) return existing;
-  }
+  // Only a resolver with no caller-owned state can be shared across callers.
+  const shareable = !options.cache && !options.cacheKey && !options.fetch && !options.headers && !options.now;
+  const key = jwksResolverKey(url, options);
+  const existing = shareable ? urlJwksResolvers.get(key) : undefined;
+  if (existing) return existing;
 
   const resolver = createRemoteJwksResolver({ ...options, url });
-  if (!options.cache && !options.cacheKey && !options.fetch && !options.headers && !options.now) urlJwksResolvers.set(key, resolver);
+  if (shareable) urlJwksResolvers.set(key, resolver);
   return resolver;
 }
 
@@ -335,10 +176,7 @@ export function jwksFromServiceBinding(binding: FetchLike, options: JwksFromServ
     return createRemoteJwksResolver({ ...options, fetch: binding, url });
   }
 
-  const key = JSON.stringify({
-    cacheTtlSeconds: options.cacheTtlSeconds ?? DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
-    url: String(url),
-  });
+  const key = jwksResolverKey(url, options);
   let resolvers = serviceBindingJwksResolvers.get(binding);
   if (!resolvers) {
     resolvers = new Map();
@@ -351,43 +189,50 @@ export function jwksFromServiceBinding(binding: FetchLike, options: JwksFromServ
   return resolver;
 }
 
+function jwksResolverKey(url: string | URL, options: JwksFromUrlOptions): string {
+  return JSON.stringify({
+    cacheTtlSeconds: options.cacheTtlSeconds ?? DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS,
+    maxResponseBytes: options.maxResponseBytes ?? DEFAULT_CAPABILITY_JWKS_RESPONSE_MAX_BYTES,
+    url: String(url),
+  });
+}
+
 export function createCapabilityTokenProvider(options: CreateCapabilityTokenProviderOptions): CapabilityTokenProvider {
-  let cached: { expiresAt: Date; token: string } | undefined;
-  let inFlight: Promise<string> | undefined;
+  let cached: { cacheKey: string; expiresAt: Date; token: string } | undefined;
+  const inFlight = new Map<string, Promise<string>>();
   const refreshSkewSeconds = normalizeRefreshSkewSeconds(options.refreshSkewSeconds ?? 10);
-  const callerServiceId = normalizeValue(options.callerServiceId, 'caller service id');
-  const targetServiceId = normalizeValue(options.targetServiceId, 'target service id');
+  const callerServiceId = requireNonEmpty(options.callerServiceId, 'capability caller service id');
+  const targetServiceId = requireNonEmpty(options.targetServiceId, 'capability target service id');
   const scopes = normalizeScopes(options.scopes);
-  const ttlSeconds = options.ttlSeconds === undefined ? undefined : normalizeTtlSeconds(options.ttlSeconds);
+  const ttlSeconds = options.ttlSeconds === undefined ? undefined : normalizeCapabilityTokenTtlSeconds(options.ttlSeconds, 500);
   const subject = options.subject === undefined ? undefined : normalizeCapabilitySubject(options.subject);
-  const senderConstrained = Boolean((options.requestToken as CapabilityTokenRequester | undefined)?.proveTokenPossession);
-  // A caller-supplied cacheKey is still partitioned by the delegated subject and by binding: services
-  // authorize per user from identity.subject, so one user's cached token must never serve another, and a
-  // proof-capable provider must never reuse an entry written by an unbound one.
-  const cacheKey = options.cacheKey
-    ? subject
-      ? `${options.cacheKey}${senderConstrained ? ':cnf' : ''}:subject:${encodeURIComponent(JSON.stringify(capabilitySubjectCacheIdentity(subject)))}`
-      : `${options.cacheKey}${senderConstrained ? ':cnf' : ''}`
-    : capabilityTokenCacheKey({
-        ...(options.abilityId ? { abilityId: normalizeValue(options.abilityId, 'ability id') } : {}),
-        callerServiceId,
-        scopes,
-        ...(senderConstrained ? { senderConstrained } : {}),
-        ...(subject ? { subject } : {}),
-        targetServiceId,
-        ...(ttlSeconds === undefined ? {} : { ttlSeconds }),
-      });
+  const requester = options.requestToken as CapabilityTokenRequester;
+  const senderConstrained = Boolean(requester.proveTokenPossession);
 
   return {
     async token() {
       const now = options.now?.() ?? new Date();
-      if (cached && cached.expiresAt.getTime() - refreshSkewSeconds * 1000 > now.getTime()) return cached.token;
-      if (inFlight) return inFlight;
+      const cacheKey = await capabilityProviderCacheKey({
+        abilityId: options.abilityId,
+        cacheKey: options.cacheKey,
+        callerServiceId,
+        requester,
+        scopes,
+        senderConstrained,
+        subject,
+        targetServiceId,
+        ttlSeconds,
+      });
+      if (cached?.cacheKey === cacheKey && cached.expiresAt.getTime() - refreshSkewSeconds * 1000 > now.getTime()) {
+        return cached.token;
+      }
+      const pending = inFlight.get(cacheKey);
+      if (pending) return pending;
 
-      inFlight = (async () => {
+      const request = (async () => {
         const shared = await readCapabilityTokenCache(options.cache, cacheKey, now, refreshSkewSeconds);
         if (shared) {
-          cached = shared;
+          cached = { ...shared, cacheKey };
           return shared.token;
         }
 
@@ -398,27 +243,59 @@ export function createCapabilityTokenProvider(options: CreateCapabilityTokenProv
           targetServiceId,
           ...(ttlSeconds === undefined ? {} : { ttlSeconds }),
         });
-        cached = {
-          expiresAt: issued.expiresAt instanceof Date ? issued.expiresAt : new Date(issued.expiresAt),
-          token: issued.token,
-        };
-        await writeCapabilityTokenCache(options.cache, cacheKey, cached, now);
+        const validatedAt = options.now?.() ?? new Date();
+        cached = { ...validateRequestedCapabilityToken(issued, validatedAt), cacheKey };
+        await writeCapabilityTokenCache(options.cache, cacheKey, cached, validatedAt);
         return cached.token;
       })();
+      inFlight.set(cacheKey, request);
 
       try {
-        return await inFlight;
+        return await request;
       } finally {
-        inFlight = undefined;
+        if (inFlight.get(cacheKey) === request) inFlight.delete(cacheKey);
       }
     },
   };
 }
 
+async function capabilityProviderCacheKey(options: {
+  abilityId: string | undefined;
+  cacheKey: string | undefined;
+  callerServiceId: string;
+  requester: CapabilityTokenRequester;
+  scopes: ReadonlyArray<string>;
+  senderConstrained: boolean;
+  subject: CapabilitySubject | undefined;
+  targetServiceId: string;
+  ttlSeconds: number | undefined;
+}): Promise<string> {
+  const senderConstraint = options.requester.cacheBinding
+    ? requireNonEmpty(await options.requester.cacheBinding(), 'capability token cache binding')
+    : undefined;
+  const bindingSuffix = senderConstraint ? `:cnf:${encodeURIComponent(senderConstraint)}` : options.senderConstrained ? ':cnf' : '';
+  if (options.cacheKey) {
+    return options.subject
+      ? `${options.cacheKey}${bindingSuffix}:subject:${encodeURIComponent(JSON.stringify(capabilitySubjectCacheIdentity(options.subject)))}`
+      : `${options.cacheKey}${bindingSuffix}`;
+  }
+  return capabilityTokenCacheKey({
+    ...(options.abilityId ? { abilityId: requireNonEmpty(options.abilityId, 'capability ability id') } : {}),
+    callerServiceId: options.callerServiceId,
+    scopes: options.scopes,
+    ...(senderConstraint ? { senderConstraint } : {}),
+    ...(options.senderConstrained ? { senderConstrained: true } : {}),
+    ...(options.subject ? { subject: options.subject } : {}),
+    targetServiceId: options.targetServiceId,
+    ...(options.ttlSeconds === undefined ? {} : { ttlSeconds: options.ttlSeconds }),
+  });
+}
+
 export function capabilityTokenCacheKey(input: {
   abilityId?: string;
   callerServiceId: string;
-  scopes: string[];
+  scopes: ReadonlyArray<string>;
+  senderConstraint?: string;
   senderConstrained?: boolean;
   subject?: CapabilitySubject;
   targetServiceId: string;
@@ -432,6 +309,7 @@ export function capabilityTokenCacheKey(input: {
     // the same caller, target, and scopes — minted through HMAC, or before binding existed — and reusing
     // it would skip the proof and hand the service a bearer token, silently losing the binding.
     ...(input.senderConstrained ? { senderConstrained: true } : {}),
+    ...(input.senderConstraint ? { senderConstraint: input.senderConstraint } : {}),
     // Included conditionally so subject-less keys stay byte-identical with earlier releases; tokens
     // delegated to a subject must never be shared across subjects through the token cache.
     ...(input.subject ? { subject: capabilitySubjectCacheIdentity(input.subject) } : {}),
@@ -445,307 +323,55 @@ function capabilitySubjectCacheIdentity(subject: CapabilitySubject): { id: strin
   return { id: subject.id, ...(subject.kind ? { kind: subject.kind } : {}), orgId: subject.orgId ?? null };
 }
 
-/**
- * The session proxy is deliberately not typed as a Cap'n Web `RpcStub`: it is a local
- * promise-returning proxy that also owns token refresh, deadlines, and transport selection.
- */
-export async function capabilityRpcSession<Scoped>(options: CapabilityRpcSessionOptions<Scoped>): Promise<AbilitySession<Scoped>> {
-  const tokenProvider = options.tokenProvider ?? createCapabilityTokenProvider(options as CreateCapabilityTokenProviderOptions);
-  const authenticate = options.authenticate ?? defaultAuthenticate<Scoped>;
-  // One proof per session, freshly signed each time a session opens: it is bound to the token and
-  // ability, so it cannot be reused for another session on another service.
-  // An explicit signer wins; otherwise a shipped requester supplies one for the key it already holds.
-  const proveTokenPossession =
-    options.proveTokenPossession ?? (options as { requestToken?: CapabilityTokenRequester }).requestToken?.proveTokenPossession;
-  const proveToken = async (token: string): Promise<string | undefined> => {
-    // Only sender-constrained tokens need a proof. Skipping the signature for the rest keeps the
-    // unbound path free rather than sending something the service would ignore.
-    if (!proveTokenPossession || !decodeCapabilityTokenPayload(token).cnf) return undefined;
-    return proveTokenPossession({
-      abilityId: options.abilityId ?? missingAbilityId(),
-      targetServiceId: options.targetServiceId,
-      token,
-    });
-  };
-  const rejectStreamMethods = options.rejectStreamMethods ? new Set(options.rejectStreamMethods) : undefined;
-  const timeoutMs = normalizeTimeoutMs(options.timeoutMs);
-  // `0` is not "no deadline": it says the budget was already gone when the session was requested —
-  // the value remainingTimeoutMs() hands a handler at exhaustion — so calls fail fast instead of
-  // spawning unbounded downstream work the original caller stopped waiting for.
-  const exhaustedBudget = options.timeoutMs === 0;
-  const idempotencyKey = normalizeIdempotencyKey(options.idempotencyKey);
-  // Session-constant wire values, derived once rather than re-serialized on every HTTP-batch call.
-  const forwardedMeta: ForwardedSessionMeta = {
-    connInfo: serializeConnInfo(options.connInfo),
-    idempotencyKey,
-    requestId: options.requestId,
-    timeout: serializeTimeoutMs(timeoutMs),
-  };
-  const openSessionInput = {
-    ...(options.abilityId === undefined ? {} : { abilityId: options.abilityId }),
-    ...(options.requestIdHeaderName === undefined ? {} : { requestIdHeaderName: options.requestIdHeaderName }),
-    ...(options.rpcSessionOptions === undefined ? {} : { rpcSessionOptions: options.rpcSessionOptions }),
-    transport: options.transport,
-  };
-  // The persistent session's Cap'n Web root stub is Disposable; keep it so the underlying
-  // transport (socket) can be released — the scoped stub alone does not close the session.
-  let persistentRoot: AuthenticatedRoot<Scoped> | undefined;
-  let persistent: Scoped | undefined;
-  let persistentOpening: Promise<void> | undefined;
-  let nativeBinding: Promise<object> | undefined;
-  let nativeTarget: object | undefined;
-  let nativeTargetDisposed = false;
-  let disposed = false;
-  const disposeNativeTarget = (target: object) => {
-    nativeTarget ??= target;
-    if (nativeTargetDisposed) return;
-    nativeTargetDisposed = true;
-    disposeSessionRoot(target);
-  };
-  const disposeNativeBinding = () => {
-    if (nativeTarget) {
-      disposeNativeTarget(nativeTarget);
-      return;
-    }
-    const binding = nativeBinding;
-    if (!binding) return;
-    void binding.then(disposeNativeTarget).catch(() => undefined);
-  };
-  const dispose = () => {
-    if (disposed) return;
-    disposed = true;
-    disposeSessionRoot(persistentRoot);
-    persistentRoot = undefined;
-    persistent = undefined;
-    persistentOpening = undefined;
-    disposeNativeBinding();
-    nativeBinding = undefined;
-  };
-  const assertActive = () => {
-    if (disposed) throw new CapabilityAuthError('Service-Plane ability session has been disposed', 410);
-  };
-  const openNativeBinding = async (): Promise<object> => {
-    const token = await tokenProvider.token();
-    assertActive();
-    if (options.transport.kind !== 'cloudflare-binding-rpc') {
-      throw new CapabilityAuthError('Cloudflare native RPC transport is required', 500);
-    }
-    const connInfo = normalizeConnInfo(options.connInfo);
-    const proof = await proveToken(token);
-    const target = await options.transport.binding.connectAbility({
-      abilityId: options.abilityId ?? missingAbilityId(),
-      ...(connInfo ? { connInfo } : {}),
-      ...(idempotencyKey ? { idempotencyKey } : {}),
-      ...(proof ? { proof } : {}),
-      ...(options.requestId ? { requestId: options.requestId } : {}),
-      ...(timeoutMs === undefined ? {} : { timeoutMs }),
-      token,
-    });
-    nativeTarget ??= target;
-    if (disposed) {
-      disposeNativeTarget(target);
-      assertActive();
-    }
-    return target;
-  };
-  const openPersistentSession = async (): Promise<void> => {
-    const token = await tokenProvider.token();
-    const proof = await proveToken(token);
-    assertActive();
-    const root = openSession<Scoped>({ ...openSessionInput, forwardedMeta });
-    persistentRoot = root;
-    try {
-      const scoped = authenticate(root, token, proof);
-      persistent = scoped;
-    } catch (error) {
-      if (persistentRoot === root) persistentRoot = undefined;
-      disposeSessionRoot(root);
-      throw error;
-    }
-  };
-  const invokeMethod = async (property: string, args: unknown[]): Promise<unknown> => {
-    assertActive();
-    if (exhaustedBudget) {
-      throw new ServicePlaneTimeoutError(`Service-Plane ability call started with an exhausted deadline: ${property}`);
-    }
-    if (rejectStreamMethods?.has(property)) {
-      throw new CapabilityAuthError(`Service-Plane streaming method requires a session transport to the caller: ${property}`, 405);
-    }
-    if (options.transport.kind === 'cloudflare-binding-rpc') {
-      let target = nativeTarget as Record<string, unknown> | undefined;
-      if (!target) {
-        nativeBinding ??= openNativeBinding();
-        const opening = nativeBinding;
-        try {
-          target = (await opening) as Record<string, unknown>;
-        } catch (error) {
-          if (nativeBinding === opening) nativeBinding = undefined;
-          throw error;
-        }
-      }
-      assertActive();
-      const method = target[property];
-      if (typeof method !== 'function') throw new CapabilityAuthError(`Service-Plane ability method is not available: ${property}`, 500);
-      // Workers RPC and Cap'n Web targets can expose callable proxies; keep this as a member
-      // call so `.apply` is not interpreted as another remote property.
-      return (target as Record<string, (...methodArgs: unknown[]) => unknown>)[property]?.(...args);
-    }
-
-    let scoped: Scoped;
-    if (options.transport.kind === 'http-batch' || options.transport.kind === 'fetch') {
-      const token = await tokenProvider.token();
-      const proof = await proveToken(token);
-      assertActive();
-      scoped = authenticate(openSession<Scoped>({ ...openSessionInput, forwardedMeta }), token, proof);
-    } else {
-      if (persistent === undefined) {
-        persistentOpening ??= openPersistentSession();
-        const opening = persistentOpening;
-        try {
-          await opening;
-        } catch (error) {
-          if (persistentOpening === opening) persistentOpening = undefined;
-          throw error;
-        }
-      }
-      assertActive();
-      if (persistent === undefined) throw new CapabilityAuthError('Service-Plane ability session failed to authenticate', 500);
-      scoped = persistent;
-    }
-    const method = (scoped as Record<string, unknown>)[property];
-    if (typeof method !== 'function') {
-      throw new CapabilityAuthError(`Service-Plane ability method is not available: ${property}`, 500);
-    }
-    // Keep this as a member call: Cap'n Web method stubs are callable proxies whose `.apply`
-    // property would itself be interpreted as a remote method named "apply".
-    return (scoped as Record<string, (...methodArgs: unknown[]) => unknown>)[property]?.(...args);
-  };
-  // The proxy target is RpcTarget-branded so the session object survives being returned over
-  // another Cap'n Web session by reference (e.g. the broker handing a connected ability to a
-  // remote caller) instead of being serialized into an empty plain object.
-  return new Proxy(new SessionProxyTarget(), {
-    get(_target, property) {
-      // Closing the session releases the socket or a disposable native binding target. Per-call
-      // http-batch/fetch legs hold no persistent root. Cap'n Web also routes a remote caller's
-      // disposal of the returned stub through here.
-      if (property === DISPOSE_SYMBOL || property === ASYNC_DISPOSE_SYMBOL) {
-        return dispose;
-      }
-      if (property === 'then') return undefined;
-      if (typeof property !== 'string') return undefined;
-      return (...args: unknown[]) => {
-        const call = invokeMethod(property, args);
-        // The remote peer keeps working after a local timeout — Cap'n Web has no cancel message, so
-        // this frees the caller rather than the callee. The same budget travels to the service,
-        // which is what actually stops the handler; the grace on top keeps the service's own error
-        // first in the common case. A result that arrives after the race was lost is disposed so a
-        // stub or stream does not stay pinned on a live session.
-        return timeoutMs === undefined
-          ? call
-          : raceDeadline(call, {
-              ceilingMs: timeoutMs + SERVICE_PLANE_TIMEOUT_GRACE_MS,
-              deadlineError: () =>
-                new ServicePlaneTimeoutError(`Service-Plane ability method exceeded its ${timeoutMs}ms deadline: ${property}`),
-              discardLateValue: discardDisposableValue,
-            });
-      };
-    },
-    // Cap'n Web only retains and remotely disposes an RpcTarget when Symbol.dispose is visible
-    // through `in`. The methods above are synthesized by the proxy, so advertise them here too.
-    has(target, property) {
-      if (property === DISPOSE_SYMBOL || property === ASYNC_DISPOSE_SYMBOL) return true;
-      return Reflect.has(target, property);
-    },
-  }) as unknown as AbilitySession<Scoped>;
-}
-
-/**
- * Closes a persistent Cap'n Web session opened by `abilitySession`/`capabilityRpcSession`,
- * releasing its transport socket or disposable native binding target. Safe (and a no-op) for
- * per-call HTTP-batch sessions, which hold nothing to close.
- */
-export async function disposeAbilitySession(session: unknown): Promise<void> {
-  const disposable = session as Record<symbol, (() => unknown) | undefined>;
-  const asyncDispose = disposable?.[ASYNC_DISPOSE_SYMBOL];
-  if (asyncDispose) {
-    await asyncDispose.call(session);
-    return;
-  }
-  disposable?.[DISPOSE_SYMBOL]?.call(session);
-}
-
-function disposeSessionRoot(root: unknown): void {
-  const disposable = root as Record<symbol, (() => void) | undefined> | undefined;
-  try {
-    disposable?.[DISPOSE_SYMBOL]?.();
-  } catch {
-    // Best effort: a transport already closed by the peer must not turn cleanup into a throw.
-  }
-}
-
-export function abilitySession<Scoped>(options: AbilitySessionOptions<Scoped>): Promise<AbilitySession<Scoped>> {
-  return capabilityRpcSession(options);
-}
-
-export function httpBatchRpc(url: Request | string | URL, path?: string): CapabilityRpcTransport {
-  return { kind: 'http-batch', ...(path ? { path } : {}), url };
-}
-
-export function websocketRpc(url: string, options: WebSocketRpcOptions = {}): CapabilityRpcTransport {
-  return { kind: 'websocket', url, ...(options.createWebSocket ? { createWebSocket: options.createWebSocket } : {}) };
-}
-
-export function cloudflareServiceBindingRpc(
-  binding: FetchLike,
-  path?: string,
-  origin = 'https://service-plane-service.internal',
-): CapabilityRpcTransport {
-  return { fetcher: binding, kind: 'fetch', origin, ...(path ? { path } : {}) };
-}
-
-export function cloudflareNativeRpc(binding: CloudflareAbilityRpcBinding): CapabilityRpcTransport {
-  return { binding, kind: 'cloudflare-binding-rpc' };
-}
-
-export function customRpcTransport(transport: RpcTransport): CapabilityRpcTransport {
-  return { kind: 'custom', transport };
-}
-
 export function controlPlaneHmacTokenRequester(
   options: ControlPlaneHmacTokenRequesterOptions,
 ): CreateCapabilityTokenProviderOptions['requestToken'] {
+  const post = controlPlaneTokenPoster(options);
+  return (input) =>
+    post(input, async (request, requestIdHeaderName) =>
+      signServicePlaneHmacRequest(request, {
+        clientId: options.clientId,
+        clientIdHeaderName: options.clientIdHeaderName ?? SERVICE_PLANE_HMAC_CLIENT_HEADER,
+        requestIdHeaderName,
+        secret: await resolveClientSecret(options.clientSecret),
+        timestampHeaderName: options.timestampHeaderName ?? SERVICE_PLANE_HMAC_TIMESTAMP_HEADER,
+        ...(options.now ? { now: options.now() } : {}),
+      }),
+    );
+}
+
+// The HTTP half both token requesters share: correlation headers, the signed POST, and a bounded,
+// validated response. Only the request signer differs between the caller-auth schemes.
+function controlPlaneTokenPoster(
+  options: ControlPlaneTokenRequestOptions,
+): (
+  input: IssueCapabilityTokenInput,
+  sign: (request: Request, requestIdHeaderName: string) => Promise<Request>,
+) => Promise<IssuedCapabilityToken> {
   const fetcher = options.fetch ?? fetch;
   const tokenUrl = new URL(options.tokenPath ?? SERVICE_PLANE_CAPABILITY_TOKEN_PATH, options.controlPlaneUrl);
   const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
-  const clientIdHeaderName = options.clientIdHeaderName ?? SERVICE_PLANE_HMAC_CLIENT_HEADER;
-  const timestampHeaderName = options.timestampHeaderName ?? SERVICE_PLANE_HMAC_TIMESTAMP_HEADER;
+  const maxResponseBytes = validateBodyByteLimit(
+    options.maxResponseBytes ?? DEFAULT_CAPABILITY_TOKEN_RESPONSE_MAX_BYTES,
+    'Service-Plane capability token maxResponseBytes must be a positive safe integer',
+  );
 
-  return async (input) => {
+  return async (input, sign) => {
     rejectRequesterSubject(input);
     const headers = new Headers(typeof options.headers === 'function' ? await options.headers() : options.headers);
     headers.set('content-type', 'application/json');
     const requestId = await resolveRequestId(options.requestId);
     if (requestId) headers.set(requestIdHeaderName, requestId);
 
-    const request = await signServicePlaneHmacRequest(
-      new Request(tokenUrl, {
-        body: JSON.stringify(input),
-        headers,
-        method: 'POST',
-      }),
-      {
-        clientId: options.clientId,
-        clientIdHeaderName,
-        requestIdHeaderName,
-        secret: await resolveClientSecret(options.clientSecret),
-        timestampHeaderName,
-        ...(options.now ? { now: options.now() } : {}),
-      },
-    );
-
-    const response = await fetchToken(fetcher, request);
+    const request = await sign(new Request(tokenUrl, { body: JSON.stringify(input), headers, method: 'POST' }), requestIdHeaderName);
+    const response = await callFetcher(fetcher, request);
     if (!response.ok) throw new CapabilityAuthError(`Unable to fetch Service-Plane capability token: ${response.status}`, response.status);
-    return parseIssuedCapabilityToken(await readJson(response, 'Invalid Service-Plane capability token response'));
+    return parseIssuedCapabilityToken(
+      await readBoundedResponseJson(response, maxResponseBytes, {
+        invalidJsonMessage: 'Invalid Service-Plane capability token response',
+        tooLargeMessage: 'Service-Plane capability token response is too large',
+      }),
+    );
   };
 }
 
@@ -790,51 +416,48 @@ async function assertProofKeyMatchesToken(privateJwk: JsonWebKey, token: string)
 }
 
 export function controlPlaneJwkTokenRequester(options: ControlPlaneJwkTokenRequesterOptions): CapabilityTokenRequester {
-  const fetcher = options.fetch ?? fetch;
-  const tokenUrl = new URL(options.tokenPath ?? SERVICE_PLANE_CAPABILITY_TOKEN_PATH, options.controlPlaneUrl);
-  const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
-  const clientIdHeaderName = options.clientIdHeaderName ?? SERVICE_PLANE_JWK_CLIENT_HEADER;
-  const keyIdHeaderName = options.keyIdHeaderName ?? SERVICE_PLANE_JWK_KEY_ID_HEADER;
-
-  const requestToken: CapabilityTokenRequester = async (input) => {
-    rejectRequesterSubject(input);
-    const headers = new Headers(typeof options.headers === 'function' ? await options.headers() : options.headers);
-    headers.set('content-type', 'application/json');
-    const requestId = await resolveRequestId(options.requestId);
-    if (requestId) headers.set(requestIdHeaderName, requestId);
-
-    const request = await signServicePlaneJwkRequest(
-      new Request(tokenUrl, {
-        body: JSON.stringify(input),
-        headers,
-        method: 'POST',
-      }),
-      {
+  const post = controlPlaneTokenPoster(options);
+  const requestToken: CapabilityTokenRequester = (input) =>
+    post(input, async (request, requestIdHeaderName) =>
+      signServicePlaneJwkRequest(request, {
         audience: options.assertionAudience ?? SERVICE_PLANE_JWK_ASSERTION_AUDIENCE,
         clientId: options.clientId,
-        clientIdHeaderName,
+        clientIdHeaderName: options.clientIdHeaderName ?? SERVICE_PLANE_JWK_CLIENT_HEADER,
         keyId: options.keyId,
-        keyIdHeaderName,
+        keyIdHeaderName: options.keyIdHeaderName ?? SERVICE_PLANE_JWK_KEY_ID_HEADER,
         ...(options.assertionTtlSeconds === undefined ? {} : { assertionTtlSeconds: options.assertionTtlSeconds }),
         ...(options.maxBodyBytes === undefined ? {} : { maxBodyBytes: options.maxBodyBytes }),
         ...(options.now ? { now: options.now() } : {}),
         privateJwk: await resolvePrivateJwk(options.privateJwk),
         requestIdHeaderName,
-      },
+      }),
     );
 
-    const response = await fetchToken(fetcher, request);
-    if (!response.ok) throw new CapabilityAuthError(`Unable to fetch Service-Plane capability token: ${response.status}`, response.status);
-    return parseIssuedCapabilityToken(await readJson(response, 'Invalid Service-Plane capability token response'));
-  };
-
   // The same key authenticates the token request and proves possession of the token it returns, so a
-  // session opened with this requester satisfies sender-constrained tokens without further config.
+  // client using this requester satisfies sender-constrained calls without further configuration.
   requestToken.proveTokenPossession = jwkCapabilityProofSigner({
     privateJwk: options.privateJwk,
     ...(options.now ? { now: options.now } : {}),
   });
+  requestToken.cacheBinding = senderConstraintCacheBinding(options.privateJwk);
   return requestToken;
+}
+
+function senderConstraintCacheBinding(privateJwk: ControlPlaneJwkTokenRequesterOptions['privateJwk']): () => Promise<string> {
+  let memo: { fingerprint: string; thumbprint: Promise<string> } | undefined;
+  return async () => {
+    const publicJwk = publicJwkFromPrivateJwk(await resolvePrivateJwk(privateJwk), 'service-plane-pop');
+    // Cache by a copied public-key fingerprint rather than object identity so stable resolvers avoid
+    // a digest per token-cache hit while in-place rotations still invalidate immediately.
+    const fingerprint = JSON.stringify({ crv: publicJwk.crv, kty: publicJwk.kty, x: publicJwk.x, y: publicJwk.y });
+    if (memo?.fingerprint === fingerprint) return memo.thumbprint;
+    const thumbprint = servicePlaneJwkThumbprint(publicJwk);
+    memo = { fingerprint, thumbprint };
+    thumbprint.catch(() => {
+      if (memo?.thumbprint === thumbprint) memo = undefined;
+    });
+    return thumbprint;
+  };
 }
 
 export function controlPlaneRpcTokenRequester(
@@ -842,17 +465,18 @@ export function controlPlaneRpcTokenRequester(
 ): CreateCapabilityTokenProviderOptions['requestToken'] {
   return async (input) => {
     rejectRequesterSubject(input);
-    if ('issueCapabilityTokenForCaller' in options.binding) {
-      if (!options.callerServiceId) throw new CapabilityAuthError('Service-Plane RPC token requester requires callerServiceId', 500);
-      return parseIssuedCapabilityToken(
-        await options.binding.issueCapabilityTokenForCaller(options.callerServiceId, {
-          scopes: input.scopes,
-          targetServiceId: input.targetServiceId,
-          ...(input.ttlSeconds === undefined ? {} : { ttlSeconds: input.ttlSeconds }),
-        }),
-      );
+    const issued = parseIssuedCapabilityToken(
+      await options.binding.issueCapabilityToken({
+        scopes: input.scopes,
+        targetServiceId: input.targetServiceId,
+        ...(input.ttlSeconds === undefined ? {} : { ttlSeconds: input.ttlSeconds }),
+      }),
+    );
+    const claims = decodeCapabilityTokenPayload(issued.token);
+    if (claims.act || claims.spa !== 'service' || claims.sub !== input.callerServiceId) {
+      throw new CapabilityAuthError('Service-Plane RPC token binding returned a token not bound to its pinned service caller', 500);
     }
-    return parseIssuedCapabilityToken(await options.binding.issueCapabilityToken(input));
+    return issued;
   };
 }
 
@@ -869,172 +493,6 @@ function rejectRequesterSubject(input: IssueCapabilityTokenInput): void {
 
 export function tokenExpiresAt(token: string): Date {
   return new Date(decodeCapabilityTokenPayload(token).exp * 1000);
-}
-
-export type { RpcCompatible, RpcSessionOptions, RpcStub, RpcTransport };
-export { RpcTarget };
-
-class SessionProxyTarget extends RpcTarget {}
-
-function defaultAuthenticate<Scoped>(root: AuthenticatedRoot<Scoped>, token: string, proof?: string): Scoped {
-  return proof === undefined ? root.authenticate(token) : root.authenticate(token, proof);
-}
-
-// Keep the transport root independent of the consumer's ability shape. The returned stub is
-// wrapped behind AbilitySession, where Service Plane adds token, deadline, and disposal behavior.
-type UntypedAuthenticatedRoot = AuthenticatedRoot<Record<string, unknown>>;
-
-type ForwardedSessionMeta = {
-  connInfo: string | undefined;
-  idempotencyKey: string | undefined;
-  requestId: string | undefined;
-  timeout: string | undefined;
-};
-
-function openSession<Scoped>(options: {
-  abilityId?: string;
-  forwardedMeta: ForwardedSessionMeta;
-  requestIdHeaderName?: string;
-  rpcSessionOptions?: RpcSessionOptions;
-  transport: CapabilityRpcTransport;
-}): AuthenticatedRoot<Scoped> {
-  const { abilityId, rpcSessionOptions, transport } = options;
-  const { connInfo, idempotencyKey, requestId, timeout } = options.forwardedMeta;
-  const requestIdHeaderName = options.requestIdHeaderName ?? SERVICE_PLANE_REQUEST_ID_HEADER;
-  const forwarded = {
-    ...(requestId ? { [requestIdHeaderName]: requestId } : {}),
-    ...(connInfo ? { [SERVICE_PLANE_CONN_INFO_HEADER]: connInfo } : {}),
-    ...(timeout ? { [SERVICE_PLANE_TIMEOUT_HEADER]: timeout } : {}),
-    ...(idempotencyKey ? { [SERVICE_PLANE_IDEMPOTENCY_KEY_HEADER]: idempotencyKey } : {}),
-  };
-  const headers = Object.keys(forwarded).length > 0 ? forwarded : undefined;
-  if (transport.kind === 'http-batch') {
-    return newHttpBatchRpcSession<UntypedAuthenticatedRoot>(
-      withServicePlaneHeaders(httpBatchUrl(transport, abilityId), headers),
-      rpcSessionOptions,
-    ) as unknown as AuthenticatedRoot<Scoped>;
-  }
-  if (transport.kind === 'websocket') {
-    const url = withServicePlaneQueryParams(transport.url, requestId, connInfo, timeout, idempotencyKey);
-    const endpoint = transport.createWebSocket?.(url) ?? url;
-    return openWebSocketSession(endpoint, rpcSessionOptions) as unknown as AuthenticatedRoot<Scoped>;
-  }
-  if (transport.kind === 'cloudflare-binding-rpc') {
-    throw new CapabilityAuthError('Cloudflare native RPC transport does not open a Cap’n Web session', 500);
-  }
-  const rpcTransport =
-    transport.kind === 'fetch'
-      ? createFetchBatchTransport(transport.fetcher, fetchTransportUrl(transport, abilityId), headers)
-      : transport.transport;
-  const session = new RpcSession<UntypedAuthenticatedRoot>(rpcTransport, undefined, rpcSessionOptions);
-  return session.getRemoteMain() as unknown as AuthenticatedRoot<Scoped>;
-}
-
-function openWebSocketSession(endpoint: string | WebSocket, options: RpcSessionOptions | undefined): UntypedAuthenticatedRoot {
-  if (typeof endpoint === 'string' || typeof globalThis.WebSocket !== 'undefined') {
-    return newWebSocketRpcSession<UntypedAuthenticatedRoot>(endpoint, undefined, options);
-  }
-
-  // Cap'n Web reads the global WebSocket.CONNECTING even when given an instance. Node 20 can inject
-  // a standards-compatible client but has no default global, so provide that one constant only for
-  // the synchronous constructor call and restore the global immediately afterward.
-  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'WebSocket');
-  try {
-    Object.defineProperty(globalThis, 'WebSocket', { configurable: true, value: { CONNECTING: 0 } });
-    return newWebSocketRpcSession<UntypedAuthenticatedRoot>(endpoint, undefined, options);
-  } finally {
-    if (descriptor) Object.defineProperty(globalThis, 'WebSocket', descriptor);
-    else Reflect.deleteProperty(globalThis, 'WebSocket');
-  }
-}
-
-// Cap'n Web sends the batch as `fetch(urlOrRequest, { method, body })`, so a bodyless template
-// Request keeps its headers across batches and carries the correlation id to the service.
-function withServicePlaneHeaders(url: Request | string, headers: Record<string, string> | undefined): Request | string {
-  if (!headers) return url;
-  const request = url instanceof Request ? new Request(url) : new Request(url, { method: 'POST' });
-  for (const [name, value] of Object.entries(headers)) request.headers.set(name, value);
-  return request;
-}
-
-function withServicePlaneQueryParams(
-  url: string,
-  requestId: string | undefined,
-  connInfo: string | undefined,
-  timeout: string | undefined,
-  idempotencyKey: string | undefined,
-): string {
-  if (!requestId && !connInfo && !timeout && !idempotencyKey) return url;
-  const parsed = new URL(url);
-  if (requestId) parsed.searchParams.set(SERVICE_PLANE_REQUEST_ID_QUERY_PARAM, requestId);
-  if (connInfo) parsed.searchParams.set(SERVICE_PLANE_CONN_INFO_QUERY_PARAM, connInfo);
-  if (timeout) parsed.searchParams.set(SERVICE_PLANE_TIMEOUT_QUERY_PARAM, timeout);
-  if (idempotencyKey) parsed.searchParams.set(SERVICE_PLANE_IDEMPOTENCY_KEY_QUERY_PARAM, idempotencyKey);
-  return parsed.toString();
-}
-
-function httpBatchUrl(transport: Extract<CapabilityRpcTransport, { kind: 'http-batch' }>, abilityId?: string): Request | string {
-  if (transport.url instanceof Request) return transport.url;
-  if (!transport.path && !abilityId) return transport.url instanceof URL ? transport.url.toString() : transport.url;
-  const url = new URL(transport.url instanceof URL ? transport.url.toString() : String(transport.url));
-  url.pathname = transport.path ?? defaultAbilityPath(abilityId);
-  return url.toString();
-}
-
-function fetchTransportUrl(transport: Extract<CapabilityRpcTransport, { kind: 'fetch' }>, abilityId?: string): string {
-  return new URL(transport.path ?? defaultAbilityPath(abilityId), transport.origin).toString();
-}
-
-function defaultAbilityPath(abilityId?: string): string {
-  if (!abilityId) throw new CapabilityAuthError('Service-Plane abilityId is required when transport path is omitted', 500);
-  return `/rpc/${abilityId}`;
-}
-
-function missingAbilityId(): never {
-  throw new CapabilityAuthError('Service-Plane abilityId is required for Cloudflare native RPC transport', 500);
-}
-
-// Matches Cap'n Web's batch scheduler: Node and Bun avoid their ~1 ms setTimeout(0) clamp, while
-// runtimes without setImmediate keep the portable timer fallback.
-const scheduleImmediate = (globalThis as { setImmediate?: (callback: () => void) => unknown }).setImmediate;
-const yieldToBatchMacrotask =
-  typeof scheduleImmediate === 'function'
-    ? () => new Promise<void>((resolve) => scheduleImmediate(resolve))
-    : () => new Promise<void>((resolve) => setTimeout(resolve, 0));
-
-function createFetchBatchTransport(fetcher: FetchLike, url: string, headers?: Record<string, string>): RpcTransport {
-  let batchToSend: string[] | null = [];
-  let batchToReceive: string[] | undefined;
-  let aborted: unknown;
-  const scheduled = (async () => {
-    // Wait for the caller's microtask cascade so same-tick promise-pipelined calls share a batch.
-    await yieldToBatchMacrotask();
-    if (aborted !== undefined) throw aborted;
-    const batch = batchToSend ?? [];
-    batchToSend = null;
-    const response = await fetcher.fetch(new Request(url, { body: batch.join('\n'), ...(headers ? { headers } : {}), method: 'POST' }));
-    if (!response.ok) {
-      response.body?.cancel();
-      throw new CapabilityAuthError(`Cap'n Web HTTP-batch transport failed: ${response.status}`, response.status);
-    }
-    const body = await response.text();
-    batchToReceive = body === '' ? [] : body.split('\n');
-  })();
-
-  return {
-    async send(message) {
-      batchToSend?.push(message);
-    },
-    async receive() {
-      if (!batchToReceive) await scheduled;
-      const message = batchToReceive?.shift();
-      if (message !== undefined) return message;
-      throw new Error('Batch RPC request ended.');
-    },
-    abort(reason) {
-      aborted = reason;
-    },
-  };
 }
 
 function requireExplicitJwksCacheKeyForVariantSources(options: JwksFromUrlOptions, source: 'binding' | 'headers'): void {
@@ -1054,36 +512,15 @@ function normalizeScopeDefinition(scope: CapabilityScopeDefinition): CapabilityS
   };
 }
 
-function normalizeScopes(scopes: string[]): string[] {
+function normalizeScopes(scopes: ReadonlyArray<string>): string[] {
   if (scopes.length === 0) throw new CapabilityAuthError('Service-Plane capability requires at least one scope', 500);
   return [...new Set(scopes.map(normalizeScope))];
 }
 
 function normalizeScope(scope: string): string {
-  const normalized = normalizeValue(scope, 'scope');
+  const normalized = requireNonEmpty(scope, 'capability scope');
   if (normalized.includes('*')) throw new CapabilityAuthError('Service-Plane capability wildcards are not supported', 500);
   return normalized;
-}
-
-function normalizeValue(value: string, field: string): string {
-  const normalized = value.trim();
-  if (!normalized) throw new CapabilityAuthError(`Service-Plane capability ${field} cannot be empty`, 500);
-  return normalized;
-}
-
-function normalizeTtlSeconds(ttlSeconds: number): number {
-  if (
-    !Number.isFinite(ttlSeconds) ||
-    !Number.isSafeInteger(ttlSeconds) ||
-    ttlSeconds <= 0 ||
-    ttlSeconds > MAX_CAPABILITY_TOKEN_TTL_SECONDS
-  ) {
-    throw new CapabilityAuthError(
-      `Service-Plane capability token TTL must be a positive integer no greater than ${MAX_CAPABILITY_TOKEN_TTL_SECONDS} seconds`,
-      500,
-    );
-  }
-  return ttlSeconds;
 }
 
 function normalizeRefreshSkewSeconds(refreshSkewSeconds: number): number {
@@ -1106,6 +543,10 @@ function createRemoteJwksResolver(options: JwksFromUrlOptions & { url: string | 
   const cacheTtlSeconds = normalizeCacheTtlSeconds(options.cacheTtlSeconds ?? DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS);
   const cacheKey = options.cacheKey ?? capabilityJwksCacheKey(options.url);
   const fetcher = options.fetch ?? fetch;
+  const maxResponseBytes = validateBodyByteLimit(
+    options.maxResponseBytes ?? DEFAULT_CAPABILITY_JWKS_RESPONSE_MAX_BYTES,
+    'Service-Plane JWKS maxResponseBytes must be a positive safe integer',
+  );
   let cached: { expiresAt: number; jwks: CapabilityJwks } | undefined;
   let inFlight: Promise<CapabilityJwks> | undefined;
 
@@ -1125,11 +566,17 @@ function createRemoteJwksResolver(options: JwksFromUrlOptions & { url: string | 
     inFlight = (async () => {
       const headers = typeof options.headers === 'function' ? await options.headers() : options.headers;
       const request = headers === undefined ? new Request(String(options.url)) : new Request(String(options.url), { headers });
-      const response = await fetchJwks(fetcher, request);
+      const response = await callFetcher(fetcher, request);
+
       if (!response.ok) {
         throw new CapabilityAuthError(`Unable to fetch Service-Plane JWKS: ${response.status}`, 500);
       }
-      const jwks = parseRemoteJwks(await readJson(response, 'Invalid Service-Plane JWKS response'));
+      const jwks = parseRemoteJwks(
+        await readBoundedResponseJson(response, maxResponseBytes, {
+          invalidJsonMessage: 'Invalid Service-Plane JWKS response',
+          tooLargeMessage: 'Service-Plane JWKS response is too large',
+        }),
+      );
       cached = {
         expiresAt: now + cacheTtlSeconds * 1000,
         jwks,
@@ -1150,27 +597,12 @@ function capabilityJwksCacheKey(url: string | URL): string {
   return `service-plane:jwks:${encodeURIComponent(String(url))}`;
 }
 
-function fetchJwks(fetcher: RemoteJwksFetch, request: Request): Promise<Response> {
+function callFetcher(fetcher: RemoteJwksFetch, request: Request): Promise<Response> {
   return typeof fetcher === 'function' ? fetcher(request) : fetcher.fetch(request);
-}
-
-function fetchToken(fetcher: typeof fetch | FetchLike, request: Request): Promise<Response> {
-  return typeof fetcher === 'function' ? fetcher(request) : fetcher.fetch(request);
-}
-
-async function readJson(response: Response, message: string): Promise<unknown> {
-  try {
-    return await response.json();
-  } catch {
-    throw new CapabilityAuthError(message, 500);
-  }
 }
 
 async function resolveClientSecret(secret: ControlPlaneHmacTokenRequesterOptions['clientSecret']): Promise<string> {
-  const resolved = typeof secret === 'function' ? await secret() : secret;
-  const normalized = resolved.trim();
-  if (!normalized) throw new CapabilityAuthError('Service-Plane HMAC client secret cannot be empty', 500);
-  return normalized;
+  return requireNonEmpty(typeof secret === 'function' ? await secret() : secret, 'HMAC client secret');
 }
 
 async function resolvePrivateJwk(privateJwk: ControlPlaneJwkTokenRequesterOptions['privateJwk']): Promise<JsonWebKey> {
@@ -1191,10 +623,36 @@ function parseIssuedCapabilityToken(value: unknown): IssuedCapabilityToken {
   if (!(typeof issued.expiresAt === 'string' || issued.expiresAt instanceof Date) || typeof issued.token !== 'string') {
     throw new CapabilityAuthError('Invalid Service-Plane capability token response', 500);
   }
+  const expiresAt = issued.expiresAt instanceof Date ? new Date(issued.expiresAt.getTime()) : new Date(issued.expiresAt);
+  const token = issued.token.trim();
+  if (!token || !Number.isFinite(expiresAt.getTime())) {
+    throw new CapabilityAuthError('Invalid Service-Plane capability token response', 500);
+  }
   return {
-    expiresAt: issued.expiresAt instanceof Date ? issued.expiresAt : new Date(issued.expiresAt),
-    token: issued.token,
+    expiresAt,
+    token,
   };
+}
+
+function validateRequestedCapabilityToken(value: unknown, now: Date): IssuedCapabilityToken {
+  const issued = parseIssuedCapabilityToken(value);
+  const jwtExpiresAt = decodedCapabilityTokenExpiration(issued.token);
+  const expiresAt = jwtExpiresAt && jwtExpiresAt < issued.expiresAt ? jwtExpiresAt : issued.expiresAt;
+  if (expiresAt.getTime() <= now.getTime()) {
+    throw new CapabilityAuthError('Service-Plane capability token response is already expired', 500);
+  }
+  return { expiresAt, token: issued.token };
+}
+
+// A custom requester may use an opaque token, so JWT decoding is deliberately best effort. When it
+// does return a Service Plane JWT, its signed expiry is the authoritative upper bound for caching.
+function decodedCapabilityTokenExpiration(token: string): Date | undefined {
+  try {
+    const expiresAt = tokenExpiresAt(token);
+    return Number.isFinite(expiresAt.getTime()) ? expiresAt : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function parseRemoteJwks(value: unknown): CapabilityJwks {

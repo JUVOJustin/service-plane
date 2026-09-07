@@ -13,144 +13,165 @@ export const DEFAULT_CAPABILITY_JWKS_CACHE_TTL_SECONDS = 300;
 
 export const SERVICE_PLANE_AUTHORIZATION_SCHEME = 'ServicePlane';
 export const SERVICE_PLANE_REQUEST_ID_HEADER = 'X-Request-Id';
+/** Proof-of-possession JWS paired with a sender-constrained capability token. */
+export const SERVICE_PLANE_PROOF_HEADER = 'X-Service-Plane-Proof';
 /**
  * WebSocket upgrades cannot carry custom headers portably, so request ids ride a query parameter there.
  */
 export const SERVICE_PLANE_REQUEST_ID_QUERY_PARAM = 'request_id';
 
 export type AbilityAccess = 'plane' | 'service';
-
-/**
- * The one membership test for `AbilityAccess`. Registry validation, discovery normalization, token
- * issuance, and claim parsing all gate on this union; a single predicate next to the type keeps a
- * future widening from needing four synchronized hand-written checks.
- */
-export function isAbilityAccess(value: unknown): value is AbilityAccess {
-  return value === 'plane' || value === 'service';
-}
 export type AbilityExposure = 'private' | 'published';
-export type AbilityTransport = 'cloudflare-binding-rpc' | 'http-batch' | 'websocket';
+
+export type AbilityTransport = 'fetch' | 'service-binding' | 'websocket';
 /**
  * `query` is the HTTP QUERY method (RFC 10008): a safe, idempotent request that carries its
  * parameters in a body. OpenAPI 3.2 gives it a fixed `query` field on the Path Item Object,
- * and Hono 4.13+ routes it first-class (`app.query()`), which is why hono >=4.13 is the peer floor.
+ * and Hono 4.13+ routes it first-class (`app.query()`). The peer floor includes the query-parser,
+ * request-body, and JSX escaping security fixes available in Hono 4.13.7.
  */
 export type ServiceHttpMethod = 'delete' | 'get' | 'patch' | 'post' | 'put' | 'query';
 
 export type CapabilityScopeDefinition = {
-  description?: string;
-  id: string;
-  title?: string;
+  readonly description?: string;
+  readonly id: string;
+  readonly title?: string;
 };
 
 export type CapabilityCatalog = {
-  scopes: CapabilityScopeDefinition[];
-  serviceId: string;
+  readonly scopes: ReadonlyArray<CapabilityScopeDefinition>;
+  readonly serviceId: string;
 };
 
 export type OpenApiObject = Record<string, unknown>;
 
+type DeepReadonly<T> = T extends (...args: never[]) => unknown
+  ? T
+  : T extends ReadonlyArray<infer TItem>
+    ? ReadonlyArray<DeepReadonly<TItem>>
+    : T extends object
+      ? { readonly [TKey in keyof T]: DeepReadonly<T[TKey]> }
+      : T;
+
+type ReadonlyJsonElement = string | number | boolean | null | ReadonlyOpenApiObject | ReadonlyArray<ReadonlyJsonElement>;
+
+/** Deeply immutable JSON Schema or OpenAPI fragment owned by a live Service Plane definition. */
+export type ReadonlyOpenApiObject = {
+  readonly [key: string]: ReadonlyJsonElement | undefined;
+};
+
+type ReadonlyJsonWebKey = DeepReadonly<JsonWebKey & { kid?: string }>;
+
 export type ServiceAbilityRpcDiscovery = {
-  path: string;
-  transports: AbilityTransport[];
+  readonly path: string;
+  /** Wire revision advertised by the service; absent legacy catalogs cannot be invoked. */
+  readonly protocol?: string;
+  readonly transports: ReadonlyArray<AbilityTransport>;
 };
 
 export type ServiceAbilityRestProjection = {
-  description?: string;
-  method: ServiceHttpMethod;
-  operationId?: string;
-  path: string;
+  readonly description?: string;
+  readonly method: ServiceHttpMethod;
+  readonly operationId?: string;
+  readonly path: string;
   /**
    * Successful HTTP response status. Defaults to 200; it is never inferred from the method because
    * action-style POST operations legitimately return 200, 201, or 202.
    */
-  status?: number;
-  summary?: string;
-  tags?: string[];
+  readonly status?: number;
+  readonly summary?: string;
+  readonly tags?: ReadonlyArray<string>;
 };
 
 export type ServiceAbilityMcpProjection = {
-  description?: string;
-  name: string;
+  readonly description?: string;
+  readonly name: string;
 };
 
 /**
  * A `{var}` URI declares a resource template; template variables become the method input.
  */
 export type ServiceAbilityMcpResourceProjection = {
-  description?: string;
-  mimeType?: string;
-  name: string;
-  title?: string;
-  uri: string;
+  readonly description?: string;
+  readonly mimeType?: string;
+  readonly name: string;
+  readonly title?: string;
+  readonly uri: string;
 };
 
 export type ServiceAbilityMcpPromptArgument = {
-  description?: string;
-  name: string;
-  required?: boolean;
+  readonly description?: string;
+  readonly name: string;
+  readonly required?: boolean;
 };
 
 /**
  * Prompt arguments default to the method input schema's top-level properties when omitted.
  */
 export type ServiceAbilityMcpPromptProjection = {
-  arguments?: ServiceAbilityMcpPromptArgument[];
-  description?: string;
-  name: string;
-  title?: string;
+  readonly arguments?: ReadonlyArray<ServiceAbilityMcpPromptArgument>;
+  readonly description?: string;
+  readonly name: string;
+  readonly title?: string;
 };
 
 export type ServiceAbilityMethodDiscovery = {
-  inputSchema: OpenApiObject;
-  mcp?: ServiceAbilityMcpProjection;
-  mcpPrompt?: ServiceAbilityMcpPromptProjection;
-  mcpResource?: ServiceAbilityMcpResourceProjection;
-  outputSchema: OpenApiObject;
-  rest?: ServiceAbilityRestProjection;
+  readonly inputSchema: OpenApiObject;
+  readonly mcp?: ServiceAbilityMcpProjection;
+  readonly mcpPrompt?: ServiceAbilityMcpPromptProjection;
+  readonly mcpResource?: ServiceAbilityMcpResourceProjection;
+  readonly outputSchema: OpenApiObject;
+  readonly rest?: ServiceAbilityRestProjection;
   /**
    * The method is safe to call again with the same input: a retry after an ambiguous failure
    * cannot double its effect. Advertised so callers and gateways can decide whether retrying is
    * safe — this package never retries on its own.
    */
-  idempotent?: true;
-  scopes: string[];
+  readonly idempotent?: true;
+  readonly scopes: ReadonlyArray<string>;
   /**
-   * Streaming methods return a ReadableStream of output items over a Cap'n Web session
+   * Streaming methods return an async iterator of output items over Service Plane RPC
    * transport; `outputSchema` then describes one streamed item, not the whole response.
    */
-  stream?: true;
+  readonly stream?: true;
   /**
    * How long this method may run, in milliseconds, independent of any caller budget. Advertised so
    * a gateway can size its own wait against it. Absent on streaming methods, which are not bounded
    * this way.
    */
-  timeoutMs?: number;
+  readonly timeoutMs?: number;
 };
 
 export type ServiceAbilityDiscovery = {
-  access: AbilityAccess;
-  description?: string;
-  exposure: AbilityExposure;
-  id: string;
-  methods: Record<string, ServiceAbilityMethodDiscovery>;
-  rpc: ServiceAbilityRpcDiscovery;
-  scopes: string[];
-  title?: string;
+  readonly access: AbilityAccess;
+  readonly description?: string;
+  readonly exposure: AbilityExposure;
+  readonly id: string;
+  readonly methods: Readonly<Record<string, ServiceAbilityMethodDiscovery>>;
+  readonly rpc: ServiceAbilityRpcDiscovery;
+  readonly scopes: ReadonlyArray<string>;
+  readonly title?: string;
 };
 
 export type ServiceCallerAuthDiscovery = {
-  jwks: CapabilityJwks;
+  readonly jwks: CapabilityJwks;
+};
+
+/** Caller-auth discovery held by a live service after defensive snapshotting. */
+export type ReadonlyServiceCallerAuthDiscovery = {
+  readonly jwks: {
+    readonly keys: ReadonlyArray<ReadonlyJsonWebKey>;
+  };
 };
 
 export type ServiceDiscoveryDocument = {
-  abilities: ServiceAbilityDiscovery[];
-  callerAuth?: ServiceCallerAuthDiscovery;
-  capabilities?: CapabilityCatalog;
-  id: string;
-  ingress?: ServiceIngressDiscovery;
-  title: string;
-  version: string;
+  readonly abilities: ReadonlyArray<ServiceAbilityDiscovery>;
+  readonly callerAuth?: ServiceCallerAuthDiscovery;
+  readonly capabilities?: CapabilityCatalog;
+  readonly id: string;
+  readonly ingress?: ServiceIngressDiscovery;
+  readonly title: string;
+  readonly version: string;
 };
 
 export type FetchLike = {
@@ -159,7 +180,7 @@ export type FetchLike = {
 
 export type ServiceGrant = {
   caller: string;
-  scopes: string[];
+  scopes: ReadonlyArray<string>;
   target: string;
 };
 
@@ -168,35 +189,41 @@ export type ServiceEndpointGrant = Omit<ServiceGrant, 'target'> & {
 };
 
 export type ServiceGrantDefinition = {
-  grants: ServiceGrant[];
+  grants: ReadonlyArray<ServiceGrant>;
 };
 
-/**
- * Native ability RPC surface a service can expose next to `fetch` (e.g. a Cloudflare
- * WorkerEntrypoint forwarding to ServicePlaneService.connectAbility). Session-shaped, so
- * streaming method returns flow through it natively.
- */
+/** One unary method invocation sent through a Cloudflare native service binding. */
+export type ServiceAbilityNativeCall = {
+  /** Wire revision supplied automatically by Service Plane clients and brokers. */
+  protocol: string;
+  /** Stable contract id the target service resolves before selecting a method. */
+  abilityId: string;
+  /** Advisory original-client metadata forwarded only across the authenticated service boundary. */
+  connInfo?: ConnInfo;
+  /** Caller-owned key that lets a handler recognize the same logical attempt across retries. */
+  idempotencyKey?: string;
+  /** Untrusted value validated against the selected method schema after authorization. */
+  input: unknown;
+  /** Public method key resolved within the selected ability contract. */
+  method: string;
+  /** Proof required when the capability token is sender-constrained. */
+  proof?: string;
+  /** Caller correlation id preserved for downstream logs and handlers. */
+  requestId?: string;
+  /** Remaining end-to-end caller budget when the native hop begins, in milliseconds. */
+  timeoutMs?: number;
+  /** Capability the target service verifies before selecting or validating the method input. */
+  token: string;
+};
+
+/** Native ability surface advertised by a Cloudflare service endpoint. */
 export type ServiceAbilityNativeRpcBinding = {
-  connectAbility(input: {
-    abilityId: string;
-    connInfo?: ConnInfo;
-    /**
-     * The caller's key for this attempt, surfaced to handlers as `idempotencyKey`.
-     */
-    idempotencyKey?: string;
-    requestId?: string;
-    /**
-     * Milliseconds of the caller's budget. Native binding sessions are opened once and cached, so
-     * this bounds the whole session, not each call on it.
-     */
-    timeoutMs?: number;
-    token: string;
-  }): Promise<object> | object;
+  /** Calls one unary Service Plane method without the Service Plane HTTP/JSON codec. */
+  invokeAbility(input: ServiceAbilityNativeCall): Promise<unknown> | unknown;
 };
 
 export type ServiceEndpoint = {
   abilityRpc?: ServiceAbilityNativeRpcBinding;
-  createWebSocket?: (url: string) => WebSocket;
   discovery?: ServiceDiscoveryDocument | (() => Promise<ServiceDiscoveryDocument> | ServiceDiscoveryDocument);
   fetch(request: Request): Promise<Response>;
   grants?: ServiceEndpointGrant[];
@@ -415,8 +442,8 @@ export type CapabilityJwksCache = {
 
 export type VerifyCapabilityTokenOptions = {
   /**
-   * Required to check a proof of possession, because a proof is bound to the ability whose session it
-   * opens. A sender-constrained token presented without both of these is rejected.
+   * Required to check a proof of possession, because a proof is bound to the ability being called.
+   * A sender-constrained token presented without both of these is rejected.
    */
   abilityId?: string;
   expectedAudience: string;
@@ -424,7 +451,7 @@ export type VerifyCapabilityTokenOptions = {
   jwks: CapabilityJwksResolver;
   now?: Date;
   proof?: string;
-  requiredScopes?: string[];
+  requiredScopes?: ReadonlyArray<string>;
 };
 
 export type CapabilityVerifierOptions = Omit<VerifyCapabilityTokenOptions, 'requiredScopes'>;
@@ -436,7 +463,7 @@ export type IssueCapabilityTokenInput = {
    * the request, never by the caller — a caller-chosen confirmation would bind a key of its choosing.
    */
   confirmation?: CapabilityConfirmation;
-  scopes: string[];
+  scopes: ReadonlyArray<string>;
   subject?: CapabilitySubject;
   targetServiceId: string;
   ttlSeconds?: number;
@@ -445,6 +472,15 @@ export type IssueCapabilityTokenInput = {
 export type IssuedCapabilityToken = {
   expiresAt: Date;
   token: string;
+};
+
+/** Token request accepted by a control-plane binding whose caller identity is deployment-pinned. */
+export type PinnedCapabilityTokenInput = Omit<IssueCapabilityTokenInput, 'callerServiceId' | 'confirmation' | 'subject'>;
+
+/** Native STS surface exposed to exactly one configured service caller. */
+export type ControlPlaneRpcTokenBinding = {
+  /** Issues a token for the caller identity fixed behind this binding. */
+  issueCapabilityToken(input: PinnedCapabilityTokenInput): Promise<IssuedCapabilityToken | { expiresAt: Date | string; token: string }>;
 };
 
 export type CapabilityTokenCacheEntry = {
@@ -458,5 +494,6 @@ export type CapabilityTokenCache = {
 };
 
 export type CapabilityTokenProvider = {
-  token(): Promise<string>;
+  /** Returns a token; typed ability clients supply the scopes required by the current method. */
+  token(scopes?: readonly string[]): Promise<string>;
 };

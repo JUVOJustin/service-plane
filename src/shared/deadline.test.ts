@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  discardDisposableValue,
   MAX_SERVICE_PLANE_TIMEOUT_MS,
   normalizeTimeoutMs,
   parseTimeoutMs,
@@ -7,6 +8,53 @@ import {
   resolveTimeoutMs,
   serializeTimeoutMs,
 } from './deadline.js';
+
+describe('discardDisposableValue', () => {
+  it('cancels a late Response body so timed-out public streams do not stay pinned', async () => {
+    let cancelCalls = 0;
+    const body = new ReadableStream({
+      cancel() {
+        cancelCalls += 1;
+      },
+    });
+
+    discardDisposableValue(new Response(body));
+    await Promise.resolve();
+
+    expect(cancelCalls).toBe(1);
+  });
+
+  it('ends an async iterator that arrives after its caller stopped waiting', async () => {
+    let returnCalls = 0;
+    const iterator = {
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+      next: () => Promise.resolve({ done: false as const, value: 'late' }),
+      return: () => {
+        returnCalls += 1;
+        return Promise.resolve({ done: true as const, value: undefined });
+      },
+    };
+
+    discardDisposableValue(iterator);
+    await Promise.resolve();
+
+    expect(returnCalls).toBe(1);
+  });
+
+  it('does not invoke an unrelated return property', () => {
+    let returnCalls = 0;
+
+    discardDisposableValue({
+      return: () => {
+        returnCalls += 1;
+      },
+    });
+
+    expect(returnCalls).toBe(0);
+  });
+});
 
 describe('normalizeTimeoutMs', () => {
   it('keeps a usable budget and clamps one above the ceiling', () => {

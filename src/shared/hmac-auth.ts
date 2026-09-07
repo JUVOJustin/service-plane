@@ -1,5 +1,7 @@
-import { CapabilityAuthError } from './errors.js';
-import { boundedRequestBodyBytes } from './request-body.js';
+import { credentialFromAuthorization } from './authorization.js';
+import { boundedRequestBodyBytes } from './body-limit.js';
+import { bytesToBase64Url, sha256Base64Url } from './encoding.js';
+import { requireNonEmpty } from './errors.js';
 import { SERVICE_PLANE_REQUEST_ID_HEADER } from './types.js';
 
 export const SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME = 'ServicePlane-HMAC';
@@ -64,8 +66,7 @@ export async function servicePlaneHmacRequestParts(
 }
 
 export async function servicePlaneHmacSignature(secret: string, parts: ServicePlaneHmacRequestParts): Promise<string> {
-  const normalizedSecret = secret.trim();
-  if (!normalizedSecret) throw new CapabilityAuthError('Service-Plane HMAC secret cannot be empty', 500);
+  const normalizedSecret = requireNonEmpty(secret, 'HMAC secret');
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(normalizedSecret), { hash: 'SHA-256', name: 'HMAC' }, false, [
     'sign',
   ]);
@@ -90,14 +91,10 @@ export function servicePlaneHmacAuthorization(signature: string): string {
 }
 
 export function extractServicePlaneHmacSignature(request: Request): string {
-  const authorization = request.headers.get('authorization')?.trim();
-  if (!authorization) throw new CapabilityAuthError('Missing Service-Plane HMAC authorization', 401);
-  const parts = authorization.split(/\s+/u);
-  const [scheme, signature] = parts;
-  if (parts.length !== 2 || scheme?.toLowerCase() !== SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME.toLowerCase() || !signature) {
-    throw new CapabilityAuthError('Invalid Service-Plane HMAC authorization scheme', 401);
-  }
-  return signature;
+  return credentialFromAuthorization(request, SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME, {
+    invalid: 'Invalid Service-Plane HMAC authorization scheme',
+    missing: 'Missing Service-Plane HMAC authorization',
+  });
 }
 
 export function timingSafeEqual(left: string, right: string): boolean {
@@ -109,18 +106,6 @@ export function timingSafeEqual(left: string, right: string): boolean {
     diff |= (leftBytes[index] ?? 0) ^ (rightBytes[index] ?? 0);
   }
   return diff === 0;
-}
-
-export async function sha256Base64Url(value: Uint8Array): Promise<string> {
-  const bytes = new Uint8Array(value.byteLength);
-  bytes.set(value);
-  return bytesToBase64Url(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)));
-}
-
-export function bytesToBase64Url(bytes: Uint8Array): string {
-  let binary = '';
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/gu, '-').replace(/\//gu, '_').replace(/=+$/u, '');
 }
 
 async function requestBodyBytes(request: Request, maxBodyBytes?: number): Promise<Uint8Array> {

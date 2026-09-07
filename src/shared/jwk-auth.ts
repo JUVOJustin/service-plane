@@ -1,6 +1,9 @@
 import { decode, sign, verifyWithJwks } from 'hono/jwt';
-import { CapabilityAuthError } from './errors.js';
-import { boundedRequestBodyBytes } from './request-body.js';
+import { credentialFromAuthorization } from './authorization.js';
+import { boundedRequestBodyBytes } from './body-limit.js';
+import { sha256Base64Url } from './encoding.js';
+
+import { CapabilityAuthError, requireNonEmpty } from './errors.js';
 import { type CapabilityJwks, SERVICE_PLANE_REQUEST_ID_HEADER } from './types.js';
 
 export const SERVICE_PLANE_JWK_ALGORITHM = 'ES256';
@@ -11,6 +14,9 @@ export const SERVICE_PLANE_JWK_KEY_ID_HEADER = 'X-Service-Plane-Key-Id';
 
 const DEFAULT_JWK_ASSERTION_TTL_SECONDS = 60;
 const MAX_JWK_ASSERTION_TTL_SECONDS = 300;
+
+/** JWK members that carry private or secret material and must never be published. */
+export const PRIVATE_JWK_MEMBERS = ['d', 'dp', 'dq', 'k', 'oth', 'p', 'q', 'qi'] as const;
 
 export type ServicePlaneJwkRequestParts = {
   bodyHash: string;
@@ -110,7 +116,7 @@ export async function servicePlaneJwkAssertion(options: {
   const issuedAt = Math.floor(now.getTime() / 1000);
   const ttlSeconds = normalizeAssertionTtlSeconds(options.ttlSeconds ?? DEFAULT_JWK_ASSERTION_TTL_SECONDS);
   const claims: ServicePlaneJwkAssertionClaims = {
-    aud: normalizeClaimString(options.audience, 'JWK assertion audience'),
+    aud: requireNonEmpty(options.audience, 'JWK assertion audience'),
     bodyHash: options.parts.bodyHash,
     exp: issuedAt + ttlSeconds,
     iat: issuedAt,
@@ -131,14 +137,10 @@ export function servicePlaneJwkAuthorization(assertion: string): string {
 }
 
 export function extractServicePlaneJwkAssertion(request: Request): string {
-  const authorization = request.headers.get('authorization')?.trim();
-  if (!authorization) throw new CapabilityAuthError('Missing Service-Plane JWK authorization', 401);
-  const parts = authorization.split(/\s+/u);
-  const [scheme, assertion] = parts;
-  if (parts.length !== 2 || scheme?.toLowerCase() !== SERVICE_PLANE_JWK_AUTHORIZATION_SCHEME.toLowerCase() || !assertion) {
-    throw new CapabilityAuthError('Invalid Service-Plane JWK authorization scheme', 401);
-  }
-  return assertion;
+  return credentialFromAuthorization(request, SERVICE_PLANE_JWK_AUTHORIZATION_SCHEME, {
+    invalid: 'Invalid Service-Plane JWK authorization scheme',
+    missing: 'Missing Service-Plane JWK authorization',
+  });
 }
 
 export function decodeServicePlaneJwkAssertion(assertion: string): { header: unknown; payload: unknown } {
@@ -154,9 +156,9 @@ export function decodeServicePlaneJwkToken(token: string, errorMessage: string, 
 }
 
 export function publicJwkFromPrivateJwk(privateJwk: JsonWebKey, keyId: string): JsonWebKey & { kid?: string } {
-  const { d: _d, dp: _dp, dq: _dq, k: _k, oth: _oth, p: _p, q: _q, qi: _qi, ...publicJwk } = privateJwk;
+  const publicMembers = Object.entries(privateJwk).filter(([member]) => !(PRIVATE_JWK_MEMBERS as readonly string[]).includes(member));
   return {
-    ...publicJwk,
+    ...(Object.fromEntries(publicMembers) as JsonWebKey),
     alg: SERVICE_PLANE_JWK_ALGORITHM,
     kid: keyId,
     key_ops: ['verify'],
@@ -217,18 +219,6 @@ async function requestBodyBytes(request: Request, maxBodyBytes?: number): Promis
   });
 }
 
-async function sha256Base64Url(value: Uint8Array): Promise<string> {
-  const bytes = new Uint8Array(value.byteLength);
-  bytes.set(value);
-  return bytesToBase64Url(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)));
-}
-
-function bytesToBase64Url(bytes: Uint8Array): string {
-  let binary = '';
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/gu, '-').replace(/\//gu, '_').replace(/=+$/u, '');
-}
-
 function normalizeAssertionTtlSeconds(ttlSeconds: number): number {
   if (!Number.isFinite(ttlSeconds) || !Number.isSafeInteger(ttlSeconds) || ttlSeconds <= 0 || ttlSeconds > MAX_JWK_ASSERTION_TTL_SECONDS) {
     throw new CapabilityAuthError(
@@ -237,12 +227,6 @@ function normalizeAssertionTtlSeconds(ttlSeconds: number): number {
     );
   }
   return ttlSeconds;
-}
-
-function normalizeClaimString(value: string, field: string): string {
-  const normalized = value.trim();
-  if (!normalized) throw new CapabilityAuthError(`Service-Plane ${field} cannot be empty`, 500);
-  return normalized;
 }
 
 export function randomServicePlaneJwkId(): string {

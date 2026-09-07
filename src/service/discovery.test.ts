@@ -1,36 +1,31 @@
 import { describe, expect, it } from 'vitest';
 import * as z from 'zod';
-import type { CapabilityIdentity } from '../shared/types.js';
-import { defineCapabilities, RpcTarget } from './capabilities.js';
-import {
-  abilityMethod,
-  createValidatingAbilityHandler,
-  defineAbility,
-  defineAbilityService,
-  serviceDiscoveryDocument,
-} from './discovery.js';
+import { type AbilityMethodMetadata, createAbilityBuilder } from './ability.js';
+import { defineCapabilities } from './capabilities.js';
+import { defineAbility, defineAbilityService, implementAbility, serviceDiscoveryDocument } from './discovery.js';
 
 describe('ability service discovery', () => {
   const capabilities = defineCapabilities({
     scopes: [{ id: 'example.search' }, { id: 'example.sync.run' }],
     serviceId: 'example',
   });
+  const ability = createAbilityBuilder();
 
   const searchAbility = defineAbility({
     access: 'plane',
     exposure: 'published',
     id: 'example.search',
     methods: {
-      search: abilityMethod({
-        input: z.object({ query: z.string() }),
+      search: ability.method({
         mcp: { name: 'example_search' },
-        output: z.object({ results: z.array(z.string()) }),
         rest: { method: 'get', path: '/examples/search', summary: 'Search examples' },
         scopes: ['example.search'],
+        input: z.object({ query: z.string() }),
+        output: z.object({ results: z.array(z.string()) }),
+        handler: ({ input }) => ({ results: [input.query] }),
       }),
     },
     scopes: ['example.search'],
-    handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
     title: 'Example Search',
   });
 
@@ -41,15 +36,15 @@ describe('ability service discovery', () => {
         defineAbility({
           id: 'example.sync',
           methods: {
-            runSync: abilityMethod({
+            runSync: ability.method({
+              scopes: ['example.sync.run'],
               input: z.object({ since: z.string().optional() }),
               output: z.object({ ok: z.literal(true) }),
-              scopes: ['example.sync.run'],
+              handler: () => ({ ok: true as const }),
             }),
           },
-          rpc: { transports: ['http-batch', 'websocket'] },
+          rpc: { transports: ['fetch', 'websocket'] },
           scopes: ['example.sync.run'],
-          handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
         }),
       ],
       capabilities,
@@ -77,17 +72,147 @@ describe('ability service discovery', () => {
               scopes: ['example.search'],
             },
           },
-          rpc: { path: '/rpc/example.search', transports: ['http-batch'] },
+          rpc: { path: '/rpc/v1/example.search', transports: ['fetch'] },
           scopes: ['example.search'],
         },
         {
           access: 'plane',
           exposure: 'private',
           id: 'example.sync',
-          rpc: { path: '/rpc/example.sync', transports: ['http-batch', 'websocket'] },
+          rpc: { path: '/rpc/v1/example.sync', transports: ['fetch', 'websocket'] },
         },
       ],
       id: 'example',
+    });
+  });
+
+  it('snapshots and freezes the live declarative service graph', () => {
+    const methodScopes = ['example.search'];
+    const restTags = ['examples'];
+    const rest: { method: 'post'; path: string; tags: string[] } = {
+      method: 'post',
+      path: '/examples/run',
+      tags: restTags,
+    };
+    const run = ability.method({
+      handler: ({ input }) => input,
+      input: z.object({ value: z.string() }),
+      output: z.object({ value: z.string() }),
+      rest,
+      scopes: methodScopes,
+    });
+    const sourceMethods: Record<string, typeof run> = { run };
+    const abilityScopes = ['example.search'];
+    const transports: Array<'fetch' | 'websocket'> = ['fetch'];
+    const contract = defineAbility({
+      exposure: 'published',
+      id: 'example.immutable',
+      methods: sourceMethods,
+      rpc: { transports },
+      scopes: abilityScopes,
+    });
+
+    sourceMethods.extra = run;
+    abilityScopes.splice(0);
+    transports.push('websocket');
+    methodScopes.splice(0);
+    rest.path = '/changed';
+    restTags.splice(0);
+
+    expect(Object.isFrozen(run)).toBe(true);
+    expect(Object.isFrozen(run.metadata)).toBe(true);
+    expect(Object.isFrozen(run.metadata.rest)).toBe(true);
+    expect(Object.isFrozen(run.metadata.rest?.tags)).toBe(true);
+    expect(Object.isFrozen(contract)).toBe(true);
+    expect(Object.isFrozen(contract.methods)).toBe(true);
+    expect(Object.isFrozen(contract.rpc)).toBe(true);
+    expect(Object.isFrozen(contract.rpc?.transports)).toBe(true);
+    expect(Object.isFrozen(contract.scopes)).toBe(true);
+    expect(Object.keys(contract.methods)).toEqual(['run']);
+    expect(contract.methods.run?.metadata).toMatchObject({
+      rest: { path: '/examples/run', tags: ['examples'] },
+      scopes: ['example.search'],
+    });
+    expect(contract.rpc?.transports).toEqual(['fetch']);
+    expect(contract.scopes).toEqual(['example.search']);
+
+    const capabilityInput = { scopes: [{ id: 'example.search' }], serviceId: 'example' };
+    const callerKeys: Array<JsonWebKey & { kid?: string }> = [{ key_ops: ['verify'], kid: 'caller', kty: 'EC' }];
+    const service = defineAbilityService({
+      abilities: [contract],
+      callerAuth: { jwks: { keys: callerKeys } },
+      capabilities: capabilityInput,
+      id: 'example',
+      title: 'Example',
+      version: '1.0.0',
+    });
+    capabilityInput.scopes.splice(0);
+    const sourceCallerKey = callerKeys[0];
+    if (!sourceCallerKey) throw new Error('missing source caller key');
+    sourceCallerKey.kid = 'changed';
+    sourceCallerKey.key_ops?.push('sign');
+
+    const normalizedAbility = service.abilities[0];
+    const normalizedMethod = normalizedAbility?.methods.run;
+    const serviceCapabilities = service.capabilities;
+    const liveKeyOperations = service.callerAuth?.jwks.keys[0]?.key_ops;
+    if (!normalizedAbility || !normalizedMethod || !serviceCapabilities || !liveKeyOperations) {
+      throw new Error('missing normalized ability');
+    }
+    expect(Object.isFrozen(service)).toBe(true);
+    expect(Object.isFrozen(service.abilities)).toBe(true);
+    expect(Object.isFrozen(serviceCapabilities)).toBe(true);
+    expect(Object.isFrozen(serviceCapabilities.scopes)).toBe(true);
+    expect(Object.isFrozen(serviceCapabilities.scopes[0])).toBe(true);
+    expect(Object.isFrozen(service.callerAuth)).toBe(true);
+    expect(Object.isFrozen(service.callerAuth?.jwks)).toBe(true);
+    expect(Object.isFrozen(service.callerAuth?.jwks.keys)).toBe(true);
+    expect(Object.isFrozen(service.callerAuth?.jwks.keys[0])).toBe(true);
+    expect(Object.isFrozen(service.callerAuth?.jwks.keys[0]?.key_ops)).toBe(true);
+    expect(Object.isFrozen(normalizedAbility)).toBe(true);
+    expect(Object.isFrozen(normalizedAbility.methods)).toBe(true);
+    expect(Object.isFrozen(normalizedMethod)).toBe(true);
+    expect(Object.isFrozen(normalizedMethod.rest)).toBe(true);
+    expect(Object.isFrozen(normalizedMethod.rest?.tags)).toBe(true);
+    expect(Object.isFrozen(normalizedMethod.inputSchema)).toBe(true);
+    expect(Object.isFrozen(normalizedMethod.inputSchema.properties)).toBe(true);
+    expect(serviceCapabilities.scopes).toEqual([{ id: 'example.search' }]);
+    expect(service.callerAuth?.jwks.keys[0]).toMatchObject({ key_ops: ['verify'], kid: 'caller' });
+
+    expect(() => {
+      (service as unknown as { id: string }).id = 'changed-service';
+    }).toThrow(TypeError);
+    expect(() => {
+      (serviceCapabilities.scopes as unknown as unknown[]).splice(0);
+    }).toThrow(TypeError);
+    expect(() => {
+      (normalizedMethod.rest as unknown as { path: string }).path = '/changed';
+    }).toThrow(TypeError);
+    expect(() => {
+      (normalizedMethod.inputSchema as unknown as Record<string, unknown>).type = 'string';
+    }).toThrow(TypeError);
+    expect(() => {
+      (liveKeyOperations as unknown as string[]).push('sign');
+    }).toThrow(TypeError);
+
+    const discovery = serviceDiscoveryDocument(service);
+    expect(discovery).toMatchObject({
+      abilities: [{ id: 'example.immutable', methods: { run: { rest: { path: '/examples/run' } } } }],
+      id: 'example',
+    });
+    const discoveryKey = discovery.callerAuth?.jwks.keys[0];
+    const discoveryMethod = discovery.abilities[0]?.methods.run;
+    const discoveryRequired = discoveryMethod?.inputSchema.required;
+    if (!discoveryKey || !Array.isArray(discoveryRequired)) throw new Error('missing discovery snapshot');
+    discoveryKey.kid = 'wire-copy';
+    discoveryKey.key_ops?.push('sign');
+    discoveryRequired.push('wireOnly');
+
+    expect(service.callerAuth?.jwks.keys[0]).toMatchObject({ key_ops: ['verify'], kid: 'caller' });
+    expect(normalizedMethod.inputSchema.required).toEqual(['value']);
+    expect(serviceDiscoveryDocument(service)).toMatchObject({
+      abilities: [{ methods: { run: { inputSchema: { required: ['value'] } } } }],
+      callerAuth: { jwks: { keys: [{ key_ops: ['verify'], kid: 'caller' }] } },
     });
   });
 
@@ -99,15 +224,15 @@ describe('ability service discovery', () => {
             exposure: 'published',
             id: 'example.search',
             methods: {
-              search: abilityMethod({
-                input: z.object({ query: z.string() }),
-                output: z.object({ results: z.array(z.string()) }),
+              search: ability.method({
                 rest: { method: method as never, path: '/examples/search' },
                 scopes: ['example.search'],
+                input: z.object({ query: z.string() }),
+                output: z.object({ results: z.array(z.string()) }),
+                handler: ({ input }) => ({ results: [input.query] }),
               }),
             },
             scopes: ['example.search'],
-            handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
           }),
         ],
         capabilities,
@@ -145,15 +270,15 @@ describe('ability service discovery', () => {
             exposure: 'published',
             id: 'example.write',
             methods: {
-              write: abilityMethod({
-                input: z.object({ id: z.string() }),
-                output: z.object({ ok: z.boolean() }),
+              write: ability.method({
                 rest,
                 scopes: ['example.search'],
+                input: z.object({ id: z.string() }),
+                output: z.object({ ok: z.boolean() }),
+                handler: () => ({ ok: true }),
               }),
             },
             scopes: ['example.search'],
-            handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
           }),
         ],
         capabilities,
@@ -185,31 +310,33 @@ describe('ability service discovery', () => {
           exposure: 'published',
           id: 'example.search',
           methods: {
-            item: abilityMethod({
-              input: z.object({ itemId: z.string() }),
+            item: ability.method({
               mcpResource: { description: 'One item', name: 'item', uri: 'example://items/{itemId}' },
+              scopes: ['example.search'],
+              input: z.object({ itemId: z.string() }),
               output: z.object({ id: z.string() }),
-              scopes: ['example.search'],
+              handler: ({ input }) => ({ id: input.itemId }),
             }),
-            readme: abilityMethod({
-              input: z.object({}),
+            readme: ability.method({
               mcpResource: { mimeType: 'text/markdown', name: 'readme', title: 'Readme', uri: ' example://docs/readme ' },
-              output: z.string(),
               scopes: ['example.search'],
+              input: z.object({}),
+              output: z.string(),
+              handler: () => '# Readme',
             }),
-            summarize: abilityMethod({
-              input: z.object({ topic: z.string() }),
+            summarize: ability.method({
               mcpPrompt: {
                 arguments: [{ description: 'What to summarize', name: ' topic ', required: true }],
                 description: 'Summarize a topic',
                 name: 'example_summarize',
               },
-              output: z.string(),
               scopes: ['example.search'],
+              input: z.object({ topic: z.string() }),
+              output: z.string(),
+              handler: ({ input }) => input.topic,
             }),
           },
           scopes: ['example.search'],
-          handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
         }),
       ],
       capabilities,
@@ -239,16 +366,17 @@ describe('ability service discovery', () => {
   });
 
   it('rejects invalid MCP resource and prompt metadata', () => {
-    const abilityWith = (methods: Parameters<typeof defineAbility>[0]['methods']) => () =>
+    const abilityWith = (metadata: AbilityMethodMetadata) => () =>
       defineAbilityService({
         abilities: [
           defineAbility({
             access: 'plane',
             exposure: 'published',
             id: 'example.search',
-            methods,
+            methods: {
+              read: ability.method({ ...metadata, input: z.object({}), output: z.string(), handler: () => 'item' }),
+            },
             scopes: ['example.search'],
-            handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
           }),
         ],
         capabilities,
@@ -256,27 +384,35 @@ describe('ability service discovery', () => {
         title: 'Example',
         version: '0.1.0',
       });
-    const base = { input: z.object({}), output: z.string(), scopes: ['example.search'] };
 
-    expect(abilityWith({ read: abilityMethod({ ...base, mcpResource: { name: 'item', uri: 'example://items/{item-id}' } }) })).toThrow(
+    expect(abilityWith({ mcpResource: { name: 'item', uri: 'example://items/{item-id}' }, scopes: ['example.search'] })).toThrow(
       'invalid template expression',
     );
-    expect(abilityWith({ read: abilityMethod({ ...base, mcpResource: { name: 'item', uri: 'example://items/{itemId' } }) })).toThrow(
+    expect(abilityWith({ mcpResource: { name: 'item', uri: 'example://items/{itemId' }, scopes: ['example.search'] })).toThrow(
       'invalid template expression',
     );
-    expect(abilityWith({ read: abilityMethod({ ...base, mcpResource: { name: 'item', uri: 'example://items/}itemId{' } }) })).toThrow(
+    expect(abilityWith({ mcpResource: { name: 'item', uri: 'example://items/}itemId{' }, scopes: ['example.search'] })).toThrow(
       'invalid template expression',
     );
-    expect(abilityWith({ read: abilityMethod({ ...base, mcpResource: { name: 'item', uri: '  ' } }) })).toThrow(
+    for (const uri of [
+      'example://items/{left}{right}',
+      'example://items/{left}-between-{right}',
+      'example://{host}.{suffix}/items',
+      'example://items?q={query}&page={page}',
+      'example://items/{id}#part-{id}',
+    ]) {
+      expect(abilityWith({ mcpResource: { name: 'item', uri }, scopes: ['example.search'] })).toThrow('invalid template expression');
+    }
+    expect(abilityWith({ mcpResource: { name: 'item', uri: '  ' }, scopes: ['example.search'] })).toThrow(
       'MCP resource URI for example.search/read cannot be empty',
     );
-    expect(abilityWith({ read: abilityMethod({ ...base, mcpResource: { name: ' ', uri: 'example://items' } }) })).toThrow(
+    expect(abilityWith({ mcpResource: { name: ' ', uri: 'example://items' }, scopes: ['example.search'] })).toThrow(
       'MCP resource name for example.search/read cannot be empty',
     );
-    expect(abilityWith({ read: abilityMethod({ ...base, mcpPrompt: { name: ' ' } }) })).toThrow(
+    expect(abilityWith({ mcpPrompt: { name: ' ' }, scopes: ['example.search'] })).toThrow(
       'MCP prompt name for example.search/read cannot be empty',
     );
-    expect(abilityWith({ read: abilityMethod({ ...base, mcpPrompt: { arguments: [{ name: ' ' }], name: 'example_prompt' } }) })).toThrow(
+    expect(abilityWith({ mcpPrompt: { arguments: [{ name: ' ' }], name: 'example_prompt' }, scopes: ['example.search'] })).toThrow(
       'MCP prompt argument name for example.search/read cannot be empty',
     );
   });
@@ -290,16 +426,16 @@ describe('ability service discovery', () => {
             defineAbility({
               id: 'example.search',
               methods: {
-                search: abilityMethod({
-                  input: z.object({}),
-                  output: z.object({}),
+                search: ability.method({
                   rest: { method: 'post', path: restPath },
                   scopes: ['example.search'],
+                  input: z.object({}),
+                  output: z.object({}),
+                  handler: () => ({}),
                 }),
               },
               rpc: { path: rpcPath },
               scopes: ['example.search'],
-              handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
             }),
           ],
           capabilities,
@@ -309,7 +445,74 @@ describe('ability service discovery', () => {
         });
 
     expect(defineWithPaths('//other.example/rpc')).toThrow('path must be origin-relative');
-    expect(defineWithPaths('/rpc/example.search', '/\\other.example/rest')).toThrow('path must be origin-relative');
+    expect(defineWithPaths('/rpc/v1/example.search', '/\\other.example/rest')).toThrow('path must be origin-relative');
+  });
+
+  it('normalizes the capability catalog and rejects one owned by another service', () => {
+    const service = defineAbilityService({
+      abilities: [searchAbility],
+      capabilities: { scopes: [{ id: ' example.search ' }], serviceId: ' example ' },
+      id: 'example',
+      title: 'Example',
+      version: '0.1.0',
+    });
+
+    expect(service.capabilities).toEqual({ scopes: [{ id: 'example.search' }], serviceId: 'example' });
+    expect(() =>
+      defineAbilityService({
+        abilities: [searchAbility],
+        capabilities: { scopes: [{ id: 'example.search' }], serviceId: 'other' },
+        id: 'example',
+        title: 'Example',
+        version: '0.1.0',
+      }),
+    ).toThrow('Service-Plane capability catalog belongs to other, not service example');
+  });
+
+  it.each([
+    ['/rpc/v1/items', '/rpc/v1/items/admin'],
+    ['/rpc/v1/items/admin', '/rpc/v1/items'],
+    ['/', '/rpc/v1/items'],
+  ])('rejects overlapping ability RPC paths %s and %s', (firstPath, secondPath) => {
+    const withPath = (id: string, path: string) =>
+      defineAbility({
+        id,
+        methods: {
+          run: ability.method({
+            handler: () => ({}),
+            input: z.object({}),
+            output: z.object({}),
+            scopes: ['example.search'],
+          }),
+        },
+        rpc: { path, transports: ['fetch', 'websocket'] },
+        scopes: ['example.search'],
+      });
+
+    expect(() =>
+      defineAbilityService({
+        abilities: [withPath('example.first', firstPath), withPath('example.second', secondPath)],
+        capabilities,
+        id: 'example',
+        title: 'Example',
+        version: '0.1.0',
+      }),
+    ).toThrow('Overlapping Service-Plane ability RPC paths');
+  });
+
+  it('allows ability RPC paths that merely share a string prefix', () => {
+    const service = defineAbilityService({
+      abilities: [
+        { ...searchAbility, rpc: { path: '/rpc/v1/item', transports: ['fetch'] } },
+        { ...searchAbility, id: 'example.search-more', rpc: { path: '/rpc/v1/items', transports: ['fetch'] } },
+      ],
+      capabilities,
+      id: 'example',
+      title: 'Example',
+      version: '0.1.0',
+    });
+
+    expect(service.abilities.map((entry) => entry.rpc.path)).toEqual(['/rpc/v1/item', '/rpc/v1/items']);
   });
 
   it('rejects duplicate ability ids, unknown scopes, and unscoped abilities', () => {
@@ -329,10 +532,9 @@ describe('ability service discovery', () => {
           defineAbility({
             id: 'example.unknown',
             methods: {
-              run: abilityMethod({ input: z.object({}), output: z.object({}), scopes: ['example.unknown'] }),
+              run: ability.method({ scopes: ['example.unknown'], input: z.object({}), output: z.object({}), handler: () => ({}) }),
             },
             scopes: ['example.unknown'],
-            handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
           }),
         ],
         capabilities,
@@ -347,8 +549,9 @@ describe('ability service discovery', () => {
         abilities: [
           defineAbility({
             id: 'example.unscoped',
-            methods: { run: abilityMethod({ input: z.object({}), output: z.object({}) }) },
-            handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
+            methods: {
+              run: ability.method({ input: z.object({}), output: z.object({}), handler: () => ({}) }),
+            },
           }),
         ],
         capabilities,
@@ -363,9 +566,10 @@ describe('ability service discovery', () => {
         abilities: [
           defineAbility({
             id: 'example.unscoped-method',
-            methods: { run: abilityMethod({ input: z.object({}), output: z.object({}) }) },
+            methods: {
+              run: ability.method({ input: z.object({}), output: z.object({}), handler: () => ({}) }),
+            },
             scopes: ['example.sync.run'],
-            handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
           }),
         ],
         capabilities,
@@ -381,10 +585,9 @@ describe('ability service discovery', () => {
           defineAbility({
             id: 'example.scope-mismatch',
             methods: {
-              run: abilityMethod({ input: z.object({}), output: z.object({}), scopes: ['example.sync.run'] }),
+              run: ability.method({ scopes: ['example.sync.run'], input: z.object({}), output: z.object({}), handler: () => ({}) }),
             },
             scopes: ['example.search'],
-            handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
           }),
         ],
         capabilities,
@@ -401,10 +604,9 @@ describe('ability service discovery', () => {
         defineAbility({
           id: 'example.sync',
           methods: {
-            run: abilityMethod({ input: z.object({}), output: z.object({}), scopes: ['example.sync.run'] }),
+            run: ability.method({ scopes: ['example.sync.run'], input: z.object({}), output: z.object({}), handler: () => ({}) }),
           },
           scopes: ['example.sync.run'],
-          handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
         }),
       ],
       capabilities,
@@ -416,17 +618,16 @@ describe('ability service discovery', () => {
     expect(serviceDiscoveryDocument(service).abilities[0]).toMatchObject({ access: 'plane', exposure: 'private' });
   });
 
-  it('rejects abilities without a handler factory', () => {
+  it.each(['then', 'toJSON', '__proto__'])('rejects the reserved ability method name %s', (methodName) => {
+    const method = ability.method({ scopes: ['example.search'], input: z.object({}), output: z.object({}), handler: () => ({}) });
+
     expect(() =>
       defineAbilityService({
         abilities: [
           defineAbility({
-            handler: undefined as never,
-            id: 'example.sync',
-            methods: {
-              run: abilityMethod({ input: z.object({}), output: z.object({}), scopes: ['example.sync.run'] }),
-            },
-            scopes: ['example.sync.run'],
+            id: 'example.bad',
+            methods: { [methodName]: method },
+            scopes: ['example.search'],
           }),
         ],
         capabilities,
@@ -434,7 +635,68 @@ describe('ability service discovery', () => {
         title: 'Example',
         version: '0.1.0',
       }),
-    ).toThrow('Service-Plane ability requires a handler factory: example.sync');
+    ).toThrow(`Service-Plane ability method name is reserved: example.bad/${methodName}`);
+  });
+
+  it('rejects an ordinary __proto__ method literal instead of silently losing its typed method', () => {
+    expect(() =>
+      defineAbility({
+        id: 'example.bad',
+        methods: {
+          __proto__: ability.method({
+            handler: () => ({ ok: true as const }),
+            input: z.object({}),
+            output: z.object({ ok: z.literal(true) }),
+          }),
+        },
+      }),
+    ).toThrow('Service-Plane ability method name is reserved: example.bad/__proto__');
+  });
+
+  it('keeps valid own methods on a record with an application-defined prototype', () => {
+    const method = ability.method({
+      handler: () => ({ ok: true as const }),
+      input: z.object({}),
+      output: z.object({ ok: z.literal(true) }),
+    });
+    const methods = Object.assign(Object.create({ applicationMetadata: true }) as Record<string, typeof method>, { get: method });
+
+    expect(defineAbility({ id: 'example.custom-record', methods }).methods.get).toBe(method);
+  });
+
+  it('accepts natural JavaScript property names as ability methods', () => {
+    const names = ['apply', 'call', 'constructor', 'hasOwnProperty', 'name', 'toString', 'valueOf'];
+    const method = ability.method({ scopes: ['example.search'], input: z.object({}), output: z.object({}), handler: () => ({}) });
+    const service = defineAbilityService({
+      abilities: [
+        defineAbility({
+          id: 'example.natural-names',
+          methods: Object.fromEntries(names.map((name) => [name, method])),
+          scopes: ['example.search'],
+        }),
+      ],
+      capabilities,
+      id: 'example',
+      title: 'Example',
+      version: '0.1.0',
+    });
+
+    expect(Object.keys(service.abilities[0]?.methods ?? {})).toEqual(names);
+  });
+
+  it('requires an own implementation handler for a constructor method', () => {
+    const contract = defineAbility({
+      id: 'example.constructor',
+      methods: {
+        constructor: ability.method({ scopes: ['example.search'], input: z.object({}), output: z.object({}) }),
+      },
+      scopes: ['example.search'],
+    });
+
+    expect(() => implementAbility(contract, {} as never)).toThrow(
+      'Service-Plane ability implementation is missing method: example.constructor/constructor',
+    );
+    expect(() => implementAbility(contract, { constructor: () => ({}) })).not.toThrow();
   });
 
   it('does not publish private caller-auth key material', () => {
@@ -444,10 +706,9 @@ describe('ability service discovery', () => {
           defineAbility({
             id: 'example.sync',
             methods: {
-              run: abilityMethod({ input: z.object({}), output: z.object({}), scopes: ['example.sync.run'] }),
+              run: ability.method({ scopes: ['example.sync.run'], input: z.object({}), output: z.object({}), handler: () => ({}) }),
             },
             scopes: ['example.sync.run'],
-            handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
           }),
         ],
         callerAuth: {
@@ -464,186 +725,5 @@ describe('ability service discovery', () => {
         version: '0.1.0',
       }),
     ).toThrow('Service-Plane caller-auth JWKS must not include private key material');
-  });
-});
-
-describe('ability handler safety', () => {
-  const capabilities = defineCapabilities({
-    scopes: [{ id: 'example.search' }],
-    serviceId: 'example',
-  });
-
-  const identity = (tokenId: string): CapabilityIdentity => ({
-    audience: 'example',
-    callerAccess: 'service',
-    expiresAt: new Date('2100-01-01T00:00:00Z'),
-    issuer: 'control-plane',
-    scopes: ['example.search'],
-    serviceId: 'caller',
-    tokenId,
-  });
-
-  const searchService = () =>
-    defineAbilityService({
-      abilities: [
-        defineAbility({
-          id: 'example.search',
-          methods: {
-            search: abilityMethod({
-              input: z.object({ query: z.string() }),
-              output: z.object({ results: z.array(z.string()) }),
-              scopes: ['example.search'],
-            }),
-          },
-          scopes: ['example.search'],
-          handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
-        }),
-      ],
-      capabilities,
-      id: 'example',
-      title: 'Example',
-      version: '0.1.0',
-    });
-
-  it.each(['invoke', 'then', 'map', 'catch'])('rejects the reserved ability method name %s', (methodName) => {
-    expect(() =>
-      defineAbilityService({
-        abilities: [
-          defineAbility({
-            id: 'example.bad',
-            methods: {
-              [methodName]: abilityMethod({
-                input: z.object({}),
-                output: z.object({}),
-                scopes: ['example.search'],
-              }),
-            },
-            scopes: ['example.search'],
-            handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
-          }),
-        ],
-        capabilities,
-        id: 'example',
-        title: 'Example',
-        version: '0.1.0',
-      }),
-    ).toThrow(`Service-Plane ability method name is reserved: example.bad/${methodName}`);
-  });
-
-  it('enforces service-only access in the validating wrapper, so custom shells inherit it', () => {
-    const definition = defineAbilityService({
-      abilities: [
-        defineAbility({
-          access: 'service',
-          id: 'example.search',
-          methods: {
-            search: abilityMethod({
-              input: z.object({ query: z.string() }),
-              output: z.object({ results: z.array(z.string()) }),
-              scopes: ['example.search'],
-            }),
-          },
-          scopes: ['example.search'],
-          handler: () => new RpcTarget() as RpcTarget & Record<string, unknown>,
-        }),
-      ],
-      capabilities,
-      id: 'example',
-      title: 'Example',
-      version: '0.1.0',
-    });
-    const ability = definition.abilities[0];
-    if (!ability) throw new Error('missing ability');
-
-    // A shell built straight from the primitives — no ServicePlaneService in front — still may
-    // not hand a plane-class caller a service-only ability.
-    expect(() =>
-      createValidatingAbilityHandler(ability, new RpcTarget() as RpcTarget & Record<string, unknown>, {
-        ...identity('cap_plane'),
-        callerAccess: 'plane',
-      }),
-    ).toThrow('Service-Plane ability is callable by services only: example.search');
-    expect(
-      createValidatingAbilityHandler(ability, new RpcTarget() as RpcTarget & Record<string, unknown>, identity('cap_service')),
-    ).toBeDefined();
-  });
-
-  it('rejects handler factories that return a shared instance across sessions', () => {
-    const ability = searchService().abilities[0];
-    if (!ability) throw new Error('missing ability');
-    const shared = new RpcTarget() as RpcTarget & Record<string, unknown>;
-
-    expect(createValidatingAbilityHandler(ability, shared, identity('cap_1'))).toBeDefined();
-    expect(() => createValidatingAbilityHandler(ability, shared, identity('cap_2'))).toThrow(
-      'Service-Plane ability handler factory must return a new instance per call: example.search',
-    );
-  });
-
-  it('reuses the generated validating wrapper prototype for one normalized ability', async () => {
-    const ability = searchService().abilities[0];
-    if (!ability) throw new Error('missing ability');
-
-    class SearchHandler extends RpcTarget {
-      search(input: { query: string }) {
-        return { results: [input.query] };
-      }
-    }
-
-    type SearchTarget = RpcTarget & {
-      search(input: { query: string }): Promise<{ results: string[] }>;
-    };
-    const first = createValidatingAbilityHandler(
-      ability,
-      new SearchHandler() as SearchHandler & Record<string, unknown>,
-      identity('cap_1'),
-    ) as SearchTarget;
-    const second = createValidatingAbilityHandler(
-      ability,
-      new SearchHandler() as SearchHandler & Record<string, unknown>,
-      identity('cap_2'),
-    ) as SearchTarget;
-
-    expect(Object.getPrototypeOf(first)).toBe(Object.getPrototypeOf(second));
-    await expect(first.search({ query: 'first' })).resolves.toEqual({ results: ['first'] });
-    await expect(second.search({ query: 'second' })).resolves.toEqual({ results: ['second'] });
-  });
-
-  it('delegates disposal once and rejects calls after the wrapper is disposed', async () => {
-    const ability = searchService().abilities[0];
-    if (!ability) throw new Error('missing ability');
-    let calls = 0;
-    let disposals = 0;
-    let disposedReceiver: unknown;
-
-    class DisposableSearchHandler extends RpcTarget {
-      search(input: { query: string }) {
-        calls += 1;
-        return { results: [input.query] };
-      }
-
-      [Symbol.dispose](): void {
-        disposedReceiver = this;
-        disposals += 1;
-      }
-    }
-
-    type SearchTarget = RpcTarget &
-      Disposable & {
-        search(input: { query: string }): Promise<{ results: string[] }>;
-      };
-    const handler = new DisposableSearchHandler();
-    const target = createValidatingAbilityHandler(
-      ability,
-      handler as DisposableSearchHandler & Record<string, unknown>,
-      identity('cap_1'),
-    ) as SearchTarget;
-
-    target[Symbol.dispose]();
-    target[Symbol.dispose]();
-
-    expect(disposals).toBe(1);
-    expect(disposedReceiver).toBe(handler);
-    await expect(target.search({ query: 'after-dispose' })).rejects.toThrow('ability handler has been disposed');
-    expect(calls).toBe(0);
   });
 });

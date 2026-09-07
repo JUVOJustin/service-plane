@@ -1,252 +1,222 @@
 # service-plane
 
-Ability-first service APIs for TypeScript services.
+One public control plane for TypeScript services on Cloudflare Workers, Node.js, Bun, and Deno.
 
-`service-plane` gives independently deployed services one shared model:
-
-- Services define schema-backed abilities.
-- The control plane issues short-lived capability tokens.
-- Cap'n Web carries RPC method calls over HTTP-batch, WebSocket, or Cloudflare bindings.
-- Schemas validate inputs and outputs, using the validation library you already use.
-- Published abilities can become OpenAPI or MCP tools from the control plane.
-- Request ids and structured JSON logs correlate plane and service calls out of the box.
-
-Service authors define abilities. Hono stays the HTTP shell for middleware, discovery, and adapter routes.
-
-The library is written against web-standard globals only (`crypto.subtle`, `fetch`/`Request`, `TextEncoder`, timers) and runs on Node 20+, Cloudflare Workers, Deno, and Bun. That claim is exercised in CI on every push: the full test suite runs on Node 20/22/24 **and inside real workerd isolates** (via `@cloudflare/vitest-pool-workers`), and a bundled smoke — HTTP-batch end to end, streaming over a session transport, token verification accepting and rejecting — runs on Deno and Bun.
+Define a method once, then use the same contract for runtime validation, typed clients, service
+discovery, REST/OpenAPI, and MCP. Hono remains the HTTP shell. Fetch, WebSocket, batching,
+compression, and the underlying RPC engine stay implementation details of `service-plane`.
 
 ## Install
 
 ```sh
-npm install service-plane hono @hono/capnweb capnweb
+npm install service-plane@next hono zod
 ```
 
-Ability schemas come from a validation library you choose; `service-plane` does not bundle or require any particular one. Add whichever you already use — anything implementing [Standard Schema](https://standardschema.dev) and its [Standard JSON Schema](https://standardschema.dev/json-schema) companion:
+`service-plane` requires Hono `>=4.13.7 <5.0.0`.
 
-```sh
-npm install arktype     # or zod, or @vinejs/vine, or valibot + @valibot/to-json-schema
-```
+This branch prepares `0.4.0-beta.1`. The private oRPC engine is still a prerelease; keep deployments
+on the `next` channel until the release has been exercised in your target runtimes.
 
-See [Choosing A Validation Library](docs/service-creation.md#choosing-a-validation-library) for versions and the one wrapper Valibot needs. Code samples in this README and the docs use Zod so they stay concrete — that is an arbitrary choice, not a default.
+Schemas must implement [Standard Schema](https://standardschema.dev) and
+[Standard JSON Schema](https://standardschema.dev/json-schema). Use the validation library you
+already have; Zod 4 is installed above only so the examples work as written.
 
-## Minimal Service
+## 1. Share A Contract
 
 ```ts
-import { RpcTarget } from 'capnweb';
+// tasks.contract.ts
 import * as z from 'zod';
-import {
-  ServicePlaneService,
-  abilityMethod,
-  defineAbility,
-  defineCapabilities,
-  jwksFromServiceBinding,
-} from 'service-plane/service';
+import { createAbilityBuilder, defineAbility } from 'service-plane/service';
 
-type Env = {
-  ASANA_CONNECTIONS: DurableObjectNamespace;
-  CONTROL_PLANE: Fetcher;
-};
+const ability = createAbilityBuilder();
 
-const capabilities = defineCapabilities({
-  serviceId: 'asana',
-  scopes: [{ id: 'asana.tasks.write', title: 'Create Asana tasks' }],
-});
-
-const asanaTasks = defineAbility({
-  id: 'asana.tasks',
-  title: 'Asana Tasks',
+export const tasksContract = defineAbility({
+  id: 'tasks',
+  title: 'Tasks',
   exposure: 'published',
-  access: 'plane',
-  scopes: ['asana.tasks.write'],
+  scopes: ['tasks.read'],
+  rpc: { transports: ['fetch', 'service-binding'] },
   methods: {
-    createTask: abilityMethod({
-      input: z.object({
-        connectionId: z.string(),
-        name: z.string().min(1),
-        projectId: z.string(),
-      }),
-      output: z.object({
-        id: z.string(),
-        url: z.string().url(),
-      }),
-      scopes: ['asana.tasks.write'],
-      rest: { method: 'post', path: '/asana/tasks', summary: 'Create an Asana task' },
-      mcp: { name: 'asana_create_task', description: 'Create a task in Asana' },
+    get: ability.method({
+      input: z.object({ id: z.string() }),
+      output: z.object({ id: z.string(), title: z.string() }),
+      scopes: ['tasks.read'],
+      rest: { method: 'get', path: '/tasks/{id}', summary: 'Get a task' },
+      mcp: { name: 'tasks_get', description: 'Get a task by id' },
     }),
   },
-  handler: ({ context, identity }) => new AsanaTasksHandler(context.env, identity),
+});
+```
+
+The shared module contains schemas and metadata, but no handler and no private RPC type.
+
+## 2. Implement The Service
+
+```ts
+// service.ts
+import { WorkerEntrypoint } from 'cloudflare:workers';
+import {
+  type FetchLike,
+  type NativeAbilityCall,
+  ServicePlaneService,
+  defineCapabilities,
+  implementAbility,
+  jwksFromServiceBinding,
+} from 'service-plane/service';
+import { tasksContract } from './tasks.contract';
+
+type Env = { CONTROL_PLANE: FetchLike };
+
+const tasks = implementAbility(tasksContract, {
+  get: ({ input }) => loadTask(input.id),
 });
 
-class AsanaTasksHandler extends RpcTarget {
-  constructor(
-    private readonly env: Env,
-    private readonly identity: { serviceId: string },
-  ) {
-    super();
-  }
-
-  async createTask(input: { connectionId: string; name: string; projectId: string }) {
-    const id = this.env.ASANA_CONNECTIONS.idFromName(`${this.identity.serviceId}:${input.connectionId}`);
-    const connection = this.env.ASANA_CONNECTIONS.get(id);
-    return connection.createTask(input);
-  }
-}
-
-export default new ServicePlaneService<{ Bindings: Env }>({
-  id: 'asana',
-  title: 'Asana Service',
-  version: '0.2.0',
+const service = new ServicePlaneService<{ Bindings: Env }>({
+  id: 'tasks-service',
+  title: 'Tasks Service',
+  version: '1.0.0',
+  capabilities: defineCapabilities({
+    serviceId: 'tasks-service',
+    scopes: [{ id: 'tasks.read', title: 'Read tasks' }],
+  }),
+  abilities: [tasks],
   auth: {
     issuer: 'control-plane',
     jwks: (c) => jwksFromServiceBinding(c.env.CONTROL_PLANE),
   },
-  capabilities,
-  abilities: [asanaTasks],
 });
+
+export default class extends WorkerEntrypoint<Env> {
+  fetch(request: Request) {
+    return service.fetch(request, this.env, this.ctx);
+  }
+  invokeAbility(input: NativeAbilityCall) {
+    return service.invokeAbility(input, this.env);
+  }
+}
 ```
 
-This service mounts:
+For a small service, put `handler` directly in `ability.method({ ... })` and skip
+`implementAbility`. Keeping the contract separate is preferable when browsers or other packages
+import it.
 
-```txt
-GET /.well-known/service-plane/service.json
-ALL /rpc/asana.tasks
-```
+The entrypoint above enables Cloudflare native unary RPC. [Self-hosted runtimes](docs/nodejs.md)
+serve the same `service.fetch` through their Hono adapter or runtime server.
 
-## Minimal Control Plane
+Services require a signed control-plane broker claim by default. Only the control plane should be
+public. An internal ability uses `access: 'service'`; `exposure: 'private'` alone only hides its
+REST/MCP projection and does not grant or deny RPC access.
+
+## 3. Mount The Control Plane
 
 ```ts
+import type { AbilityNativeBinding } from 'service-plane/service';
 import {
+  type FetchLike,
   ServicePlaneControlPlane,
   cloudflareServiceBinding,
-  hmacServiceClientAuth,
+  httpsService,
 } from 'service-plane/control-plane';
 
-export default new ServicePlaneControlPlane({
-  signingKeys: (env) => [{ kid: '2026-07', secret: env.STS_SIGNING_SECRET }],
-  invocationMiddleware: async (c, next) => {
-    if (c.req.header('authorization') !== `Bearer ${c.env.PRODUCT_API_TOKEN}`) {
-      return c.json({ error: 'Unauthorized' }, 401);
-    }
-    c.set('servicePlaneCaller', { id: 'product-api', kind: 'user' });
-    await next();
-  },
-  authenticateCaller: (c) =>
-    hmacServiceClientAuth({
-      clients: [{ clientId: 'workflow-runner', secret: c.env.WORKFLOW_RUNNER_SECRET }],
-    })(c),
-  services: (c) => [
-    cloudflareServiceBinding({
-      id: 'asana',
-      binding: c.env.ASANA,
-      grants: [{ caller: 'workflow-runner', scopes: ['asana.tasks.write'] }],
-    }),
-  ],
-});
-```
-
-The control plane mounts:
-
-```txt
-POST /.well-known/service-plane/capability-token
-GET  /.well-known/service-plane/jwks.json
-GET  /openapi.json
-POST /mcp                                        (when published MCP projections exist)
-*    <published rest.path>                       (metadata-driven REST facade)
-```
-
-`invocationMiddleware` is ordinary Hono middleware shared by product-facing REST, MCP, and optional
-RPC broker traffic. It authenticates the request and must place its `BrokerCaller` in
-`servicePlaneCaller` before calling `next()`. It is separate from `authenticateCaller`, which
-authenticates services asking the capability-token endpoint for a token. A method's
-`rest: { method, path, status? }` metadata drives both OpenAPI and the live route; no per-route Hono
-handler is required.
-
-The plane serves the OpenAPI document; to render it, mount a Hono UI extension (e.g. `@hono/swagger-ui` or `@scalar/hono-api-reference`) on `plane.app` pointed at `/openapi.json`.
-
-For this compact local-development walkthrough, the service above leaves `ingress` disabled so the caller below can connect directly. Do not use this direct topology as the production boundary. Production services should enable `ingress: {}` and route ability calls through the control-plane broker; direct non-brokered tokens are then rejected with `403` before handler creation. See [Service-Plane Ingress](docs/plane-creation.md#service-plane-ingress).
-
-## Minimal Local Caller
-
-```ts
-import {
-  abilitySession,
-  cloudflareServiceBindingRpc,
-  controlPlaneHmacTokenRequester,
-  type AbilityRpc,
-} from 'service-plane/service';
-
-declare const env: {
-  ASANA: Fetcher;
-  CONTROL_PLANE: Fetcher;
-  WORKFLOW_RUNNER_SECRET: string;
+type ControlPlaneEnv = {
+  Bindings: {
+    STS_SIGNING_SECRET: string;
+    TASKS: FetchLike & AbilityNativeBinding;
+  };
 };
 
-const asana = await abilitySession<AbilityRpc<typeof asanaTasks>>({
-  abilityId: 'asana.tasks',
-  callerServiceId: 'workflow-runner',
-  targetServiceId: 'asana',
-  scopes: ['asana.tasks.write'],
-  requestToken: controlPlaneHmacTokenRequester({
-    clientId: 'workflow-runner',
-    clientSecret: env.WORKFLOW_RUNNER_SECRET,
-    controlPlaneUrl: 'https://control-plane.internal',
-    fetch: env.CONTROL_PLANE,
-  }),
-  transport: cloudflareServiceBindingRpc(env.ASANA),
+export default new ServicePlaneControlPlane<ControlPlaneEnv>({
+  signingKeys: (env) => [{ kid: '2026-08', secret: env.STS_SIGNING_SECRET }],
+  services: (c) => [
+    cloudflareServiceBinding({
+      id: 'tasks-service',
+      binding: c.env.TASKS,
+      abilityRpc: true,
+      grants: [{ caller: 'control-plane', scopes: ['tasks.read'] }],
+    }),
+    httpsService({
+      id: 'reports-service',
+      baseUrl: 'https://reports.internal.example',
+      grants: [{ caller: 'control-plane', scopes: ['reports.read'] }],
+    }),
+  ],
+  invocationMiddleware: async (c, next) => {
+    const caller = await authenticateProductRequest(c.req.raw);
+    if (!caller) return c.json({ error: 'Unauthorized' }, 401);
+    c.set('servicePlaneCaller', { id: caller.id, kind: 'user' });
+    await next();
+  },
+  authorizeInvocation: (invocation, c) => canInvoke(c.env, invocation),
+  broker: {},
+  mcp: {},
+});
+```
+
+The plane always mounts capability-token/JWKS endpoints and OpenAPI unless disabled. Published REST
+routes are on by default; `rest: false` removes their catch-all. `broker: {}` adds `/rpc/v1/broker` and
+`mcp: {}` adds `/mcp`. Every product-facing surface fails closed unless trusted middleware sets
+`servicePlaneCaller`.
+
+The second endpoint may run on Node, Bun, or Deno behind TLS or a private tunnel. Hosting location
+does not determine exposure: every service owns its ability metadata and verifies brokered tokens.
+Public RPC, REST, and MCP all use the same discovery, grants, schemas, and execution boundary.
+
+`authenticateProductRequest` and `canInvoke` are application functions. Authentication identifies
+the caller; `authorizeInvocation` decides which method and scopes that caller may use before a
+capability is minted. Service handlers still enforce tenant ownership and other input-level rules.
+
+## 4. Call Through The Plane
+
+```ts
+import { createBrokeredAbilityClient } from 'service-plane/service';
+import { tasksContract } from './tasks.contract';
+
+const tasks = createBrokeredAbilityClient({
+  ability: tasksContract,
+  targetServiceId: 'tasks-service',
+  transport: {
+    origin: 'https://api.example.com',
+    headers: () => ({ authorization: `Bearer ${readProductToken()}` }),
+  },
 });
 
-await asana.createTask({
-  connectionId: 'conn_123',
-  name: 'Follow up',
-  projectId: 'proj_456',
-});
+const task = await tasks.get({ id: 'task_123' }, { timeoutMs: 2_000 });
 ```
 
-## Agent Skill
+Required method scopes are inferred from the contract. Each call can override `requestId`,
+`idempotencyKey`, `timeoutMs`, and `signal`. TanStack Query needs only explicit one-line wrappers:
+`mutationFn: (input) => tasks.create(input)` and `queryFn: () => tasks.get({ id })`. The wrappers
+keep TanStack's own query and mutation contexts out of Service Plane call options.
 
-The repo ships an [APM](https://microsoft.github.io/apm/) package with a
-`service-plane` skill that teaches coding agents the ability model, the
-security boundaries, and where to find deeper reference material. It is
-distributed through this Git repo by the APM CLI, independently of npm.
+`transport.headers` authenticates Fetch only. Authenticate a broker WebSocket's HTTP upgrade with a
+secure cookie, short-lived URL ticket, or runtime-specific `createWebSocket` closure.
 
-Install the APM CLI once ([instructions](https://microsoft.github.io/apm/quickstart/)), then install the skill into a consumer project:
+## Runtime Choices
 
-```sh
-apm install JUVOJustin/service-plane
-```
+- Cloudflare Worker to Worker: native service-binding RPC for unary calls; binding Fetch for streams.
+- Cross-runtime or cross-account: Fetch by default.
+- Long-lived interactive streams: WebSocket.
+- Public browser or headless client: the control-plane broker, REST, or MCP; do not expose services.
 
-Or pin it as a dependency so every teammate gets the same version. Minimal
-`apm.yml` in the consumer repo:
+The package runs on Cloudflare Workers and supported Node.js releases (22+) and uses web-standard
+APIs. oRPC is a pinned, private dependency: consumers import only Service Plane contracts, clients,
+errors, and wire options.
 
-```yaml
-name: my-project
-version: 1.0.0
-dependencies:
-  apm:
-    - JUVOJustin/service-plane
-```
-
-```sh
-apm install
-```
-
-Either way the skill deploys to your agent's native location
-(`.claude/skills/` for Claude Code, `.agents/skills/` for Copilot, Cursor,
-and others; commit `apm.lock.yaml` to keep installs reproducible). From
-there the agent activates it automatically whenever a task touches
-service-plane code — no prompting needed. The skill source lives in
-[`.apm/skills/service-plane/`](.apm/skills/service-plane/SKILL.md); its
-references are synced copies of [`docs/`](docs/).
-
-## Docs
+## Documentation
 
 - [Architecture](docs/architecture.md)
-- [Create A Service](docs/service-creation.md)
-- [Create A Control Plane](docs/plane-creation.md)
-- [Streaming](docs/streaming.md)
-- [Choosing A Transport](docs/transports.md)
-- [Auth](docs/auth.md)
-- [Cloudflare](docs/cloudflare.md)
-- [Node.js And Self-Hosted Services](docs/nodejs.md)
-- [OpenAPI And MCP](docs/openapi-mcp.md)
-- [Reference](docs/reference.md)
+- [Create a service](docs/service-creation.md)
+- [Create a control plane](docs/plane-creation.md)
+- [Authentication and authorization](docs/auth.md)
+- [Transports](docs/transports.md) and [streaming](docs/streaming.md)
+- [OpenAPI and MCP](docs/openapi-mcp.md); deploy on [Cloudflare](docs/cloudflare.md) or [Node.js](docs/nodejs.md)
+- [API reference](docs/reference.md)
+- [Migration guide](docs/migration-rpc-boundary.md)
+
+## Releases
+
+Update `package.json` and `package-lock.json` to the intended version in a reviewed release PR, then
+publish a GitHub release with the matching SemVer tag, such as `v0.5.0` or `v0.5.0-beta.1`. The
+release workflow checks that the tag and package version agree, reruns the complete verification,
+and publishes with npm provenance: stable versions to `latest`, prereleases to `next`. A standalone
+pushed tag does not publish anything.

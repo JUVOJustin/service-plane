@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { SERVICE_PLANE_CAPABILITY_TOKEN_PATH, SERVICE_PLANE_OPENAPI_PATH, type ServiceDiscoveryDocument } from '../shared/types.js';
+import { z } from 'zod';
+import { createAbilityBuilder } from '../service/ability.js';
+import { createBrokeredAbilityClient } from '../service/client.js';
+import { defineAbility } from '../service/discovery.js';
+import {
+  type OpenApiDocument,
+  SERVICE_PLANE_CAPABILITY_TOKEN_PATH,
+  SERVICE_PLANE_OPENAPI_PATH,
+  type ServiceDiscoveryDocument,
+} from '../shared/types.js';
 import { ServicePlaneControlPlane } from './control-plane.js';
 import { cloudflareServiceBinding } from './endpoints.js';
 import { memoryRegistryCache } from './registry.js';
@@ -17,7 +26,7 @@ const discovery = (id: string): ServiceDiscoveryDocument => ({
       exposure: 'published',
       id: `${id}.run`,
       methods: { go: { inputSchema: { type: 'object' }, outputSchema: { type: 'object' }, scopes: [`${id}.use`] } },
-      rpc: { path: `/rpc/${id}.run`, transports: ['http-batch'] },
+      rpc: { path: `/rpc/v1/${id}.run`, transports: ['fetch'] },
       scopes: [`${id}.use`],
     },
   ],
@@ -53,9 +62,9 @@ function planeWith(options: { cache?: false | ReturnType<typeof memoryRegistryCa
   return { counter, plane };
 }
 
-const tokenRequest = () =>
+const tokenRequest = (targetServiceId = 'svc0', scope = `${targetServiceId}.use`) =>
   new Request(`https://plane.internal${SERVICE_PLANE_CAPABILITY_TOKEN_PATH}`, {
-    body: JSON.stringify({ scopes: ['svc0.use'], targetServiceId: 'svc0' }),
+    body: JSON.stringify({ scopes: [scope], targetServiceId }),
     headers: { 'content-type': 'application/json' },
     method: 'POST',
   });
@@ -147,6 +156,39 @@ describe('discovery cache on the token path', () => {
     // Recovery is cached normally once it is complete.
     expect((await plane.fetch(tokenRequest())).status).toBe(200);
     expect(fetches).toBe(2);
+  });
+
+  it('keeps healthy token issuance available when another service reports malformed scopes', async () => {
+    const secret = await generateCapabilitySigningSecret();
+    const plane = new ServicePlaneControlPlane({
+      authenticateCaller: () => 'worker-a',
+      log: false,
+      services: () => [
+        cloudflareServiceBinding({
+          binding: { fetch: async () => Response.json(discovery('svc0')) },
+          grants: [{ caller: 'worker-a', scopes: ['svc0.use'] }],
+          id: 'svc0',
+        }),
+        cloudflareServiceBinding({
+          binding: {
+            fetch: async () =>
+              Response.json({
+                ...discovery('broken'),
+                capabilities: { scopes: [null], serviceId: 'broken' },
+              }),
+          },
+          grants: [{ caller: 'worker-a', scopes: ['broken.use'] }],
+          id: 'broken',
+        }),
+      ],
+      signingKeys: () => [{ kid: 'test-key', secret }],
+    });
+
+    expect((await plane.fetch(tokenRequest())).status).toBe(200);
+
+    const malformedTarget = await plane.fetch(tokenRequest('broken'));
+    expect(malformedTarget.status).toBe(500);
+    await expect(malformedTarget.json()).resolves.toEqual({ error: 'Unknown Service-Plane capability target: broken' });
   });
 
   it('still refuses a withdrawn grant while the catalog is cached', async () => {
@@ -278,12 +320,133 @@ describe('discovery cache on the token path', () => {
     expect(fetches).toBe(1);
   });
 
+  it('serves an explicit OpenAPI document-cache hit without resolving services', async () => {
+    const document = {
+      info: { title: 'Cached API', version: '7.0.0' },
+      openapi: '3.2.0',
+      paths: {},
+    } satisfies OpenApiDocument;
+    const plane = new ServicePlaneControlPlane({
+      broker: false,
+      log: false,
+      openapi: {
+        cache: {
+          get: async (key) => (key === 'product-api-v7' ? document : undefined),
+          set: async () => {
+            throw new Error('A cache hit must not be replaced');
+          },
+        },
+        cacheKey: 'product-api-v7',
+      },
+      rest: false,
+      services: () => {
+        throw new Error('A cache hit must not resolve services');
+      },
+      signingKeys: () => [],
+    });
+
+    const response = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`));
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual(document);
+  });
+
+  it.each(['get', 'set'] as const)('generates OpenAPI when the explicit document cache rejects %s', async (failedOperation) => {
+    let failedOperationCalls = 0;
+    let fetches = 0;
+    const plane = new ServicePlaneControlPlane({
+      broker: false,
+      log: false,
+      openapi: {
+        cache: {
+          async get() {
+            if (failedOperation === 'get') {
+              failedOperationCalls += 1;
+              throw new Error('cache unavailable');
+            }
+            return undefined;
+          },
+          async set() {
+            if (failedOperation === 'set') {
+              failedOperationCalls += 1;
+              throw new Error('cache unavailable');
+            }
+          },
+        },
+        cacheKey: 'product-api-v8',
+      },
+      rest: false,
+      services: () => [
+        cloudflareServiceBinding({
+          binding: {
+            fetch: async () => {
+              fetches += 1;
+              return Response.json(discovery('svc0'));
+            },
+          },
+          id: 'svc0',
+        }),
+      ],
+      signingKeys: () => [],
+    });
+
+    const response = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`));
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ info: { title: 'Service Plane API' }, openapi: '3.2.0' });
+    expect(failedOperationCalls).toBe(1);
+    expect(fetches).toBe(1);
+  });
+
+  it.each([
+    { broker: {}, brokerPath: '/rpc/v1/broker' },
+    { broker: { path: '/custom-broker/' }, brokerPath: '/custom-broker' },
+  ])('keeps REST projections out of the $brokerPath broker namespace', async ({ broker, brokerPath }) => {
+    const projectedDiscovery = (id: string, path: string): ServiceDiscoveryDocument => {
+      const document = discovery(id);
+      const ability = document.abilities[0];
+      const method = ability?.methods.go;
+      if (!ability || !method) throw new Error('missing discovery fixture method');
+      return {
+        ...document,
+        abilities: [
+          {
+            ...ability,
+            methods: { go: { ...method, rest: { method: 'get', path } } },
+          },
+        ],
+      };
+    };
+    const plane = new ServicePlaneControlPlane({
+      broker,
+      log: false,
+      services: () => [
+        cloudflareServiceBinding({
+          binding: { fetch: async () => Response.json(projectedDiscovery('healthy', '/healthy')) },
+          id: 'healthy',
+        }),
+        cloudflareServiceBinding({
+          binding: { fetch: async () => Response.json(projectedDiscovery('shadow', `${brokerPath}/shadow`)) },
+          id: 'shadow',
+        }),
+      ],
+      signingKeys: () => [],
+    });
+
+    const response = await plane.fetch(new Request(`https://plane.internal${SERVICE_PLANE_OPENAPI_PATH}`));
+    const openApi = (await response.json()) as OpenApiDocument;
+
+    expect(response.status).toBe(200);
+    expect(openApi.paths).toHaveProperty('/healthy');
+    expect(openApi.paths).not.toHaveProperty(`${brokerPath}/shadow`);
+  });
+
   it('resolves a brokered request once, not once per half', async () => {
     const secret = await generateCapabilitySigningSecret();
     let fetches = 0;
     const plane = new ServicePlaneControlPlane({
       authenticateCaller: () => 'worker-a',
-      rpc: {},
+      broker: { path: '/rpc' },
       invocationMiddleware: async (context, next) => {
         context.set('servicePlaneCaller', { id: 'gateway', kind: 'user' });
         await next();
@@ -304,20 +467,77 @@ describe('discovery cache on the token path', () => {
       signingKeys: () => [{ kid: 'test-key', secret }],
     });
 
-    const brokerRequest = () =>
-      new Request('https://plane.internal/rpc', {
-        body: JSON.stringify([]),
-        headers: { 'content-type': 'application/json' },
-        method: 'POST',
-      });
+    const ability = createAbilityBuilder();
+    const contract = defineAbility({
+      id: 'svc0.run',
+      methods: {
+        go: ability.method({
+          input: z.object({}),
+          output: z.object({}),
+          scopes: ['svc0.use'],
+        }),
+      },
+      scopes: ['svc0.use'],
+    });
+    const client = createBrokeredAbilityClient({
+      ability: contract,
+      targetServiceId: 'svc0',
+      transport: {
+        fetch: async (url, init) => plane.fetch(new Request(url, init)),
+        origin: 'https://plane.internal',
+        path: '/rpc',
+      },
+    });
 
     // A brokered call needs an issuer *and* a registry. Both are the call path, so both read the
     // same store: one resolution for the request, not one per half.
-    await plane.fetch(brokerRequest());
+    await client.go({}).catch(() => undefined);
     expect(fetches).toBe(1);
 
-    await plane.fetch(brokerRequest());
+    await client.go({}).catch(() => undefined);
     expect(fetches).toBe(1);
+  });
+
+  it('does not resolve signing material for an unknown broker ability', async () => {
+    const ability = createAbilityBuilder();
+    const contract = defineAbility({
+      id: 'missing.run',
+      methods: {
+        go: ability.method({
+          input: z.object({}),
+          output: z.object({}),
+          scopes: ['missing.use'],
+        }),
+      },
+      scopes: ['missing.use'],
+    });
+    let signingKeyResolutions = 0;
+    const plane = new ServicePlaneControlPlane({
+      broker: {},
+      invocationMiddleware: async (context, next) => {
+        context.set('servicePlaneCaller', { id: 'gateway', kind: 'user' });
+        await next();
+      },
+      log: false,
+      openapi: false,
+      rest: false,
+      services: () => [],
+      signingKeys: () => {
+        signingKeyResolutions += 1;
+        throw new Error('Unknown abilities must not need signing material');
+      },
+    });
+    const client = createBrokeredAbilityClient({
+      ability: contract,
+      targetServiceId: 'missing',
+      transport: {
+        fetch: async (url, init) => plane.fetch(new Request(url, init)),
+        origin: 'https://plane.internal',
+      },
+    });
+
+    await expect(client.go({})).rejects.toMatchObject({ status: 404 });
+    expect(signingKeyResolutions).toBe(0);
   });
 
   it('coalesces concurrent fills instead of fanning out per request', async () => {
@@ -383,7 +603,7 @@ describe('discovery cache on the token path', () => {
                       methods: {
                         go: { inputSchema: { type: 'object' }, outputSchema: { type: 'object' }, scopes: [`svc0.${tenant}`] },
                       },
-                      rpc: { path: '/rpc/svc0.run', transports: ['http-batch' as const] },
+                      rpc: { path: '/rpc/v1/svc0.run', transports: ['fetch' as const] },
                       scopes: [`svc0.${tenant}`],
                     },
                   ],

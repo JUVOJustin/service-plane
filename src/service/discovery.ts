@@ -1,221 +1,212 @@
 import type { StandardJSONSchemaV1, StandardSchemaV1 } from '@standard-schema/spec';
-import { RpcPromise, RpcTarget } from 'capnweb';
-import type { Context, Env } from 'hono';
+import type { Env } from 'hono';
 import type { ConnInfo } from '../shared/conn-info.js';
-import { DEFAULT_ABILITY_TIMEOUT_MS, discardDisposableValue, raceDeadline } from '../shared/deadline.js';
-import {
-  AbilityValidationError,
-  type AbilityValidationIssue,
-  CapabilityAuthError,
-  rememberHandlerFailureCause,
-  ServicePlaneError,
-  ServicePlaneTimeoutError,
-  servicePlaneErrorInfo,
-} from '../shared/errors.js';
+import { DEFAULT_ABILITY_TIMEOUT_MS } from '../shared/deadline.js';
+import { CapabilityAuthError, requireNonEmpty } from '../shared/errors.js';
+import { isAbilityAccess, isAbilityExposure, isAbilityTransport, isServiceHttpMethod } from '../shared/guards.js';
 import { jsonSchemaRootProperties } from '../shared/json-schema.js';
-import { isOriginRelativePath, pathTemplateVariables } from '../shared/paths.js';
+import { PRIVATE_JWK_MEMBERS } from '../shared/jwk-auth.js';
 import {
-  type AbilityAccess,
-  type AbilityExposure,
-  type AbilityTransport,
-  type CapabilityCatalog,
-  type CapabilityIdentity,
-  isAbilityAccess,
-  type OpenApiObject,
-  SERVICE_DISCOVERY_PATH,
-  type ServiceAbilityDiscovery,
-  type ServiceAbilityMcpProjection,
-  type ServiceAbilityMcpPromptProjection,
-  type ServiceAbilityMcpResourceProjection,
-  type ServiceAbilityMethodDiscovery,
-  type ServiceAbilityRestProjection,
-  type ServiceCallerAuthDiscovery,
-  type ServiceDiscoveryDocument,
-  type ServiceHttpMethod,
+  hasOnlySimpleTemplateExpressions,
+  isOriginRelativePath,
+  normalizeOriginRelativePath,
+  pathTemplateVariables,
+} from '../shared/paths.js';
+import { SERVICE_PLANE_RPC_PREFIX, SERVICE_PLANE_RPC_PROTOCOL } from '../shared/rpc-protocol.js';
+import type {
+  AbilityAccess,
+  AbilityExposure,
+  AbilityTransport,
+  CapabilityCatalog,
+  OpenApiObject,
+  ReadonlyOpenApiObject,
+  ReadonlyServiceCallerAuthDiscovery,
+  ServiceAbilityDiscovery,
+  ServiceAbilityMcpProjection,
+  ServiceAbilityMcpPromptProjection,
+  ServiceAbilityMcpResourceProjection,
+  ServiceAbilityMethodDiscovery,
+  ServiceAbilityRestProjection,
+  ServiceCallerAuthDiscovery,
+  ServiceDiscoveryDocument,
+  ServiceHttpMethod,
 } from '../shared/types.js';
-import { bindCapabilityIdentity, capabilityIdentity, requireScopes } from './capabilities.js';
+import {
+  type AbilityMethodDefinition,
+  type AbilityMethodHandlerFor,
+  type AbilityMethodKind,
+  type AbilitySchema,
+  type AbilityStream,
+  type AnyAbilityMethodDefinition,
+  implementAbilityMethod,
+  isAbilityMethodDefinition,
+  isImplementedAbilityMethod,
+} from './ability.js';
+import { defineCapabilities } from './capabilities.js';
 
 /**
  * Abilities accept any Standard Schema value, so services pick their own validation library.
  * The JSON Schema half of the spec is required rather than optional: every ability method is
  * projected into the discovery document, and OpenAPI/MCP projections read those schemas.
  */
-export type AbilitySchema = StandardSchemaV1 & StandardJSONSchemaV1;
-
 // Discovery documents have always carried draft-2020-12 JSON Schema; naming the target keeps
 // that stable across validation libraries instead of inheriting each vendor's default.
 const ABILITY_JSON_SCHEMA_TARGET: StandardJSONSchemaV1.Target = 'draft-2020-12';
 
-type AbilitySchemaInput<TSchema extends AbilitySchema> = StandardSchemaV1.InferInput<TSchema>;
-type AbilitySchemaOutput<TSchema extends AbilitySchema> = StandardSchemaV1.InferOutput<TSchema>;
+// Promise and JSON machinery call these names implicitly. Every other string is safe because the
+// public client is a flat null-prototype object rather than a recursive function proxy.
+const RESERVED_ABILITY_METHOD_NAMES = new Set(['then', 'toJSON', '__proto__']);
 
-export type AbilityMethodDefinition<TInput extends AbilitySchema = AbilitySchema, TOutput extends AbilitySchema = AbilitySchema> = {
-  /**
-   * Declares that calling this method again with the same input cannot double its effect, so a
-   * caller may safely retry an ambiguous failure. Projected into discovery for callers and
-   * gateways to read; this package never retries on its own.
-   */
-  idempotent?: true;
-  input: TInput;
-  mcp?: ServiceAbilityMcpProjection;
-  mcpPrompt?: ServiceAbilityMcpPromptProjection;
-  mcpResource?: ServiceAbilityMcpResourceProjection;
-  output: TOutput;
-  rest?: ServiceAbilityRestProjection;
-  scopes?: string[];
-  /**
-   * Streaming methods return a ReadableStream of `output`-shaped items over the ordinary
-   * Cap'n Web session instead of one value; `output` validates each item.
-   */
-  stream?: true;
-  /**
-   * How long this method may run, overriding the service-wide ceiling. Set it on the one export
-   * that legitimately takes minutes rather than raising the ceiling for everything — unlike a
-   * forwarded deadline it is not clamped to the 10-minute wire ceiling. Ignored on streaming
-   * methods. `0` removes the ceiling for this method; anything else must be a positive integer or
-   * the service definition is refused.
-   */
+function isReservedAbilityMethodName(name: string): boolean {
+  return RESERVED_ABILITY_METHOD_NAMES.has(name);
+}
+
+/** Transport-neutral method contracts forming one ability. */
+export type AbilityMethodDefinitions<TEnv extends Env = never> = Readonly<Record<string, AnyAbilityMethodDefinition<TEnv>>>;
+
+/** Service-side handlers inferred from a shared ability contract. */
+export type AbilityImplementation<TMethods extends AbilityMethodDefinitions<never>> = {
+  readonly [TMethod in keyof TMethods]: AbilityMethodHandlerFor<TMethods[TMethod]>;
+};
+
+/** Ability definition consumed by Service Plane independently of its private RPC engine. */
+export type ServiceAbilityDefinition<
+  _TEnv extends Env = Env,
+  TMethods extends AbilityMethodDefinitions<_TEnv> = AbilityMethodDefinitions<_TEnv>,
+> = {
+  /** Which authenticated caller class may invoke the ability. */
+  readonly access?: AbilityAccess;
+  /** Human-readable ability description used by projections. */
+  readonly description?: string;
+  /** Whether user-facing projections may publish the ability. */
+  readonly exposure?: AbilityExposure;
+  /** Stable ability identifier within the service. */
+  readonly id: string;
+  /** Service Plane method contracts; implementations are attached privately by the service. */
+  readonly methods: Readonly<TMethods>;
+  /** Wire path and transports implemented by the owning service. */
+  readonly rpc?: {
+    /** Origin-relative path prefix for this ability. */
+    readonly path?: string;
+    /** Transports the deployed service accepts. */
+    readonly transports?: ReadonlyArray<AbilityTransport>;
+  };
+  /** Maximum capability scope surface available to methods in this ability. */
+  readonly scopes?: ReadonlyArray<string>;
+  /** Human-readable ability title used by projections. */
+  readonly title?: string;
+};
+
+/** The only supported ability definition shape. */
+export type AnyServiceAbilityDefinition<TEnv extends Env = never> = ServiceAbilityDefinition<TEnv>;
+
+/** Per-call controls shared by every generated ability client. */
+export type AbilityCallOptions = {
+  /** Advisory connection information for this call, overriding the client default. */
+  connInfo?: ConnInfo;
+  /** Caller-owned key for this logical attempt, overriding the client default. */
+  idempotencyKey?: string;
+  /** Correlation id for this call, overriding the client default. */
+  requestId?: string;
+  /** Cancels the local transport call when the selected runtime supports cancellation. */
+  signal?: AbortSignal;
+  /** End-to-end budget for this call in milliseconds, overriding the client default. */
   timeoutMs?: number;
 };
 
-export type AbilityMethodDefinitions = Record<string, AbilityMethodDefinition>;
+type AbilityClientMethod<TMethod extends AnyAbilityMethodDefinition<never>, TCallOptions extends AbilityCallOptions> = (
+  input: StandardSchemaV1.InferInput<TMethod['input']>,
+  options?: TCallOptions,
+) => Promise<
+  TMethod['kind'] extends 'unary'
+    ? StandardSchemaV1.InferOutput<TMethod['output']>
+    : AbilityStream<StandardSchemaV1.InferOutput<TMethod['output']>>
+>;
 
-export type ServiceAbilityHandlerFactoryInput<TEnv extends Env = Env> = {
-  abilityId: string;
-  /**
-   * Advisory connection info about the original client, forwarded by the control plane. Present
-   * only for brokered calls into an ingress-protected service; unlike `identity` it is not
-   * signature-verified, so use it for audit and logging, never for authorization.
-   */
-  connInfo?: ConnInfo;
-  context: Context<TEnv>;
-  identity: CapabilityIdentity;
-  /**
-   * The caller's key for this attempt, when it sent one. It identifies the attempt, not the
-   * individual method call, so a handler that stores results must scope it by method name —
-   * `${idempotencyKey}:createTask` — or two different methods on one session would collide.
-   * Storing and expiring those results is the service's job; this package only forwards the key.
-   */
-  idempotencyKey?: string;
-  /**
-   * Milliseconds still left of the caller's deadline, read at call time. Present only when the
-   * caller sent one, and 0 once the budget is gone.
-   *
-   * This is what makes a chain work: a handler that calls another service must pass the remainder
-   * on as that call's `timeoutMs`, or the next hop starts a fresh budget and the end-to-end bound
-   * the first caller asked for is lost. Both readings come from this machine's clock, so no hop
-   * has to agree with any other about the time.
-   *
-   * ```ts
-   * const downstream = await abilitySession({ ...opts, timeoutMs: remainingTimeoutMs?.() });
-   * ```
-   */
-  remainingTimeoutMs?: () => number;
-  /**
-   * Aborts when the caller's forwarded deadline elapses. Present only when the caller sent one.
-   * Pass it to outbound `fetch` calls and long-running work so a handler stops doing work nobody is
-   * waiting for; the wrapper also fails the method on abort, so ignoring it costs the work, not
-   * correctness. Over a session transport the budget is fixed when the session opens and therefore
-   * bounds every call on it, not each call separately.
-   */
-  signal?: AbortSignal;
+/** Fully typed client shape derived only from the portable ability contract. */
+export type AbilityClient<TAbility extends AnyServiceAbilityDefinition, TCallOptions extends AbilityCallOptions = AbilityCallOptions> = {
+  [TMethod in keyof TAbility['methods']]: TAbility['methods'][TMethod] extends AnyAbilityMethodDefinition<never>
+    ? AbilityClientMethod<TAbility['methods'][TMethod], TCallOptions>
+    : never;
 };
-
-/**
- * `Iterable & object` keeps plain strings out: a string is Iterable<string>, but handing one
- * back from a streaming method is almost certainly a bug, and the runtime rejects it.
- */
-export type AbilityStreamSource<TItem> = AsyncIterable<TItem> | (Iterable<TItem> & object) | ReadableStream<TItem>;
-
-// Streamed items are re-validated against `output`, so handlers must yield the schema's INPUT
-// shape: for transforming schemas (pipes, coercions) the transformed output would fail
-// re-validation, so unlike unary methods the output side is not accepted here.
-type AbilityMethodItem<TMethod extends AbilityMethodDefinition> = AbilitySchemaInput<TMethod['output']>;
-
-export type AbilityImplementation<TAbility extends ServiceAbilityDefinition> = {
-  [TMethod in keyof TAbility['methods']]: TAbility['methods'][TMethod] extends { stream: true }
-    ? (
-        input: AbilitySchemaOutput<TAbility['methods'][TMethod]['input']>,
-      ) =>
-        | AbilityStreamSource<AbilityMethodItem<TAbility['methods'][TMethod]>>
-        | Promise<AbilityStreamSource<AbilityMethodItem<TAbility['methods'][TMethod]>>>
-    : (
-        input: AbilitySchemaOutput<TAbility['methods'][TMethod]['input']>,
-      ) =>
-        | Promise<AbilitySchemaInput<TAbility['methods'][TMethod]['output']> | AbilitySchemaOutput<TAbility['methods'][TMethod]['output']>>
-        | AbilitySchemaInput<TAbility['methods'][TMethod]['output']>
-        | AbilitySchemaOutput<TAbility['methods'][TMethod]['output']>;
-};
-
-/**
- * Streaming methods resolve to a native Cap'n Web ReadableStream of validated items; they
- * require a session transport (WebSocket, native binding, custom bidirectional).
- */
-export type AbilityRpc<TAbility extends ServiceAbilityDefinition> = {
-  [TMethod in keyof TAbility['methods']]: TAbility['methods'][TMethod] extends { stream: true }
-    ? (
-        input: AbilitySchemaInput<TAbility['methods'][TMethod]['input']>,
-      ) => Promise<ReadableStream<AbilitySchemaOutput<TAbility['methods'][TMethod]['output']>>>
-    : (
-        input: AbilitySchemaInput<TAbility['methods'][TMethod]['input']>,
-      ) => Promise<AbilitySchemaOutput<TAbility['methods'][TMethod]['output']>>;
-};
-
-export type ServiceAbilityHandlerFactory<TEnv extends Env = Env> = (
-  input: ServiceAbilityHandlerFactoryInput<TEnv>,
-) => Promise<RpcTarget & Record<string, unknown>> | (RpcTarget & Record<string, unknown>);
-
-export type ServiceAbilityDefinition<TEnv extends Env = Env, TMethods extends AbilityMethodDefinitions = AbilityMethodDefinitions> = {
-  access?: AbilityAccess;
-  description?: string;
-  exposure?: AbilityExposure;
-  id: string;
-  methods: TMethods;
-  rpc?: {
-    path?: string;
-    transports?: AbilityTransport[];
-  };
-  scopes?: string[];
-  handler: ServiceAbilityHandlerFactory<TEnv>;
-  title?: string;
-};
-
-export type AnyServiceAbilityDefinition<TEnv extends Env = Env> = ServiceAbilityDefinition<TEnv, AbilityMethodDefinitions>;
 
 export type NormalizedAbilityMethodDefinition<
   TInput extends AbilitySchema = AbilitySchema,
   TOutput extends AbilitySchema = AbilitySchema,
-> = AbilityMethodDefinition<TInput, TOutput> & {
-  inputSchema: OpenApiObject;
-  outputSchema: OpenApiObject;
-  scopes: string[];
+  in TEnv extends Env = Env,
+> = {
+  /** Whether retrying the same logical operation is declared safe. */
+  readonly idempotent?: true;
+  /** Validates caller data at the service boundary before the handler runs. */
+  readonly input: TInput;
+  /** Draft 2020-12 representation emitted into discovery and public projections. */
+  readonly inputSchema: ReadonlyOpenApiObject;
+  /** Validated metadata emitted when this method is published as an MCP tool. */
+  readonly mcp?: ServiceAbilityMcpProjection;
+  /** Validated metadata emitted when this method is published as an MCP prompt. */
+  readonly mcpPrompt?: ServiceAbilityMcpPromptProjection;
+  /** Validated metadata emitted when this method is published as an MCP resource. */
+  readonly mcpResource?: ServiceAbilityMcpResourceProjection;
+  /** Portable method contract compiled by the private runtime. */
+  readonly method: AbilityMethodDefinition<TEnv, TInput, TOutput, AbilityMethodKind>;
+  /** Validates a unary result or every yielded stream item before transport. */
+  readonly output: TOutput;
+  /** Draft 2020-12 representation emitted into discovery and public projections. */
+  readonly outputSchema: ReadonlyOpenApiObject;
+  /** Validated HTTP method, path, and response metadata emitted into the REST facade. */
+  readonly rest?: ServiceAbilityRestProjection;
+  /** Minimum capability scopes required by the method. */
+  readonly scopes: ReadonlyArray<string>;
+  /** When present, `output` and `outputSchema` describe each yielded item rather than one aggregate result. */
+  readonly stream?: true;
+  /** Effective unary execution ceiling in milliseconds. */
+  readonly timeoutMs?: number;
 };
 
-export type NormalizedServiceAbility<TEnv extends Env = Env> = Omit<
-  AnyServiceAbilityDefinition<TEnv>,
-  'access' | 'exposure' | 'methods' | 'rpc' | 'scopes'
-> & {
-  access: AbilityAccess;
-  exposure: AbilityExposure;
-  methods: Record<string, NormalizedAbilityMethodDefinition>;
-  rpc: {
-    path: string;
-    transports: AbilityTransport[];
+export type NormalizedServiceAbility<in TEnv extends Env = Env> = {
+  /** Normalized caller access class. */
+  readonly access: AbilityAccess;
+  /** Definition-authored description copied into discovery and public projections. */
+  readonly description?: string;
+  /** Normalized projection visibility. */
+  readonly exposure: AbilityExposure;
+  /** Trimmed service-local key used by routes, tokens, discovery, and typed clients. */
+  readonly id: string;
+  /** Normalized methods keyed by their public names. */
+  readonly methods: Readonly<Record<string, NormalizedAbilityMethodDefinition<AbilitySchema, AbilitySchema, TEnv>>>;
+  /** Normalized path and transport declarations. */
+  readonly rpc: {
+    /** Origin-relative ability path prefix. */
+    readonly path: string;
+    /** Enabled transports with duplicates removed. */
+    readonly transports: ReadonlyArray<AbilityTransport>;
   };
-  scopes: string[];
+  /** Normalized maximum scope surface. */
+  readonly scopes: ReadonlyArray<string>;
+  /** Definition-authored title copied into discovery and public projections. */
+  readonly title?: string;
 };
 
 export type ServiceDefinition<TEnv extends Env = Env> = {
-  abilities: NormalizedServiceAbility<TEnv>[];
-  callerAuth?: ServiceCallerAuthDiscovery;
-  capabilities?: CapabilityCatalog;
-  id: string;
-  title: string;
-  version: string;
+  /** Validated and normalized abilities owned by the service. */
+  readonly abilities: ReadonlyArray<NormalizedServiceAbility<TEnv>>;
+  /** Optional caller-auth capabilities advertised in discovery. */
+  readonly callerAuth?: ReadonlyServiceCallerAuthDiscovery;
+  /** Capability scopes issued for this service. */
+  readonly capabilities?: CapabilityCatalog;
+  /** Trimmed service id used as the capability audience and registry key. */
+  readonly id: string;
+  /** Non-empty display title emitted into service discovery. */
+  readonly title: string;
+  /** Non-empty contract version emitted so caches and consumers can identify the deployed shape. */
+  readonly version: string;
 };
 
-export type DefineServiceInput<TEnv extends Env = Env> = Omit<ServiceDefinition<TEnv>, 'abilities'> & {
-  abilities: Array<AnyServiceAbilityDefinition<TEnv>>;
+export type DefineServiceInput<TEnv extends Env = Env> = Omit<ServiceDefinition<TEnv>, 'abilities' | 'callerAuth'> & {
+  /** Portable ability definitions to validate and normalize. */
+  readonly abilities: ReadonlyArray<AnyServiceAbilityDefinition<TEnv>>;
+  /** Optional caller-auth capabilities to snapshot and advertise in discovery. */
+  readonly callerAuth?: ServiceCallerAuthDiscovery;
 };
 
 export type DefineServiceOptions = {
@@ -223,50 +214,142 @@ export type DefineServiceOptions = {
    * Ceiling applied to every unary method that does not set its own `timeoutMs`. `false` removes it.
    */
   defaultMethodTimeoutMs?: false | number;
+  /** Requires non-empty scopes on every ability and method when true. */
   requireAbilityScopes?: boolean;
 };
 
-/**
- * Returns the definition's own type (not the widened AbilityMethodDefinition) so the
- * `stream: true` discriminator survives into AbilityRpc and AbilityImplementation.
- */
-export function abilityMethod<TDefinition extends AbilityMethodDefinition>(definition: TDefinition): TDefinition {
-  return definition;
+type DefineAbilityInput<TMethods extends AbilityMethodDefinitions<never>> = Omit<ServiceAbilityDefinition<never, TMethods>, 'methods'> & {
+  readonly methods: TMethods;
+};
+
+/** Returns the definition's exact method contract for typed client inference. */
+export function defineAbility<TMethods extends AbilityMethodDefinitions<never>>(
+  definition: DefineAbilityInput<TMethods>,
+): ServiceAbilityDefinition<never, TMethods> {
+  assertAbilityMethodRecord(definition.id, definition.methods);
+  return immutableAbilityDefinition<TMethods>(definition);
 }
 
-export function defineAbility<TEnv extends Env = Env, TMethods extends AbilityMethodDefinitions = AbilityMethodDefinitions>(
-  definition: ServiceAbilityDefinition<TEnv, TMethods>,
-): ServiceAbilityDefinition<TEnv, TMethods> {
-  return definition;
+/** Derives the complete capability scope set needed by each client method. */
+export function abilityClientScopesByMethod(
+  ability: AnyServiceAbilityDefinition,
+  additionalScopes: ReadonlyArray<string> | undefined,
+): ReadonlyMap<string, string[]> {
+  assertAbilityMethodRecord(ability.id, ability.methods);
+  const abilityScopes = normalizeScopes(ability.scopes ?? [], ability.id);
+  const allowedScopes = new Set(abilityScopes);
+  const additional = normalizeScopes(additionalScopes ?? [], ability.id);
+  for (const scope of additional) {
+    if (!allowedScopes.has(scope)) {
+      throw new CapabilityAuthError(`Service-Plane client scope is not declared by ability: ${ability.id} -> ${scope}`, 500);
+    }
+  }
+
+  return new Map(
+    Object.entries(ability.methods).map(([methodName, method]) => {
+      if (isReservedAbilityMethodName(methodName)) {
+        throw new CapabilityAuthError(`Service-Plane ability method name is reserved: ${ability.id}/${methodName}`, 500);
+      }
+      const required = normalizeScopes(method.metadata.scopes ?? [], `${ability.id}/${methodName}`);
+      for (const scope of required) {
+        if (!allowedScopes.has(scope)) {
+          throw new CapabilityAuthError(
+            `Service-Plane ability method requires scope not declared by ability: ${ability.id}/${methodName} -> ${scope}`,
+            500,
+          );
+        }
+      }
+      return [methodName, [...new Set([...required, ...additional])]];
+    }),
+  );
+}
+
+/** Reads one method's previously derived capability scopes. */
+export function abilityClientScopesForMethod(
+  scopesByMethod: ReadonlyMap<string, string[]>,
+  abilityId: string,
+  methodName: string,
+): string[] {
+  const scopes = scopesByMethod.get(methodName);
+  if (!scopes) throw new CapabilityAuthError(`Service-Plane ability method not found: ${abilityId}/${methodName}`, 404);
+  return scopes;
+}
+
+/**
+ * Attaches service-only handlers to a portable ability contract. Keep the contract in a shared
+ * module and this implementation in the service module so browser clients never bundle handlers.
+ */
+export function implementAbility<TMethods extends AbilityMethodDefinitions<never>>(
+  contract: ServiceAbilityDefinition<never, TMethods>,
+  handlers: AbilityImplementation<TMethods>,
+): ServiceAbilityDefinition<never, TMethods> {
+  const methodNames = Object.keys(contract.methods);
+  const handlerNames = Object.keys(handlers);
+  const missing = methodNames.find((name) => !Object.hasOwn(handlers, name) || typeof handlers[name] !== 'function');
+  if (missing) throw new CapabilityAuthError(`Service-Plane ability implementation is missing method: ${contract.id}/${missing}`, 500);
+  const extra = handlerNames.find((name) => !Object.hasOwn(contract.methods, name));
+  if (extra) throw new CapabilityAuthError(`Service-Plane ability implementation has unknown method: ${contract.id}/${extra}`, 500);
+  return immutableAbilityDefinition<TMethods>({
+    ...contract,
+    methods: Object.fromEntries(
+      methodNames.map((name) => [
+        name,
+        implementAbilityMethod(contract.methods[name] as AnyAbilityMethodDefinition<never>, handlers[name] as never),
+      ]),
+    ) as TMethods,
+  });
+}
+
+function immutableAbilityDefinition<TMethods extends AbilityMethodDefinitions<never>>(
+  definition: ServiceAbilityDefinition<never, TMethods>,
+): ServiceAbilityDefinition<never, TMethods> {
+  return Object.freeze({
+    ...definition,
+    methods: Object.freeze(Object.fromEntries(Object.entries(definition.methods))) as Readonly<TMethods>,
+    ...(definition.rpc
+      ? {
+          rpc: Object.freeze({
+            ...definition.rpc,
+            ...(definition.rpc.transports ? { transports: Object.freeze([...definition.rpc.transports]) } : {}),
+          }),
+        }
+      : {}),
+    ...(definition.scopes ? { scopes: Object.freeze([...definition.scopes]) } : {}),
+  }) as ServiceAbilityDefinition<never, TMethods>;
 }
 
 export function defineAbilityService<TEnv extends Env = Env>(
   input: DefineServiceInput<TEnv>,
   options: DefineServiceOptions = {},
 ): ServiceDefinition<TEnv> {
-  const serviceId = normalizeValue(input.id, 'service id');
+  const serviceId = requireNonEmpty(input.id, 'service id');
+  const capabilities = input.capabilities ? defineCapabilities(input.capabilities) : undefined;
+  if (capabilities && capabilities.serviceId !== serviceId) {
+    throw new CapabilityAuthError(`Service-Plane capability catalog belongs to ${capabilities.serviceId}, not service ${serviceId}`, 500);
+  }
+  const callerAuth = input.callerAuth ? immutableCallerAuthDiscovery(input.callerAuth) : undefined;
   const service: ServiceDefinition<TEnv> = {
     abilities: normalizeAbilities(
       serviceId,
       input.abilities,
-      input.capabilities,
+      capabilities,
       options.requireAbilityScopes ?? true,
       options.defaultMethodTimeoutMs === undefined ? DEFAULT_ABILITY_TIMEOUT_MS : options.defaultMethodTimeoutMs,
     ),
-    ...(input.callerAuth ? { callerAuth: input.callerAuth } : {}),
-    ...(input.capabilities ? { capabilities: input.capabilities } : {}),
+    ...(callerAuth ? { callerAuth } : {}),
+    ...(capabilities ? { capabilities } : {}),
     id: serviceId,
-    title: normalizeValue(input.title, 'service title'),
-    version: normalizeValue(input.version, 'service version'),
+    title: requireNonEmpty(input.title, 'service title'),
+    version: requireNonEmpty(input.version, 'service version'),
   };
   validateCallerAuthDiscovery(service);
-  return service;
+  return Object.freeze(service);
 }
 
 export function serviceDiscoveryDocument<TEnv extends Env = Env>(service: ServiceDefinition<TEnv>): ServiceDiscoveryDocument {
   return {
     abilities: service.abilities.map(abilityDiscovery),
-    ...(service.callerAuth ? { callerAuth: service.callerAuth } : {}),
+    ...(service.callerAuth ? { callerAuth: structuredClone(service.callerAuth) as unknown as ServiceCallerAuthDiscovery } : {}),
     ...(service.capabilities ? { capabilities: service.capabilities } : {}),
     id: service.id,
     title: service.title,
@@ -275,525 +358,184 @@ export function serviceDiscoveryDocument<TEnv extends Env = Env>(service: Servic
 }
 
 export function defaultAbilityRpcPath(abilityId: string): string {
-  return `/rpc/${abilityId}`;
+  return `${SERVICE_PLANE_RPC_PREFIX}/${abilityId}`;
 }
-
-export type CreateValidatingAbilityHandlerOptions = {
-  /**
-   * Cap'n Web streams need an ongoing session. Defaults to false (fail-closed): a caller must
-   * opt in only for a session transport (WebSocket upgrade, native binding). Over HTTP-batch,
-   * streaming methods then fail with a clear 405 instead of a dangling stub after the batch ends.
-   */
-  allowStreaming?: boolean;
-  /**
-   * The caller's deadline as an absolute reading of this machine's clock. A method whose handler
-   * outlives it fails with a timeout error rather than resolving late, so a handler that ignores
-   * its `signal` still cannot exceed the budget the caller was promised. A number rather than an
-   * AbortSignal so per-call enforcement needs no listener on a shared session signal.
-   */
-  deadlineAt?: number;
-  /**
-   * Told about every handler failure the wrapper replaces with an opaque error, with the original
-   * throw — the one place a service can still log what actually broke, since the replacement is all
-   * the caller ever sees.
-   */
-  onHandlerFailure?: (cause: unknown, methodName: string) => void;
-};
-
-type ValidatingAbilityHandlerState = {
-  abilityId: string;
-  allowStreaming: boolean;
-  deadlineAt?: number;
-  disposed: boolean;
-  handler: RpcTarget & Record<string, unknown>;
-  methods: Record<string, NormalizedAbilityMethodDefinition>;
-  onHandlerFailure?: (cause: unknown, methodName: string) => void;
-};
-
-type ValidatingAbilityHandlerConstructor = new () => RpcTarget;
-
-// Ability definitions are long-lived while handler instances are created per session. Reusing
-// the generated class avoids rebuilding an identical prototype on every authenticated call while
-// WeakMap state keeps caller-specific data out of Cap'n Web's remotely visible object surface.
-const validatingHandlerConstructorByAbility = new WeakMap<object, ValidatingAbilityHandlerConstructor>();
-const validatingHandlerStateByTarget = new WeakMap<object, ValidatingAbilityHandlerState>();
-
-/**
- * Refuses a caller class the ability does not admit, from the service's own definition rather than
- * any discovered catalog. `ServicePlaneService` runs this before the handler factory; it is also
- * built into `createValidatingAbilityHandler`, so custom shells assembled from these primitives
- * inherit the same boundary. Guard-return shape mirrors the broker's check on purpose — the two
- * must visibly agree.
- */
-export function verifyAbilityAccess(ability: Pick<NormalizedServiceAbility, 'access' | 'id'>, identity: CapabilityIdentity): void {
-  if (ability.access !== 'service') return;
-  if (identity.callerAccess === 'service') return;
-  throw new CapabilityAuthError(`Service-Plane ability is callable by services only: ${ability.id}`, 403);
-}
-
-export function createValidatingAbilityHandler<TEnv extends Env>(
-  ability: NormalizedServiceAbility<TEnv>,
-  handler: RpcTarget & Record<string, unknown>,
-  identity: CapabilityIdentity,
-  options: CreateValidatingAbilityHandlerOptions = {},
-): RpcTarget {
-  // Backstop for custom shells; the shipped shell has already refused before the handler factory ran.
-  verifyAbilityAccess(ability, identity);
-  // A handler instance carries one caller's identity; a factory that returns a shared
-  // instance would let concurrent sessions overwrite each other's identity and scopes.
-  if (capabilityIdentity(handler)) {
-    throw new CapabilityAuthError(`Service-Plane ability handler factory must return a new instance per call: ${ability.id}`, 500);
-  }
-  bindCapabilityIdentity(handler, identity);
-
-  const ValidatingAbilityHandler = validatingAbilityHandlerConstructor(ability);
-  const target = new ValidatingAbilityHandler();
-  validatingHandlerStateByTarget.set(target, {
-    abilityId: ability.id,
-    allowStreaming: options.allowStreaming ?? false,
-    ...(options.deadlineAt === undefined ? {} : { deadlineAt: options.deadlineAt }),
-    disposed: false,
-    handler,
-    methods: ability.methods,
-    ...(options.onHandlerFailure ? { onHandlerFailure: options.onHandlerFailure } : {}),
-  });
-  return bindCapabilityIdentity(target, identity);
-}
-
-function validatingAbilityHandlerConstructor<TEnv extends Env>(
-  ability: NormalizedServiceAbility<TEnv>,
-): ValidatingAbilityHandlerConstructor {
-  const cached = validatingHandlerConstructorByAbility.get(ability);
-  if (cached) return cached;
-
-  class ValidatingAbilityHandler extends RpcTarget {
-    [Symbol.dispose](): void {
-      disposeValidatingAbilityHandler(this);
-    }
-  }
-
-  for (const methodName of Object.keys(ability.methods)) {
-    Object.defineProperty(ValidatingAbilityHandler.prototype, methodName, {
-      async value(this: RpcTarget, ...args: unknown[]) {
-        return invokeValidatingAbilityMethod(this, methodName, args);
-      },
-    });
-  }
-
-  validatingHandlerConstructorByAbility.set(ability, ValidatingAbilityHandler);
-  return ValidatingAbilityHandler;
-}
-
-async function invokeValidatingAbilityMethod(target: RpcTarget, methodName: string, args: unknown[]): Promise<unknown> {
-  const state = activeValidatingAbilityHandlerState(target);
-  const method = state.methods[methodName];
-  if (!method) throw new AbilityValidationError(`Unknown Service-Plane ability method: ${methodName}`, 404);
-  if (method.stream && !state.allowStreaming) {
-    throw new AbilityValidationError(
-      `Service-Plane streaming method requires a session transport (WebSocket, native binding, or custom bidirectional): ${methodName}`,
-      405,
-    );
-  }
-  if (args.length !== 1) {
-    throw new AbilityValidationError(`Service-Plane ability method expects a single input object: ${methodName}`, 422);
-  }
-
-  requireScopes(target, ...method.scopes);
-  const implementation = state.handler[methodName];
-  if (typeof implementation !== 'function') {
-    throw new AbilityValidationError(`Service-Plane ability handler does not implement method: ${methodName}`, 500);
-  }
-
-  const input = await validateAbilityValue(method.input, args[0], `input for ${methodName}`, 422);
-  activeValidatingAbilityHandlerState(target);
-  let output: unknown;
-  try {
-    // Two independent bounds, whichever fires first: the caller's session budget and this method's
-    // own ceiling. Layered the way Envoy layers a route timeout under a client's, so a service stays
-    // bounded even when nobody upstream set anything. One race, one timer; an already-spent budget
-    // rejects before the handler runs — the caller stopped waiting, so there is nothing to gain.
-    output = await raceDeadline(
-      Promise.resolve().then(() => implementation.call(state.handler, input)),
-      {
-        ceilingError: (ceilingMs) =>
-          new ServicePlaneTimeoutError(`Service-Plane ability method exceeded its ${ceilingMs}ms limit: ${methodName}`),
-        ...(method.stream || method.timeoutMs === undefined ? {} : { ceilingMs: method.timeoutMs }),
-        ...(state.deadlineAt === undefined ? {} : { deadlineAt: state.deadlineAt }),
-        deadlineError: () => new ServicePlaneTimeoutError(`Service-Plane ability method exceeded its caller's deadline: ${methodName}`),
-        discardLateValue: discardDisposableValue,
-      },
-    );
-  } catch (error) {
-    throw abilityHandlerFailure(error, methodName, state.onHandlerFailure);
-  }
-  // Streaming methods return their items as a native Cap'n Web ReadableStream, validated
-  // one item at a time as the consumer pulls.
-  if (method.stream) return validatedAbilityItemStream(method, methodName, output, state);
-  return validateAbilityValue(method.output, output, `output for ${methodName}`, 500);
-}
-
-// The one place a handler's failure becomes what the caller sees. Errors carrying the taxonomy pass
-// through: instances this process raised, and — because Cap'n Web rebuilds a received error as a
-// plain Error whose own props survive — errors a downstream service already shaped, which would
-// otherwise be flattened to an opaque 500 at every intermediate hop of a chain. Everything else is
-// whatever the handler's dependencies threw: written for an operator, not a caller, and routinely
-// carrying connection strings, hostnames, SQL, or row data. Only the fact of the failure crosses
-// the boundary; the original goes to onFailure and stays reachable through handlerFailureCause.
-function abilityHandlerFailure(
-  error: unknown,
-  methodName: string,
-  onFailure: ((cause: unknown, methodName: string) => void) | undefined,
-): unknown {
-  if (error instanceof ServicePlaneError || servicePlaneErrorInfo(error) !== undefined) return error;
-  const opaque = new ServicePlaneError(`Service-Plane ability handler failed: ${methodName}`, 500);
-  rememberHandlerFailureCause(opaque, error);
-  try {
-    onFailure?.(error, methodName);
-  } catch {
-    // A logging hook must never replace the failure it is reporting.
-  }
-  return opaque;
-}
-
-// Standard Schema reports failures as issues rather than by throwing, so the boundary that owns
-// the caller/handler distinction turns them into an error: a bad input is the caller's fault
-// (422), a bad output means the handler broke its own contract (500). Schemas come from a
-// library this package never sees, so every deviation from the contract must fail closed here:
-// an unrecognized result would otherwise hand the handler unvalidated data.
-async function validateAbilityValue(schema: AbilitySchema, value: unknown, source: string, status: number): Promise<unknown> {
-  let result: StandardSchemaV1.Result<unknown>;
-  try {
-    result = await schema['~standard'].validate(value);
-  } catch (error) {
-    // A validator that throws instead of returning issues still means "this value is invalid";
-    // reporting it as an unclassified error would hide whose fault the call was.
-    throw new AbilityValidationError(`Service-Plane ability ${source}: ${errorMessage(error)}`, status);
-  }
-  if (result?.issues) {
-    throw new AbilityValidationError(
-      `Service-Plane ability ${source}: ${formatSchemaIssues(result.issues)}`,
-      status,
-      normalizeSchemaIssues(result.issues),
-    );
-  }
-  if (!result || !('value' in result)) {
-    throw new AbilityValidationError(`Service-Plane ability ${source}: schema returned no validated value`, status);
-  }
-  return result.value;
-}
-
-// Flattens the vendor's issues into the package's own shape so consumers can read them without
-// depending on the spec package, and so a malformed issue cannot escape into a caught error.
-function normalizeSchemaIssues(issues: ReadonlyArray<StandardSchemaV1.Issue>): AbilityValidationIssue[] {
-  if (!Array.isArray(issues)) return [];
-  return issues.map((issue) => {
-    const segments = issue?.path;
-    const path = Array.isArray(segments) ? segments.map(schemaIssuePathKey) : undefined;
-    return { message: issue?.message ?? 'invalid value', ...(path ? { path } : {}) };
-  });
-}
-
-function schemaIssuePathKey(segment: unknown): PropertyKey {
-  const key = segment && typeof segment === 'object' ? (segment as { key?: unknown }).key : segment;
-  return typeof key === 'string' || typeof key === 'number' || typeof key === 'symbol' ? key : String(key);
-}
-
-function formatSchemaIssues(issues: ReadonlyArray<StandardSchemaV1.Issue>): string {
-  if (!Array.isArray(issues) || issues.length === 0) return 'schema reported no issue detail';
-  return issues.map(formatSchemaIssue).join('; ');
-}
-
-function formatSchemaIssue(issue: StandardSchemaV1.Issue | undefined): string {
-  const message = issue?.message ?? 'invalid value';
-  const segments = issue?.path;
-  if (!Array.isArray(segments) || segments.length === 0) return message;
-  const path = segments.map(formatSchemaIssuePathSegment).join('.');
-  return path ? `${path}: ${message}` : message;
-}
-
-function formatSchemaIssuePathSegment(segment: unknown): string {
-  return String(schemaIssuePathKey(segment));
-}
-
-function activeValidatingAbilityHandlerState(target: RpcTarget): ValidatingAbilityHandlerState {
-  const state = validatingHandlerStateByTarget.get(target);
-  if (!state) throw new AbilityValidationError('Service-Plane ability handler is not initialized', 500);
-  if (state.disposed) {
-    throw new AbilityValidationError(`Service-Plane ability handler has been disposed: ${state.abilityId}`, 410);
-  }
-  return state;
-}
-
-function disposeValidatingAbilityHandler(target: RpcTarget): void {
-  const state = validatingHandlerStateByTarget.get(target);
-  if (!state || state.disposed) return;
-  state.disposed = true;
-  const dispose = (state.handler as RpcTarget & Partial<Disposable>)[Symbol.dispose];
-  dispose?.call(state.handler);
-}
-
-// Wraps a handler's stream source into a ReadableStream that validates each item lazily, so
-// backpressure from the consumer reaches the handler's generator untouched.
-function validatedAbilityItemStream(
-  method: NormalizedAbilityMethodDefinition,
-  methodName: string,
-  source: unknown,
-  state: Pick<ValidatingAbilityHandlerState, 'deadlineAt' | 'onHandlerFailure'>,
-): ReadableStream<unknown> {
-  const puller = abilityStreamPuller(source, methodName);
-  // Constant for the whole stream; building it per item would allocate once per pull for a
-  // message that is only read when an item fails validation.
-  const itemSource = `stream item for ${methodName}`;
-  return new ReadableStream<unknown>({
-    cancel(reason) {
-      // Cancel the underlying source directly and without awaiting: an async generator's
-      // return() queues behind an in-flight next(), and a disconnected consumer must not
-      // keep the handler pinned while it waits for the next chunk that may never come.
-      puller.cancel(reason);
-    },
-    async pull(controller) {
-      try {
-        // The wrapper's promise-level bound cannot see individual pulls, so the deadline is
-        // re-checked here: without it, items would keep flowing past a budget the caller's other
-        // calls are already being refused under.
-        if (state.deadlineAt !== undefined && Date.now() >= state.deadlineAt) {
-          throw new ServicePlaneTimeoutError(`Service-Plane streaming method exceeded its caller's deadline: ${methodName}`);
-        }
-        const next = await puller.next();
-        if (next.done) {
-          controller.close();
-          return;
-        }
-        controller.enqueue(await validateAbilityValue(method.output, next.value, itemSource, 500));
-      } catch (error) {
-        // A failed pull or invalid item errors the stream, which can no longer be cancelled by
-        // the consumer. Release the handler's source here so iterator return/finally cleanup and
-        // reader locks are not stranded. Cancel with the original — the source's own cleanup is
-        // in-process — but surface the same replacement a unary failure would get.
-        puller.cancel(error);
-        throw abilityHandlerFailure(error, methodName, state.onHandlerFailure);
-      }
-    },
-  });
-}
-
-type AbilityStreamPuller = {
-  cancel(reason?: unknown): void;
-  next(): Promise<IteratorResult<unknown>>;
-};
-
-function abilityStreamPuller(source: unknown, methodName: string): AbilityStreamPuller {
-  if (source instanceof ReadableStream) {
-    const reader = (source as ReadableStream<unknown>).getReader();
-    return {
-      cancel(reason) {
-        void reader.cancel(reason).catch(() => undefined);
-      },
-      async next() {
-        const { done, value } = await reader.read();
-        return done ? { done: true, value: undefined } : { done: false, value };
-      },
-    };
-  }
-  if (source && typeof source === 'object' && Symbol.asyncIterator in source) {
-    const iterator = (source as AsyncIterable<unknown>)[Symbol.asyncIterator]();
-    return {
-      cancel() {
-        void Promise.resolve()
-          .then(() => iterator.return?.(undefined))
-          .catch(() => undefined);
-      },
-      next: () => iterator.next(),
-    };
-  }
-  if (source && typeof source === 'object' && Symbol.iterator in source) {
-    const iterator = (source as Iterable<unknown>)[Symbol.iterator]();
-    return {
-      cancel() {
-        try {
-          iterator.return?.(undefined);
-        } catch {
-          // best effort: sync iterator cleanup must not fail cancellation
-        }
-      },
-      next: async () => iterator.next(),
-    };
-  }
-  throw new AbilityValidationError(
-    `Service-Plane streaming method must return an async iterable, iterable, or ReadableStream: ${methodName}`,
-    500,
-  );
-}
-
-export { SERVICE_DISCOVERY_PATH };
 
 function normalizeAbilities<TEnv extends Env>(
   serviceId: string,
-  abilities: Array<AnyServiceAbilityDefinition<TEnv>>,
+  abilities: ReadonlyArray<AnyServiceAbilityDefinition<TEnv>>,
   capabilities: CapabilityCatalog | undefined,
   requireAbilityScopes: boolean,
   defaultMethodTimeoutMs: false | number,
-): NormalizedServiceAbility<TEnv>[] {
+): ReadonlyArray<NormalizedServiceAbility<TEnv>> {
   if (abilities.length === 0) {
     throw new CapabilityAuthError('Service-Plane service must define at least one ability', 500);
   }
   const methodTimeoutDefault = validateDefaultMethodTimeoutMs(defaultMethodTimeoutMs);
-
   const knownScopes = new Set(capabilities?.scopes.map((scope) => normalizeScope(scope.id)) ?? []);
   const seenIds = new Set<string>();
   const seenPaths = new Set<string>();
 
-  return abilities.map((ability) => {
-    const id = normalizeValue(ability.id, 'ability id');
-    if (seenIds.has(id)) throw new CapabilityAuthError(`Duplicate Service-Plane ability: ${id}`, 500);
-    seenIds.add(id);
-    if (typeof ability.handler !== 'function') {
-      throw new CapabilityAuthError(`Service-Plane ability requires a handler factory: ${id}`, 500);
-    }
-
-    const scopes = normalizeScopes(ability.scopes ?? []);
-    if (requireAbilityScopes && scopes.length === 0) {
-      throw new CapabilityAuthError(`Service-Plane ability is missing required scopes: ${id}`, 500);
-    }
-    validateKnownScopes(scopes, knownScopes, capabilities, `Service-Plane ability requires unknown scope`);
-
-    const methods = normalizeMethods(
-      serviceId,
-      id,
-      ability.methods,
-      scopes,
-      knownScopes,
-      capabilities,
-      requireAbilityScopes,
-      methodTimeoutDefault,
-    );
-    const path = normalizePath(ability.rpc?.path ?? defaultAbilityRpcPath(id), id);
-    if (seenPaths.has(path)) throw new CapabilityAuthError(`Duplicate Service-Plane ability RPC path: ${path}`, 500);
-    seenPaths.add(path);
-    const transports = normalizeAbilityTransports(ability.rpc?.transports ?? ['http-batch']);
-    // Cap'n Web streams need an ongoing session; the one-round-trip HTTP-batch transport
-    // cannot carry them, so fail at setup instead of at the first streamed call.
-    if (
-      Object.values(methods).some((method) => method.stream) &&
-      !transports.includes('websocket') &&
-      !transports.includes('cloudflare-binding-rpc')
-    ) {
-      throw new CapabilityAuthError(
-        `Service-Plane ability with streaming methods must enable a session transport (websocket or cloudflare-binding-rpc): ${id}`,
-        500,
+  return Object.freeze(
+    abilities.map((ability) => {
+      const id = requireNonEmpty(ability.id, 'ability id');
+      if (seenIds.has(id)) throw new CapabilityAuthError(`Duplicate Service-Plane ability: ${id}`, 500);
+      seenIds.add(id);
+      const scopes = normalizeScopes(ability.scopes ?? []);
+      if (requireAbilityScopes && scopes.length === 0) {
+        throw new CapabilityAuthError(`Service-Plane ability is missing required scopes: ${id}`, 500);
+      }
+      validateKnownScopes(scopes, knownScopes, capabilities, 'Service-Plane ability requires unknown scope');
+      const methods = normalizeAbilityMethods(
+        serviceId,
+        id,
+        ability.methods,
+        scopes,
+        knownScopes,
+        capabilities,
+        requireAbilityScopes,
+        methodTimeoutDefault,
       );
-    }
+      const path = normalizePath(ability.rpc?.path ?? defaultAbilityRpcPath(id), id);
+      if (seenPaths.has(path)) throw new CapabilityAuthError(`Duplicate Service-Plane ability RPC path: ${path}`, 500);
+      const overlappingPath = [...seenPaths].find((existing) => routePathsOverlap(existing, path));
+      if (overlappingPath) {
+        throw new CapabilityAuthError(`Overlapping Service-Plane ability RPC paths: ${overlappingPath} and ${path}`, 500);
+      }
+      seenPaths.add(path);
+      const transports = normalizeAbilityTransports(ability.rpc?.transports ?? ['fetch']);
+      if (Object.values(methods).some((method) => method.method.kind === 'hibernation') && !transports.includes('websocket')) {
+        throw new CapabilityAuthError(`Service-Plane hibernation ability must enable the websocket transport: ${id}`, 500);
+      }
 
-    return {
-      ...ability,
-      access: normalizeAbilityAccess(ability.access ?? 'plane', id),
-      exposure: normalizeAbilityExposure(ability.exposure ?? 'private', id),
-      id,
-      methods,
-      rpc: {
-        path,
-        transports,
-      },
-      scopes,
-    };
-  });
+      return Object.freeze({
+        ...ability,
+        access: normalizeAbilityAccess(ability.access ?? 'plane', id),
+        exposure: normalizeAbilityExposure(ability.exposure ?? 'private', id),
+        id,
+        methods,
+        rpc: Object.freeze({
+          path,
+          transports: Object.freeze(transports),
+        }),
+        scopes: Object.freeze(scopes),
+      });
+    }),
+  );
 }
 
-const CAPNWEB_RPC_PROMISE_PROTOTYPE = (RpcPromise as unknown as { prototype: object }).prototype;
-
-// Cap'n Web treats its promise/stub prototype members as local control operations rather than
-// remote method names. Reject them when defining the ability instead of publishing an API that a
-// caller cannot invoke. `invoke` is retained for compatibility with the former wrapper dispatcher.
-function isReservedMethodName(methodName: string): boolean {
-  return methodName === 'invoke' || methodName in CAPNWEB_RPC_PROMISE_PROTOTYPE;
+function routePathsOverlap(left: string, right: string): boolean {
+  return routePathContains(left, right) || routePathContains(right, left);
 }
 
-function normalizeMethods(
+function routePathContains(parent: string, child: string): boolean {
+  return parent === '/' ? child.startsWith('/') : child.startsWith(`${parent}/`);
+}
+
+function normalizeAbilityMethods<TEnv extends Env>(
   serviceId: string,
   abilityId: string,
-  methods: AbilityMethodDefinitions,
-  abilityScopes: string[],
+  methods: AbilityMethodDefinitions<TEnv>,
+  abilityScopes: ReadonlyArray<string>,
   knownScopes: Set<string>,
   capabilities: CapabilityCatalog | undefined,
   requireAbilityScopes: boolean,
   defaultMethodTimeoutMs: false | number,
-): Record<string, NormalizedAbilityMethodDefinition> {
+): Readonly<Record<string, NormalizedAbilityMethodDefinition<AbilitySchema, AbilitySchema, TEnv>>> {
+  assertAbilityMethodRecord(abilityId, methods);
   const names = Object.keys(methods);
   if (names.length === 0) throw new CapabilityAuthError(`Service-Plane ability must define at least one method: ${abilityId}`, 500);
 
-  // Names are trimmed below, so two distinct keys can collapse into one. Without this guard the
-  // later definition silently wins and the earlier method's scopes stop being enforced.
   const seenNames = new Set<string>();
+  return Object.freeze(
+    Object.fromEntries(
+      names.map((methodName) => {
+        const name = requireNonEmpty(methodName, `method name for ${abilityId}`);
+        if (isReservedAbilityMethodName(name)) {
+          throw new CapabilityAuthError(`Service-Plane ability method name is reserved: ${abilityId}/${name}`, 500);
+        }
+        if (seenNames.has(name)) {
+          throw new CapabilityAuthError(`Service-Plane ability method name is duplicated: ${abilityId}/${name}`, 500);
+        }
+        seenNames.add(name);
+        const method = methods[methodName];
+        if (!method || !isAbilityMethodDefinition(method)) {
+          throw new CapabilityAuthError(
+            `Service-Plane ability method must be created with createAbilityBuilder: ${abilityId}/${name}`,
+            500,
+          );
+        }
+        if (!isImplementedAbilityMethod(method)) {
+          throw new CapabilityAuthError(`Service-Plane ability method has no implementation: ${abilityId}/${name}`, 500);
+        }
 
-  return Object.fromEntries(
-    names.map((methodName) => {
-      const name = normalizeValue(methodName, `method name for ${abilityId}`);
-      if (isReservedMethodName(name)) {
-        throw new CapabilityAuthError(`Service-Plane ability method name is reserved: ${abilityId}/${name}`, 500);
-      }
-      if (seenNames.has(name)) {
-        throw new CapabilityAuthError(`Service-Plane ability method name is duplicated: ${abilityId}/${name}`, 500);
-      }
-      seenNames.add(name);
-      const method = methods[methodName];
-      if (!method) throw new CapabilityAuthError(`Service-Plane ability method is missing: ${abilityId}/${methodName}`, 500);
-      const scopes = normalizeScopes(method.scopes ?? []);
-      if (requireAbilityScopes && scopes.length === 0) {
-        throw new CapabilityAuthError(`Service-Plane ability method is missing required scopes: ${abilityId}/${name}`, 500);
-      }
-      validateKnownScopes(scopes, knownScopes, capabilities, `Service-Plane ability method requires unknown scope`);
-      validateMethodScopesDeclaredByAbility(abilityId, name, scopes, abilityScopes);
-      if (method.stream && (method.mcpPrompt || method.mcpResource)) {
-        // MCP prompts and resources are single-response protocol surfaces; only tools can
-        // be backed by streaming methods.
-        throw new CapabilityAuthError(`Service-Plane streaming method cannot project an MCP prompt or resource: ${abilityId}/${name}`, 500);
-      }
-      if (method.stream && method.rest) {
-        // The generated OpenAPI documents request/response operations; a streamed return has
-        // no REST serving semantics here.
-        throw new CapabilityAuthError(`Service-Plane streaming method cannot project a REST operation: ${abilityId}/${name}`, 500);
-      }
-      // Resolved once here rather than per call: a streaming method is exempt (the bound that suits
-      // a request is wrong for a stream), an explicit 0 opts out, and anything else falls back to
-      // the service-wide ceiling. Validated like every other definition mistake — an invalid value
-      // must not silently drop the ceiling (or worse: an unvalidated 0 once enforced as a 0ms limit).
-      const timeoutMs = method.stream ? undefined : resolveMethodTimeoutMs(abilityId, name, method.timeoutMs, defaultMethodTimeoutMs);
-      const inputSchema = abilityJsonSchema(
-        method.input,
-        'input',
-        `${abilityId}/${name}`,
-        schemaResourceId(serviceId, abilityId, name, 'input'),
-      );
-      const rest = method.rest ? normalizeRestProjection(serviceId, abilityId, name, method.rest, inputSchema) : undefined;
-      const mcp = method.mcp ? normalizeMcpProjection(abilityId, name, method.mcp) : undefined;
-      const mcpPrompt = method.mcpPrompt ? normalizeMcpPromptProjection(abilityId, name, method.mcpPrompt) : undefined;
-      const mcpResource = method.mcpResource ? normalizeMcpResourceProjection(abilityId, name, method.mcpResource) : undefined;
-      // The raw definition's own timeoutMs must not survive the spread: the resolved value below is
-      // the only one enforcement and discovery may see, and for streams and opt-outs that value is
-      // "absent", not whatever the author wrote.
-      const { timeoutMs: _declaredTimeoutMs, ...methodWithoutTimeout } = method;
-      return [
-        name,
-        {
-          ...methodWithoutTimeout,
-          inputSchema,
-          ...(mcp ? { mcp } : {}),
-          ...(mcpPrompt ? { mcpPrompt } : {}),
-          ...(mcpResource ? { mcpResource } : {}),
-          outputSchema: abilityJsonSchema(
-            method.output,
-            'output',
-            `${abilityId}/${name}`,
-            schemaResourceId(serviceId, abilityId, name, 'output'),
-          ),
-          ...(rest ? { rest } : {}),
-          scopes,
-          ...(method.stream ? { stream: true as const } : {}),
-          ...(timeoutMs === undefined ? {} : { timeoutMs }),
-        },
-      ];
-    }),
+        const definition = method.metadata;
+        const input = method.input;
+        const output = method.output;
+        const stream = method.kind !== 'unary';
+        const scopes = normalizeScopes(definition.scopes ?? []);
+        if (requireAbilityScopes && scopes.length === 0) {
+          throw new CapabilityAuthError(`Service-Plane ability method is missing required scopes: ${abilityId}/${name}`, 500);
+        }
+        validateKnownScopes(scopes, knownScopes, capabilities, `Service-Plane ability method requires unknown scope`);
+        validateMethodScopesDeclaredByAbility(abilityId, name, scopes, abilityScopes);
+        if (method.kind === 'hibernation' && definition.mcp) {
+          throw new CapabilityAuthError(`Service-Plane hibernation method cannot project an MCP tool: ${abilityId}/${name}`, 500);
+        }
+        if (stream && (definition.mcpPrompt || definition.mcpResource)) {
+          throw new CapabilityAuthError(
+            `Service-Plane streaming method cannot project an MCP prompt or resource: ${abilityId}/${name}`,
+            500,
+          );
+        }
+        if (stream && definition.rest) {
+          throw new CapabilityAuthError(`Service-Plane streaming method cannot project a REST operation: ${abilityId}/${name}`, 500);
+        }
+        const timeoutMs = stream ? undefined : resolveMethodTimeoutMs(abilityId, name, definition.timeoutMs, defaultMethodTimeoutMs);
+        const inputSchema = abilityJsonSchema(
+          input as AbilitySchema,
+          'input',
+          `${abilityId}/${name}`,
+          schemaResourceId(serviceId, abilityId, name, 'input'),
+        );
+        const rest = definition.rest ? normalizeRestProjection(serviceId, abilityId, name, definition.rest, inputSchema) : undefined;
+        const mcp = definition.mcp ? normalizeMcpProjection(abilityId, name, definition.mcp) : undefined;
+        const mcpPrompt = definition.mcpPrompt ? normalizeMcpPromptProjection(abilityId, name, definition.mcpPrompt) : undefined;
+        const mcpResource = definition.mcpResource ? normalizeMcpResourceProjection(abilityId, name, definition.mcpResource) : undefined;
+
+        return [
+          name,
+          Object.freeze({
+            ...(definition.idempotent ? { idempotent: true as const } : {}),
+            input: input as AbilitySchema,
+            inputSchema,
+            ...(mcp ? { mcp } : {}),
+            ...(mcpPrompt ? { mcpPrompt } : {}),
+            ...(mcpResource ? { mcpResource } : {}),
+            method: method as AbilityMethodDefinition<TEnv, AbilitySchema, AbilitySchema, AbilityMethodKind>,
+            output: output as AbilitySchema,
+            outputSchema: abilityJsonSchema(
+              output as AbilitySchema,
+              'output',
+              `${abilityId}/${name}`,
+              schemaResourceId(serviceId, abilityId, name, 'output'),
+            ),
+            ...(rest ? { rest } : {}),
+            scopes: Object.freeze(scopes),
+            ...(stream ? { stream: true as const } : {}),
+            ...(timeoutMs === undefined ? {} : { timeoutMs }),
+          } satisfies NormalizedAbilityMethodDefinition<AbilitySchema, AbilitySchema, TEnv>),
+        ];
+      }),
+    ),
   );
+}
+
+function assertAbilityMethodRecord(abilityId: string, methods: AbilityMethodDefinitions<never>): void {
+  const prototype = Object.getPrototypeOf(methods);
+  if (isAbilityMethodDefinition(prototype)) {
+    throw new CapabilityAuthError(`Service-Plane ability method name is reserved: ${abilityId}/__proto__`, 500);
+  }
 }
 
 // setTimeout clamps delays above 2^31-1 to 1ms, so a huge ceiling would fire instantly instead of
@@ -839,8 +581,8 @@ function validateDefaultMethodTimeoutMs(value: false | number): false | number {
 function validateMethodScopesDeclaredByAbility(
   abilityId: string,
   methodName: string,
-  methodScopes: string[],
-  abilityScopes: string[],
+  methodScopes: ReadonlyArray<string>,
+  abilityScopes: ReadonlyArray<string>,
 ): void {
   const declared = new Set(abilityScopes);
   const missing = methodScopes.find((scope) => !declared.has(scope));
@@ -862,21 +604,21 @@ function abilityDiscovery<TEnv extends Env>(ability: NormalizedServiceAbility<TE
       Object.entries(ability.methods).map(([methodName, method]) => [
         methodName,
         {
-          inputSchema: method.inputSchema,
+          inputSchema: structuredClone(method.inputSchema) as unknown as OpenApiObject,
           ...(method.mcp ? { mcp: method.mcp } : {}),
           ...(method.mcpPrompt ? { mcpPrompt: method.mcpPrompt } : {}),
           ...(method.mcpResource ? { mcpResource: method.mcpResource } : {}),
-          outputSchema: method.outputSchema,
+          outputSchema: structuredClone(method.outputSchema) as unknown as OpenApiObject,
           ...(method.idempotent ? { idempotent: true as const } : {}),
           ...(method.rest ? { rest: method.rest } : {}),
-          scopes: method.scopes,
+          scopes: [...method.scopes],
           ...(method.stream ? { stream: true as const } : {}),
           ...(method.timeoutMs === undefined ? {} : { timeoutMs: method.timeoutMs }),
         } satisfies ServiceAbilityMethodDiscovery,
       ]),
     ),
-    rpc: ability.rpc,
-    scopes: ability.scopes,
+    rpc: { path: ability.rpc.path, protocol: SERVICE_PLANE_RPC_PROTOCOL, transports: [...ability.rpc.transports] },
+    scopes: [...ability.scopes],
     ...(ability.title ? { title: ability.title } : {}),
   };
 }
@@ -886,21 +628,21 @@ function normalizeRestProjection(
   abilityId: string,
   methodName: string,
   rest: ServiceAbilityRestProjection,
-  inputSchema: OpenApiObject,
+  inputSchema: ReadonlyOpenApiObject,
 ): ServiceAbilityRestProjection {
   const path = normalizePath(rest.path, `${abilityId}/${methodName}`);
   const pathVariables = validateRestPathTemplate(path, abilityId, methodName);
   validateRestPathInputFields(inputSchema, pathVariables, abilityId, methodName);
-  return {
+  return Object.freeze({
     ...rest,
     method: normalizeHttpMethod(rest.method),
     operationId: rest.operationId
-      ? normalizeValue(rest.operationId, `REST operation id for ${abilityId}/${methodName}`)
+      ? requireNonEmpty(rest.operationId, `REST operation id for ${abilityId}/${methodName}`)
       : `${serviceId}.${abilityId}.${methodName}`,
     path,
     ...(rest.status === undefined ? {} : { status: normalizeRestStatus(rest.status, abilityId, methodName) }),
-    ...(rest.tags ? { tags: normalizeTags(rest.tags, `${abilityId}/${methodName}`) } : {}),
-  };
+    ...(rest.tags ? { tags: Object.freeze(normalizeTags(rest.tags, `${abilityId}/${methodName}`)) } : {}),
+  });
 }
 
 function validateRestPathTemplate(path: string, abilityId: string, methodName: string): string[] {
@@ -911,7 +653,12 @@ function validateRestPathTemplate(path: string, abilityId: string, methodName: s
   return variables;
 }
 
-function validateRestPathInputFields(inputSchema: OpenApiObject, pathVariables: string[], abilityId: string, methodName: string): void {
+function validateRestPathInputFields(
+  inputSchema: ReadonlyOpenApiObject,
+  pathVariables: string[],
+  abilityId: string,
+  methodName: string,
+): void {
   const properties = jsonSchemaRootProperties(inputSchema);
   const missing = pathVariables.find((name) => !properties || !Object.hasOwn(properties, name));
   if (missing) {
@@ -933,10 +680,10 @@ function normalizeRestStatus(status: number, abilityId: string, methodName: stri
 }
 
 function normalizeMcpProjection(abilityId: string, methodName: string, mcp: ServiceAbilityMcpProjection): ServiceAbilityMcpProjection {
-  return {
+  return Object.freeze({
     ...mcp,
-    name: normalizeValue(mcp.name, `MCP tool name for ${abilityId}/${methodName}`),
-  };
+    name: requireNonEmpty(mcp.name, `MCP tool name for ${abilityId}/${methodName}`),
+  });
 }
 
 function normalizeMcpPromptProjection(
@@ -944,18 +691,22 @@ function normalizeMcpPromptProjection(
   methodName: string,
   prompt: ServiceAbilityMcpPromptProjection,
 ): ServiceAbilityMcpPromptProjection {
-  return {
+  return Object.freeze({
     ...prompt,
     ...(prompt.arguments
       ? {
-          arguments: prompt.arguments.map((argument) => ({
-            ...argument,
-            name: normalizeValue(argument.name, `MCP prompt argument name for ${abilityId}/${methodName}`),
-          })),
+          arguments: Object.freeze(
+            prompt.arguments.map((argument) =>
+              Object.freeze({
+                ...argument,
+                name: requireNonEmpty(argument.name, `MCP prompt argument name for ${abilityId}/${methodName}`),
+              }),
+            ),
+          ),
         }
       : {}),
-    name: normalizeValue(prompt.name, `MCP prompt name for ${abilityId}/${methodName}`),
-  };
+    name: requireNonEmpty(prompt.name, `MCP prompt name for ${abilityId}/${methodName}`),
+  });
 }
 
 function normalizeMcpResourceProjection(
@@ -963,26 +714,26 @@ function normalizeMcpResourceProjection(
   methodName: string,
   resource: ServiceAbilityMcpResourceProjection,
 ): ServiceAbilityMcpResourceProjection {
-  const uri = normalizeValue(resource.uri, `MCP resource URI for ${abilityId}/${methodName}`);
+  const uri = requireNonEmpty(resource.uri, `MCP resource URI for ${abilityId}/${methodName}`);
   validateMcpResourceUriTemplate(uri, abilityId, methodName);
-  return {
+  return Object.freeze({
     ...resource,
-    name: normalizeValue(resource.name, `MCP resource name for ${abilityId}/${methodName}`),
+    name: requireNonEmpty(resource.name, `MCP resource name for ${abilityId}/${methodName}`),
     uri,
-  };
+  });
+}
+
+function immutableCallerAuthDiscovery(callerAuth: ServiceCallerAuthDiscovery): ReadonlyServiceCallerAuthDiscovery {
+  return Object.freeze({
+    jwks: Object.freeze({
+      keys: Object.freeze(callerAuth.jwks.keys.map((key) => immutableJsonSnapshot(key))),
+    }),
+  }) as unknown as ReadonlyServiceCallerAuthDiscovery;
 }
 
 // Only simple `{var}` template expressions are supported; the plane matches them and passes variables as method input.
 function validateMcpResourceUriTemplate(uri: string, abilityId: string, methodName: string): void {
-  const expressions = uri.match(/\{[^}]*\}|\{|\}/gu) ?? [];
-  let balance = 0;
-  for (const char of uri) {
-    if (char === '{') balance += 1;
-    if (char === '}') balance -= 1;
-    if (balance < 0) break;
-  }
-  const allSimple = expressions.every((expression) => /^\{[A-Za-z_][\w]*\}$/u.test(expression));
-  if (balance !== 0 || !allSimple) {
+  if (!hasOnlySimpleTemplateExpressions(uri)) {
     throw new CapabilityAuthError(`Service-Plane MCP resource URI has an invalid template expression: ${abilityId}/${methodName}`, 500);
   }
 }
@@ -996,27 +747,15 @@ function validateCallerAuthDiscovery(service: Pick<ServiceDefinition, 'callerAut
   }
 }
 
-function containsPrivateJwkMaterial(key: JsonWebKey): boolean {
-  return (
-    typeof key.d === 'string' ||
-    typeof key.dp === 'string' ||
-    typeof key.dq === 'string' ||
-    typeof key.k === 'string' ||
-    key.oth !== undefined ||
-    typeof key.p === 'string' ||
-    typeof key.q === 'string' ||
-    typeof key.qi === 'string'
-  );
+function containsPrivateJwkMaterial(key: ReadonlyServiceCallerAuthDiscovery['jwks']['keys'][number]): boolean {
+  return PRIVATE_JWK_MEMBERS.some((member) => key[member] !== undefined);
 }
 
-function normalizeAbilityTransports(transports: AbilityTransport[]): AbilityTransport[] {
+function normalizeAbilityTransports(transports: ReadonlyArray<AbilityTransport>): AbilityTransport[] {
   if (transports.length === 0) throw new CapabilityAuthError('Service-Plane ability must enable at least one transport', 500);
   const normalized = [...new Set(transports)];
-  for (const transport of normalized) {
-    if (transport !== 'cloudflare-binding-rpc' && transport !== 'http-batch' && transport !== 'websocket') {
-      throw new CapabilityAuthError(`Unknown Service-Plane ability transport: ${transport as string}`, 500);
-    }
-  }
+  const unknown = normalized.find((transport) => !isAbilityTransport(transport));
+  if (unknown !== undefined) throw new CapabilityAuthError(`Unknown Service-Plane ability transport: ${String(unknown)}`, 500);
   return normalized;
 }
 
@@ -1028,27 +767,18 @@ function normalizePath(path: string, source: string): string {
   if (!isOriginRelativePath(normalized)) {
     throw new CapabilityAuthError(`Service-Plane path must not include query or fragment: ${source}`, 500);
   }
-  return normalized.replace(/\/+$/u, '') || '/';
+  return normalizeOriginRelativePath(normalized) as string;
 }
 
 function normalizeHttpMethod(method: ServiceHttpMethod): ServiceHttpMethod {
   if (typeof method !== 'string') throw new CapabilityAuthError('Service-Plane REST method cannot be empty', 500);
-  const normalized = method.toLowerCase() as ServiceHttpMethod;
-  if (
-    normalized !== 'delete' &&
-    normalized !== 'get' &&
-    normalized !== 'patch' &&
-    normalized !== 'post' &&
-    normalized !== 'put' &&
-    normalized !== 'query'
-  ) {
-    throw new CapabilityAuthError(`Unknown Service-Plane REST method: ${method as string}`, 500);
-  }
+  const normalized = method.toLowerCase();
+  if (!isServiceHttpMethod(normalized)) throw new CapabilityAuthError(`Unknown Service-Plane REST method: ${method}`, 500);
   return normalized;
 }
 
 function normalizeAbilityExposure(exposure: AbilityExposure, abilityId: string): AbilityExposure {
-  if (exposure !== 'private' && exposure !== 'published') {
+  if (!isAbilityExposure(exposure)) {
     throw new CapabilityAuthError(`Unknown Service-Plane ability exposure for ${abilityId}: ${String(exposure)}`, 500);
   }
   return exposure;
@@ -1061,25 +791,27 @@ function normalizeAbilityAccess(access: AbilityAccess, abilityId: string): Abili
   return access;
 }
 
-function normalizeTags(tags: string[], source: string): string[] {
-  const normalized = [...new Set(tags.map((tag) => normalizeValue(tag, `REST tag for ${source}`)))];
+function normalizeTags(tags: ReadonlyArray<string>, source: string): string[] {
+  const normalized = [...new Set(tags.map((tag) => requireNonEmpty(tag, `REST tag for ${source}`)))];
   if (normalized.length === 0) throw new CapabilityAuthError(`Service-Plane REST projection has an empty tag list: ${source}`, 500);
   return normalized;
 }
 
-function normalizeScopes(scopes: string[]): string[] {
-  return [...new Set(scopes.map(normalizeScope))];
+// `source` names the ability or method a client-side check is validating, so the error can say where.
+function normalizeScopes(scopes: ReadonlyArray<string>, source?: string): string[] {
+  return [...new Set(scopes.map((scope) => normalizeScope(scope, source)))];
 }
 
-function normalizeScope(scope: string): string {
+function normalizeScope(scope: string, source?: string): string {
+  const where = source ? `: ${source}` : '';
   const normalized = scope.trim();
-  if (!normalized) throw new CapabilityAuthError('Service-Plane capability scope cannot be empty', 500);
-  if (normalized.includes('*')) throw new CapabilityAuthError('Service-Plane capability wildcards are not supported', 500);
+  if (!normalized) throw new CapabilityAuthError(`Service-Plane capability scope cannot be empty${where}`, 500);
+  if (normalized.includes('*')) throw new CapabilityAuthError(`Service-Plane capability wildcards are not supported${where}`, 500);
   return normalized;
 }
 
 function validateKnownScopes(
-  scopes: string[],
+  scopes: ReadonlyArray<string>,
   knownScopes: Set<string>,
   capabilities: CapabilityCatalog | undefined,
   message: string,
@@ -1090,12 +822,6 @@ function validateKnownScopes(
   for (const scope of scopes) {
     if (!knownScopes.has(scope)) throw new CapabilityAuthError(`${message}: ${scope}`, 500);
   }
-}
-
-function normalizeValue(value: string, field: string): string {
-  const normalized = value.trim();
-  if (!normalized) throw new CapabilityAuthError(`Service-Plane ${field} cannot be empty`, 500);
-  return normalized;
 }
 
 // Both halves of the Standard Schema contract are checked here, at setup, so a schema that
@@ -1130,7 +856,7 @@ function assertAbilitySchemaContract(
   return typed as StandardSchemaV1.Props<unknown, unknown> & StandardJSONSchemaV1.Props;
 }
 
-function abilityJsonSchema(schema: AbilitySchema, io: 'input' | 'output', source: string, resourceId: string): OpenApiObject {
+function abilityJsonSchema(schema: AbilitySchema, io: 'input' | 'output', source: string, resourceId: string): ReadonlyOpenApiObject {
   const converter = assertAbilitySchemaContract(schema, source).jsonSchema;
   let rendered: unknown;
   try {
@@ -1150,7 +876,23 @@ function abilityJsonSchema(schema: AbilitySchema, io: 'input' | 'output', source
       500,
     );
   }
-  return withSchemaResourceId(rendered as OpenApiObject, resourceId);
+  const anchored = withSchemaResourceId(rendered as ReadonlyOpenApiObject, resourceId);
+  try {
+    const serialized = JSON.stringify(anchored);
+    if (serialized === undefined) throw new TypeError('schema has no JSON representation');
+    return immutableJsonSnapshot(JSON.parse(serialized) as ReadonlyOpenApiObject);
+  } catch (error) {
+    throw new CapabilityAuthError(
+      `Service-Plane ability schema rendered a non-serializable JSON Schema for ${source}: ${errorMessage(error)}`,
+      500,
+    );
+  }
+}
+
+function immutableJsonSnapshot<T>(value: T): T {
+  if (Array.isArray(value)) return Object.freeze(value.map((entry) => immutableJsonSnapshot(entry))) as T;
+  if (!value || typeof value !== 'object') return value;
+  return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, immutableJsonSnapshot(entry)]))) as T;
 }
 
 // JSON Schema 2020-12 resource identity: a schema whose fragment `$ref`s point at itself
@@ -1164,7 +906,7 @@ function schemaResourceId(serviceId: string, abilityId: string, methodName: stri
   return `urn:service-plane:${segment(serviceId)}/${segment(abilityId)}/${segment(methodName)}/${io}`;
 }
 
-function withSchemaResourceId(schema: OpenApiObject, resourceId: string): OpenApiObject {
+function withSchemaResourceId(schema: ReadonlyOpenApiObject, resourceId: string): ReadonlyOpenApiObject {
   // A vendor-declared `$id` already anchors the schema's own refs; overriding it would break them.
   if (typeof schema.$id === 'string' && schema.$id.length > 0) return schema;
   if (!containsLocalRef(schema)) return schema;
@@ -1172,11 +914,19 @@ function withSchemaResourceId(schema: OpenApiObject, resourceId: string): OpenAp
 }
 
 function containsLocalRef(value: unknown): boolean {
-  if (Array.isArray(value)) return value.some(containsLocalRef);
-  if (!value || typeof value !== 'object') return false;
-  const record = value as Record<string, unknown>;
-  if (typeof record.$ref === 'string' && record.$ref.startsWith('#')) return true;
-  return Object.values(record).some(containsLocalRef);
+  const pending: unknown[] = [value];
+  const seen = new WeakSet<object>();
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (!current || typeof current !== 'object' || seen.has(current)) continue;
+    seen.add(current);
+    if (!Array.isArray(current)) {
+      const record = current as Record<string, unknown>;
+      if (typeof record.$ref === 'string' && record.$ref.startsWith('#')) return true;
+    }
+    pending.push(...Object.values(current));
+  }
+  return false;
 }
 
 function errorMessage(error: unknown): string {
