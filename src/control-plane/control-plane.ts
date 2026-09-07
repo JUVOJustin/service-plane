@@ -549,7 +549,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
             'broker WebSocket invocation middleware',
           );
         } catch (error) {
-          return servicePlaneErrorResponse(error, CONTROL_PLANE_REQUEST_FAILED_MESSAGE);
+          return respondWith(context, servicePlaneErrorResponse(error, CONTROL_PLANE_REQUEST_FAILED_MESSAGE));
         }
       });
     }
@@ -575,7 +575,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
           },
         );
       } catch (error) {
-        return servicePlaneErrorResponse(error, CONTROL_PLANE_REQUEST_FAILED_MESSAGE);
+        return respondWith(context, servicePlaneErrorResponse(error, CONTROL_PLANE_REQUEST_FAILED_MESSAGE));
       }
       // Product authentication may bind a signature to the body. Give the private decoder its own
       // branch so middleware can consume the original without making the RPC request unusable.
@@ -615,7 +615,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
           discardDisposableValue,
         );
       } catch (error) {
-        return servicePlaneErrorResponse(error, CONTROL_PLANE_REQUEST_FAILED_MESSAGE);
+        return respondWith(context, servicePlaneErrorResponse(error, CONTROL_PLANE_REQUEST_FAILED_MESSAGE));
       } finally {
         cancelUnusedRequestBody(decodingRequest);
         if (middlewareRequest) cancelUnusedRequestBody(middlewareRequest);
@@ -682,7 +682,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
       const deadline = operationDeadline(receivedAt, timeoutMs);
       let parsedRequestId: string | number | null = null;
       try {
-        return await preparation.run(async () => {
+        const response = await preparation.run(async () => {
           const invocation = this.runInvocationMiddleware(
             context,
             async () => {
@@ -726,8 +726,9 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
             return controlPlaneMcpErrorResponse(error, parsedRequestId);
           }
         }, discardDisposableValue);
+        return respondWith(context, response);
       } catch (error) {
-        return controlPlaneMcpErrorResponse(error, parsedRequestId);
+        return respondWith(context, controlPlaneMcpErrorResponse(error, parsedRequestId));
       } finally {
         cancelUnusedRequestBody(parsingRequest);
         cancelUnusedRequestBody(context.req.raw);
@@ -754,7 +755,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
           receivedAt,
           timeoutMs,
         }));
-      return handleControlPlaneRestRequest(context.req.raw, {
+      const response = await handleControlPlaneRestRequest(context.req.raw, {
         ...(this.log ? { log: (event) => this.log?.(event, context) } : {}),
         ...(restOptions.maxBodyBytes === undefined ? {} : { maxBodyBytes: restOptions.maxBodyBytes }),
         onInvocation: (invocation) => setControlPlaneInvocation(context, invocation),
@@ -779,6 +780,7 @@ export class ServicePlaneControlPlane<TEnv extends Env = Env> {
         resolveInvocation: async () => scopeForCaller().invocation(),
         ...(timeoutMs === undefined ? {} : { timeoutMs }),
       });
+      return respondWith(context, response);
     });
   }
 
@@ -1052,6 +1054,15 @@ function forwardedRequestFacts(context: Context): Pick<ControlPlaneRequestFacts,
 
 function operationDeadline(receivedAt: number, timeoutMs: number | undefined): ControlPlaneOperationDeadline {
   return { receivedAt, ...(timeoutMs === undefined ? {} : { timeoutMs }) };
+}
+
+// Invocation middleware finalizes `context.res` with whatever `next()` produced, and Hono keeps a
+// finalized response over a handler's return value. When a lost deadline race replaces that
+// response, the replacement has to go through the context, or the caller reads the discarded one.
+function respondWith(context: Context, response: Response): Response {
+  if (!context.finalized || context.res === response) return response;
+  context.res = response;
+  return context.res;
 }
 
 function callerNotConfigured(context: Context, log: ServicePlaneLogSink | undefined, message: string): Response {
