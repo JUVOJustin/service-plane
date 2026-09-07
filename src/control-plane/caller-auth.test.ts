@@ -1,7 +1,11 @@
 import { Hono } from 'hono';
 import { describe, expect, it } from 'vitest';
 import { SERVICE_PLANE_HMAC_AUTHORIZATION_SCHEME, signServicePlaneHmacRequest } from '../shared/hmac-auth.js';
-import { SERVICE_PLANE_JWK_AUTHORIZATION_SCHEME, SERVICE_PLANE_JWK_CLIENT_HEADER } from '../shared/jwk-auth.js';
+import {
+  generateServicePlaneJwkSigningKey,
+  SERVICE_PLANE_JWK_AUTHORIZATION_SCHEME,
+  signServicePlaneJwkRequest,
+} from '../shared/jwk-auth.js';
 import { SERVICE_PLANE_CAPABILITY_JWKS_PATH, SERVICE_PLANE_CAPABILITY_TOKEN_PATH, type ServiceEndpoint } from '../shared/types.js';
 import {
   type HmacServiceClient,
@@ -155,17 +159,12 @@ describe('control-plane caller authentication', () => {
       return result instanceof Response ? result : context.text(result.serviceId);
     });
 
-    const response = await app.request(
-      '/',
-      {
-        headers: {
-          authorization: `${SERVICE_PLANE_JWK_AUTHORIZATION_SCHEME} invalid-assertion`,
-          [SERVICE_PLANE_JWK_CLIENT_HEADER]: 'missing-client',
-        },
-        method: 'POST',
-      },
-      bindings,
-    );
+    const request = await signServicePlaneJwkRequest(new Request('https://plane.example/', { method: 'POST' }), {
+      clientId: 'missing-client',
+      keyId: 'caller-key',
+      privateJwk: await generateServicePlaneJwkSigningKey({ keyId: 'caller-key' }),
+    });
+    const response = await app.request(request, undefined, bindings);
 
     expect(response.status).toBe(401);
     expect(observedClients).toBe(bindings.JWK_CLIENTS);

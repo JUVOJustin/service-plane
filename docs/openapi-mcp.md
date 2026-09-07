@@ -136,7 +136,10 @@ mcpResource: {
 ```
 
 URI template variables must exist in the method's object input schema. Resources use a unary method
-result as their content.
+result as their content. Each `/`, `?`, or `#`-delimited component may contain one variable, and each
+variable name must be unique across the URI. Literal affixes such as `items://{id}.json` are allowed;
+overlapping captures such as `items://{left}-{right}` are rejected. Matching never searches competing
+capture lengths, keeping resource lookup predictable even for long, non-matching URIs.
 
 ### Prompts
 

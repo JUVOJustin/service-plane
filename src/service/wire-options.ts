@@ -38,7 +38,7 @@ export type ServicePlaneClientCompressionOptions =
 export type ServicePlaneServerCompressionOptions =
   | boolean
   | {
-      /** Accepts compressed request bodies. */
+      /** Accepts one gzip, deflate, or deflate-raw request encoding; rejects stacked or unsupported encodings with 415. */
       request?: boolean;
       /** Compresses eligible non-batched unary responses; never buffers batches or event streams. */
       response?:
@@ -65,6 +65,6 @@ export type ServicePlaneServerWireOptions = {
   batch?: ServicePlaneBatchOptions;
   /** Accepts compressed Fetch requests and/or compresses non-batched unary responses. */
   compression?: ServicePlaneServerCompressionOptions;
-  /** Maximum decoded Fetch body or WebSocket message size. Defaults to one MiB; `false` disables the limit. */
+  /** Maximum decoded Fetch body or WebSocket message size. Defaults to one MiB; `false` disables this byte limit, not the compression depth limit. */
   maxRequestBodyBytes?: false | number;
 };

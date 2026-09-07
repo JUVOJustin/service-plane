@@ -5,16 +5,44 @@ export function normalizePath(path: string): string {
   return withLeadingSlash.length > 1 ? withLeadingSlash.replace(/\/+$/u, '') : withLeadingSlash;
 }
 
-/** Accepts only balanced `{identifier}` expressions while allowing ordinary URI text around them. */
+/** A literal URI component or its single variable with fixed surrounding text. */
+export type SimpleTemplateComponent =
+  | string
+  | {
+      /** Globally unique identifier used as a method input property. */
+      name: string;
+      /** Literal component text before the variable. */
+      prefix: string;
+      /** Literal component text after the variable. */
+      suffix: string;
+    };
+
+/** Accepts one globally unique `{identifier}` per component delimited by `/`, `?`, or `#`. */
 export function hasOnlySimpleTemplateExpressions(value: string): boolean {
-  const expressions = value.match(/\{[^}]*\}|\{|\}/gu) ?? [];
-  let balance = 0;
-  for (const char of value) {
-    if (char === '{') balance += 1;
-    if (char === '}') balance -= 1;
-    if (balance < 0) return false;
+  return simpleTemplateComponents(value) !== undefined;
+}
+
+/** Keeps delimiters literal and prevents overlapping captures in URI template matching. */
+export function simpleTemplateComponents(value: string): SimpleTemplateComponent[] | undefined {
+  const components: SimpleTemplateComponent[] = [];
+  const names = new Set<string>();
+  for (const component of value.split(/([/?#])/u)) {
+    const opening = component.indexOf('{');
+    if (opening === -1) {
+      if (component.includes('}')) return undefined;
+      components.push(component);
+      continue;
+    }
+
+    const closing = component.indexOf('}', opening + 1);
+    const name = templateVariableName(component.slice(opening, closing + 1));
+    const prefix = component.slice(0, opening);
+    const suffix = component.slice(closing + 1);
+    if (!name || names.has(name) || prefix.includes('}') || suffix.includes('{') || suffix.includes('}')) return undefined;
+    names.add(name);
+    components.push({ name, prefix, suffix });
   }
-  return balance === 0 && expressions.every((expression) => templateVariableName(expression) !== undefined);
+  return components;
 }
 
 /** The variable a whole `{name}` template segment declares, or undefined for any other text. */

@@ -5,7 +5,7 @@ import { CapabilityAuthError, servicePlaneErrorInfo } from '../shared/errors.js'
 import { isAsyncIterable, isRecord } from '../shared/guards.js';
 import { inlineJsonSchemaRoot as inlineSchemaRoot } from '../shared/json-schema.js';
 import { emitBestEffortServicePlaneLog, logErrorFields, type ServicePlaneBrokerLogEvent } from '../shared/logging.js';
-import { escapeRegExp, templateVariableName } from '../shared/paths.js';
+import { hasOnlySimpleTemplateExpressions, simpleTemplateComponents } from '../shared/paths.js';
 import {
   type DiscoveredServiceAbility,
   type McpDiscoveryDocument,
@@ -161,6 +161,9 @@ function indexMcpProjections(snapshot: ServiceRegistrySnapshot): McpProjectionIn
         indexMcpProjection(tools, definition.mcp.name, 'tool name', { ...match, projection: definition.mcp });
       }
       if (definition.mcpResource) {
+        if (!hasOnlySimpleTemplateExpressions(definition.mcpResource.uri)) {
+          throw new Error(`Service-Plane MCP resource URI has an invalid template expression: ${ability.id}/${method}`);
+        }
         indexMcpProjection(resources, definition.mcpResource.uri, 'resource uri', {
           ...match,
           projection: definition.mcpResource,
@@ -820,18 +823,27 @@ function isResourceTemplateUri(uri: string): boolean {
   return uri.includes('{');
 }
 
-// Template variables become string method inputs; a variable matches one path segment and is URI-decoded.
+// Fixed component boundaries and literal affixes leave no competing capture lengths to search.
 function matchResourceTemplate(template: string, uri: string): Record<string, string> | undefined {
-  const pattern = template
-    .split(/(\{[A-Za-z_]\w*\})/gu)
-    .map((part) => {
-      const variable = templateVariableName(part);
-      return variable ? `(?<${variable}>[^/?#]+)` : escapeRegExp(part);
-    })
-    .join('');
-  const matched = new RegExp(`^${pattern}$`, 'u').exec(uri);
-  if (!matched) return undefined;
-  return Object.fromEntries(Object.entries(matched.groups ?? {}).map(([name, value]) => [name, decodeUriComponentSafe(value)]));
+  const templateComponents = simpleTemplateComponents(template);
+  const uriComponents = uri.split(/([/?#])/u);
+  if (!templateComponents || templateComponents.length !== uriComponents.length) return undefined;
+
+  const captures: [string, string][] = [];
+  for (const [index, component] of templateComponents.entries()) {
+    const value = uriComponents[index];
+    if (value === undefined) return undefined;
+    if (typeof component === 'string') {
+      if (component !== value) return undefined;
+      continue;
+    }
+
+    const { name, prefix, suffix } = component;
+    const end = value.length - suffix.length;
+    if (end <= prefix.length || !value.startsWith(prefix) || !value.endsWith(suffix)) return undefined;
+    captures.push([name, value.slice(prefix.length, end)]);
+  }
+  return Object.fromEntries(captures.map(([name, value]) => [name, decodeUriComponentSafe(value)]));
 }
 
 function decodeUriComponentSafe(value: string): string {

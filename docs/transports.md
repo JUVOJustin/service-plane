@@ -156,7 +156,9 @@ transport: {
 ```
 
 Supported Service Plane encodings are `gzip`, `deflate`, and `deflate-raw`; choose only values
-available in the target runtime. Compression helps large JSON or text payloads and usually hurts
+available in the target runtime. Requests may use one encoding; stacked, malformed, and unsupported
+encodings are rejected with 415 before allocating a decoder, on Fetch and WebSocket alike.
+Compression helps large JSON or text payloads and usually hurts
 small requests through extra CPU and latency. Measure with realistic payloads.
 
 Compression applies to request bodies, including batches, and ordinary unary responses. Framed
@@ -165,7 +167,7 @@ and Node-specific compression dependencies that would otherwise change portabili
 
 Every RPC server rejects decoded request bodies and individual WebSocket messages larger than one
 MiB by default, including compressed and batched requests. Change `maxRequestBodyBytes`
-deliberately; `false` disables the guard.
+deliberately; `false` disables the byte limit, not the compression depth limit.
 
 ## Performance Expectations
 

@@ -120,6 +120,7 @@ export function createRpcHandlerPlugins<TContext extends object = Record<Propert
   options: ServicePlaneServerWireOptions,
   hibernation: boolean,
 ): StandardHandlerPlugin<TContext>[] {
+  const serializer = new RPCSerializer();
   // These guards apply before decoded values reach schemas or application code. oRPC orders the
   // byte limit around complete batches and after request decompression.
   const plugins: StandardHandlerPlugin<TContext>[] = [
@@ -146,7 +147,37 @@ export function createRpcHandlerPlugins<TContext extends object = Record<Propert
   }
 
   const compression = normalizeCompression<Exclude<ServicePlaneServerCompressionOptions, boolean>>(options.compression);
-  if (compression.request) plugins.push(new RequestCompressionHandlerPlugin());
+  if (compression.request) {
+    plugins.push(new RequestCompressionHandlerPlugin(), {
+      name: 'service-plane-request-compression',
+      // Routing interceptors prepend during initialization: guard before any decoder or batch.
+      after: ['~request-compression'],
+      before: ['service-plane-protocol'],
+      init: (handler) => ({
+        ...handler,
+        routingInterceptors: [
+          async ({ request, next }) => {
+            if (!isSupportedRequestContentEncoding(request.headers['content-encoding'])) {
+              return {
+                matched: true,
+                response: {
+                  status: 415,
+                  headers: {},
+                  body: serializer.serialize(
+                    new ORPCError('UNSUPPORTED_MEDIA_TYPE', {
+                      message: 'Service-Plane RPC accepts one Content-Encoding: gzip, deflate, or deflate-raw',
+                    }).toJSON(),
+                  ),
+                },
+              };
+            }
+            return next();
+          },
+          ...(handler.routingInterceptors ?? []),
+        ],
+      }),
+    });
+  }
   if (compression.response) {
     const response =
       typeof compression.response === 'boolean'
@@ -162,7 +193,6 @@ export function createRpcHandlerPlugins<TContext extends object = Record<Propert
     plugins.push(new ResponseCompressionHandlerPlugin(response));
   }
   if (hibernation) plugins.push(new HibernationHandlerPlugin());
-  const serializer = new RPCSerializer();
   plugins.push({
     name: 'service-plane-protocol',
     init: (handler) => ({
@@ -205,6 +235,16 @@ export function createRpcHandlerPlugins<TContext extends object = Record<Propert
     }),
   });
   return plugins;
+}
+
+// Bound native decoder allocation independently of body bytes, including pending WebSocket bodies.
+function isSupportedRequestContentEncoding(header: unknown): boolean {
+  if (header === undefined) return true;
+  const encoding = Array.isArray(header) && header.length === 1 ? header[0] : header;
+  return (
+    typeof encoding === 'string' &&
+    (SUPPORTED_COMPRESSION_ENCODINGS as readonly string[]).includes(encoding.replace(/^[\t ]+|[\t ]+$/g, '').toLowerCase())
+  );
 }
 
 // `true` enables both directions; an object names them individually.

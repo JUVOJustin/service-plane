@@ -15,6 +15,7 @@ import { requestIdFromContext } from '../shared/hono-context.js';
 import {
   decodeServicePlaneJwkAssertion,
   extractServicePlaneJwkAssertion,
+  randomServicePlaneJwkId,
   SERVICE_PLANE_JWK_ALGORITHM,
   SERVICE_PLANE_JWK_ASSERTION_AUDIENCE,
   SERVICE_PLANE_JWK_AUTHORIZATION_SCHEME,
@@ -29,12 +30,14 @@ import {
 import { defaultServicePlaneLogSink, emitBestEffortServicePlaneLog } from '../shared/logging.js';
 import {
   type CapabilityJwks,
+  DEFAULT_REGISTRY_CACHE_TTL_SECONDS,
   type RegistryCache,
   SERVICE_PLANE_REQUEST_ID_HEADER,
   type ServiceCallerAuthDiscovery,
   type ServiceEndpoint,
 } from '../shared/types.js';
 import type { CallerAuthResult } from './capabilities.js';
+import { serviceEndpointDiscoverySource } from './endpoints.js';
 import { createServiceRegistry } from './registry.js';
 
 const HMAC_CLIENT_SECRET_BYTES = 32;
@@ -43,6 +46,11 @@ const DEFAULT_HMAC_MAX_BODY_BYTES = 64 * 1024;
 const DEFAULT_JWK_MAX_SKEW_SECONDS = 60;
 const DEFAULT_JWK_MAX_BODY_BYTES = 64 * 1024;
 const DEFAULT_JWK_MAX_ASSERTION_TTL_SECONDS = 300;
+const JWK_DISCOVERY_MAX_ENTRIES = 128;
+const JWK_DISCOVERY_TIMEOUT_MS = 10_000;
+const JWK_DISCOVERY_RETRY_MS = 1_000;
+// ES256 signatures contain 64 bytes, encoded without base64url padding.
+const JWK_ASSERTION_SIGNATURE_LENGTH = 86;
 
 export type HmacServiceClient = {
   clientId: string;
@@ -196,6 +204,7 @@ export function jwkServiceClientAuth<TEnv extends Env = Env>(options: JwkService
     options.maxAssertionTtlSeconds ?? DEFAULT_JWK_MAX_ASSERTION_TTL_SECONDS,
     'JWK max assertion TTL',
   );
+  const discovery = new JwkCallerDiscovery(options);
   const log = options.log ?? defaultServicePlaneLogSink;
 
   return async (context: Context<TEnv>): Promise<Response | CallerAuthResult> => {
@@ -217,7 +226,28 @@ export function jwkServiceClientAuth<TEnv extends Env = Env>(options: JwkService
       throw error;
     }
 
-    const client = await resolveJwkServiceClient(context, options, clientId);
+    const keyId = context.req.header(keyIdHeader)?.trim();
+    if (!keyId) return refuse('missing_key', 'Missing Service-Plane JWK key id');
+
+    let decoded: ReturnType<typeof decodeServicePlaneJwkAssertion>;
+    let headerKeyId: string;
+    try {
+      // Only reject impossible assertions here; unverified claims never authenticate a caller.
+      const parts = assertion.split('.');
+      if (
+        parts.length !== 3 ||
+        parts.some((part) => !/^[A-Za-z0-9_-]+$/u.test(part) || part.length % 4 === 1) ||
+        parts[2]?.length !== JWK_ASSERTION_SIGNATURE_LENGTH
+      ) {
+        return refuse('invalid_assertion', 'Invalid Service-Plane JWK assertion encoding');
+      }
+      decoded = decodeServicePlaneJwkAssertion(assertion);
+      headerKeyId = validateJwkAssertionHeader(decoded.header, keyId);
+    } catch {
+      return refuse('invalid_assertion', 'Invalid Service-Plane JWK assertion');
+    }
+
+    const client = await resolveJwkServiceClient(context, options, clientId, discovery);
     if (!client) return refuse('client_not_found', 'Unknown Service-Plane JWK client');
 
     const jwks = typeof client.jwks === 'function' ? await client.jwks() : client.jwks;
@@ -226,11 +256,7 @@ export function jwkServiceClientAuth<TEnv extends Env = Env>(options: JwkService
     try {
       await verifyServicePlaneJwkSignature(assertion, jwks);
 
-      const { header, payload } = decodeServicePlaneJwkAssertion(assertion);
-      const claims = parseJwkAssertionClaims(payload);
-      const keyId = context.req.header(keyIdHeader)?.trim();
-      if (!keyId) return refuse('missing_key', 'Missing Service-Plane JWK key id');
-      const headerKeyId = validateJwkAssertionHeader(header, keyId);
+      const claims = parseJwkAssertionClaims(decoded.payload);
       const audience = await resolveJwkAssertionAudience(context, options);
       const now = options.now?.() ?? new Date();
       await validateJwkAssertionClaims(context, claims, {
@@ -307,6 +333,7 @@ async function resolveJwkServiceClient<TEnv extends Env>(
   context: Context<TEnv>,
   options: JwkServiceClientAuthOptions<TEnv>,
   clientId: string,
+  discovery: JwkCallerDiscovery,
 ): Promise<JwkServiceClient | undefined> {
   const clients = typeof options.clients === 'function' ? await options.clients(context) : (options.clients ?? []);
   const configured = clients.find((candidate) => timingSafeEqual(candidate.clientId, clientId));
@@ -314,24 +341,173 @@ async function resolveJwkServiceClient<TEnv extends Env>(
 
   if (!options.services) return undefined;
   const services = typeof options.services === 'function' ? await options.services(context) : options.services;
-  const registry = createServiceRegistry({
-    ...(options.registryCache
+  const endpoint = services.find((candidate) => candidate.id === clientId);
+  return endpoint ? discovery.resolve(endpoint) : undefined;
+}
+
+type JwkDiscoveryEntry = { expiresAt: number; pending: Promise<JwkServiceClient | undefined> };
+
+// Cache only selected caller keys. Instance and source identities prevent unrelated bindings from
+// sharing verification trust, including when applications supply the same external cache key.
+class JwkCallerDiscovery {
+  private readonly entries = new Map<string, JwkDiscoveryEntry>();
+  private readonly sources = new WeakMap<object, number>();
+  private namespace: string | undefined;
+  private nextSourceId = 0;
+  private readonly ttlSeconds: number;
+
+  // Hono-dependent service and client resolvers remain request-owned.
+  constructor(
+    private readonly options: Pick<JwkServiceClientAuthOptions, 'registryCache' | 'registryCacheKey' | 'registryCacheTtlSeconds'>,
+  ) {
+    this.ttlSeconds = options.registryCacheTtlSeconds ?? DEFAULT_REGISTRY_CACHE_TTL_SECONDS;
+  }
+
+  // Store the pending promise before yielding, so misses coalesce without an external registry cache.
+  resolve(endpoint: ServiceEndpoint): Promise<JwkServiceClient | undefined> {
+    const key = this.cacheKey(endpoint);
+    const cached = this.entries.get(key);
+    if (cached && cached.expiresAt > Date.now()) {
+      this.entries.delete(key);
+      this.entries.set(key, cached);
+      return cached.pending;
+    }
+    this.entries.delete(key);
+    if (this.entries.size >= JWK_DISCOVERY_MAX_ENTRIES) {
+      // Never evict running fills: saturation must not disable the coalescing bound.
+      const oldest = [...this.entries].find(([, entry]) => entry.expiresAt !== Number.POSITIVE_INFINITY)?.[0];
+      if (oldest === undefined) return Promise.resolve(undefined);
+      this.entries.delete(oldest);
+    }
+    const entry: JwkDiscoveryEntry = {
+      expiresAt: Number.POSITIVE_INFINITY,
+      pending: this.discover(endpoint, key).then((client) => {
+        entry.expiresAt = Date.now() + (client ? this.ttlSeconds * 1_000 : JWK_DISCOVERY_RETRY_MS);
+        return client;
+      }),
+    };
+    this.entries.set(key, entry);
+    return entry.pending;
+  }
+
+  // Replacing a fetch binding or inline document changes the verification-key authority.
+  private cacheKey(endpoint: ServiceEndpoint): string {
+    // Workers permit randomness during requests, not module-scope configuration.
+    this.namespace ??= randomServicePlaneJwkId();
+    const source = serviceEndpointDiscoverySource(endpoint);
+    let sourceId = this.sources.get(source);
+    if (sourceId === undefined) {
+      sourceId = ++this.nextSourceId;
+      this.sources.set(source, sourceId);
+    }
+    return JSON.stringify([
+      'service-plane:caller-jwk:v1',
+      this.namespace,
+      this.options.registryCacheKey,
+      endpoint.id,
+      endpoint.origin,
+      sourceId,
+    ]);
+  }
+
+  // Bound the whole fill, including cache access and discovery response bodies. A timed-out source
+  // cannot publish a late cache entry; its failed result is retried after a short local cooldown.
+  private async discover(endpoint: ServiceEndpoint, cacheKey: string): Promise<JwkServiceClient | undefined> {
+    const controller = new AbortController();
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const backing = this.options.registryCache;
+    const cache: RegistryCache | undefined = backing
       ? {
-          cache: options.registryCache,
-          ...(options.registryCacheKey ? { cacheKey: options.registryCacheKey } : {}),
-          ...(options.registryCacheTtlSeconds ? { cacheTtlSeconds: options.registryCacheTtlSeconds } : {}),
+          get: (key) => backing.get(key),
+          ...(backing.getStale ? { getStale: (key: string) => backing.getStale?.(key) ?? Promise.resolve(undefined) } : {}),
+          set: (key, snapshot, ttl) => (active ? backing.set(key, snapshot, ttl) : Promise.resolve()),
         }
-      : {}),
-    services,
-  });
-  const snapshot = await registry.discover();
-  const service = snapshot.services.find((candidate) => timingSafeEqual(candidate.id, clientId));
-  if (!service?.callerAuth?.jwks) return undefined;
-  return {
-    clientId: service.id,
-    jwks: { keys: service.callerAuth.jwks.keys.map(mutableJsonWebKey) },
-    serviceId: service.id,
+      : undefined;
+    const registry = createServiceRegistry({
+      ...(cache ? { cache } : {}),
+      cacheKey,
+      cacheTtlSeconds: this.ttlSeconds,
+      services: [{ ...endpoint, fetch: (request) => fetchJwkDiscovery(endpoint, request, controller.signal) }],
+    });
+    try {
+      const snapshot = await Promise.race([
+        registry.discover(),
+        new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => {
+            active = false;
+            controller.abort();
+            resolve(undefined);
+          }, JWK_DISCOVERY_TIMEOUT_MS);
+        }),
+      ]);
+      const service = snapshot?.services.find((candidate) => candidate.id === endpoint.id);
+      if (!service?.callerAuth?.jwks) return undefined;
+      return { clientId: service.id, jwks: { keys: service.callerAuth.jwks.keys.map(mutableJsonWebKey) }, serviceId: service.id };
+    } catch {
+      return undefined;
+    } finally {
+      active = false;
+      controller.abort();
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+}
+
+// Binding responses need explicit reader cancellation: neither their Request nor an intermediate
+// pipe is guaranteed to interrupt a pending source read promptly in every supported runtime.
+async function fetchJwkDiscovery(endpoint: ServiceEndpoint, request: Request, signal: AbortSignal): Promise<Response> {
+  const response = await endpoint.fetch(new Request(request, { signal }));
+  if (signal.aborted) {
+    void response.body?.cancel().catch(() => undefined);
+    throw new CapabilityAuthError('Service-Plane JWK discovery timed out', 401);
+  }
+  if (!response.body) return response;
+  const reader = response.body.getReader();
+  let finished = false;
+  let output: ReadableStreamDefaultController<Uint8Array>;
+  const release = () => {
+    signal.removeEventListener('abort', abort);
+    reader.releaseLock();
   };
+  const cancel = (reason: unknown) => {
+    if (finished) return;
+    finished = true;
+    void reader.cancel(reason).catch(() => undefined);
+    release();
+  };
+  const abort = () => {
+    if (finished) return;
+    output.error(signal.reason);
+    cancel(signal.reason);
+  };
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      output = controller;
+      signal.addEventListener('abort', abort, { once: true });
+      if (signal.aborted) abort();
+    },
+    async pull(controller) {
+      try {
+        const result = await reader.read();
+        if (finished) return;
+        if (!result.done) {
+          controller.enqueue(result.value);
+          return;
+        }
+        finished = true;
+        release();
+        controller.close();
+      } catch (error) {
+        if (finished) return;
+        finished = true;
+        release();
+        controller.error(error);
+      }
+    },
+    cancel,
+  });
+  return new Response(body, response);
 }
 
 function mutableJsonWebKey(key: ServiceCallerAuthDiscovery['jwks']['keys'][number]): JsonWebKey & { kid?: string } {
@@ -369,7 +545,12 @@ function parseJwkAssertionClaims(value: unknown): ServicePlaneJwkAssertionClaims
 }
 
 function validateJwkAssertionHeader(header: unknown, expectedKeyId: string): string {
-  if (!isRecord(header) || header.alg !== SERVICE_PLANE_JWK_ALGORITHM || typeof header.kid !== 'string') {
+  if (
+    !isRecord(header) ||
+    header.alg !== SERVICE_PLANE_JWK_ALGORITHM ||
+    typeof header.kid !== 'string' ||
+    (header.typ !== undefined && header.typ !== 'JWT')
+  ) {
     throw new CapabilityAuthError('Invalid Service-Plane JWK assertion header', 401);
   }
   if (header.kid !== expectedKeyId) {

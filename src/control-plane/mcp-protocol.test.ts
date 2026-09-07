@@ -297,6 +297,80 @@ const duplicateDispatchCases: {
 ];
 
 describe('control-plane MCP protocol hardening', () => {
+  it.each([
+    ['example://items/{left}{right}', 'example://items/ab'],
+    ['example://items/{left}-between-{right}', 'example://items/a-between-b'],
+    ['example://{host}.{suffix}/items', 'example://alpha.test/items'],
+    ['example://items?q={query}&page={page}', 'example://items?q=a&page=b'],
+    ['example://items/{id}#part-{id}', 'example://items/a#part-a'],
+    ['example://items/{nested{id}}', 'example://items/{nesteda}'],
+  ])('rejects unsafe resource templates in caller-supplied snapshots: %s', async (template, uri) => {
+    const { invocations, issueCapabilityToken, onInvocation, options, snapshot } = mcpDispatchFixture([
+      { mcpResource: { name: 'unsafe', uri: template } },
+      {},
+    ]);
+
+    expect(() => generateMcpDiscovery(snapshot)).toThrow('invalid template expression');
+    const response = await handlePreparedControlPlaneMcpRequest(
+      { acceptsEventStream: true, id: 'unsafe-template', method: 'resources/read', params: { uri } },
+      options,
+    );
+
+    await expect(response.json()).resolves.toMatchObject({ error: { code: -32603, message: 'Internal error' } });
+    expect(onInvocation).not.toHaveBeenCalled();
+    expect(issueCapabilityToken).not.toHaveBeenCalled();
+    expect(invocations).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { input: { id: '42' }, template: 'tasks://{id}', uri: 'tasks://42' },
+    {
+      input: { fragment: 'sec#one', host: 'tenant', id: 'a/b', query: 'x/y' },
+      template: 'example://{host}.internal/items/pre-{id}.json?q={query}&fixed=yes#part-{fragment}-end',
+      uri: 'example://tenant.internal/items/pre-a%2Fb.json?q=x%2Fy&fixed=yes#part-sec%23one-end',
+    },
+    { input: { id: 'a.json' }, template: 'example://items/{id}.json', uri: 'example://items/a.json.json' },
+    { input: { id: '%ZZ' }, template: 'example://items/{id}', uri: 'example://items/%ZZ' },
+    { input: { id: '%E0%A4%A' }, template: 'example://items/{id}', uri: 'example://items/%E0%A4%A' },
+    { input: { id: '42' }, template: 'example://items/a.+({id}).json?fixed=1', uri: 'example://items/a.+(42).json?fixed=1' },
+    { input: { ['__proto__']: 'safe' }, template: 'example://items/{__proto__}', uri: 'example://items/safe' },
+  ])('matches bounded URI components and decodes captures after matching: $uri', async ({ input, template, uri }) => {
+    const { invocations, options, snapshot } = mcpDispatchFixture([{ mcpResource: { name: 'item', uri: template } }, {}]);
+    expect(generateMcpDiscovery(snapshot).resourceTemplates).toHaveLength(1);
+
+    const response = await handlePreparedControlPlaneMcpRequest(
+      { acceptsEventStream: true, id: 'template-match', method: 'resources/read', params: { uri } },
+      options,
+    );
+
+    await expect(response.json()).resolves.toMatchObject({ result: { contents: [{ uri }] } });
+    expect(invocations).toHaveBeenCalledOnce();
+    expect(invocations).toHaveBeenCalledWith(expect.objectContaining({ input }));
+  });
+
+  it.each([
+    'example://items/pre-.json?q=query#part-fragment',
+    'example://items/pre-a/b.json?q=query#part-fragment',
+    'example://items/pre-id.json#q=query?part-fragment',
+    'example://items/pre-id.json?q=query#part-fragment/extra',
+    'example://items/wrong-id.json?q=query#part-fragment',
+    'example://items/pre-id.txt?q=query#part-fragment',
+  ])('does not match empty captures or changed literal components: %s', async (uri) => {
+    const { invocations, issueCapabilityToken, options } = mcpDispatchFixture([
+      { mcpResource: { name: 'item', uri: 'example://items/pre-{id}.json?q={query}#part-{fragment}' } },
+      {},
+    ]);
+
+    const response = await handlePreparedControlPlaneMcpRequest(
+      { acceptsEventStream: true, id: 'template-miss', method: 'resources/read', params: { uri } },
+      options,
+    );
+
+    await expect(response.json()).resolves.toMatchObject({ error: { code: -32002, data: { status: 404 } } });
+    expect(issueCapabilityToken).not.toHaveBeenCalled();
+    expect(invocations).not.toHaveBeenCalled();
+  });
+
   it.each(duplicateDispatchCases)(
     'rejects duplicate $label before invoking a service',
     async ({ expectedError, method, params, projection }) => {

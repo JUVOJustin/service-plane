@@ -85,7 +85,7 @@ export type ControlPlaneRpcBrokerCallInput = {
 
 export type ControlPlaneRpcBroker = {
   /** Calls one ability method through discovery, authorization, token minting, and routing. */
-  callAbility(input: ControlPlaneRpcBrokerCallInput): Promise<unknown>;
+  callAbility(input: ControlPlaneRpcBrokerCallInput, expectedKind?: 'call' | 'stream'): Promise<unknown>;
 };
 
 /** Private wire envelope for the control plane's generic broker methods. */
@@ -132,8 +132,14 @@ export const controlPlaneBrokerRouter = {
     .input(controlPlaneBrokerProcedureInputSchema)
     .output(typeSchema<unknown>())
     .handler(async ({ context, input }) => {
-      const output = await callBrokerProcedure(context, input);
+      const output = await callBrokerProcedure(context, input, 'call');
       if (isAsyncIterable(output)) {
+        // A stale catalog or divergent backend must not leave an unconsumed stream alive.
+        try {
+          void Promise.resolve(output[Symbol.asyncIterator]().return?.()).catch(() => undefined);
+        } catch {
+          // Cleanup cannot replace the endpoint refusal.
+        }
         throw new ORPCError('METHOD_NOT_SUPPORTED', {
           message: `Service-Plane streaming method must use the broker stream endpoint: ${input.method}`,
         });
@@ -145,7 +151,7 @@ export const controlPlaneBrokerRouter = {
     .input(controlPlaneBrokerProcedureInputSchema)
     .output(asyncIteratorObject(typeSchema<unknown>()))
     .handler(async ({ context, input }) => {
-      const output = await callBrokerProcedure(context, input);
+      const output = await callBrokerProcedure(context, input, 'stream');
       if (!isAsyncIterable(output)) {
         throw new ORPCError('METHOD_NOT_SUPPORTED', {
           message: `Service-Plane unary method must use the broker call endpoint: ${input.method}`,
@@ -155,10 +161,14 @@ export const controlPlaneBrokerRouter = {
     }),
 };
 
-async function callBrokerProcedure(context: ControlPlaneBrokerProcedureContext, input: ControlPlaneBrokerProcedureInput): Promise<unknown> {
+async function callBrokerProcedure(
+  context: ControlPlaneBrokerProcedureContext,
+  input: ControlPlaneBrokerProcedureInput,
+  expectedKind: 'call' | 'stream',
+): Promise<unknown> {
   try {
     const { broker, caller } = await context.resolveBroker(context.reqHeaders);
-    return await broker.callAbility({ ...input, ...(caller ? { caller } : {}) });
+    return await broker.callAbility({ ...input, ...(caller ? { caller } : {}) }, expectedKind);
   } catch (error) {
     if (error instanceof ORPCError) throw error;
     throw orpcErrorFromServicePlane(error) ?? new ORPCError('INTERNAL_SERVER_ERROR', { data: undefined });
@@ -187,7 +197,7 @@ export function createControlPlaneRpcBroker(options: CreateControlPlaneRpcBroker
   const timeoutMs = normalizeTimeoutMs(options.timeoutMs);
   const idempotencyKey = normalizeIdempotencyKey(options.idempotencyKey);
   return {
-    async callAbility(input) {
+    async callAbility(input, expectedKind) {
       const callReceivedAt = options.receivedAt ?? now();
       try {
         const initialRemaining = remainingTimeoutMs(timeoutMs, now() - callReceivedAt);
@@ -222,6 +232,13 @@ export function createControlPlaneRpcBroker(options: CreateControlPlaneRpcBroker
               `Service-Plane broker has no ability method: ${input.targetServiceId}/${input.abilityId}/${input.method}`,
               404,
             );
+          }
+          // Endpoint intent is server-owned, never taken from the untrusted wire envelope.
+          const methodKind = method.stream === true ? 'stream' : 'call';
+          if (expectedKind !== undefined && expectedKind !== methodKind) {
+            throw new ORPCError('METHOD_NOT_SUPPORTED', {
+              message: `Service-Plane ${method.stream === true ? 'streaming' : 'unary'} method must use the broker ${methodKind} endpoint: ${input.method}`,
+            });
           }
           const scopes = validateBrokerScopes(ability, input.method, input.scopes);
           if (options.authorizeInvocation) {

@@ -19,7 +19,7 @@ The token endpoint first reads the physical request into an exact, bounded byte 
 only that bounded request to `authenticateCaller`, then parses the same bytes before resolving the
 catalog-backed issuer. Custom body-signature authenticators can therefore consume the request
 without an unread cloned stream buffering beyond the STS limit. Oversized input never reaches
-authentication; malformed or unauthorized input never starts discovery or key derivation. The
+authentication; malformed or unauthorized input never starts issuer discovery or signing-key derivation. The
 default body limit is one MiB; configure `tokenMaxBodyBytes` on `ServicePlaneControlPlane` or
 `maxBodyBytes` on `mountCapabilityTokenEndpoint`.
 
@@ -117,6 +117,13 @@ authenticateCaller: jwkServiceClientAuth({
   clients: [{ clientId: 'workflow-service', jwks: publicJwks }],
 }),
 ```
+
+With `services` instead of explicit `clients`, JWK authentication discovers only the configured
+endpoint matching the caller ID. Unknown caller IDs and malformed assertion encodings or headers
+trigger no discovery.
+Selected keys are cached and concurrent lookups coalesced per authenticator for 30 seconds by
+default (`registryCacheTtlSeconds`); allow this overlap when rotating caller keys. Discovery has a
+10-second timeout and failed lookups retry after one second. Explicit `clients` still take precedence.
 
 Use HMAC only when asymmetric keys are impractical:
 

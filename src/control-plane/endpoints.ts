@@ -7,6 +7,9 @@ import {
   type ServiceEndpointGrant,
 } from '../shared/types.js';
 
+// Factory wrappers are request-local; their underlying fetch authority remains stable.
+const endpointFetchSources = new WeakMap<ServiceEndpoint['fetch'], object>();
+
 export function cloudflareServiceBinding(input: {
   /** Enables native unary RPC on `binding`, or supplies a separate native RPC adapter. */
   abilityRpc?: true | ServiceAbilityNativeRpcBinding;
@@ -21,7 +24,7 @@ export function cloudflareServiceBinding(input: {
   // service that implements `invokeAbility` from one that does not. `true` is the caller's explicit
   // assertion that the same binding implements it; an object remains available for custom adapters.
   const abilityRpc = input.abilityRpc === true ? (input.binding as ServiceAbilityNativeRpcBinding) : input.abilityRpc;
-  return {
+  const endpoint: ServiceEndpoint = {
     ...(abilityRpc ? { abilityRpc } : {}),
     ...(input.discovery ? { discovery: input.discovery } : {}),
     fetch: (request) => input.binding.fetch(request),
@@ -29,6 +32,8 @@ export function cloudflareServiceBinding(input: {
     id: input.id,
     origin: input.origin ?? `https://${input.id}.service-plane.internal`,
   };
+  endpointFetchSources.set(endpoint.fetch, input.binding);
+  return endpoint;
 }
 
 export function httpsService(input: {
@@ -39,13 +44,20 @@ export function httpsService(input: {
   id: string;
 }): ServiceEndpoint {
   const fetcher = input.fetch ?? fetch;
-  return {
+  const endpoint: ServiceEndpoint = {
     ...(input.discovery ? { discovery: input.discovery } : {}),
     fetch: (request) => fetcher(request),
     ...(input.grants ? { grants: input.grants } : {}),
     id: input.id,
     origin: input.baseUrl.replace(/\/+$/u, ''),
   };
+  endpointFetchSources.set(endpoint.fetch, fetcher);
+  return endpoint;
+}
+
+/** Identifies the authority behind discovery without equating unrelated bindings by origin. */
+export function serviceEndpointDiscoverySource(endpoint: ServiceEndpoint): object {
+  return endpoint.discovery ?? endpointFetchSources.get(endpoint.fetch) ?? endpoint.fetch;
 }
 
 export function serviceDiscoveryRequest(endpoint: ServiceEndpoint, discoveryPath = SERVICE_DISCOVERY_PATH): Request {

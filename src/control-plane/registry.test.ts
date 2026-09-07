@@ -461,6 +461,11 @@ describe('service registry', () => {
     ['a non-string resource URI', { mcpResource: { name: 'bad', uri: 42 } }],
     ['a blank resource URI', { mcpResource: { name: 'bad', uri: ' ' } }],
     ['an invalid resource template', { mcpResource: { name: 'bad', uri: 'example://items/{nested{id}}' } }],
+    ['adjacent resource variables', { mcpResource: { name: 'bad', uri: 'example://items/{left}{right}' } }],
+    ['overlapping resource variables', { mcpResource: { name: 'bad', uri: 'example://items/{left}-between-{right}' } }],
+    ['multiple host variables', { mcpResource: { name: 'bad', uri: 'example://{host}.{suffix}/items' } }],
+    ['multiple query variables', { mcpResource: { name: 'bad', uri: 'example://items?q={query}&page={page}' } }],
+    ['a reused resource variable', { mcpResource: { name: 'bad', uri: 'example://items/{id}#part-{id}' } }],
     ['non-string resource metadata', { mcpResource: { mimeType: 42, name: 'bad', uri: 'example://bad' } }],
   ])('isolates a service whose method publishes %s', async (_description, projection) => {
     const ability = document.abilities[0];

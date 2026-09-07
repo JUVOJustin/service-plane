@@ -394,6 +394,15 @@ describe('ability service discovery', () => {
     expect(abilityWith({ mcpResource: { name: 'item', uri: 'example://items/}itemId{' }, scopes: ['example.search'] })).toThrow(
       'invalid template expression',
     );
+    for (const uri of [
+      'example://items/{left}{right}',
+      'example://items/{left}-between-{right}',
+      'example://{host}.{suffix}/items',
+      'example://items?q={query}&page={page}',
+      'example://items/{id}#part-{id}',
+    ]) {
+      expect(abilityWith({ mcpResource: { name: 'item', uri }, scopes: ['example.search'] })).toThrow('invalid template expression');
+    }
     expect(abilityWith({ mcpResource: { name: 'item', uri: '  ' }, scopes: ['example.search'] })).toThrow(
       'MCP resource URI for example.search/read cannot be empty',
     );
